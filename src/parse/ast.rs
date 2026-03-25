@@ -1,6 +1,8 @@
-use crate::{idx, TiVec};
+use derive_more::{From, Into};
+use typed_index_collections::TiVec;
 
-idx!(MemberId, "id{}");
+#[derive(Debug, From, Into, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct MemberId(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Program(pub(super) TiVec<MemberId, Declaration>);
@@ -317,6 +319,7 @@ pub enum IndexOp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Invariant(pub Option<HeapExp>);
 
+#[allow(unused)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WhileSpec {
     Inv(Invariant),

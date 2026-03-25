@@ -10,7 +10,6 @@ peg = "0.8.2"
 num = "0.4.3"
 indexmap = "2.9.0"
 petgraph = "0.6.5"
-internment = { git = "https://github.com/JonasAlaif/internment", default-features = false, features = ["std", "bump"] }
 
-typed-index-collections = "3.2.3"
-nonmax = "0.5"
+typed-index-collections = "3.5.0"
+derive_more = "0.99"

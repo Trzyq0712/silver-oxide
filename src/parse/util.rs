@@ -1,5 +1,3 @@
-use core::ops::Index;
-
 use super::*;
 
 impl Program {
@@ -11,16 +9,14 @@ impl Program {
         self.0.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (MemberId, &Declaration)> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &Declaration)> {
         self.0
             .iter()
             .enumerate()
             .map(|(id, decl)| (id.into(), decl))
     }
 
-    pub fn iter_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (MemberId, &mut Declaration)> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut Declaration)> {
         self.0
             .iter_mut()
             .enumerate()
@@ -75,7 +71,13 @@ impl Declaration {
 
 impl Adt {
     pub fn identity(&self) -> Type {
-        Type::Domain(self.name.0.clone(), self.params.iter().map(|p| Type::Domain(p.0.clone(), Vec::new())).collect())
+        Type::Domain(
+            self.name.0.clone(),
+            self.params
+                .iter()
+                .map(|p| Type::Domain(p.0.clone(), Vec::new()))
+                .collect(),
+        )
     }
 }
 
@@ -193,13 +195,6 @@ impl ResourceExp {
             ExpKind::MagicWand(lhs, rhs) => Err((lhs, rhs)),
             _ => unreachable!(),
         }
-    }
-}
-
-impl Index<MemberId> for Program {
-    type Output = Declaration;
-    fn index(&self, index: MemberId) -> &Self::Output {
-        &self.0[index]
     }
 }
 

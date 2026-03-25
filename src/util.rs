@@ -1,8 +1,7 @@
-use core::fmt;
+use std::fmt;
 
 use typed_index_collections::TiEnumerated;
 
-pub(crate) type NonMaxU32 = nonmax::NonMaxU32;
 pub type TiVec<K, V> = typed_index_collections::TiVec<K, V>;
 pub type TiSlice<K, V> = typed_index_collections::TiSlice<K, V>;
 pub type HashMap<K, V> = indexmap::IndexMap<K, V>;
@@ -19,7 +18,10 @@ pub struct Brackets<T, I: IntoIterator<Item = T> + Copy>(char, I, char);
 
 impl<'a, K: From<usize>, V> IntoIterator for PairAdapter<'a, K, V> {
     type Item = Pair<'a, K, V>;
-    type IntoIter = std::iter::Map<TiEnumerated<core::slice::Iter<'a, V>, K, &'a V>, fn((K, &'a V)) -> Self::Item>;
+    type IntoIter = std::iter::Map<
+        TiEnumerated<core::slice::Iter<'a, V>, K, &'a V>,
+        fn((K, &'a V)) -> Self::Item,
+    >;
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter_enumerated().map(Pair)
     }
@@ -40,10 +42,14 @@ impl<'a, T> AsBrackets<'a, &'a T> for [T] {
 }
 
 impl<'a, K: From<usize>, V> AsBrackets<'a, Pair<'a, K, V>> for TiSlice<K, V> {
-    fn parenthesised(&'a self) -> Brackets<Pair<'a, K, V>, impl IntoIterator<Item = Pair<'a, K, V>> + Copy> {
+    fn parenthesised(
+        &'a self,
+    ) -> Brackets<Pair<'a, K, V>, impl IntoIterator<Item = Pair<'a, K, V>> + Copy> {
         Brackets('(', PairAdapter(self), ')')
     }
-    fn bracketed(&'a self) -> Brackets<Pair<'a, K, V>, impl IntoIterator<Item = Pair<'a, K, V>> + Copy> {
+    fn bracketed(
+        &'a self,
+    ) -> Brackets<Pair<'a, K, V>, impl IntoIterator<Item = Pair<'a, K, V>> + Copy> {
         Brackets('[', PairAdapter(self), ']')
     }
 }

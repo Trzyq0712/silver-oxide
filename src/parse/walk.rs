@@ -545,7 +545,12 @@ walk_struct!(
 );
 walk_struct!(Adt, walk_adt, walk_mut_adt, name, params, variants, derives);
 walk_struct!(Variant, walk_variant, walk_mut_variant, name, fields);
-walk_struct!(AdtConstructor, walk_adt_constructor, walk_mut_adt_constructor, signature);
+walk_struct!(
+    AdtConstructor,
+    walk_adt_constructor,
+    walk_mut_adt_constructor,
+    signature
+);
 
 // impl<T: AstWalkable> AstWalkable for Box<T> {
 //     fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
