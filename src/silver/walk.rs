@@ -1,6 +1,6 @@
 use num::{BigInt, BigRational};
 
-use crate::{parse::ast::*, TiVec};
+use crate::{silver::ast::*, TiVec};
 
 macro_rules! walk_children {
     ($name:ident, $l:lifetime, $ty:ident) => {

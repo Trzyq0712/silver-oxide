@@ -5,7 +5,7 @@ use typed_index_collections::TiVec;
 pub struct MemberId(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Program(pub(super) TiVec<MemberId, Declaration>);
+pub struct Program(pub TiVec<MemberId, Declaration>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PrePostDec {

@@ -1,4 +1,4 @@
-use crate::parse::ast::*;
+use crate::silver::ast::*;
 
 peg::parser! {
     pub grammar silver_parser() for str {
@@ -424,5 +424,14 @@ peg::parser! {
 #[test]
 fn precedence_test() {
     let exp = silver_parser::exp("!r.b").unwrap();
-    assert_eq!(exp, Box::new(ExpKind::UnOp(UnOp::Not, Box::new(ExpKind::Field(Box::new(ExpKind::Ident(Ident("r".to_string()))), Ident("b".to_string()))))));
+    assert_eq!(
+        exp,
+        Box::new(ExpKind::UnOp(
+            UnOp::Not,
+            Box::new(ExpKind::Field(
+                Box::new(ExpKind::Ident(Ident("r".to_string()))),
+                Ident("b".to_string())
+            ))
+        ))
+    );
 }

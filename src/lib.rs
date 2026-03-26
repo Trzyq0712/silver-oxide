@@ -1,4 +1,6 @@
-mod parse;
+pub mod silver;
+pub mod translate;
 mod util;
-pub use parse::silver_parser;
+pub mod vmir;
+pub use silver::silver_parser;
 pub use util::*;
