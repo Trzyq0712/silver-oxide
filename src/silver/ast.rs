@@ -1,11 +1,5 @@
-use derive_more::{From, Into};
-use typed_index_collections::TiVec;
-
-#[derive(Debug, From, Into, Eq, PartialEq, Hash, Clone, Copy)]
-pub struct MemberId(usize);
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Program(pub TiVec<MemberId, Declaration>);
+pub struct Program(pub Vec<Declaration>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PrePostDec {
@@ -127,8 +121,6 @@ pub struct ResourceExp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HeapExp {
-    /// Empty when parsed, later stages pull out all `acc` expressions here.
-    pub res: Vec<ResourceExp>,
     pub exp: Exp,
 }
 
@@ -138,20 +130,19 @@ pub type Exp = Box<ExpKind>;
 pub enum ExpKind {
     Const(ConstKind),
     Result,
-    // At(Ident, Exp),
+    // old(e) or old[label](e)
     Old(Option<Ident>, Exp),
-    // Lhs(Exp),
+    // e : Type
     Ascribe(Exp, Type),
-    /// unfolding(e) in E
+    /// unfolding(e) in E, and similarly for folding, applying, and packaging.
     HeapUpdate(HeapUpdateOp, AccExp, Exp),
     /// forall/exists x: T, y: U, ... :: { trigger } e
     Quantifier(QuantifierKind, Vec<IdnDeclTyped>, Vec<Trigger>, Exp),
-    /// let x = e1 in e2
+    /// let x == (e1) in e2
     LetIn(IdnDecl, Exp, Exp),
     /// Quantified permissions. forperm x: T, y: U, ... [Perm] :: e1
     ForPerm(Vec<IdnDeclTyped>, ResAccess, Exp),
     /// acc(e)
-    /// Moved to `ResourceExp` after desugaring.
     Acc(AccExp),
     /// f(e1, e2, ..., en)
     FuncApp(Ident, Vec<Exp>),
@@ -164,7 +155,6 @@ pub enum ExpKind {
     /// c ? e1 : e2
     Ternary(Exp, Exp, Exp),
     /// e.f
-    /// Replaced with `FuncApp` after desugaring.
     Field(Exp, Ident),
     /// e[e1]
     Index(Exp, IndexOp),
@@ -219,20 +209,15 @@ pub struct AccExp {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinOp {
-    /// Replaced with `Ternary` after desugaring.
     Implies,
-    /// Replaced with `Ternary` after desugaring.
     Or,
-    /// Replaced with `Ternary` after desugaring.
     And,
     Iff,
     Eq,
     Neq,
     Lt,
     Le,
-    /// Replaced with swapped `Lt` after desugaring.
     Gt,
-    /// Replaced with swapped `Le` after desugaring.
     Ge,
     In,
     Plus,
@@ -333,7 +318,7 @@ pub struct LocAccess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Field(pub Signature);
+pub struct Field(pub IdnDeclTyped);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Domain {

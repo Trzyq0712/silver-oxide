@@ -44,8 +44,7 @@ impl Declaration {
                 DomainElementKind::Axiom(_) => None,
             },
             AdtConstructor(a) => Some(&a.signature),
-            Field(f) => Some(&f.0),
-            Import(_) | Define(_) | Domain(_) | Adt(_) => None,
+            Field(_) | Import(_) | Define(_) | Domain(_) | Adt(_) => None,
         }
     }
 
@@ -62,7 +61,7 @@ impl Declaration {
             Import(_) => None,
             Define(d) => Some(&d.name),
             Domain(d) => Some(&d.name),
-            Field(f) => Some(&f.0.name),
+            Field(f) => Some(&f.0.idn),
             Adt(a) => Some(&a.name),
             AdtConstructor(a) => Some(&a.signature.name),
         }
@@ -102,7 +101,7 @@ impl AdtConstructor {
 
 impl HeapExp {
     pub(crate) fn new(exp: Exp) -> Self {
-        Self { res: vec![], exp }
+        Self { exp }
     }
 
     pub(super) fn conjoin(exp: Vec<Exp>) -> Option<Self> {
@@ -154,7 +153,7 @@ impl Contract {
 
 impl Field {
     pub fn ty(&self) -> &Type {
-        self.0.ret[0].ty()
+        &self.0.ty
     }
 }
 
@@ -175,16 +174,6 @@ impl ExpKind {
             Some(t) if matches!(*t, ExpKind::Const(ConstKind::Bool(true))) => new,
             Some(other) => Box::new(ExpKind::BinOp(BinOp::And, other, new)),
         })
-    }
-}
-
-impl HeapExp {
-    pub fn is_pure(&self) -> bool {
-        self.res.is_empty()
-    }
-
-    pub fn is_true(&self) -> bool {
-        self.is_pure() && self.exp.is_true()
     }
 }
 

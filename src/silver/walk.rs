@@ -69,9 +69,6 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_big_int, 'a, BigInt);
     walk_children!(walk_big_rational, 'a, BigRational);
     walk_children!(walk_usize, 'a, usize);
-
-    #[allow(unused_variables)]
-    fn visit_member_id(&mut self, did: MemberId) {}
 }
 
 macro_rules! walk_mut_children {
@@ -140,9 +137,6 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_big_int, 'a, BigInt);
     walk_mut_children!(walk_mut_big_rational, 'a, BigRational);
     walk_mut_children!(walk_mut_usize, 'a, usize);
-
-    #[allow(unused_variables)]
-    fn visit_member_id(&mut self, did: MemberId) {}
 }
 
 pub trait AstWalkable {
@@ -306,7 +300,7 @@ walk_struct!(
     cond,
     acc
 );
-walk_struct!(HeapExp, walk_heap_exp, walk_mut_heap_exp, res, exp);
+walk_struct!(HeapExp, walk_heap_exp, walk_mut_heap_exp, exp);
 walk_box!(Exp, walk_exp, walk_mut_exp);
 walk_enum!(
     ExpKind,
@@ -668,18 +662,3 @@ pub trait AstVisitable {
     fn visit<'a>(self, walker: &mut impl AstWalker<'a>);
     fn visit_mut<'a>(self, walker: &mut impl AstWalkerMut<'a>);
 }
-
-macro_rules! visit {
-    ($name:ident, $walk:ident) => {
-        impl AstVisitable for $name {
-            fn visit<'a>(self, walker: &mut impl AstWalker<'a>) {
-                walker.$walk(self);
-            }
-            fn visit_mut<'a>(self, walker: &mut impl AstWalkerMut<'a>) {
-                walker.$walk(self);
-            }
-        }
-    };
-}
-
-visit!(MemberId, visit_member_id);

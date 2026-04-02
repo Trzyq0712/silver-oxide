@@ -1,65 +1,125 @@
+use crate::vmir::{exp::Exp, Type};
 use derive_more::{From, Into};
+use lasso::{Key, Rodeo};
 use typed_index_collections::TiVec;
 
 #[derive(Debug, From, Into, Eq, PartialEq, Hash, Clone, Copy)]
-pub struct MemberId(usize);
+pub struct MemberId(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Program(pub TiVec<MemberId, Declaration>);
+unsafe impl Key for MemberId {
+    fn into_usize(self) -> usize {
+        self.0
+    }
+
+    fn try_from_usize(int: usize) -> Option<Self> {
+        Some(Self(int))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Program {
+    pub decls: TiVec<MemberId, Declaration>,
+    pub interner: Rodeo<MemberId>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Declaration {
-    Domain,
+    Domain(Domain),
     DomainElement,
     Function(Function),
     Method(Method),
     Resource(Resource),
-    Adt,
+    Adt(Adt),
     AdtConstructor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {
-    pub signature: Signature,
-    pub contract: Contract,
+    pub name: MemberId,
+    pub signature: MethSig,
+    pub contract: MethContract,
     pub body: Option<StmtBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
-    pub name: IdnDecl,
+    pub name: MemberId,
     pub args: Vec<Type>,
-    pub body: Option<ResourceBody>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ResourceBody {
-    // Placeholder for resource body (permissions and assertions)
-    // Will be expanded when we translate predicate bodies
+    pub snapshot: MemberId,
+    pub body: Option<Exp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Signature {
-    pub name: IdnDecl,
     pub args: Vec<Type>,
     pub ret: Vec<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Function {
-    pub signature: Signature,
-    pub contract: Contract,
-    pub body: Option<ExpBlock>,
+pub struct FuncSig {
+    pub args: Vec<Type>,
+    pub ret: Type,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Contract;
+pub struct MethSig {
+    pub args: Vec<Type>,
+    pub rets: Vec<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Function {
+    pub name: MemberId,
+    pub signature: FuncSig,
+    pub contract: FuncContract,
+    pub body: Option<Exp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Domain {
+    pub name: MemberId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Adt {
+    pub name: MemberId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MethContract {
+    pub requires: Option<Exp>,
+    pub ensures: Option<Exp>,
+}
+
+impl MethContract {
+    pub fn empty() -> Self {
+        Self {
+            requires: None,
+            ensures: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FuncContract {
+    pub requires: Option<Exp>,
+    pub ensures: Option<Exp>,
+}
+
+impl FuncContract {
+    pub fn empty() -> Self {
+        Self {
+            requires: None,
+            ensures: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExpBlock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StmtBlock;
+pub struct StmtBlock(pub Vec<Statement>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdnDecl(pub Ident);
@@ -68,29 +128,7 @@ pub struct IdnDecl(pub Ident);
 pub struct Ident(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Type {
-    Bool,
-    Int,
-    Real,
-    Ref,
-    Domain,
-    Addr(Box<Type>),
-    Resource(Ident), // Resource type (e.g., pr_heap)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
+    /// Variable declaration: var x: T
     VarDecl(IdnDecl, Type),
-    Assign(Vec<Ident>, Expr),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Expr {
-    BinOp(BinOp, Box<Expr>, Box<Expr>),
-    Call(Ident, Vec<Expr>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BinOp {
-    Add,
 }

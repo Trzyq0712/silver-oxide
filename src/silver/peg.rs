@@ -366,7 +366,7 @@ peg::parser! {
         rule func_interpretation() -> String = "interpretation" _ s:string_lit() { s }
 
         rule field() -> Vec<Declaration> = "field" _ fields:((f:formal_arg() {
-            Declaration::Field(Field(Signature::field(f)))
+            Declaration::Field(Field(f))
         }) ** comma()) { fields }
 
         rule function() -> Function = sig:function_signature() _ cont:contract()  _ body:block_exp()?

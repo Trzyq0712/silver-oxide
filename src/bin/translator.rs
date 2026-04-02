@@ -1,4 +1,4 @@
-use silver_oxide::{silver_parser, translate::VmirTranslator, silver::walk::AstWalker};
+use silver_oxide::{silver_parser, translate::VmirTranslator};
 use std::{error::Error, fs};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -9,14 +9,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("=== Silver AST ===");
     println!("{:#?}", program);
 
-    let mut translator = VmirTranslator::new();
-    translator.walk_program(&program);
+    let vmir_program = VmirTranslator::translate(&program).unwrap();
 
     println!("\n=== VMIR AST (Debug) ===");
-    println!("{:#?}", translator.program);
+    println!("{:#?}", vmir_program);
 
     println!("\n=== VMIR AST (Display) ===");
-    println!("{}", translator.program);
+    println!("{}", vmir_program);
 
     Ok(())
 }
