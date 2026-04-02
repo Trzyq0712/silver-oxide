@@ -440,7 +440,31 @@ impl VmirTranslator {
                             | silver::BinOp::Lt
                             | silver::BinOp::Le
                             | silver::BinOp::Gt
-                            | silver::BinOp::Ge => typecheck::Type::Bool,
+                            | silver::BinOp::Ge => {
+                                // Comparison: operands must have compatible types
+                                // If one side is concrete, impose it on the other
+                                let left_key = ctx.tc.get_var_key(&left_val);
+                                let right_key = ctx.tc.get_var_key(&right_val);
+                                
+                                // Impose that both sides should be compatible
+                                // If left is concrete (not Numeric/Top), constrain right to it
+                                if !matches!(left_ty, typecheck::Type::Numeric | typecheck::Type::Top) {
+                                    ctx.tc.impose(right_key.concretizes_explicit(left_ty.clone())).unwrap();
+                                }
+                                // If right is concrete, constrain left to it
+                                else if !matches!(right_ty, typecheck::Type::Numeric | typecheck::Type::Top) {
+                                    ctx.tc.impose(left_key.concretizes_explicit(right_ty.clone())).unwrap();
+                                }
+                                // Otherwise both are flexible, impose they should meet
+                                else {
+                                    let unified = ctx.tc.new_term_key();
+                                    ctx.tc.impose(unified.is_meet_of(left_key, right_key)).unwrap();
+                                    ctx.tc.impose(left_key.concretizes(unified)).unwrap();
+                                    ctx.tc.impose(right_key.concretizes(unified)).unwrap();
+                                }
+                                
+                                typecheck::Type::Bool
+                            }
                             
                             // Division produces Numeric type (can be Int or Real)
                             silver::BinOp::Div => typecheck::Type::Numeric,
