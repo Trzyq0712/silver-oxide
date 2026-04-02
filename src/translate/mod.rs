@@ -4,6 +4,7 @@ use crate::translate::name_resolution::DeclKind;
 use crate::vmir::{self, exp, MemberId};
 use lasso::{Key, Rodeo};
 use nonmax::NonMaxU32;
+use rusttyc::{TcKey, TcVar, TypeChecker};
 use std::collections::HashMap;
 use typed_index_collections::{ti_vec, TiVec};
 
@@ -25,7 +26,7 @@ use typed_index_collections::{ti_vec, TiVec};
 
 pub mod name_resolution;
 pub mod signatures;
-pub mod typeck;
+pub mod typecheck;
 pub use name_resolution::{IdentifierError, NameCollector};
 pub use signatures::SignatureContext;
 
@@ -40,9 +41,12 @@ pub struct VmirTranslator {
 /// This tracks locals, generates SSA instructions, and accumulates type information
 struct ExpTranslationContext<'a, 'b> {
     /// Maps Silver variable names to VMIR local indices
-    locals: &'b HashMap<String, NonMaxU32>,
+    locals: HashMap<&'b str, NonMaxU32>,
     /// Current instruction list being built
-    insts: Vec<exp::Inst>,
+    /// Stores (InstKind, initial type, TcKey for resolving)
+    insts: Vec<(exp::InstKind, typecheck::Type, TcKey)>,
+
+    tc: TypeChecker<typecheck::Type, vmir::exp::Value>,
     /// Current impure access expressions (acc(...))
     impures: Vec<exp::Acc>,
     /// Counter for generating temporary indices
@@ -51,11 +55,27 @@ struct ExpTranslationContext<'a, 'b> {
     translator: &'a VmirTranslator,
 }
 
+impl TcVar for vmir::exp::Value {}
+
 impl<'a, 'b> ExpTranslationContext<'a, 'b> {
-    fn new(translator: &'a VmirTranslator, locals: &'b HashMap<String, NonMaxU32>) -> Self {
+    fn new(
+        translator: &'a VmirTranslator,
+        locals: impl IntoIterator<Item = (&'b silver::IdnDecl, vmir::Type)>,
+    ) -> Self {
+        let mut name_idx_map = HashMap::new();
+        let mut tc = TypeChecker::new();
+        for (idx, (name, ty)) in locals.into_iter().enumerate() {
+            let idx = NonMaxU32::new(idx as u32).expect("Too many parameters");
+            let ty = typecheck::Type::from_vmir_type(&ty);
+            name_idx_map.insert(name.0 .0.as_str(), idx);
+            let tc_key = tc.get_var_key(&vmir::exp::Value::Local(idx));
+            tc.impose(tc_key.concretizes_explicit(ty)).unwrap();
+        }
+
         Self {
-            locals,
+            locals: name_idx_map,
             insts: Vec::new(),
+            tc,
             impures: Vec::new(),
             temp_counter: 0,
             translator,
@@ -70,16 +90,36 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
     }
 
     /// Add an instruction and return the temporary holding its result
-    fn add_inst(&mut self, kind: exp::InstKind, ty: vmir::Type) -> exp::Value {
+    fn add_inst(&mut self, kind: exp::InstKind, ty: typecheck::Type) -> exp::Value {
         let temp = self.fresh_temp();
-        self.insts.push(exp::Inst { kind, ty });
-        exp::Value::Temp(temp)
+        let val = exp::Value::Temp(temp);
+        
+        // Impose constraint on the result value and get the key
+        let key = self.tc.get_var_key(&val);
+        self.tc.impose(key.concretizes_explicit(ty.clone())).unwrap();
+        
+        self.insts.push((kind, ty, key));
+        val
     }
 
     /// Finalize the expression into a VMIR Exp
+    /// This resolves all type constraints and converts typecheck types to VMIR types
     fn finalize(self, res: exp::Value) -> exp::Exp {
+        // Run type checking to resolve all constraints
+        let type_table = self.tc.type_check_preliminary()
+            .expect("Type checking failed");
+        
+        // Convert instructions, resolving types using stored keys
+        let insts = self.insts.into_iter().map(|(kind, _, key)| {
+            let resolved_ty = &type_table[&key].variant;
+            exp::Inst {
+                kind,
+                ty: resolved_ty.to_vmir_type(),
+            }
+        }).collect();
+        
         exp::Exp {
-            insts: self.insts,
+            insts,
             res,
             impures: self.impures,
         }
@@ -312,27 +352,34 @@ impl VmirTranslator {
         &self,
         exp: &silver::Exp,
         ctx: &mut ExpTranslationContext,
-    ) -> (exp::Value, vmir::Type) {
+    ) -> (exp::Value, typecheck::Type) {
         use silver::ExpKind;
 
         match exp.as_ref() {
             ExpKind::Const(const_) => {
                 let ty = match const_ {
-                    silver::ConstKind::Bool(_) => vmir::Type::Bool,
-                    silver::ConstKind::Int(_) => vmir::Type::Int,
-                    silver::ConstKind::Real(_) => vmir::Type::Real,
-                    silver::ConstKind::Null => vmir::Type::Ref,
+                    silver::ConstKind::Bool(_) => typecheck::Type::Bool,
+                    silver::ConstKind::Int(_) => typecheck::Type::Int,
+                    silver::ConstKind::Real(_) => typecheck::Type::Real,
+                    silver::ConstKind::Null => typecheck::Type::Ref,
                     _ => unimplemented!("Constant type inference: {:?}", const_),
                 };
-                (exp::Value::Const(self.translate_const(const_)), ty)
+                (
+                    exp::Value::Const(self.translate_const(const_)),
+                    ty,
+                )
             }
 
             ExpKind::Ident(ident) => {
                 // Look up in locals
-                if let Some(&local_idx) = ctx.locals.get(&ident.0) {
-                    // TODO: We need type information for locals
-                    // For now, we'll assume Int (will need proper type tracking)
-                    (exp::Value::Local(local_idx), vmir::Type::Int)
+                if let Some(&local_idx) = ctx.locals.get(ident.0.as_str()) {
+                    let val = exp::Value::Local(local_idx);
+                    // The type was already imposed in the context constructor
+                    // We can query it from the type checker
+                    let key = ctx.tc.get_var_key(&val);
+                    // Type will be resolved at finalize time
+                    // For now, just return Top as a placeholder
+                    (val, typecheck::Type::Top)
                 } else {
                     panic!("Undefined variable: {}", ident.0);
                 }
@@ -349,9 +396,9 @@ impl VmirTranslator {
 
                         let val = ctx.add_inst(
                             exp::InstKind::Ternary(cond_val, then_val, else_val),
-                            vmir::Type::Bool,
+                            typecheck::Type::Bool,
                         );
-                        (val, vmir::Type::Bool)
+                        (val, typecheck::Type::Bool)
                     }
 
                     silver::BinOp::Or => {
@@ -362,9 +409,9 @@ impl VmirTranslator {
 
                         let val = ctx.add_inst(
                             exp::InstKind::Ternary(cond_val, then_val, else_val),
-                            vmir::Type::Bool,
+                            typecheck::Type::Bool,
                         );
-                        (val, vmir::Type::Bool)
+                        (val, typecheck::Type::Bool)
                     }
 
                     silver::BinOp::Implies => {
@@ -375,32 +422,41 @@ impl VmirTranslator {
 
                         let val = ctx.add_inst(
                             exp::InstKind::Ternary(cond_val, then_val, else_val),
-                            vmir::Type::Bool,
+                            typecheck::Type::Bool,
                         );
-                        (val, vmir::Type::Bool)
+                        (val, typecheck::Type::Bool)
                     }
 
                     _ => {
                         // Regular binary operations
                         let (left_val, left_ty) = self.translate_exp(left, ctx);
-                        let (right_val, _right_ty) = self.translate_exp(right, ctx);
+                        let (right_val, right_ty) = self.translate_exp(right, ctx);
 
                         // Determine the result type based on the operator
                         let result_ty = match op {
-                            silver::BinOp::Iff => vmir::Type::Bool,
+                            silver::BinOp::Iff => typecheck::Type::Bool,
                             silver::BinOp::Eq
                             | silver::BinOp::Neq
                             | silver::BinOp::Lt
                             | silver::BinOp::Le
                             | silver::BinOp::Gt
-                            | silver::BinOp::Ge => vmir::Type::Bool,
+                            | silver::BinOp::Ge => typecheck::Type::Bool,
+                            
+                            // Division produces Numeric type (can be Int or Real)
+                            silver::BinOp::Div => typecheck::Type::Numeric,
+                            
                             silver::BinOp::Plus
                             | silver::BinOp::Minus
                             | silver::BinOp::Mult
-                            | silver::BinOp::Div
                             | silver::BinOp::Mod
                             | silver::BinOp::IntDiv => {
-                                // Arithmetic operations preserve numeric types
+                                // Arithmetic operations: result is meet of operand types
+                                let left_key = ctx.tc.get_var_key(&left_val);
+                                let right_key = ctx.tc.get_var_key(&right_val);
+                                let result = ctx.tc.new_term_key();
+                                ctx.tc.impose(result.is_meet_of(left_key, right_key)).unwrap();
+                                
+                                // Return the left type as placeholder (will be resolved)
                                 left_ty.clone()
                             }
                             _ => unimplemented!("BinOp type inference: {:?}", op),
@@ -420,7 +476,7 @@ impl VmirTranslator {
                 let (inner_val, inner_ty) = self.translate_exp(inner, ctx);
 
                 let result_ty = match op {
-                    silver::UnOp::Not => vmir::Type::Bool,
+                    silver::UnOp::Not => typecheck::Type::Bool,
                     silver::UnOp::Neg => inner_ty.clone(),
                     _ => unimplemented!("UnOp type inference: {:?}", op),
                 };
@@ -481,8 +537,12 @@ impl VmirTranslator {
                     .get(&field_name.0)
                     .expect(&format!("Field {} not found", field_name.0));
 
-                // Fields are functions that take a Ref and return an address
-                let result_ty = vmir::Type::Addr(Box::new(vmir::Type::Int)); // Simplified
+                // Get field signature and convert to typecheck type
+                let result_ty = self
+                    .signatures
+                    .get_function_return_type(field_id)
+                    .map(|ty| typecheck::Type::from_vmir_type(ty))
+                    .unwrap_or_else(|| typecheck::Type::AddrOf(Box::new(typecheck::Type::Int))); // Fallback
 
                 let val = ctx.add_inst(
                     exp::InstKind::Call(field_id, vec![base_val]),
@@ -501,7 +561,7 @@ impl VmirTranslator {
         &self,
         (func_name, args): (&silver::Ident, &Vec<silver::Exp>),
         ctx: &mut ExpTranslationContext,
-    ) -> (exp::Value, vmir::Type) {
+    ) -> (exp::Value, typecheck::Type) {
         let func_id = self
             .interner
             .get(&func_name.0)
@@ -514,11 +574,11 @@ impl VmirTranslator {
 
         // Look up return type from signature context
         // All callables (functions, predicates, fields) are stored in functions map
-        let result_ty = self.signatures.get_function_return_type(func_id)
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!("No signature found for callable: {}", func_name.0)
-            });
+        let result_ty = self
+            .signatures
+            .get_function_return_type(func_id)
+            .map(|ty| typecheck::Type::from_vmir_type(ty))
+            .unwrap_or_else(|| panic!("No signature found for callable: {}", func_name.0));
 
         let val = ctx.add_inst(exp::InstKind::Call(func_id, arg_vals), result_ty.clone());
         (val, result_ty)
@@ -528,7 +588,7 @@ impl VmirTranslator {
         &self,
         loc_exp: &silver::LocAccess,
         ctx: &mut ExpTranslationContext,
-    ) -> (exp::Value, vmir::Type) {
+    ) -> (exp::Value, typecheck::Type) {
         match loc_exp.loc.as_ref() {
             silver::ExpKind::FuncApp(func_name, args) => {
                 self.translate_func_app((func_name, args), ctx)
@@ -542,9 +602,15 @@ impl VmirTranslator {
         &self,
         acc_exp: &silver::AccExp,
         ctx: &mut ExpTranslationContext,
-    ) -> (exp::Value, vmir::Type) {
+    ) -> (exp::Value, typecheck::Type) {
         let (loc_val, _) = self.translate_loc_exp(&acc_exp.acc, ctx);
-        let (perm_val, _) = self.translate_exp(&acc_exp.perm, ctx);
+        let (perm_val, _perm_ty) = self.translate_exp(&acc_exp.perm, ctx);
+
+        // IMPORTANT: Impose constraint that permission must be Real type
+        // This will cause Numeric types (like 1/2) to resolve to Real
+        let perm_key = ctx.tc.get_var_key(&perm_val);
+        ctx.tc.impose(perm_key.concretizes_explicit(typecheck::Type::Real))
+            .expect("Failed to impose Real constraint on permission");
 
         // Add to impures list
         ctx.impures.push(exp::Acc {
@@ -555,7 +621,7 @@ impl VmirTranslator {
         // acc() expressions evaluate to true (unit/bool) in the pure context
         (
             exp::Value::Const(exp::Literal::Bool(true)),
-            vmir::Type::Bool,
+            typecheck::Type::Bool,
         )
     }
 
@@ -590,13 +656,18 @@ impl VmirTranslator {
         silver_exp: &silver::Exp,
         params: impl IntoIterator<Item = &'a silver::ArgOrType>,
     ) -> exp::Exp {
-        let locals = HashMap::from_iter(params.into_iter().enumerate().map(|(idx, param)| {
-            let name = param.idn().expect("Param to be named");
-            let idx = NonMaxU32::new(idx as u32).expect("Too many parameters");
-            (name.0 .0.clone(), idx)
-        }));
-
-        let mut ctx = ExpTranslationContext::new(self, &locals);
+        // Convert ArgOrType to (IdnDecl, Type) pairs
+        let locals = params.into_iter().filter_map(|arg| {
+            match arg {
+                silver::ArgOrType::Arg(typed) => {
+                    let vmir_ty = self.translate_type(&typed.ty);
+                    Some((&typed.idn, vmir_ty))
+                },
+                silver::ArgOrType::Type(_) => None, // Skip type-only parameters
+            }
+        });
+        
+        let mut ctx = ExpTranslationContext::new(self, locals);
 
         let (result, _ty) = self.translate_exp(silver_exp, &mut ctx);
         ctx.finalize(result)
