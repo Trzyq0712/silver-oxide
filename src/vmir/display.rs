@@ -2,7 +2,6 @@ use crate::vmir::ast::*;
 use crate::vmir::exp;
 use crate::vmir::Type;
 use lasso::Rodeo;
-use std::fmt::write;
 use std::fmt::{self, Display, Formatter};
 
 /// Helper struct for displaying VMIR with access to the string interner
@@ -103,7 +102,7 @@ impl<'a> Display for VmirDisplay<'a, Function> {
 
         write!(f, ": {}", self.with(&self.item.signature.ret))?;
 
-        if let Some(ref body) = self.item.body {
+        if let Some(ref _body) = self.item.body {
             writeln!(f, " {{")?;
             write!(f, "  // body")?;
             writeln!(f)?;
@@ -148,7 +147,7 @@ impl<'a> Display for VmirDisplay<'a, Method> {
             self.write_indent(f)?;
             writeln!(f, "{{")?;
             let body_display = self.with_indent(body);
-            write!(f, "{}", body_display)?;
+            // write!(f, "{}", body_display)?;
             self.write_indent(f)?;
             writeln!(f, "}}")?;
         }
@@ -284,9 +283,9 @@ impl<'a> Display for VmirDisplay<'a, exp::InstKind> {
 impl<'a> Display for VmirDisplay<'a, exp::Value> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            exp::Value::Temp(idx) => write!(f, "e{}", idx),
-            exp::Value::Local(idx) => write!(f, "_{}", idx),
-            exp::Value::Const(lit) => {
+            exp::Value::Temp(idx) => write!(f, "e{}", idx.0),
+            exp::Value::Local(idx) => write!(f, "_{}", idx.0),
+            exp::Value::Literal(lit) => {
                 let lit_display = self.with(lit);
                 write!(f, "{}", lit_display)
             }
@@ -314,26 +313,15 @@ impl<'a> Display for VmirDisplay<'a, exp::Acc> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, StmtBlock> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for stmt in &self.item.0 {
-            let stmt_display = self.with(stmt);
-            writeln!(f, "{}", stmt_display)?;
-        }
-        Ok(())
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, Statement> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
-            Statement::VarDecl(idn, ty) => {
-                self.write_indent(f)?;
-                write!(f, "var {} : {}", self.with(idn), self.with(ty))
-            }
-        }
-    }
-}
+// impl<'a> Display for VmirDisplay<'a, StmtBlock> {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+//         for stmt in &self.item.0 {
+//             let stmt_display = self.with(stmt);
+//             writeln!(f, "{}", stmt_display)?;
+//         }
+//         Ok(())
+//     }
+// }
 
 impl<'a> Display for VmirDisplay<'a, Type> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

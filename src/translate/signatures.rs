@@ -37,10 +37,7 @@ impl SignatureContext {
     }
 
     /// Collect all signatures from a Silver program
-    pub fn collect(
-        program: &silver::Program,
-        interner: &Rodeo<MemberId>,
-    ) -> Self {
+    pub fn collect(program: &silver::Program, interner: &Rodeo<MemberId>) -> Self {
         let mut collector = SignatureCollector {
             context: SignatureContext::new(),
             interner,
@@ -49,9 +46,8 @@ impl SignatureContext {
         collector.context
     }
 
-    /// Get the return type of a function (includes predicates and fields)
-    pub fn get_function_return_type(&self, func_id: MemberId) -> Option<&Type> {
-        self.functions.get(&func_id).map(|sig| &sig.ret)
+    pub fn function_sig(&self, func_id: MemberId) -> &FunctionSignature {
+        self.functions.get(&func_id).unwrap()
     }
 }
 
@@ -68,7 +64,8 @@ impl<'a> SignatureCollector<'a> {
             silver::Type::Real => Type::Real,
             silver::Type::Ref => Type::Ref,
             silver::Type::Domain(ident, _) => {
-                let domain_id = self.interner
+                let domain_id = self
+                    .interner
                     .get(&ident.0)
                     .expect("Domain name should be interned");
                 Type::Domain(domain_id)
@@ -81,16 +78,17 @@ impl<'a, 'b> AstWalker<'b> for SignatureCollector<'a> {
     fn walk_field(&mut self, field: &'b silver::Field) {
         let silver::Field(decl) = field;
         let name = &decl.idn.0 .0;
-        
-        let field_id = self.interner
+
+        let field_id = self
+            .interner
             .get(name)
             .expect("Field name should be interned");
-        
+
         let field_type = self.translate_type(&decl.ty);
-        
+
         // Field is a function returning an address to the field type
         let ret_type = Type::Addr(Box::new(field_type));
-        
+
         self.context.functions.insert(
             field_id,
             FunctionSignature {
@@ -103,77 +101,82 @@ impl<'a, 'b> AstWalker<'b> for SignatureCollector<'a> {
     fn walk_function(&mut self, function: &'b silver::Function) {
         let sig = &function.signature;
         let name = &sig.name.0 .0;
-        
-        let func_id = self.interner
+
+        let func_id = self
+            .interner
             .get(name)
             .expect("Function name should be interned");
-        
-        let args: Vec<_> = sig.args
+
+        let args: Vec<_> = sig
+            .args
             .iter()
             .map(|arg| self.translate_type(arg.ty()))
             .collect();
-        
+
         let ret = if sig.ret.is_empty() {
             Type::Bool // Default for no return type
         } else {
             self.translate_type(sig.ret[0].ty())
         };
-        
-        self.context.functions.insert(
-            func_id,
-            FunctionSignature { args, ret },
-        );
+
+        self.context
+            .functions
+            .insert(func_id, FunctionSignature { args, ret });
     }
 
     fn walk_method(&mut self, method: &'b silver::Method) {
         let sig = &method.signature;
         let name = &sig.name.0 .0;
-        
-        let method_id = self.interner
+
+        let method_id = self
+            .interner
             .get(name)
             .expect("Method name should be interned");
-        
-        let args: Vec<_> = sig.args
+
+        let args: Vec<_> = sig
+            .args
             .iter()
             .map(|arg| self.translate_type(arg.ty()))
             .collect();
-        
-        let ret: Vec<_> = sig.ret
+
+        let ret: Vec<_> = sig
+            .ret
             .iter()
             .map(|r| self.translate_type(r.ty()))
             .collect();
-        
-        self.context.methods.insert(
-            method_id,
-            MethodSignature { args, ret },
-        );
+
+        self.context
+            .methods
+            .insert(method_id, MethodSignature { args, ret });
     }
 
     fn walk_predicate(&mut self, predicate: &'b silver::Predicate) {
         let sig = &predicate.signature;
         let name = &sig.name.0 .0;
-        
-        let pred_id = self.interner
+
+        let pred_id = self
+            .interner
             .get(name)
             .expect("Predicate name should be interned");
-        
-        let args: Vec<_> = sig.args
+
+        let args: Vec<_> = sig
+            .args
             .iter()
             .map(|arg| self.translate_type(arg.ty()))
             .collect();
-        
+
         // Compute snapshot domain name
         let snap_name = format!("{}@snap", name);
-        let snap_id = self.interner
+        let snap_id = self
+            .interner
             .get(&snap_name)
             .expect("Snapshot name should be interned");
-        
+
         // Predicate is a function returning address to snapshot domain
         let ret = Type::Addr(Box::new(Type::Domain(snap_id)));
-        
-        self.context.functions.insert(
-            pred_id,
-            FunctionSignature { args, ret },
-        );
+
+        self.context
+            .functions
+            .insert(pred_id, FunctionSignature { args, ret });
     }
 }

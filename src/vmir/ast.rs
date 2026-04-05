@@ -1,6 +1,7 @@
-use crate::vmir::{exp::Exp, Type};
+use crate::vmir::{exp::Exp, Local, Type};
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
+use nonmax::NonMaxU32;
 use typed_index_collections::TiVec;
 
 #[derive(Debug, From, Into, Eq, PartialEq, Hash, Clone, Copy)]
@@ -129,6 +130,22 @@ pub struct Ident(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
-    /// Variable declaration: var x: T
-    VarDecl(IdnDecl, Type),
+    /// x, y := m(a, b, c)
+    MethodCall(Vec<AssignTarget>, MemberId, Vec<Local>),
+    /// Assign to a local or a temporary
+    /// x := e
+    /// x: T, e: T
+    Assign(AssignTarget, Exp),
+    /// Assign to a heap location
+    /// x *= e
+    /// x: &T, e: T
+    HeapAssign(AssignTarget, Exp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AssignTarget {
+    /// Named local variable
+    Local(NonMaxU32),
+    /// Anonymous temporary
+    Temp(NonMaxU32),
 }
