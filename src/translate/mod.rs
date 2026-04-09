@@ -1,6 +1,5 @@
 use crate::silver::walk::AstWalkable;
 use crate::translate::name_resolution::DeclKind;
-use crate::translate::typecheck::TcType;
 use crate::vmir;
 use crate::{silver, translate::exp::ExpTranslationContext};
 use lasso::{Key, Rodeo};
@@ -26,6 +25,7 @@ use typed_index_collections::{ti_vec, TiVec};
 //   - Build a type environment that translation can use
 
 pub mod exp;
+// pub mod method;
 pub mod name_resolution;
 pub mod signatures;
 pub mod typecheck;
@@ -40,23 +40,6 @@ pub struct VmirTranslator {
     signatures: SignatureContext,
 }
 
-// /// Context for translating method bodies
-// /// Manages locals, temps, statements and type checking for method body translation
-// struct MethodTranslationContext<'a, 'b> {
-//     /// Maps Silver variable names to (VMIR local index, type)
-//     /// Includes both parameters and local variable declarations
-//     locals: HashMap<&'b str, (NonMaxU32, typecheck::TcType)>,
-//     /// Counter for generating local indices (for var declarations)
-//     local_counter: u32,
-//     /// Counter for generating temporary indices
-//     temp_counter: u32,
-//     /// Accumulated statements in the method body
-//     statements: Vec<vmir::Statement>,
-//     /// Type checker for method locals and temps
-//     tc: TypeChecker<typecheck::TcType, vmir::vmir::exp::Value>,
-//     /// Reference to the translator for looking up global names
-//     translator: &'a VmirTranslator,
-// }
 //
 // impl<'a, 'b> MethodTranslationContext<'a, 'b> {
 //     fn new(
@@ -308,7 +291,7 @@ impl VmirTranslator {
             body: predicate
                 .body
                 .as_ref()
-                .map(|body| self.translate_exp(&body.0.exp, &sig.args, &vmir::Type::Bool)),
+                .map(|body| self.translate_impure_exp(&body.0.exp, &sig.args, &vmir::Type::Bool)),
         };
 
         assert!(
@@ -320,14 +303,14 @@ impl VmirTranslator {
     }
 
     /// Translate a complete expression with predefined locals (e.g., for predicate bodies)
-    fn translate_exp<'a>(
+    fn translate_impure_exp<'a>(
         &self,
         exp: &silver::ExpKind,
         env: impl IntoIterator<Item = &'a silver::ArgOrType>,
         ty: &vmir::Type,
-    ) -> vmir::exp::Exp {
+    ) -> vmir::impure::HeapExp {
         // Convert ArgOrType to (IdnDecl, Type) pairs
-        let env = env.into_iter().filter_map(|arg| {
+        let locals = env.into_iter().filter_map(|arg| {
             match arg {
                 silver::ArgOrType::Arg(typed) => {
                     let vmir_ty = self.translate_type(&typed.ty);
@@ -337,9 +320,9 @@ impl VmirTranslator {
             }
         });
 
-        let mut ctx = ExpTranslationContext::new(self);
+        let ctx = ExpTranslationContext::new(self, locals);
 
-        ctx.translate_exp(exp, env, ty)
+        ctx.translate_exp(exp)
     }
 
     fn translate_method(&mut self, method: &silver::Method) {
@@ -661,17 +644,33 @@ impl VmirTranslator {
         contract: &silver::Contract,
         signature: &silver::Signature,
     ) -> vmir::FuncContract {
+        // Build requires input signature: [heap, ...args]
+        let mut requires_inputs = vec![vmir::Type::Heap];
+        for arg in &signature.args {
+            if let silver::ArgOrType::Arg(typed) = arg {
+                requires_inputs.push(self.translate_type(&typed.ty));
+            }
+        }
+
         let requires = contract
             .precondition
             .as_ref()
-            .map(|pre| self.translate_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
+            .map(|pre| self.translate_impure_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
+
+        // Build ensures input signature: [heap, old_heap, ...args]
+        let mut ensures_inputs = vec![vmir::Type::Heap, vmir::Type::Heap];
+        for arg in &signature.args {
+            if let silver::ArgOrType::Arg(typed) = arg {
+                ensures_inputs.push(self.translate_type(&typed.ty));
+            }
+        }
 
         let ensures = contract
             .postcondition
             .as_ref()
-            .map(|post| self.translate_exp(&post.exp, &signature.args, &vmir::Type::Bool));
+            .map(|post| self.translate_impure_exp(&post.exp, &signature.args, &vmir::Type::Bool));
 
-        vmir::FuncContract { requires, ensures }
+        vmir::FuncContract::with_inputs(requires, ensures, requires_inputs, ensures_inputs)
     }
 
     fn translate_method_contract(
@@ -679,18 +678,39 @@ impl VmirTranslator {
         contract: &silver::Contract,
         signature: &silver::Signature,
     ) -> vmir::MethContract {
+        // Build requires input signature: [heap, ...args]
+        let mut requires_inputs = vec![vmir::Type::Heap];
+        for arg in &signature.args {
+            if let silver::ArgOrType::Arg(typed) = arg {
+                requires_inputs.push(self.translate_type(&typed.ty));
+            }
+        }
+
         let requires = contract
             .precondition
             .as_ref()
-            .map(|pre| self.translate_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
+            .map(|pre| self.translate_impure_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
+
+        // Build ensures input signature: [heap, old_heap, ...args, ...returns]
+        let mut ensures_inputs = vec![vmir::Type::Heap, vmir::Type::Heap];
+        for arg in &signature.args {
+            if let silver::ArgOrType::Arg(typed) = arg {
+                ensures_inputs.push(self.translate_type(&typed.ty));
+            }
+        }
+        for ret in &signature.ret {
+            if let silver::ArgOrType::Arg(typed) = ret {
+                ensures_inputs.push(self.translate_type(&typed.ty));
+            }
+        }
 
         let ensures_locals = signature.args.iter().chain(signature.ret.iter());
         let ensures = contract
             .postcondition
             .as_ref()
-            .map(|post| self.translate_exp(&post.exp, ensures_locals, &vmir::Type::Bool));
+            .map(|post| self.translate_impure_exp(&post.exp, ensures_locals, &vmir::Type::Bool));
 
-        vmir::MethContract { requires, ensures }
+        vmir::MethContract::with_inputs(requires, ensures, requires_inputs, ensures_inputs)
     }
 }
 

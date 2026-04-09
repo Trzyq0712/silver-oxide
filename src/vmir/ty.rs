@@ -9,4 +9,6 @@ pub enum Type {
 
     Domain(MemberId),
     Addr(Box<Type>),
+
+    Heap,
 }

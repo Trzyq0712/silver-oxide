@@ -1,11 +1,6 @@
 use crate::vmir::{ty::Type, MemberId};
 use nonmax::NonMaxU32;
 
-pub struct TypedExp {
-    pub kind: InstKind,
-    pub ty: Type,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Plus,
@@ -29,27 +24,20 @@ pub enum Literal {
     Bool(bool),
     Null,
     Real(num::BigRational),
+    EmptyHeap,
 }
 
-/// Each value is either a temporary, a local, or a constant literal.
+/// Each value is either a temporary, or a constant literal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     /// Refers to an earlier instruction result
     Temp(Temp),
-    /// A local from the scope
-    Local(Local),
     Literal(Literal),
 }
 
 impl From<Literal> for Value {
     fn from(value: Literal) -> Self {
         Self::Literal(value)
-    }
-}
-
-impl From<Local> for Value {
-    fn from(value: Local) -> Self {
-        Self::Local(value)
     }
 }
 
@@ -85,31 +73,43 @@ pub struct Inst {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PermOp {
+    /// Adjust permission to a location: (location, amount_delta)
+    /// Positive amount = add permission, Negative = remove permission
+    Adjust(Value, Value),
+}
+
+type Heap = Value;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InstKind {
+    /// Read the current value of a local
+    Read(Local),
+
     Unary(UnOp, Value),
     Binary(BinOp, Value, Value),
     Ternary(Value, Value, Value),
 
+    /// Call a function
     Call(MemberId, Vec<Value>),
 
-    Deref(Value),
+    // Heap operations
+    /// Get the amount of permission held to a location in the given heap
+    Perm(Heap, Value),
+    /// Adjust the amount of permission held to a location in the given heap
+    PermOp(Heap, PermOp),
+    /// Dereference an address in the given heap
+    Deref(Heap, Value),
 }
 
-/// Represents an access expression `acc(loc, perm)`
-/// In VMIR, the access expressions are flattened. This means
-/// `v == null ? acc(loc, 1/1) : true` is transformed into
-/// `acc(loc, v == null ? 1/1 : 0/1)` (in reality the condition is a separate instruction result
-/// itself).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Acc {
-    pub loc: Value,
-    pub perm: Value,
-}
-
-/// Expression is a list of instructions
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Exp {
+pub struct HeapExp {
+    /// Types of inputs this heap expression expects
+    /// For requires: [heap, ...method_args]
+    /// For ensures: [heap, old_heap, ...method_args, ...returns]
+    pub input_types: Vec<crate::vmir::Type>,
     pub insts: Vec<Inst>,
-    pub res: Value,
-    pub impures: Vec<Acc>,
+    /// The pure result - a boolean
+    pub res_pure: Value,
+    /// The impure part - a heap
+    pub res_impure: Value,
 }

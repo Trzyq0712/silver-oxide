@@ -1,4 +1,4 @@
-use crate::vmir::{exp::Exp, Local, Type};
+use crate::vmir::{impure::HeapExp, Local, Type};
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
 use nonmax::NonMaxU32;
@@ -47,7 +47,7 @@ pub struct Resource {
     pub name: MemberId,
     pub args: Vec<Type>,
     pub snapshot: MemberId,
-    pub body: Option<Exp>,
+    pub body: Option<HeapExp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -73,7 +73,7 @@ pub struct Function {
     pub name: MemberId,
     pub signature: FuncSig,
     pub contract: FuncContract,
-    pub body: Option<Exp>,
+    pub body: Option<HeapExp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,8 +88,8 @@ pub struct Adt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MethContract {
-    pub requires: Option<Exp>,
-    pub ensures: Option<Exp>,
+    pub requires: Option<HeapExp>,
+    pub ensures: Option<HeapExp>,
 }
 
 impl MethContract {
@@ -99,12 +99,32 @@ impl MethContract {
             ensures: None,
         }
     }
+
+    /// Create a contract with input signature metadata
+    /// requires_inputs: [heap, ...args]
+    /// ensures_inputs: [heap, old_heap, ...args, ...returns]
+    pub fn with_inputs(
+        requires: Option<HeapExp>,
+        ensures: Option<HeapExp>,
+        requires_inputs: Vec<Type>,
+        ensures_inputs: Vec<Type>,
+    ) -> Self {
+        let requires = requires.map(|mut exp| {
+            exp.input_types = requires_inputs;
+            exp
+        });
+        let ensures = ensures.map(|mut exp| {
+            exp.input_types = ensures_inputs;
+            exp
+        });
+        Self { requires, ensures }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncContract {
-    pub requires: Option<Exp>,
-    pub ensures: Option<Exp>,
+    pub requires: Option<HeapExp>,
+    pub ensures: Option<HeapExp>,
 }
 
 impl FuncContract {
@@ -113,6 +133,26 @@ impl FuncContract {
             requires: None,
             ensures: None,
         }
+    }
+
+    /// Create a contract with input signature metadata
+    /// requires_inputs: [heap, ...args]
+    /// ensures_inputs: [heap, old_heap, ...args]
+    pub fn with_inputs(
+        requires: Option<HeapExp>,
+        ensures: Option<HeapExp>,
+        requires_inputs: Vec<Type>,
+        ensures_inputs: Vec<Type>,
+    ) -> Self {
+        let requires = requires.map(|mut exp| {
+            exp.input_types = requires_inputs;
+            exp
+        });
+        let ensures = ensures.map(|mut exp| {
+            exp.input_types = ensures_inputs;
+            exp
+        });
+        Self { requires, ensures }
     }
 }
 
@@ -135,11 +175,11 @@ pub enum Statement {
     /// Assign to a local or a temporary
     /// x := e
     /// x: T, e: T
-    Assign(AssignTarget, Exp),
+    Assign(AssignTarget, HeapExp),
     /// Assign to a heap location
     /// x *= e
     /// x: &T, e: T
-    HeapAssign(AssignTarget, Exp),
+    HeapAssign(AssignTarget, HeapExp),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

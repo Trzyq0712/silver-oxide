@@ -26,6 +26,7 @@ pub enum TcType {
     Addr,
     /// Either an Int or Real
     Numeric,
+    Heap,
     /// Top type (supertype of all types)
     Top,
 }
@@ -74,6 +75,7 @@ impl Variant for TcType {
             (Addr, Addr) => Addr,
             (Int, Int) => Int,
             (Real, Real) => Real,
+            (Heap, Heap) => Heap,
 
             // Domains with same ID
             (Domain(id1), Domain(id2)) if id1 == id2 => Domain(id1),
@@ -108,6 +110,7 @@ impl Constructable for TcType {
             TcType::Bool => VmirType::Bool,
             TcType::Int => VmirType::Int,
             TcType::Real => VmirType::Real,
+            TcType::Numeric => VmirType::Real,
             TcType::Ref => VmirType::Ref,
             TcType::Domain(id) => VmirType::Domain(*id),
             TcType::Addr => {
@@ -116,8 +119,7 @@ impl Constructable for TcType {
                     .ok_or_else(|| TypeErr("AddrOf missing child type".to_string()))?;
                 VmirType::Addr(Box::new(inner.clone()))
             }
-            // Promote a numeric to a real
-            TcType::Numeric => dbg!(VmirType::Real),
+            TcType::Heap => VmirType::Heap,
             TcType::Top => Err(TypeErr("Abstract type in VMIR".to_string()))?,
         })
     }
@@ -132,6 +134,7 @@ impl From<&VmirType> for TcType {
             VmirType::Ref => TcType::Ref,
             VmirType::Domain(id) => TcType::Domain(*id),
             VmirType::Addr(_) => TcType::Addr,
+            VmirType::Heap => TcType::Heap,
         }
     }
 }

@@ -1,0 +1,10 @@
+field x: Int
+field y: Int
+
+predicate Point(p: Ref) {
+  acc(p.x, write) && acc(p.y, write)
+}
+
+predicate Pair(a: Ref, b: Ref) {
+  Point(a) && Point(b)
+}

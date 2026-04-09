@@ -1,0 +1,4 @@
+method test(x: Int) returns (y: Int)
+{
+  y := x
+}
