@@ -1,5 +1,5 @@
 use crate::vmir::ast::*;
-use crate::vmir::impure;
+use crate::vmir;
 use crate::vmir::Type;
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
@@ -200,7 +200,7 @@ impl<'a> Display for VmirDisplay<'a, Resource> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, impure::HeapExp> {
+impl<'a> Display for VmirDisplay<'a, vmir::HeapExp> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         // Display input signatures
         if !self.item.input_types.is_empty() {
@@ -216,7 +216,7 @@ impl<'a> Display for VmirDisplay<'a, impure::HeapExp> {
         }
 
         // Display the SSA instructions
-        for (idx, impure::Inst { kind, ty }) in self.item.insts.iter().enumerate() {
+        for (idx, vmir::Inst { kind, ty }) in self.item.insts.iter().enumerate() {
             self.write_indent(f)?;
             writeln!(f, "e{}: {} := {}", idx, self.with(ty), self.with(kind))?;
         }
@@ -232,19 +232,19 @@ impl<'a> Display for VmirDisplay<'a, impure::HeapExp> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, impure::InstKind> {
+impl<'a> Display for VmirDisplay<'a, vmir::InstKind> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            impure::InstKind::Unary(op, val) => {
+            vmir::InstKind::Unary(op, val) => {
                 let val_display = self.with(val);
                 write!(f, "{:?}({})", op, val_display)
             }
-            impure::InstKind::Binary(op, lhs, rhs) => {
+            vmir::InstKind::Binary(op, lhs, rhs) => {
                 let lhs_display = self.with(lhs);
                 let rhs_display = self.with(rhs);
                 write!(f, "{:?}({}, {})", op, lhs_display, rhs_display)
             }
-            impure::InstKind::Ternary(cond, then_val, else_val) => {
+            vmir::InstKind::Ternary(cond, then_val, else_val) => {
                 let cond_display = self.with(cond);
                 let then_display = self.with(then_val);
                 let else_display = self.with(else_val);
@@ -254,7 +254,7 @@ impl<'a> Display for VmirDisplay<'a, impure::InstKind> {
                     cond_display, then_display, else_display
                 )
             }
-            impure::InstKind::Call(func_id, args) => {
+            vmir::InstKind::Call(func_id, args) => {
                 let func_name = self.interner.resolve(func_id);
                 write!(f, "{}(", func_name)?;
                 for (i, arg) in args.iter().enumerate() {
@@ -266,18 +266,18 @@ impl<'a> Display for VmirDisplay<'a, impure::InstKind> {
                 }
                 write!(f, ")")
             }
-            impure::InstKind::Deref(heap, val) => {
+            vmir::InstKind::Deref(heap, val) => {
                 write!(f, "*[{}]{}", self.with(heap), self.with(val))
             }
-            impure::InstKind::Read(local) => {
+            vmir::InstKind::Read(local) => {
                 write!(f, "read {}", self.with(local))
             }
-            impure::InstKind::Perm(heap, loc) => {
+            vmir::InstKind::Perm(heap, loc) => {
                 write!(f, "perm [{}] {}", self.with(heap), self.with(loc))
             }
-            impure::InstKind::PermOp(heap, perm_op) => {
+            vmir::InstKind::PermOp(heap, perm_op) => {
                 match perm_op {
-                    impure::PermOp::Adjust(loc, amt) => {
+                    vmir::PermOp::Adjust(loc, amt) => {
                         write!(
                             f,
                             "perm_op [{}] {} by {}",
@@ -292,31 +292,31 @@ impl<'a> Display for VmirDisplay<'a, impure::InstKind> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, impure::Value> {
+impl<'a> Display for VmirDisplay<'a, vmir::Value> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            impure::Value::Temp(idx) => write!(f, "e{}", idx.0),
-            impure::Value::Literal(lit) => {
+            vmir::Value::Temp(idx) => write!(f, "e{}", idx.0),
+            vmir::Value::Literal(lit) => {
                 write!(f, "{}", self.with(lit))
             }
         }
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, impure::Local> {
+impl<'a> Display for VmirDisplay<'a, vmir::Local> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "_{}", &self.item.0)
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, impure::Literal> {
+impl<'a> Display for VmirDisplay<'a, vmir::Literal> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            impure::Literal::Int(i) => write!(f, "{}", i),
-            impure::Literal::Bool(b) => write!(f, "{}", b),
-            impure::Literal::Null => write!(f, "null"),
-            impure::Literal::Real(r) => write!(f, "{}", r),
-            impure::Literal::EmptyHeap => write!(f, "∅"),
+            vmir::Literal::Int(i) => write!(f, "{}", i),
+            vmir::Literal::Bool(b) => write!(f, "{}", b),
+            vmir::Literal::Null => write!(f, "null"),
+            vmir::Literal::Real(r) => write!(f, "{}", r),
+            vmir::Literal::EmptyHeap => write!(f, "∅"),
         }
     }
 }

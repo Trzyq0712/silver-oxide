@@ -308,7 +308,7 @@ impl VmirTranslator {
         exp: &silver::ExpKind,
         env: impl IntoIterator<Item = &'a silver::ArgOrType>,
         ty: &vmir::Type,
-    ) -> vmir::impure::HeapExp {
+    ) -> vmir::HeapExp {
         // Convert ArgOrType to (IdnDecl, Type) pairs
         let locals = env.into_iter().filter_map(|arg| {
             match arg {

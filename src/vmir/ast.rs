@@ -1,4 +1,4 @@
-use crate::vmir::{impure::HeapExp, Local, Type};
+use crate::vmir::{HeapExp, Local, Type};
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
 use nonmax::NonMaxU32;
