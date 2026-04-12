@@ -216,6 +216,8 @@ peg::parser! {
         rule exp_kind() -> ExpKind = annotated(<full_exp()>)
 
         pub(super) rule exp() -> Exp = e:exp_kind() { Box::new(e) }
+        rule pure_exp() -> PureExp = e:exp() { e.into() }
+        rule assert_exp() -> AssertExp = e:exp() { e.into() }
 
         rule suffix_exp() -> ExpKind = a:atom() _ suff:(("." id:ident() { Ok(id) } / "[" _ e:exp() _ "]" { Err(e) }) ** _)
             {
@@ -245,11 +247,11 @@ peg::parser! {
         rule block_exp() -> ExpBlock = "{" _ e:exp() _ "}" { Block(e) }
 
         rule statement() -> Statement
-            = kw(<"assert">) _ e:exp() { Statement::Assert(e.into())}
-            / kw(<"refute">) _ e:exp() { Statement::Refute(e.into())}
-            / kw(<"assume">) _ e:exp() { Statement::Assume(e.into())}
-            / kw(<"inhale">) _ e:exp() { Statement::Inhale(HeapExp::new(e))}
-            / kw(<"exhale">) _ e:exp() { Statement::Exhale(HeapExp::new(e))}
+            = kw(<"assert">) _ e:assert_exp() { Statement::Assert(e)}
+            / kw(<"refute">) _ e:assert_exp() { Statement::Refute(e)}
+            / kw(<"assume">) _ e:assert_exp() { Statement::Assume(e)}
+            / kw(<"inhale">) _ e:assert_exp() { Statement::Inhale(HeapExp::new(e))}
+            / kw(<"exhale">) _ e:assert_exp() { Statement::Exhale(HeapExp::new(e))}
             / kw(<"fold">) _ e:predicate_perm() { Statement::Fold(e)}
             / kw(<"unfold">) _ e:predicate_perm() { Statement::Unfold(e)}
             / kw(<"goto">) _ id:label() { Statement::Goto(id)}
@@ -276,24 +278,24 @@ peg::parser! {
         rule bracketed<R>(r: rule<R>) -> Vec<R> = "[" _ res:(r() ** comma()) _ "]" { res }
         rule braced<R>(r: rule<R>) -> Vec<R> = "{" _ res:(r() ** comma()) _ "}" { res }
 
-        rule while_statement() -> Statement = "while" _ "(" _ cond:exp() _ ")" _ spec:semied(<while_spec_item()>)* _ block:block()
+        rule while_statement() -> Statement = "while" _ "(" _ cond:pure_exp() _ ")" _ spec:semied(<while_spec_item()>)* _ block:block()
             {
                 let c = Contract::from(spec);
-                Statement::While(cond.into(), Invariant(c.precondition), c.decreases, block)
+                Statement::While(cond, Invariant(c.precondition), c.decreases, block)
             }
 
         rule while_spec_item() -> PrePostDec = i:invariant() { PrePostDec::Pre(i) } / d:decreases() { d }
 
         rule invariant() -> Exp = "invariant" _ e:exp() { e }
 
-        rule if_statement() -> Statement = "if" _ "(" _ cond:exp() _ ")" _ then:block() _ elsifs:(elsif_block()** _) _ else_:("else" _ else_:block() { else_})? {
-            let mut elsifs = [(cond.into(), then)].into_iter().chain(elsifs).rev();
+        rule if_statement() -> Statement = "if" _ "(" _ cond:pure_exp() _ ")" _ then:block() _ elsifs:(elsif_block()** _) _ else_:("else" _ else_:block() { else_})? {
+            let mut elsifs = [(cond, then)].into_iter().chain(elsifs).rev();
             let (cond, then) = elsifs.next().unwrap();
             elsifs.fold(Statement::If(cond, then, else_), |acc, (cond, then)| Statement::If(cond, then, Some(Block(vec![acc]))))
         }
 
         rule elsif_block() -> (PureExp, StmtBlock) =
-            "elseif" _ "(" _ exp:exp() _ ")" _ block:block() { (exp.into(), block)}
+            "elseif" _ "(" _ exp:pure_exp() _ ")" _ block:block() { (exp, block)}
 
         rule assign_stmt() -> Statement = tgts:(tgts:(assign_target() ++ comma()) _ ":=" { tgts })? _ rhs:assign_rhs()
             { Statement::Assign(tgts.unwrap_or_default(), rhs) }
@@ -303,9 +305,9 @@ peg::parser! {
         rule assign_rhs() -> AssignRhs =
               "new" _ "(" _ "*" _ ")" { AssignRhs::New(StarOrNames::Star) }
             / "new" _ "(" _ args:(ident() ** comma()) _ ")" { AssignRhs::New(StarOrNames::Names(args))}
-            / e:exp() { match *e {
-                ExpKind::FuncApp(id, args) => AssignRhs::Call(id, args),
-                _ => AssignRhs::Exp(e.into())
+            / e:pure_exp() { match e.0.as_ref() {
+                ExpKind::FuncApp(id, args) => AssignRhs::Call(id.clone(), args.clone()),
+                _ => AssignRhs::Exp(e)
             }}
 
         rule wand_statement() -> Statement =// "wand" _ name:ident() _ ":" _ exp:exp() { Statement::Wand(name, exp) } /
