@@ -2,7 +2,12 @@ use rusttyc::{TcErr, TcKey, TypeChecker};
 
 use crate::{
     silver,
-    translate::{name_resolution::DeclKind, typecheck::TcType, VmirTranslator},
+    translate::{
+        name_resolution::DeclKind,
+        pure_exp::{PureExpBackend, PureExpTranslator},
+        typecheck::TcType,
+        VmirTranslator,
+    },
     vmir, HashMap,
 };
 
@@ -124,19 +129,19 @@ impl<'sil, 'vmir> MethodTranslCtxt<'sil, 'vmir> {
 
         let lhs = idns
             .iter()
-            .map(|idn| Box::new(silver::ExpKind::Ident(idn.idn.0.clone())))
+            .map(|idn| silver::AssignLhs::Ident(idn.idn.0.clone()))
             .collect::<Vec<_>>();
         self.translate_assign(&lhs, asgn);
     }
 
-    fn translate_assign(&mut self, lhs: &[silver::Exp], assign_rhs: &silver::AssignRhs) {
+    fn translate_assign(&mut self, lhs: &[silver::AssignLhs], assign_rhs: &silver::AssignRhs) {
         match assign_rhs {
             silver::AssignRhs::Exp(exp) => {
-                let rhs = self.translate_exp(exp);
+                let rhs = self.translate_pure_exp(exp);
                 let [lhs] = lhs else {
                     unimplemented!("Tuple assignment is not implemented");
                 };
-                let lhs_ident = self.translate_assign_ident(lhs.as_ref());
+                let lhs_ident = self.translate_assign_ident(lhs);
                 let declared = self.declared_type(lhs_ident).clone();
                 self.impose_type(&rhs, &declared).unwrap();
                 self.bind_ident(lhs_ident, rhs);
@@ -148,7 +153,7 @@ impl<'sil, 'vmir> MethodTranslCtxt<'sil, 'vmir> {
 
     fn translate_call(
         &mut self,
-        lhs: &[silver::Exp],
+        lhs: &[silver::AssignLhs],
         call_tgt: &silver::Ident,
         args: &[silver::Exp],
     ) {
@@ -168,11 +173,10 @@ impl<'sil, 'vmir> MethodTranslCtxt<'sil, 'vmir> {
         }
     }
 
-    fn translate_assign_ident<'a>(&self, exp: &'a silver::ExpKind) -> &'a silver::Ident {
-        match exp {
-            silver::ExpKind::Ident(idn) => idn,
-            silver::ExpKind::Field(exp, idn) => unimplemented!(),
-            _ => panic!("Assign LHS can be an identifier or a field access only"),
+    fn translate_assign_ident<'a>(&self, lhs: &'a silver::AssignLhs) -> &'a silver::Ident {
+        match lhs {
+            silver::AssignLhs::Ident(idn) => idn,
+            silver::AssignLhs::Field(_, _) => unimplemented!(),
         }
     }
 
@@ -206,34 +210,20 @@ impl<'sil, 'vmir> MethodTranslCtxt<'sil, 'vmir> {
     }
 
     fn translate_exp(&mut self, exp: &silver::ExpKind) -> vmir::Value {
-        match exp {
-            silver::ExpKind::Ident(idn) => self.var_map.get(&idn).unwrap().clone(),
-            silver::ExpKind::Const(_) => unimplemented!(),
-            silver::ExpKind::BinOp(silver::BinOp::Plus, lhs, rhs) => {
-                let lhs = self.translate_exp(lhs);
-                let rhs = self.translate_exp(rhs);
-                let lhs_key = self.tc.get_var_key(&lhs);
-                let rhs_key = self.tc.get_var_key(&rhs);
-                let val = self.add_inst(vmir::method::InstKind::BinOp(vmir::BinOp::Plus, lhs, rhs));
-                let v_key = self.tc.get_var_key(&val);
-                self.tc
-                    .impose(lhs_key.concretizes_explicit(TcType::Numeric))
-                    .unwrap();
-                self.tc
-                    .impose(rhs_key.concretizes_explicit(TcType::Numeric))
-                    .unwrap();
-                self.tc
-                    .impose(v_key.concretizes_explicit(TcType::Numeric))
-                    .unwrap();
-                val
-            }
-            _ => unimplemented!(),
-        }
+        PureExpTranslator::new(self)
+            .translate_exp_kind(exp)
+            .unwrap_or_else(|e| panic!("Method expression type checking failed: {:?}", e))
+    }
+
+    fn translate_pure_exp(&mut self, exp: &silver::PureExp) -> vmir::Value {
+        PureExpTranslator::new(self)
+            .translate_pure_exp(exp)
+            .unwrap_or_else(|e| panic!("Method expression type checking failed: {:?}", e))
     }
 
     fn translate_method_call(
         &mut self,
-        lhs: &[silver::Exp],
+        lhs: &[silver::AssignLhs],
         memid: vmir::MemberId,
         args: &[silver::Exp],
     ) {
@@ -261,7 +251,7 @@ impl<'sil, 'vmir> MethodTranslCtxt<'sil, 'vmir> {
             .iter()
             .zip(callee_sig.ret.iter())
             .map(|(lhs_exp, ret_ty)| {
-                let lhs_ident = self.translate_assign_ident(lhs_exp.as_ref());
+                let lhs_ident = self.translate_assign_ident(lhs_exp);
                 let ret_val = self.freshen_ident_binding(lhs_ident);
                 self.impose_type(&ret_val, ret_ty).unwrap();
                 ret_val
@@ -362,5 +352,30 @@ impl<'sil, 'vmir> MethodTranslCtxt<'sil, 'vmir> {
                 })
                 .collect(),
         )
+    }
+}
+
+impl<'sil, 'vmir> PureExpBackend for MethodTranslCtxt<'sil, 'vmir> {
+    fn resolve_ident(&self, ident: &silver::Ident) -> vmir::Value {
+        self.var_map
+            .get(ident)
+            .unwrap_or_else(|| panic!("Undefined variable: {}", ident.0))
+            .clone()
+    }
+
+    fn current_heap(&self) -> vmir::Value {
+        self.curr_heap.clone()
+    }
+
+    fn emit_pure_inst(&mut self, inst: vmir::PureInst) -> vmir::Value {
+        self.add_inst(vmir::method::InstKind::Pure(inst))
+    }
+
+    fn tc_mut(&mut self) -> &mut TypeChecker<TcType, vmir::Value> {
+        &mut self.tc
+    }
+
+    fn translator(&self) -> &VmirTranslator {
+        self.translator
     }
 }

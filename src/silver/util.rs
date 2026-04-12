@@ -100,13 +100,20 @@ impl AdtConstructor {
 }
 
 impl HeapExp {
-    pub(crate) fn new(exp: impl Into<AssertExp>) -> Self {
-        Self { exp: exp.into() }
+    pub(crate) fn new(exp: Exp) -> Self {
+        Self {
+            kind: HeapExpKind::Pure(exp),
+        }
     }
 
-    pub(super) fn conjoin(exp: Vec<Exp>) -> Option<Self> {
-        let exp = exp.into_iter().fold(None, ExpKind::conjoin);
-        exp.map(Self::new)
+    pub(super) fn conjoin(exps: Vec<HeapExp>) -> Option<Self> {
+        if exps.is_empty() {
+            None
+        } else {
+            Some(HeapExp {
+                kind: HeapExpKind::Conjunction(exps),
+            })
+        }
     }
 }
 
@@ -135,10 +142,8 @@ impl Contract {
             match p {
                 PrePostDec::Post(e) => {
                     let new = match self.postcondition {
-                        Some(mut post) => {
-                            post.exp =
-                                AssertExp(Box::new(ExpKind::BinOp(BinOp::And, post.exp.0, e)));
-                            post
+                        Some(post) => {
+                            HeapExp::new(Box::new(ExpKind::BinOp(BinOp::And, post.into_exp(), e)))
                         }
                         None => HeapExp::new(e),
                     };
@@ -175,6 +180,41 @@ impl ExpKind {
             Some(t) if matches!(*t, ExpKind::Const(ConstKind::Bool(true))) => new,
             Some(other) => Box::new(ExpKind::BinOp(BinOp::And, other, new)),
         })
+    }
+}
+
+impl HeapExp {
+    pub fn into_exp(self) -> Exp {
+        match self.kind {
+            HeapExpKind::Pure(exp) => exp,
+            HeapExpKind::Acc(_) => {
+                panic!("HeapExpKind::Acc cannot be converted into a pure ExpKind")
+            }
+            HeapExpKind::Conjunction(heap_exps) => heap_exps
+                .into_iter()
+                .fold(None, |acc, heap_exp| {
+                    ExpKind::conjoin(acc, heap_exp.into_exp())
+                })
+                .unwrap_or_else(|| Box::new(ExpKind::Const(ConstKind::Bool(true)))),
+            HeapExpKind::MagicWand(mut heap_exps) => {
+                let rhs = heap_exps
+                    .pop()
+                    .expect("magic wand must contain rhs heap expression");
+                let lhs = heap_exps
+                    .pop()
+                    .expect("magic wand must contain lhs heap expression");
+                assert!(
+                    heap_exps.is_empty(),
+                    "magic wand must contain exactly two heap expressions"
+                );
+                Box::new(ExpKind::MagicWand(lhs, rhs))
+            }
+            HeapExpKind::Ternary(cond, then_heap, else_heap) => Box::new(ExpKind::Ternary(
+                cond,
+                then_heap.into_exp(),
+                else_heap.into_exp(),
+            )),
+        }
     }
 }
 

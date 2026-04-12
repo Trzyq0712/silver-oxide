@@ -1,4 +1,4 @@
-use crate::vmir::{ty::Type, MemberId};
+use crate::vmir::{ty::Type, PureInst};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BinOp {
@@ -51,17 +51,10 @@ pub struct Inst {
 type Heap = Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InstKind {
-    Unary(UnOp, Value),
-    Binary(BinOp, Value, Value),
-    Ternary(Value, Value, Value),
-
-    /// Call a function
-    Call(MemberId, Vec<Value>),
+    Pure(PureInst),
 
     // Heap operations
     /// Get the amount of permission held to a location in the given heap
-    Perm(Heap, Value),
-    /// Adjust the amount of permission held to a location in the given heap
     Acc(Heap, Value, Value),
     /// Dereference an address in the given heap
     Deref(Heap, Value),

@@ -32,9 +32,7 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_resource_exp, 'a, ResourceExp);
     walk_children!(walk_heap_exp, 'a, HeapExp);
     walk_children!(walk_exp, 'a, Exp);
-    walk_children!(walk_pure_exp, 'a, PureExp);
-    walk_children!(walk_assert_exp, 'a, AssertExp);
-    walk_children!(walk_ghost_exp, 'a, GhostExp);
+    walk_children!(walk_heap_exp_kind, 'a, HeapExpKind);
     walk_children!(walk_exp_kind, 'a, ExpKind);
     walk_children!(walk_const, 'a, ConstKind);
     walk_children!(walk_const_heap_kind, 'a, ConstHeapKind);
@@ -47,6 +45,7 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_res_access, 'a, ResAccess);
     walk_children!(walk_block, 'a, StmtBlock);
     walk_children!(walk_statement, 'a, Statement);
+    walk_children!(walk_assign_lhs, 'a, AssignLhs);
     walk_children!(walk_assign_rhs, 'a, AssignRhs);
     walk_children!(walk_star_or_names, 'a, StarOrNames);
     walk_children!(walk_index_op, 'a, IndexOp);
@@ -103,9 +102,7 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_resource_exp, 'a, ResourceExp);
     walk_mut_children!(walk_mut_heap_exp, 'a, HeapExp);
     walk_mut_children!(walk_mut_exp, 'a, Exp);
-    walk_mut_children!(walk_mut_pure_exp, 'a, PureExp);
-    walk_mut_children!(walk_mut_assert_exp, 'a, AssertExp);
-    walk_mut_children!(walk_mut_ghost_exp, 'a, GhostExp);
+    walk_mut_children!(walk_mut_heap_exp_kind, 'a, HeapExpKind);
     walk_mut_children!(walk_mut_exp_kind, 'a, ExpKind);
     walk_mut_children!(walk_mut_const, 'a, ConstKind);
     walk_mut_children!(walk_mut_const_heap_kind, 'a, ConstHeapKind);
@@ -118,6 +115,7 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_res_access, 'a, ResAccess);
     walk_mut_children!(walk_mut_block, 'a, StmtBlock);
     walk_mut_children!(walk_mut_statement, 'a, Statement);
+    walk_mut_children!(walk_mut_assign_lhs, 'a, AssignLhs);
     walk_mut_children!(walk_mut_assign_rhs, 'a, AssignRhs);
     walk_mut_children!(walk_mut_star_or_names, 'a, StarOrNames);
     walk_mut_children!(walk_mut_index_op, 'a, IndexOp);
@@ -306,11 +304,18 @@ walk_struct!(
     cond,
     acc
 );
-walk_struct!(HeapExp, walk_heap_exp, walk_mut_heap_exp, exp);
+walk_struct!(HeapExp, walk_heap_exp, walk_mut_heap_exp, kind);
 walk_box!(Exp, walk_exp, walk_mut_exp);
-walk_struct!(PureExp, walk_pure_exp, walk_mut_pure_exp, 0);
-walk_struct!(AssertExp, walk_assert_exp, walk_mut_assert_exp, 0);
-walk_struct!(GhostExp, walk_ghost_exp, walk_mut_ghost_exp, 0);
+walk_enum!(
+    HeapExpKind,
+    walk_heap_exp_kind,
+    walk_mut_heap_exp_kind,
+    Pure(e),
+    Acc(a),
+    Conjunction(es),
+    MagicWand(es),
+    Ternary(c, t, e)
+);
 walk_enum!(
     ExpKind,
     walk_exp_kind,
@@ -323,7 +328,6 @@ walk_enum!(
     Quantifier(kind, vars, triggers, e),
     LetIn(i, e1, e2),
     ForPerm(vars, p, e),
-    Acc(a),
     FuncApp(i, args),
     Ident(i),
     BinOp(op, l, r),
@@ -445,6 +449,13 @@ walk_enum!(
     Apply(e),
     Assign(lhs, rhs),
     Block(b)
+);
+walk_enum!(
+    AssignLhs,
+    walk_assign_lhs,
+    walk_mut_assign_lhs,
+    Ident(i),
+    Field(e, i)
 );
 walk_enum!(
     AssignRhs,

@@ -244,42 +244,9 @@ impl<'a> Display for VmirDisplay<'a, heap_exp::HeapExp> {
 impl<'a> Display for VmirDisplay<'a, heap_exp::InstKind> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            heap_exp::InstKind::Unary(op, val) => {
-                let val_display = self.with(val);
-                write!(f, "{:?}({})", op, val_display)
-            }
-            heap_exp::InstKind::Binary(op, lhs, rhs) => {
-                let lhs_display = self.with(lhs);
-                let rhs_display = self.with(rhs);
-                write!(f, "{:?}({}, {})", op, lhs_display, rhs_display)
-            }
-            heap_exp::InstKind::Ternary(cond, then_val, else_val) => {
-                let cond_display = self.with(cond);
-                let then_display = self.with(then_val);
-                let else_display = self.with(else_val);
-                write!(
-                    f,
-                    "({} ? {} : {})",
-                    cond_display, then_display, else_display
-                )
-            }
-            heap_exp::InstKind::Call(func_id, args) => {
-                let func_name = self.interner.resolve(func_id);
-                write!(f, "{}(", func_name)?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    let arg_display = self.with(arg);
-                    write!(f, "{}", arg_display)?;
-                }
-                write!(f, ")")
-            }
+            heap_exp::InstKind::Pure(inst) => write!(f, "{}", self.with(inst)),
             heap_exp::InstKind::Deref(heap, val) => {
                 write!(f, "*[{}]{}", self.with(heap), self.with(val))
-            }
-            heap_exp::InstKind::Perm(heap, loc) => {
-                write!(f, "perm [{}] {}", self.with(heap), self.with(loc))
             }
             heap_exp::InstKind::Acc(heap, loc, amt) => {
                 write!(
@@ -331,12 +298,7 @@ impl<'a> Display for VmirDisplay<'a, method_ir::InstKind> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             method_ir::InstKind::Fresh => write!(f, "fresh"),
-            method_ir::InstKind::UnOp(op, val) => {
-                write!(f, "{:?}({})", op, self.with(val))
-            }
-            method_ir::InstKind::BinOp(op, lhs, rhs) => {
-                write!(f, "{:?}({}, {})", op, self.with(lhs), self.with(rhs))
-            }
+            method_ir::InstKind::Pure(inst) => write!(f, "{}", self.with(inst)),
             method_ir::InstKind::HeapOp(op, member, args) => {
                 let method_name = self.interner.resolve(member);
                 write!(f, "{} {}(", self.with(op), method_name)?;
@@ -356,6 +318,42 @@ impl<'a> Display for VmirDisplay<'a, method_ir::InstKind> {
                     self.with(addr),
                     self.with(val)
                 )
+            }
+        }
+    }
+}
+
+impl<'a> Display for VmirDisplay<'a, crate::vmir::PureInst> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.item {
+            crate::vmir::PureInst::Unary(op, val) => {
+                write!(f, "{:?}({})", op, self.with(val))
+            }
+            crate::vmir::PureInst::Binary(op, lhs, rhs) => {
+                write!(f, "{:?}({}, {})", op, self.with(lhs), self.with(rhs))
+            }
+            crate::vmir::PureInst::Ternary(cond, then_val, else_val) => {
+                write!(
+                    f,
+                    "({} ? {} : {})",
+                    self.with(cond),
+                    self.with(then_val),
+                    self.with(else_val)
+                )
+            }
+            crate::vmir::PureInst::Call(func_id, args) => {
+                let func_name = self.interner.resolve(func_id);
+                write!(f, "{}(", func_name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", self.with(arg))?;
+                }
+                write!(f, ")")
+            }
+            crate::vmir::PureInst::Perm(heap, loc) => {
+                write!(f, "perm [{}] {}", self.with(heap), self.with(loc))
             }
         }
     }

@@ -1,4 +1,4 @@
-use crate::vmir::{BinOp, MemberId, Type, UnOp, Value};
+use crate::vmir::{MemberId, PureInst, Type, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Inst {
@@ -10,8 +10,7 @@ pub struct Inst {
 pub enum InstKind {
     /// A fresh symbolic value of some type
     Fresh,
-    UnOp(UnOp, Value),
-    BinOp(BinOp, Value, Value),
+    Pure(PureInst),
 
     /// `inhale` or `exhale` a `heap_exp`
     HeapOp(HeapOp, MemberId, Vec<Value>),

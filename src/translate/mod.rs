@@ -1,4 +1,4 @@
-use crate::silver::walk::AstWalkable;
+use crate::silver::walk::{AstWalkable, AstWalkerMut};
 use crate::translate::method::MethodTranslCtxt;
 use crate::translate::name_resolution::DeclKind;
 use crate::vmir;
@@ -26,10 +26,25 @@ use typed_index_collections::{ti_vec, TiVec};
 pub mod heap_exp;
 pub mod method;
 pub mod name_resolution;
+pub mod pure_exp;
 pub mod signatures;
 pub mod typecheck;
 pub use name_resolution::{IdentifierError, NameCollector};
 pub use signatures::SignatureContext;
+
+#[derive(Debug, Clone)]
+pub struct SilverSymbols {
+    pub interner: Rodeo<vmir::MemberId>,
+    pub name_kinds: TiVec<vmir::MemberId, DeclKind>,
+    pub signatures: SignatureContext,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmirSymbols {
+    pub interner: Rodeo<vmir::MemberId>,
+    pub name_kinds: TiVec<vmir::MemberId, DeclKind>,
+    pub signatures: SignatureContext,
+}
 
 #[derive(Debug)]
 pub struct VmirTranslator {
@@ -41,18 +56,14 @@ pub struct VmirTranslator {
 
 impl VmirTranslator {
     /// Create a new translator with a pre-populated interner from name collection.
-    pub fn new(
-        interner: Rodeo<vmir::MemberId>,
-        name_kinds: TiVec<vmir::MemberId, DeclKind>,
-        signatures: SignatureContext,
-    ) -> Self {
-        let num_declarations = interner.len();
+    pub fn new(symbols: VmirSymbols) -> Self {
+        let num_declarations = symbols.interner.len();
         VmirTranslator {
             // Preallocate the vector with None placeholders
             globals: ti_vec![None; num_declarations],
-            interner,
-            name_kinds,
-            signatures,
+            interner: symbols.interner,
+            name_kinds: symbols.name_kinds,
+            signatures: symbols.signatures,
         }
     }
 
@@ -66,12 +77,27 @@ impl VmirTranslator {
         let collector = NameCollector::new();
         let (interner, name_kinds) = collector.collect(program)?;
 
-        // Second pass: collect all type signatures
-        let signatures = SignatureContext::collect(program, &interner);
+        // Normalize call RHS forms using declaration kinds before translation.
+        let mut normalized_program = program.clone();
+        normalize_assign_rhs_calls(&mut normalized_program, &interner, &name_kinds);
+        normalize_predicate_func_apps(&mut normalized_program, &interner, &name_kinds);
 
-        // Third pass: translate with the populated interner and signatures
-        let mut translator = Self::new(interner, name_kinds, signatures);
-        program.walk(&mut translator);
+        // Second pass: collect all Silver signatures from normalized AST.
+        let signatures = SignatureContext::collect(&normalized_program, &interner);
+        let silver_symbols = SilverSymbols {
+            interner: interner.clone(),
+            name_kinds: name_kinds.clone(),
+            signatures: signatures.clone(),
+        };
+
+        // Third pass: translate with the VMIR symbol context.
+        let vmir_symbols = VmirSymbols {
+            interner: silver_symbols.interner.clone(),
+            name_kinds: silver_symbols.name_kinds.clone(),
+            signatures: silver_symbols.signatures.clone(),
+        };
+        let mut translator = Self::new(vmir_symbols);
+        normalized_program.walk(&mut translator);
 
         let decls = translator
             .globals
@@ -100,6 +126,18 @@ impl VmirTranslator {
                     .expect("Domain name should be interned"),
             ),
         }
+    }
+
+    pub(crate) fn interner(&self) -> &Rodeo<vmir::MemberId> {
+        &self.interner
+    }
+
+    pub(crate) fn name_kinds(&self) -> &TiVec<vmir::MemberId, DeclKind> {
+        &self.name_kinds
+    }
+
+    pub(crate) fn signatures(&self) -> &SignatureContext {
+        &self.signatures
     }
 
     fn translate_field(&mut self, field: &silver::Field) {
@@ -636,7 +674,9 @@ impl VmirTranslator {
         contract: &silver::Contract,
         signature: &silver::Signature,
     ) {
-        const TRUE_EXP: silver::ExpKind = silver::ExpKind::Const(silver::ConstKind::Bool(true));
+        let true_assert_exp = silver::HeapExp::new(Box::new(silver::ExpKind::Const(
+            silver::ConstKind::Bool(true),
+        )));
 
         let memid = self.interner.get(method).unwrap();
 
@@ -646,11 +686,11 @@ impl VmirTranslator {
                 memid,
                 signature.args.iter().map(|a| a.idn().unwrap()),
             );
-            ctxt.translate_exp(
+            ctxt.translate_assert_exp(
                 contract
                     .precondition
                     .as_ref()
-                    .map_or(&TRUE_EXP, |pre| &pre.exp),
+                    .map_or(&true_assert_exp, |pre| pre),
             )
         };
         let ensures = {
@@ -660,11 +700,11 @@ impl VmirTranslator {
                 signature.args.iter().map(|a| a.idn().unwrap()),
                 signature.ret.iter().filter_map(|r| r.idn()),
             );
-            ctxt.translate_exp(
+            ctxt.translate_assert_exp(
                 contract
                     .postcondition
                     .as_ref()
-                    .map_or(&TRUE_EXP, |post| &post.exp),
+                    .map_or(&true_assert_exp, |post| post),
             )
         };
 
@@ -673,6 +713,145 @@ impl VmirTranslator {
         let ensures_memid = self.interner.get(format!("{method}@ensures")).unwrap();
         self.add_decl(ensures_memid, vmir::Declaration::HeapExp(ensures));
     }
+}
+
+struct AssignRhsCallDisambiguator<'a> {
+    interner: &'a Rodeo<vmir::MemberId>,
+    name_kinds: &'a TiVec<vmir::MemberId, DeclKind>,
+}
+
+impl<'a> AstWalkerMut<'a> for AssignRhsCallDisambiguator<'_> {
+    fn walk_mut_assign_rhs(&mut self, rhs: &'a mut silver::AssignRhs) {
+        if let silver::AssignRhs::Call(name, args) = rhs {
+            let Some(memid) = self.interner.get(name.0.as_str()) else {
+                panic!("Unresolved call target: {}", name.0);
+            };
+            match self.name_kinds[memid] {
+                DeclKind::Method => {}
+                DeclKind::Function
+                | DeclKind::Field
+                | DeclKind::Predicate
+                | DeclKind::DomainFunction
+                | DeclKind::AdtConstructor => {
+                    *rhs = silver::AssignRhs::Exp(
+                        Box::new(silver::ExpKind::FuncApp(name.clone(), args.clone())).into(),
+                    );
+                }
+                other => {
+                    panic!("Invalid call target kind for {}: {:?}", name.0, other);
+                }
+            }
+        }
+        rhs.walk_mut_children(self);
+    }
+}
+
+struct PredicateFuncAppDesugarer<'a> {
+    interner: &'a Rodeo<vmir::MemberId>,
+    name_kinds: &'a TiVec<vmir::MemberId, DeclKind>,
+}
+
+fn predicate_acc_from_func_app(
+    exp: &silver::ExpKind,
+    interner: &Rodeo<vmir::MemberId>,
+    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
+) -> Option<silver::AccExp> {
+    let silver::ExpKind::FuncApp(name, args) = exp else {
+        return None;
+    };
+    let Some(memid) = interner.get(name.0.as_str()) else {
+        panic!("Unresolved call target: {}", name.0);
+    };
+    if !matches!(name_kinds[memid], DeclKind::Predicate) {
+        return None;
+    }
+    Some(silver::AccExp {
+        acc: silver::LocAccess {
+            loc: Box::new(silver::ExpKind::FuncApp(name.clone(), args.clone())),
+        },
+        perm: silver::ExpKind::write(),
+    })
+}
+
+fn desugar_heap_pure_exp(
+    exp: &silver::Exp,
+    interner: &Rodeo<vmir::MemberId>,
+    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
+) -> silver::HeapExp {
+    match exp.as_ref() {
+        silver::ExpKind::BinOp(silver::BinOp::And, lhs, rhs) => {
+            let lhs = desugar_heap_pure_exp(lhs, interner, name_kinds);
+            let rhs = desugar_heap_pure_exp(rhs, interner, name_kinds);
+            let mut conjuncts = Vec::new();
+            match lhs.kind {
+                silver::HeapExpKind::Conjunction(cs) => conjuncts.extend(cs),
+                _ => conjuncts.push(lhs),
+            }
+            match rhs.kind {
+                silver::HeapExpKind::Conjunction(cs) => conjuncts.extend(cs),
+                _ => conjuncts.push(rhs),
+            }
+            silver::HeapExp {
+                kind: silver::HeapExpKind::Conjunction(conjuncts),
+            }
+        }
+        silver::ExpKind::BinOp(silver::BinOp::Implies, cond, rhs) => silver::HeapExp {
+            kind: silver::HeapExpKind::Ternary(
+                cond.clone(),
+                Box::new(desugar_heap_pure_exp(rhs, interner, name_kinds)),
+                Box::new(silver::HeapExp::new(silver::ExpKind::bool(true))),
+            ),
+        },
+        silver::ExpKind::Ternary(cond, then_exp, else_exp) => silver::HeapExp {
+            kind: silver::HeapExpKind::Ternary(
+                cond.clone(),
+                Box::new(desugar_heap_pure_exp(then_exp, interner, name_kinds)),
+                Box::new(desugar_heap_pure_exp(else_exp, interner, name_kinds)),
+            ),
+        },
+        other => {
+            if let Some(acc) = predicate_acc_from_func_app(other, interner, name_kinds) {
+                silver::HeapExp {
+                    kind: silver::HeapExpKind::Acc(acc),
+                }
+            } else {
+                silver::HeapExp::new(exp.clone())
+            }
+        }
+    }
+}
+
+impl<'a> AstWalkerMut<'a> for PredicateFuncAppDesugarer<'_> {
+    fn walk_mut_heap_exp_kind(&mut self, kind: &'a mut silver::HeapExpKind) {
+        kind.walk_mut_children(self);
+        if let silver::HeapExpKind::Pure(exp) = kind {
+            *kind = desugar_heap_pure_exp(exp, self.interner, self.name_kinds).kind;
+        }
+    }
+}
+
+fn normalize_assign_rhs_calls(
+    program: &mut silver::Program,
+    interner: &Rodeo<vmir::MemberId>,
+    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
+) {
+    let mut pass = AssignRhsCallDisambiguator {
+        interner,
+        name_kinds,
+    };
+    program.walk_mut(&mut pass);
+}
+
+fn normalize_predicate_func_apps(
+    program: &mut silver::Program,
+    interner: &Rodeo<vmir::MemberId>,
+    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
+) {
+    let mut pass = PredicateFuncAppDesugarer {
+        interner,
+        name_kinds,
+    };
+    program.walk_mut(&mut pass);
 }
 
 impl<'a> silver::walk::AstWalker<'a> for VmirTranslator {
@@ -694,5 +873,209 @@ impl<'a> silver::walk::AstWalker<'a> for VmirTranslator {
     fn walk_function(&mut self, func: &'a silver::Function) {
         self.translate_function(func);
         func.walk_children(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_assign_rhs_calls, normalize_predicate_func_apps, NameCollector};
+    use crate::silver::{self, Declaration, ExpKind, Statement};
+
+    #[test]
+    fn disambiguates_function_call_rhs_to_expression() {
+        let src = r#"
+function f(x: Int): Int
+{
+  x
+}
+
+method m(x: Int) returns (y: Int)
+{
+  y := f(x)
+}
+"#;
+        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
+        let collector = NameCollector::new();
+        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
+        normalize_assign_rhs_calls(&mut program, &interner, &kinds);
+
+        let method = program
+            .0
+            .iter()
+            .find_map(|decl| match decl {
+                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
+                _ => None,
+            })
+            .expect("method m not found");
+        let body = method.body.as_ref().expect("method body missing");
+        let Statement::Assign(_, rhs) = &body.0[0] else {
+            panic!("expected first statement to be assignment");
+        };
+        match rhs {
+            silver::AssignRhs::Exp(exp) => match exp.as_ref() {
+                ExpKind::FuncApp(name, _) => assert_eq!(name.0, "f"),
+                _ => panic!("expected function application expression"),
+            },
+            _ => panic!("function call should be rewritten to expression rhs"),
+        }
+    }
+
+    #[test]
+    fn keeps_method_call_rhs_as_call() {
+        let src = r#"
+method callee(x: Int) returns (y: Int)
+{
+  y := x
+}
+
+method caller(x: Int) returns (y: Int)
+{
+  y := callee(x)
+}
+"#;
+        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
+        let collector = NameCollector::new();
+        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
+        normalize_assign_rhs_calls(&mut program, &interner, &kinds);
+
+        let method = program
+            .0
+            .iter()
+            .find_map(|decl| match decl {
+                Declaration::Method(method) if method.signature.name.0 .0 == "caller" => {
+                    Some(method)
+                }
+                _ => None,
+            })
+            .expect("method caller not found");
+        let body = method.body.as_ref().expect("method body missing");
+        let Statement::Assign(_, rhs) = &body.0[0] else {
+            panic!("expected first statement to be assignment");
+        };
+        match rhs {
+            silver::AssignRhs::Call(name, _) => assert_eq!(name.0, "callee"),
+            _ => panic!("method call should remain call rhs"),
+        }
+    }
+
+    #[test]
+    fn desugars_predicate_funcapp_in_heap_context_to_acc() {
+        let src = r#"
+predicate p(x: Ref)
+
+method m(x: Ref)
+  requires p(x)
+{
+}
+"#;
+        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
+        let collector = NameCollector::new();
+        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
+        normalize_predicate_func_apps(&mut program, &interner, &kinds);
+
+        let method = program
+            .0
+            .iter()
+            .find_map(|decl| match decl {
+                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
+                _ => None,
+            })
+            .expect("method m not found");
+
+        let pre = method
+            .contract
+            .precondition
+            .as_ref()
+            .expect("method precondition missing");
+
+        match &pre.kind {
+            silver::HeapExpKind::Acc(acc) => match acc.acc.loc.as_ref() {
+                ExpKind::FuncApp(name, _) => assert_eq!(name.0, "p"),
+                _ => panic!("expected predicate call location inside acc"),
+            },
+            _ => panic!("predicate precondition should desugar to heap acc"),
+        }
+    }
+
+    #[test]
+    fn keeps_function_funcapp_in_heap_context_as_pure() {
+        let src = r#"
+function f(x: Int): Bool
+{
+  true
+}
+
+method m(x: Int)
+  requires f(x)
+{
+}
+"#;
+        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
+        let collector = NameCollector::new();
+        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
+        normalize_predicate_func_apps(&mut program, &interner, &kinds);
+
+        let method = program
+            .0
+            .iter()
+            .find_map(|decl| match decl {
+                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
+                _ => None,
+            })
+            .expect("method m not found");
+
+        let pre = method
+            .contract
+            .precondition
+            .as_ref()
+            .expect("method precondition missing");
+
+        match &pre.kind {
+            silver::HeapExpKind::Pure(exp) => match exp.as_ref() {
+                ExpKind::FuncApp(name, _) => assert_eq!(name.0, "f"),
+                _ => panic!("expected function call in pure precondition"),
+            },
+            _ => panic!("function precondition should remain pure function application"),
+        }
+    }
+
+    #[test]
+    fn desugars_predicate_funcapps_inside_heap_conjunction() {
+        let src = r#"
+predicate number(x: Ref)
+
+method m(this: Ref, other: Ref)
+  requires number(this) && number(other)
+{
+}
+"#;
+        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
+        let collector = NameCollector::new();
+        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
+        normalize_predicate_func_apps(&mut program, &interner, &kinds);
+
+        let method = program
+            .0
+            .iter()
+            .find_map(|decl| match decl {
+                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
+                _ => None,
+            })
+            .expect("method m not found");
+        let pre = method
+            .contract
+            .precondition
+            .as_ref()
+            .expect("method precondition missing");
+
+        match &pre.kind {
+            silver::HeapExpKind::Conjunction(parts) => {
+                assert_eq!(parts.len(), 2);
+                for part in parts {
+                    assert!(matches!(part.kind, silver::HeapExpKind::Acc(_)));
+                }
+            }
+            _ => panic!("expected precondition to desugar into heap conjunction"),
+        }
     }
 }

@@ -121,75 +121,19 @@ pub struct ResourceExp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HeapExp {
-    pub exp: AssertExp,
+    pub kind: HeapExpKind,
 }
 
-pub type Exp = Box<ExpKind>;
+pub type PureExp = Box<ExpKind>;
+pub type Exp = PureExp;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PureExp(pub Exp);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AssertExp(pub Exp);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GhostExp(pub Exp);
-
-impl From<Exp> for PureExp {
-    fn from(value: Exp) -> Self {
-        Self(value)
-    }
-}
-
-impl From<Exp> for AssertExp {
-    fn from(value: Exp) -> Self {
-        Self(value)
-    }
-}
-
-impl From<Exp> for GhostExp {
-    fn from(value: Exp) -> Self {
-        Self(value)
-    }
-}
-
-impl Deref for PureExp {
-    type Target = ExpKind;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-impl DerefMut for PureExp {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut()
-    }
-}
-
-impl Deref for AssertExp {
-    type Target = ExpKind;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-impl DerefMut for AssertExp {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut()
-    }
-}
-
-impl Deref for GhostExp {
-    type Target = ExpKind;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-impl DerefMut for GhostExp {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut()
-    }
+pub enum HeapExpKind {
+    Pure(Exp),
+    Acc(AccExp),
+    Conjunction(Vec<HeapExp>),
+    MagicWand(Vec<HeapExp>),
+    Ternary(Exp, Box<HeapExp>, Box<HeapExp>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -208,8 +152,6 @@ pub enum ExpKind {
     LetIn(IdnDecl, Exp, Exp),
     /// Quantified permissions. forperm x: T, y: U, ... [Perm] :: e1
     ForPerm(Vec<IdnDeclTyped>, ResAccess, Exp),
-    /// acc(e)
-    Acc(AccExp),
     /// f(e1, e2, ..., en)
     FuncApp(Ident, Vec<Exp>),
     /// x
@@ -324,9 +266,9 @@ pub enum ResAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
-    Assume(AssertExp),
-    Assert(AssertExp),
-    Refute(AssertExp),
+    Assume(HeapExp),
+    Assert(HeapExp),
+    Refute(HeapExp),
     Inhale(HeapExp),
     Exhale(HeapExp),
     Fold(AccExp),
@@ -341,8 +283,14 @@ pub enum Statement {
     If(PureExp, StmtBlock, Option<StmtBlock>),
     Package(AccExp, Option<StmtBlock>),
     Apply(AccExp),
-    Assign(Vec<Exp>, AssignRhs),
+    Assign(Vec<AssignLhs>, AssignRhs),
     Block(StmtBlock),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AssignLhs {
+    Ident(Ident),
+    Field(Exp, Ident),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -462,4 +410,3 @@ pub struct Variant {
 pub struct AdtConstructor {
     pub signature: Signature,
 }
-use std::ops::{Deref, DerefMut};

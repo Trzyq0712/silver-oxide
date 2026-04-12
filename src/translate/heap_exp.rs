@@ -3,7 +3,7 @@ use rusttyc::{TcErr, TcKey, TcVar, TypeChecker};
 use crate::{
     silver,
     translate::{
-        name_resolution::DeclKind,
+        pure_exp::{PureExpBackend, PureExpTranslator},
         typecheck::{self, TcType},
         VmirTranslator,
     },
@@ -12,13 +12,14 @@ use crate::{
 
 impl TcVar for vmir::Value {}
 
+#[derive(Debug, Clone)]
 enum Polarity {
     Positive,
     Negative,
 }
 
+#[derive(Debug, Clone)]
 enum PathCond {
-    None,
     Cond(Polarity, vmir::Value),
 }
 
@@ -34,10 +35,9 @@ pub struct HeapExpTranslCtxt<'a, 'b> {
 
     tc: TypeChecker<typecheck::TcType, vmir::Value>,
 
-    /// On-path condition used for building path-sensitive `acc` expressions
-    /// For example, `b ==> acc(x.f, 1/1)` would have a path condition of `b` when translating the
-    /// `acc` expression
-    path_cond: Option<vmir::Value>,
+    /// Stack of active path conditions used for path-sensitive `acc` translation.
+    /// Nested conditionals push branch guards and pop on branch exit.
+    path_cond_stack: Vec<PathCond>,
 
     /// Current state of the heap, initially mapped to one of the heaps from the input
     heap: vmir::Value,
@@ -81,7 +81,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
             args: exp_args,
             insts: Vec::new(),
             tc,
-            path_cond: None,
+            path_cond_stack: Vec::new(),
             heap,
             old_heap: None,
             locals,
@@ -120,7 +120,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
             args: exp_args,
             insts: Vec::new(),
             tc,
-            path_cond: None,
+            path_cond_stack: Vec::new(),
             heap,
             old_heap: Some(old_heap),
             locals,
@@ -157,8 +157,8 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
     //     }
     // }
 
-    pub fn translate_exp(mut self, exp: &silver::ExpKind) -> vmir::HeapExp {
-        let res_pure = self.translate_exp_inner(exp).unwrap();
+    pub fn translate_assert_exp(mut self, exp: &silver::HeapExp) -> vmir::HeapExp {
+        let res_pure = self.translate_heap_exp_inner(exp).unwrap();
 
         let key = self.tc.get_var_key(&res_pure);
         self.tc
@@ -198,6 +198,75 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         }
     }
 
+    fn translate_heap_exp_inner(
+        &mut self,
+        exp: &silver::HeapExp,
+    ) -> Result<vmir::Value, TcErr<TcType>> {
+        match &exp.kind {
+            silver::HeapExpKind::Pure(exp) => PureExpTranslator::new(self).translate_exp_kind(exp),
+            silver::HeapExpKind::Acc(acc) => self.translate_acc_exp(acc),
+            silver::HeapExpKind::Conjunction(heap_exps) => {
+                let mut pure = None;
+                for heap_exp in heap_exps {
+                    let next = self.translate_heap_exp_inner(heap_exp)?;
+                    pure = Some(match pure {
+                        None => next,
+                        Some(prev) => self.translate_bool_and(prev, next)?,
+                    });
+                }
+                Ok(pure.unwrap_or_else(|| vmir::Literal::Bool(true).into()))
+            }
+            silver::HeapExpKind::MagicWand(..) => unimplemented!("heap magic wand translation"),
+            silver::HeapExpKind::Ternary(cond, then_heap, else_heap) => {
+                let cond = PureExpTranslator::new(self).translate_exp_kind(cond)?;
+                let then =
+                    self.with_branch_path_cond(cond.clone(), Polarity::Positive, |this| {
+                        this.translate_heap_exp_inner(then_heap)
+                    })?;
+                let else_ =
+                    self.with_branch_path_cond(cond.clone(), Polarity::Negative, |this| {
+                        this.translate_heap_exp_inner(else_heap)
+                    })?;
+
+                let cond_key = self.tc.get_var_key(&cond);
+                let then_key = self.tc.get_var_key(&then);
+                let else_key = self.tc.get_var_key(&else_);
+
+                let val = self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
+                    cond, then, else_,
+                )));
+                let val_key = self.tc.get_var_key(&val);
+
+                self.tc
+                    .impose(cond_key.concretizes_explicit(TcType::Bool))?;
+                self.tc.impose(val_key.is_sym_meet_of(then_key, else_key))?;
+                Ok(val)
+            }
+        }
+    }
+
+    fn push_path_cond(&mut self, path_cond: PathCond) {
+        self.path_cond_stack.push(path_cond);
+    }
+
+    fn pop_path_cond(&mut self) {
+        self.path_cond_stack
+            .pop()
+            .expect("path condition stack underflow");
+    }
+
+    fn with_branch_path_cond<T>(
+        &mut self,
+        cond: vmir::Value,
+        polarity: Polarity,
+        f: impl FnOnce(&mut Self) -> Result<T, TcErr<TcType>>,
+    ) -> Result<T, TcErr<TcType>> {
+        self.push_path_cond(PathCond::Cond(polarity, cond));
+        let res = f(self);
+        self.pop_path_cond();
+        res
+    }
+
     /// Add an instruction and return the temporary holding its result
     fn add_inst(&mut self, kind: vmir::InstKind) -> vmir::Value {
         let temp = self.insts.len() + self.args.len();
@@ -218,224 +287,32 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         self.heap = val;
     }
 
-    fn translate_binop(
+    fn translate_bool_and(
         &mut self,
-        op: &silver::BinOp,
-        left: &silver::ExpKind,
-        right: &silver::ExpKind,
+        left: vmir::Value,
+        right: vmir::Value,
     ) -> Result<vmir::Value, TcErr<TcType>> {
-        let l = self.translate_exp_inner(left)?;
-        let r = self.translate_exp_inner(right)?;
+        let left_key = self.tc.get_var_key(&left);
+        let right_key = self.tc.get_var_key(&right);
 
-        let l_key = self.tc.get_var_key(&l);
-        let r_key = self.tc.get_var_key(&r);
+        let false_ = vmir::Literal::Bool(false).into();
+        let val = self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
+            left, right, false_,
+        )));
+        let val_key = self.tc.get_var_key(&val);
 
-        // Desugar logical operators into ternaries
-        let val = match op {
-            silver::BinOp::And => {
-                // l && r  =>  l ? r : false
-                let false_ = vmir::Literal::Bool(false).into();
-                self.add_inst(vmir::InstKind::Ternary(l, r, false_))
-            }
-            silver::BinOp::Or => {
-                // l || r  =>  l ? true : r
-                let true_ = vmir::Literal::Bool(true).into();
-                self.add_inst(vmir::InstKind::Ternary(l, true_, r))
-            }
-            silver::BinOp::Implies => {
-                // l ==> r  =>  l ? r : true
-                let true_ = vmir::Literal::Bool(true).into();
-                self.add_inst(vmir::InstKind::Ternary(l, r, true_))
-            }
-            silver::BinOp::Iff => {
-                // l <==> r  =>  l ? r : !r
-                let not_r = self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, r.clone()));
-                self.add_inst(vmir::InstKind::Ternary(l, r, not_r))
-            }
-            silver::BinOp::Eq => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Eq, l, r)),
-            silver::BinOp::Neq => {
-                // l != r => !(l == r)
-                let l_eq_r = self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Eq, l, r));
-                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, l_eq_r))
-            }
-            silver::BinOp::Lt => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, l, r)),
-            silver::BinOp::Le => {
-                // l <= r => !(r < l)
-                let r_lt_l = self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, r, l));
-                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, r_lt_l))
-            }
-            silver::BinOp::Gt => {
-                // l > r => r < l
-                self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, r, l))
-            }
-            silver::BinOp::Ge => {
-                // l >= r => !(l < r)
-                let l_lt_r = self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, l, r));
-                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, l_lt_r))
-            }
-            silver::BinOp::Plus => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Plus, l, r)),
-            silver::BinOp::Minus => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Minus, l, r)),
-            silver::BinOp::Mult => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Mult, l, r)),
-            silver::BinOp::Div => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Div, l, r)),
-            _ => unimplemented!(),
-        };
-        let v_key = self.tc.get_var_key(&val);
-        match op {
-            silver::BinOp::And
-            | silver::BinOp::Or
-            | silver::BinOp::Implies
-            | silver::BinOp::Iff => {
-                self.tc.impose(l_key.concretizes_explicit(TcType::Bool))?;
-                self.tc.impose(r_key.concretizes_explicit(TcType::Bool))?;
-                self.tc.impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::BinOp::Eq | silver::BinOp::Neq => {
-                self.tc.impose(l_key.equate_with(r_key))?;
-                self.tc.impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::BinOp::Lt | silver::BinOp::Le | silver::BinOp::Gt | silver::BinOp::Ge => {
-                self.tc
-                    .impose(l_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc
-                    .impose(r_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc.impose(l_key.equate_with(r_key))?;
-                self.tc.impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::BinOp::Plus | silver::BinOp::Minus => {
-                self.tc
-                    .impose(l_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc
-                    .impose(r_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc.impose(v_key.is_sym_meet_of(l_key, r_key))?;
-            }
-            silver::BinOp::Mult | silver::BinOp::Div => {
-                self.tc
-                    .impose(l_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc
-                    .impose(r_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc
-                    .impose(v_key.concretizes_explicit(TcType::Numeric))?;
-            }
-            _ => unimplemented!(),
-        }
+        self.tc
+            .impose(left_key.concretizes_explicit(TcType::Bool))?;
+        self.tc
+            .impose(right_key.concretizes_explicit(TcType::Bool))?;
+        self.tc.impose(val_key.concretizes_explicit(TcType::Bool))?;
         Ok(val)
-    }
-
-    fn translate_unop(
-        &mut self,
-        op: &silver::UnOp,
-        exp: &silver::ExpKind,
-    ) -> Result<vmir::Value, TcErr<TcType>> {
-        let e = self.translate_exp_inner(exp)?;
-        let e_key = self.tc.get_var_key(&e);
-        let val = match op {
-            silver::UnOp::Not => self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, e)),
-            silver::UnOp::Neg => self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Neg, e)),
-            silver::UnOp::Perm => self.add_inst(vmir::InstKind::Perm(self.heap.clone(), e)),
-            _ => unimplemented!("Unsupported unary operator: {:?}", op),
-        };
-        let v_key = self.tc.get_var_key(&val);
-        match op {
-            silver::UnOp::Not => {
-                self.tc.impose(e_key.concretizes_explicit(TcType::Bool))?;
-                self.tc.impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::UnOp::Neg => {
-                self.tc
-                    .impose(e_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc
-                    .impose(v_key.concretizes_explicit(TcType::Numeric))?;
-                self.tc.impose(e_key.equate_with(v_key))?;
-            }
-            silver::UnOp::Perm => {
-                self.tc.impose(e_key.concretizes_explicit(TcType::Addr))?;
-                self.tc.impose(v_key.concretizes_explicit(TcType::Real))?;
-            }
-            _ => unimplemented!(),
-        }
-        Ok(val)
-    }
-
-    fn translate_ident(&mut self, ident: &silver::Ident) -> vmir::Value {
-        let Some(local_idx) = self.locals.get(ident) else {
-            panic!("Undefined variable: {}", ident.0);
-        };
-        vmir::Value::Temp(*local_idx)
     }
 
     /// Translate a Silver expression to VMIR SSA form
     /// Returns the Value representing the result and the inferred type
     fn translate_exp_inner(&mut self, exp: &silver::ExpKind) -> Result<vmir::Value, TcErr<TcType>> {
-        use silver::ExpKind;
-
-        match exp {
-            ExpKind::Const(const_) => self.translate_const(const_),
-
-            ExpKind::Ident(ident) => Ok(self.translate_ident(ident)),
-
-            ExpKind::BinOp(op, left, right) => self.translate_binop(op, left, right),
-
-            ExpKind::UnOp(op, e) => self.translate_unop(op, e),
-
-            ExpKind::Ternary(cond, then, else_) => {
-                let cond = self.translate_exp_inner(cond)?;
-                self.path_cond = Some(cond.clone());
-                let then = self.translate_exp_inner(then)?;
-                let else_ = self.translate_exp_inner(else_)?;
-
-                let cond_key = self.tc.get_var_key(&cond);
-                let then_key = self.tc.get_var_key(&then);
-                let else_key = self.tc.get_var_key(&else_);
-
-                let val = self.add_inst(vmir::InstKind::Ternary(cond, then, else_));
-                let val_key = self.tc.get_var_key(&val);
-
-                self.tc
-                    .impose(cond_key.concretizes_explicit(TcType::Bool))?;
-                self.tc.impose(val_key.is_sym_meet_of(then_key, else_key))?;
-                Ok(val)
-            }
-
-            func_app @ ExpKind::FuncApp(func_name, args) => {
-                // Need to check if we are dealing with a predicate call
-                let func_id = self
-                    .translator
-                    .interner
-                    .get(&func_name.0)
-                    .expect(&format!("Function {} not found", func_name.0));
-
-                let is_predicate = self
-                    .translator
-                    .name_kinds
-                    .get(func_id)
-                    .map(|kind| *kind == DeclKind::Predicate)
-                    .unwrap_or(false);
-
-                if is_predicate {
-                    // Desugar predicate(args) into acc(predicate(args), write)
-                    let acc_exp = silver::AccExp {
-                        acc: silver::LocAccess {
-                            loc: Box::new(func_app.clone()),
-                        },
-                        perm: Box::new(ExpKind::Const(silver::ConstKind::Real(
-                            num::BigRational::from_integer(1.into()),
-                        ))),
-                    };
-
-                    self.translate_acc_exp(&acc_exp)
-                } else {
-                    self.translate_func_app(func_name, args)
-                }
-            }
-
-            ExpKind::Field(base, field_name) => {
-                self.translate_func_app(field_name, &[base.clone()])
-            }
-
-            ExpKind::Acc(acc_exp) => self.translate_acc_exp(acc_exp),
-
-            _ => unimplemented!("Expression translation: {:?}", exp),
-        }
+        PureExpTranslator::new(self).translate_exp_kind(exp)
     }
 
     fn match_type(&mut self, ty: &vmir::Type, key: TcKey) -> Result<(), TcErr<TcType>> {
@@ -473,7 +350,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
             self.match_type(ty, arg_key)?;
         }
 
-        let val = self.add_inst(vmir::InstKind::Call(func_id, args));
+        let val = self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Call(func_id, args)));
 
         // Add type constraint for return type
         let val_key = self.tc.get_var_key(&val);
@@ -501,9 +378,10 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         let loc_key = self.tc.get_var_key(&loc);
         self.tc.impose(loc_key.concretizes_explicit(TcType::Addr))?;
 
-        let amt = self.translate_exp_inner(&acc_exp.perm)?;
+        let amt = PureExpTranslator::new(self).translate_exp_kind(&acc_exp.perm)?;
         let amt_key = self.tc.get_var_key(&amt);
         self.tc.impose(amt_key.concretizes_explicit(TcType::Real))?;
+        let amt = self.conditionalize_perm_amount(amt)?;
 
         self.add_heap_inst(|curr_heap| vmir::InstKind::Acc(curr_heap, loc, amt));
 
@@ -511,27 +389,66 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         Ok(vmir::Literal::Bool(true).into())
     }
 
-    fn translate_const(
+    fn conditionalize_perm_amount(
         &mut self,
-        const_: &silver::ConstKind,
+        perm: vmir::Value,
     ) -> Result<vmir::Value, TcErr<TcType>> {
-        let val = match const_ {
-            silver::ConstKind::Bool(b) => vmir::Literal::Bool(*b),
-            silver::ConstKind::Int(i) => vmir::Literal::Int(i.clone()),
-            silver::ConstKind::Real(r) => vmir::Literal::Real(r.clone()),
-            silver::ConstKind::Null => vmir::Literal::Null,
-            _ => unimplemented!("Unsupported constant: {:?}", const_),
+        let mut perm = perm;
+        let path_conds = self.path_cond_stack.clone();
+        for path_cond in path_conds.into_iter().rev() {
+            let PathCond::Cond(polarity, cond) = path_cond;
+            let zero: vmir::Value = vmir::Literal::Real(num::BigInt::from(0).into()).into();
+
+            let perm_key = self.tc.get_var_key(&perm);
+            let zero_key = self.tc.get_var_key(&zero);
+            let cond_key = self.tc.get_var_key(&cond);
+
+            let next = match polarity {
+                Polarity::Positive => self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
+                    cond, perm, zero,
+                ))),
+                Polarity::Negative => self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
+                    cond, zero, perm,
+                ))),
+            };
+            let next_key = self.tc.get_var_key(&next);
+
+            self.tc
+                .impose(cond_key.concretizes_explicit(TcType::Bool))?;
+            self.tc
+                .impose(perm_key.concretizes_explicit(TcType::Real))?;
+            self.tc
+                .impose(zero_key.concretizes_explicit(TcType::Real))?;
+            self.tc
+                .impose(next_key.concretizes_explicit(TcType::Real))?;
+            perm = next;
         }
-        .into();
-        let ty = &match const_ {
-            silver::ConstKind::Bool(_) => vmir::Type::Bool,
-            silver::ConstKind::Int(_) => vmir::Type::Int,
-            silver::ConstKind::Real(_) => vmir::Type::Real,
-            silver::ConstKind::Null => vmir::Type::Ref,
-            _ => unimplemented!(),
+
+        Ok(perm)
+    }
+}
+
+impl<'a, 'b> PureExpBackend for HeapExpTranslCtxt<'a, 'b> {
+    fn resolve_ident(&self, ident: &silver::Ident) -> vmir::Value {
+        let Some(local_idx) = self.locals.get(ident) else {
+            panic!("Undefined variable: {}", ident.0);
         };
-        let key = self.tc.get_var_key(&val);
-        self.tc.impose(key.concretizes_explicit(ty.into()))?;
-        Ok(val)
+        vmir::Value::Temp(*local_idx)
+    }
+
+    fn current_heap(&self) -> vmir::Value {
+        self.heap.clone()
+    }
+
+    fn emit_pure_inst(&mut self, inst: vmir::PureInst) -> vmir::Value {
+        self.add_inst(vmir::InstKind::Pure(inst))
+    }
+
+    fn tc_mut(&mut self) -> &mut TypeChecker<TcType, vmir::Value> {
+        &mut self.tc
+    }
+
+    fn translator(&self) -> &VmirTranslator {
+        self.translator
     }
 }
