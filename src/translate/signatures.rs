@@ -49,6 +49,10 @@ impl SignatureContext {
     pub fn function_sig(&self, func_id: MemberId) -> &FunctionSignature {
         self.functions.get(&func_id).unwrap()
     }
+
+    pub fn method_sig(&self, method_id: MemberId) -> &MethodSignature {
+        self.methods.get(&method_id).unwrap()
+    }
 }
 
 struct SignatureCollector<'a> {

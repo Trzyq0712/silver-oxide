@@ -1,4 +1,4 @@
-use crate::vmir::{HeapExp, Local, Type};
+use crate::vmir::{heap_exp::HeapExp, Type};
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
 use nonmax::NonMaxU32;
@@ -30,6 +30,7 @@ pub enum Declaration {
     Function(Function),
     Method(Method),
     Resource(Resource),
+    HeapExp(HeapExp),
     Adt(Adt),
     AdtConstructor,
 }
@@ -38,8 +39,7 @@ pub enum Declaration {
 pub struct Method {
     pub name: MemberId,
     pub signature: MethSig,
-    pub contract: MethContract,
-    pub body: Option<StmtBlock>,
+    pub body: StmtBlock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,37 +88,8 @@ pub struct Adt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MethContract {
-    pub requires: Option<HeapExp>,
-    pub ensures: Option<HeapExp>,
-}
-
-impl MethContract {
-    pub fn empty() -> Self {
-        Self {
-            requires: None,
-            ensures: None,
-        }
-    }
-
-    /// Create a contract with input signature metadata
-    /// requires_inputs: [heap, ...args]
-    /// ensures_inputs: [heap, old_heap, ...args, ...returns]
-    pub fn with_inputs(
-        requires: Option<HeapExp>,
-        ensures: Option<HeapExp>,
-        requires_inputs: Vec<Type>,
-        ensures_inputs: Vec<Type>,
-    ) -> Self {
-        let requires = requires.map(|mut exp| {
-            exp.input_types = requires_inputs;
-            exp
-        });
-        let ensures = ensures.map(|mut exp| {
-            exp.input_types = ensures_inputs;
-            exp
-        });
-        Self { requires, ensures }
-    }
+    pub requires: HeapExp,
+    pub ensures: HeapExp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -170,16 +141,16 @@ pub struct Ident(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
-    /// x, y := m(a, b, c)
-    MethodCall(Vec<AssignTarget>, MemberId, Vec<Local>),
-    /// Assign to a local or a temporary
-    /// x := e
-    /// x: T, e: T
-    Assign(AssignTarget, HeapExp),
-    /// Assign to a heap location
-    /// x *= e
-    /// x: &T, e: T
-    HeapAssign(AssignTarget, HeapExp),
+    // /// x, y := m(a, b, c)
+    // MethodCall(Vec<AssignTarget>, MemberId, Vec<Local>),
+    // /// Assign to a local or a temporary
+    // /// x := e
+    // /// x: T, e: T
+    // Assign(AssignTarget, HeapExp),
+    // /// Assign to a heap location
+    // /// x *= e
+    // /// x: &T, e: T
+    // HeapAssign(AssignTarget, HeapExp),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

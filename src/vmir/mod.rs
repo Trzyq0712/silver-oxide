@@ -1,7 +1,7 @@
 mod ast;
-mod display;
+pub mod display;
 mod heap_exp;
-mod method;
+pub mod method;
 mod ty;
 
 pub use ast::*;

@@ -24,6 +24,7 @@ pub enum DeclKind {
     Function,
     Predicate,
     Method,
+    HeapExp,
     Domain,
     DomainFunction,
     Adt,
@@ -44,13 +45,20 @@ where
 
     /// Collect and intern all names from a Silver program.
     /// Returns an error if there are duplicate declarations.
-    pub fn collect(mut self, program: &silver::Program) -> Result<(Rodeo<K>, TiVec<K, DeclKind>), Vec<IdentifierError>> {
+    pub fn collect(
+        mut self,
+        program: &silver::Program,
+    ) -> Result<(Rodeo<K>, TiVec<K, DeclKind>), Vec<IdentifierError>> {
         use crate::silver::walk::AstWalkable;
 
         program.walk(&mut self);
 
         if self.errors.is_empty() {
-            let kinds = self.name_locations.into_iter().map(|loc| loc.kind).collect();
+            let kinds = self
+                .name_locations
+                .into_iter()
+                .map(|loc| loc.kind)
+                .collect();
             Ok((self.interner, kinds))
         } else {
             Err(self.errors)
@@ -150,6 +158,8 @@ where
     fn walk_method(&mut self, method: &'a silver::Method) {
         let name = &method.signature.name.0 .0;
         self.register_name(name, DeclKind::Method);
+        self.register_name(&format!("{name}@requires"), DeclKind::HeapExp);
+        self.register_name(&format!("{name}@ensures"), DeclKind::HeapExp);
     }
 
     fn walk_domain(&mut self, domain: &'a silver::Domain) {

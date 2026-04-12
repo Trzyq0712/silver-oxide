@@ -1,11 +1,10 @@
 use crate::silver::walk::AstWalkable;
+use crate::translate::method::MethodTranslCtxt;
 use crate::translate::name_resolution::DeclKind;
 use crate::vmir;
-use crate::{silver, translate::exp::ExpTranslationContext};
+use crate::{silver, translate::heap_exp::HeapExpTranslCtxt};
 use lasso::{Key, Rodeo};
-use nonmax::NonMaxU32;
 use rusttyc::{TcErr, TcKey, TcVar, TypeChecker};
-use std::collections::HashMap;
 use typed_index_collections::{ti_vec, TiVec};
 
 // TODO: Type Checking Phase
@@ -24,8 +23,8 @@ use typed_index_collections::{ti_vec, TiVec};
 //   - Infer missing type annotations
 //   - Build a type environment that translation can use
 
-pub mod exp;
-// pub mod method;
+pub mod heap_exp;
+pub mod method;
 pub mod name_resolution;
 pub mod signatures;
 pub mod typecheck;
@@ -39,66 +38,6 @@ pub struct VmirTranslator {
     name_kinds: TiVec<vmir::MemberId, DeclKind>,
     signatures: SignatureContext,
 }
-
-//
-// impl<'a, 'b> MethodTranslationContext<'a, 'b> {
-//     fn new(
-//         translator: &'a VmirTranslator,
-//         params: impl IntoIterator<Item = (&'b silver::IdnDecl, vmir::Type)>,
-//     ) -> Self {
-//         let mut locals_map = HashMap::new();
-//         let mut tc = TypeChecker::new();
-//         let mut local_counter = 0u32;
-//
-//         // Initialize parameters as locals
-//         for (name, ty) in params {
-//             let idx = NonMaxU32::new(local_counter).expect("Too many parameters");
-//             local_counter += 1;
-//             let ty = typecheck::TcType::from_vmir_type(&ty);
-//             locals_map.insert(name.0 .0.as_str(), (idx, ty.clone()));
-//
-//             // Impose type constraint on the local variable
-//             let tc_key = tc.get_var_key(&vmir::vmir::exp::Value::Local(idx));
-//             tc.impose(tc_key.concretizes_explicit(ty)).unwrap();
-//         }
-//
-//         Self {
-//             locals: locals_map,
-//             local_counter,
-//             temp_counter: 0,
-//             statements: Vec::new(),
-//             tc,
-//             translator,
-//         }
-//     }
-//
-//     /// Allocate a new local variable
-//     fn allocate_local(&mut self, name: &'b str, ty: typecheck::TcType) -> NonMaxU32 {
-//         let idx = NonMaxU32::new(self.local_counter).expect("Too many local variables");
-//         self.local_counter += 1;
-//
-//         // Store in locals map
-//         self.locals.insert(name, (idx, ty.clone()));
-//
-//         // Impose type constraint
-//         let tc_key = self.tc.get_var_key(&vmir::vmir::exp::Value::Local(idx));
-//         self.tc.impose(tc_key.concretizes_explicit(ty)).unwrap();
-//
-//         idx
-//     }
-//
-//     /// Generate a new temporary index
-//     fn fresh_temp(&mut self) -> NonMaxU32 {
-//         let temp = NonMaxU32::new(self.temp_counter).expect("Too many temporaries");
-//         self.temp_counter += 1;
-//         temp
-//     }
-//
-//     /// Add a statement to the method body
-//     fn add_statement(&mut self, stmt: vmir::Statement) {
-//         self.statements.push(stmt);
-//     }
-// }
 
 impl VmirTranslator {
     /// Create a new translator with a pre-populated interner from name collection.
@@ -288,10 +227,11 @@ impl VmirTranslator {
             name: resource_id,
             args,
             snapshot: snap_member_id,
-            body: predicate
-                .body
-                .as_ref()
-                .map(|body| self.translate_impure_exp(&body.0.exp, &sig.args, &vmir::Type::Bool)),
+            body: None,
+            // predicate
+            //     .body
+            //     .as_ref()
+            //     .map(|body| self.translate_impure_exp(&body.0.exp, &sig.args, &vmir::Type::Bool)),
         };
 
         assert!(
@@ -302,28 +242,28 @@ impl VmirTranslator {
         self.globals[resource_id] = Some(vmir::Declaration::Resource(resource));
     }
 
-    /// Translate a complete expression with predefined locals (e.g., for predicate bodies)
-    fn translate_impure_exp<'a>(
-        &self,
-        exp: &silver::ExpKind,
-        env: impl IntoIterator<Item = &'a silver::ArgOrType>,
-        ty: &vmir::Type,
-    ) -> vmir::HeapExp {
-        // Convert ArgOrType to (IdnDecl, Type) pairs
-        let locals = env.into_iter().filter_map(|arg| {
-            match arg {
-                silver::ArgOrType::Arg(typed) => {
-                    let vmir_ty = self.translate_type(&typed.ty);
-                    Some((&typed.idn, vmir_ty))
-                }
-                silver::ArgOrType::Type(_) => None, // Skip type-only parameters
-            }
-        });
-
-        let ctx = ExpTranslationContext::new(self, locals);
-
-        ctx.translate_exp(exp)
-    }
+    // /// Translate a complete expression with predefined locals (e.g., for predicate bodies)
+    // fn translate_impure_exp<'a>(
+    //     &self,
+    //     exp: &silver::ExpKind,
+    //     env: impl IntoIterator<Item = &'a silver::ArgOrType>,
+    //     ty: &vmir::Type,
+    // ) -> vmir::HeapExp {
+    //     // Convert ArgOrType to (IdnDecl, Type) pairs
+    //     let locals = env.into_iter().filter_map(|arg| {
+    //         match arg {
+    //             silver::ArgOrType::Arg(typed) => {
+    //                 let vmir_ty = self.translate_type(&typed.ty);
+    //                 Some((&typed.idn, vmir_ty))
+    //             }
+    //             silver::ArgOrType::Type(_) => None, // Skip type-only parameters
+    //         }
+    //     });
+    //
+    //     let ctx = HeapExpTranslCtxt::new(self, locals);
+    //
+    //     ctx.translate_exp(exp)
+    // }
 
     fn translate_method(&mut self, method: &silver::Method) {
         let sig = &method.signature;
@@ -351,20 +291,37 @@ impl VmirTranslator {
         //     .body
         //     .as_ref()
         //     .map(|body_block| self.translate_method_body(body_block, &method.signature));
+        //
+        self.translate_method_contract(ident, &method.contract, &method.signature);
 
         let vmir_method = vmir::Method {
             name: method_member_id,
             signature: vmir::MethSig { args, rets },
-            contract: self.translate_method_contract(&method.contract, &method.signature),
-            body: None, // Temporarily disabled
+            body: vmir::StmtBlock(vec![]),
         };
 
+        if let Some(body) = &method.body {
+            let mut trans_ctxt = MethodTranslCtxt::new(self, &method.signature);
+
+            for stmt in &body.0 {
+                trans_ctxt.translate_statement(stmt);
+            }
+
+            let _method = trans_ctxt.finalize();
+            let vmir_display = vmir::display::VmirDisplay::new(&_method, &self.interner);
+            println!("Translated method body for {}:\n{}", ident, vmir_display);
+        }
+
+        self.add_decl(method_member_id, vmir::Declaration::Method(vmir_method));
+    }
+
+    fn add_decl(&mut self, memid: vmir::MemberId, decl: vmir::Declaration) {
         assert!(
-            self.globals[method_member_id].is_none(),
+            self.globals[memid].is_none(),
             "Declaration at index {} already exists",
-            method_member_id.into_usize()
+            memid.into_usize()
         );
-        self.globals[method_member_id] = Some(vmir::Declaration::Method(vmir_method));
+        self.globals[memid] = Some(decl);
     }
 
     /* Temporarily disabled method body translation
@@ -627,8 +584,8 @@ impl VmirTranslator {
         let func = vmir::Function {
             name: func_member_id,
             signature: vmir::FuncSig { args, ret },
-            contract: self.translate_function_contract(contract, sig),
-            body: None, // TODO: translate function body
+            contract: vmir::FuncContract::empty(), // TODO: translate function contract
+            body: None,                            // TODO: translate function body
         };
 
         assert!(
@@ -639,78 +596,82 @@ impl VmirTranslator {
         self.globals[func_member_id] = Some(vmir::Declaration::Function(func));
     }
 
-    fn translate_function_contract(
-        &self,
-        contract: &silver::Contract,
-        signature: &silver::Signature,
-    ) -> vmir::FuncContract {
-        // Build requires input signature: [heap, ...args]
-        let mut requires_inputs = vec![vmir::Type::Heap];
-        for arg in &signature.args {
-            if let silver::ArgOrType::Arg(typed) = arg {
-                requires_inputs.push(self.translate_type(&typed.ty));
-            }
-        }
-
-        let requires = contract
-            .precondition
-            .as_ref()
-            .map(|pre| self.translate_impure_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
-
-        // Build ensures input signature: [heap, old_heap, ...args]
-        let mut ensures_inputs = vec![vmir::Type::Heap, vmir::Type::Heap];
-        for arg in &signature.args {
-            if let silver::ArgOrType::Arg(typed) = arg {
-                ensures_inputs.push(self.translate_type(&typed.ty));
-            }
-        }
-
-        let ensures = contract
-            .postcondition
-            .as_ref()
-            .map(|post| self.translate_impure_exp(&post.exp, &signature.args, &vmir::Type::Bool));
-
-        vmir::FuncContract::with_inputs(requires, ensures, requires_inputs, ensures_inputs)
-    }
+    // fn translate_function_contract(
+    //     &self,
+    //     contract: &silver::Contract,
+    //     signature: &silver::Signature,
+    // ) -> vmir::FuncContract {
+    //     // Build requires input signature: [heap, ...args]
+    //     let mut requires_inputs = vec![vmir::Type::Heap];
+    //     for arg in &signature.args {
+    //         if let silver::ArgOrType::Arg(typed) = arg {
+    //             requires_inputs.push(self.translate_type(&typed.ty));
+    //         }
+    //     }
+    //
+    //     let requires = contract
+    //         .precondition
+    //         .as_ref()
+    //         .map(|pre| self.translate_impure_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
+    //
+    //     // Build ensures input signature: [heap, old_heap, ...args]
+    //     let mut ensures_inputs = vec![vmir::Type::Heap, vmir::Type::Heap];
+    //     for arg in &signature.args {
+    //         if let silver::ArgOrType::Arg(typed) = arg {
+    //             ensures_inputs.push(self.translate_type(&typed.ty));
+    //         }
+    //     }
+    //
+    //     let ensures = contract
+    //         .postcondition
+    //         .as_ref()
+    //         .map(|post| self.translate_impure_exp(&post.exp, &signature.args, &vmir::Type::Bool));
+    //
+    //     vmir::FuncContract::with_inputs(requires, ensures, requires_inputs, ensures_inputs)
+    // }
 
     fn translate_method_contract(
-        &self,
+        &mut self,
+        method: &str,
         contract: &silver::Contract,
         signature: &silver::Signature,
-    ) -> vmir::MethContract {
-        // Build requires input signature: [heap, ...args]
-        let mut requires_inputs = vec![vmir::Type::Heap];
-        for arg in &signature.args {
-            if let silver::ArgOrType::Arg(typed) = arg {
-                requires_inputs.push(self.translate_type(&typed.ty));
-            }
-        }
+    ) {
+        const TRUE_EXP: silver::ExpKind = silver::ExpKind::Const(silver::ConstKind::Bool(true));
 
-        let requires = contract
-            .precondition
-            .as_ref()
-            .map(|pre| self.translate_impure_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
+        let memid = self.interner.get(method).unwrap();
 
-        // Build ensures input signature: [heap, old_heap, ...args, ...returns]
-        let mut ensures_inputs = vec![vmir::Type::Heap, vmir::Type::Heap];
-        for arg in &signature.args {
-            if let silver::ArgOrType::Arg(typed) = arg {
-                ensures_inputs.push(self.translate_type(&typed.ty));
-            }
-        }
-        for ret in &signature.ret {
-            if let silver::ArgOrType::Arg(typed) = ret {
-                ensures_inputs.push(self.translate_type(&typed.ty));
-            }
-        }
+        let requires = {
+            let ctxt = HeapExpTranslCtxt::new_for_requires(
+                self,
+                memid,
+                signature.args.iter().map(|a| a.idn().unwrap()),
+            );
+            ctxt.translate_exp(
+                contract
+                    .precondition
+                    .as_ref()
+                    .map_or(&TRUE_EXP, |pre| &pre.exp),
+            )
+        };
+        let ensures = {
+            let ctxt = HeapExpTranslCtxt::new_for_ensures(
+                self,
+                memid,
+                signature.args.iter().map(|a| a.idn().unwrap()),
+                signature.ret.iter().filter_map(|r| r.idn()),
+            );
+            ctxt.translate_exp(
+                contract
+                    .postcondition
+                    .as_ref()
+                    .map_or(&TRUE_EXP, |post| &post.exp),
+            )
+        };
 
-        let ensures_locals = signature.args.iter().chain(signature.ret.iter());
-        let ensures = contract
-            .postcondition
-            .as_ref()
-            .map(|post| self.translate_impure_exp(&post.exp, ensures_locals, &vmir::Type::Bool));
-
-        vmir::MethContract::with_inputs(requires, ensures, requires_inputs, ensures_inputs)
+        let requires_memid = self.interner.get(format!("{method}@requires")).unwrap();
+        self.add_decl(requires_memid, vmir::Declaration::HeapExp(requires));
+        let ensures_memid = self.interner.get(format!("{method}@ensures")).unwrap();
+        self.add_decl(ensures_memid, vmir::Declaration::HeapExp(ensures));
     }
 }
 

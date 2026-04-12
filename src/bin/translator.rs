@@ -6,8 +6,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input = fs::read_to_string(file)?;
     let program = silver_parser::sil_program(&input)?;
 
-    // println!("=== Silver AST ===");
-    // println!("{:#?}", program);
+    println!("=== Silver AST ===");
+    println!("{:#?}", program);
 
     let vmir_program = VmirTranslator::translate(&program).unwrap();
 

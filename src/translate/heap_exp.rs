@@ -1,4 +1,3 @@
-use nonmax::NonMaxU32;
 use rusttyc::{TcErr, TcKey, TcVar, TypeChecker};
 
 use crate::{
@@ -13,51 +12,150 @@ use crate::{
 
 impl TcVar for vmir::Value {}
 
+enum Polarity {
+    Positive,
+    Negative,
+}
+
+enum PathCond {
+    None,
+    Cond(Polarity, vmir::Value),
+}
+
 /// Context for translating expressions within a function/method
 /// This tracks locals, generates SSA instructions, and accumulates type information
 #[derive(Debug, Clone)]
-pub struct ExpTranslationContext<'a, 'b> {
-    /// Maps Silver variable names to VMIR local index and type
-    env: HashMap<&'b str, (NonMaxU32, vmir::Type)>,
+pub struct HeapExpTranslCtxt<'a, 'b> {
+    /// Argument types for the heap expression, these correspond to the expressions [e0, ..., en],
+    /// where n = len(args) - 1
+    args: Vec<vmir::Type>,
     /// Current instruction list being built
     insts: Vec<vmir::InstKind>,
 
     tc: TypeChecker<typecheck::TcType, vmir::Value>,
-    /// Current state of the heap
+
+    /// On-path condition used for building path-sensitive `acc` expressions
+    /// For example, `b ==> acc(x.f, 1/1)` would have a path condition of `b` when translating the
+    /// `acc` expression
+    path_cond: Option<vmir::Value>,
+
+    /// Current state of the heap, initially mapped to one of the heaps from the input
     heap: vmir::Value,
+    /// The old heap value for ensures clauses with `old` expressions
+    old_heap: Option<vmir::Value>,
+
+    /// Maps a named Silver local to a vmir temporary in the `args`
+    locals: HashMap<&'b silver::Ident, vmir::Temp>,
+
     /// Reference to the translator for looking up global names
     translator: &'a VmirTranslator,
 }
 
-impl<'a, 'b> ExpTranslationContext<'a, 'b> {
-    pub fn new(
+impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
+    pub fn new_for_requires(
         translator: &'a VmirTranslator,
-        locals: impl IntoIterator<Item = (&'b silver::IdnDecl, vmir::Type)>,
+        method: vmir::MemberId,
+        args: impl IntoIterator<Item = &'b silver::IdnDecl>,
     ) -> Self {
-        let env: HashMap<&'b str, (NonMaxU32, vmir::Type)> = locals
+        let exp_args = [
+            &[vmir::Type::Heap].as_slice(), // the input heap
+            translator.signatures.method_sig(method).args.as_slice(),
+        ]
+        .concat();
+
+        let heap = vmir::Value::Temp(0); // 0-th arg is the starting heap
+
+        let mut tc = TypeChecker::new();
+        for (idx, ty) in exp_args.iter().enumerate() {
+            let key = tc.get_var_key(&vmir::Value::Temp(idx));
+            tc.impose(key.concretizes_explicit(ty.into())).unwrap();
+        }
+
+        let locals: HashMap<&'b silver::Ident, vmir::Temp> = args
             .into_iter()
             .enumerate()
-            .map(|(idx, (name, ty))| {
-                let idx = NonMaxU32::new(idx as u32).expect("Too many parameters");
-                (name.0 .0.as_str(), (idx, ty.into()))
-            })
+            .map(|(idx, decl)| (&decl.0, idx + 1)) // skip the 0-th arg which is the heap
             .collect();
 
-        Self::with_env(translator, env)
-    }
-
-    pub fn with_env(
-        translator: &'a VmirTranslator,
-        env: HashMap<&'b str, (NonMaxU32, vmir::Type)>,
-    ) -> Self {
         Self {
-            env,
+            args: exp_args,
             insts: Vec::new(),
-            tc: TypeChecker::new(),
-            heap: vmir::Literal::EmptyHeap.into(),
+            tc,
+            path_cond: None,
+            heap,
+            old_heap: None,
+            locals,
             translator,
         }
     }
+
+    pub fn new_for_ensures(
+        translator: &'a VmirTranslator,
+        method: vmir::MemberId,
+        args: impl IntoIterator<Item = &'b silver::IdnDecl>,
+        rets: impl IntoIterator<Item = &'b silver::IdnDecl>,
+    ) -> Self {
+        let exp_args = [
+            &[vmir::Type::Heap, vmir::Type::Heap].as_slice(), // the input heap and old heap
+            translator.signatures.method_sig(method).args.as_slice(),
+            translator.signatures.method_sig(method).ret.as_slice(),
+        ]
+        .concat();
+
+        let heap = vmir::Value::Temp(0); // 0-th arg is the starting heap
+        let old_heap = vmir::Value::Temp(1); // 1-st arg is the old heap
+
+        let mut tc = TypeChecker::new();
+        for (idx, ty) in exp_args.iter().enumerate() {
+            let key = tc.get_var_key(&vmir::Value::Temp(idx));
+            tc.impose(key.concretizes_explicit(ty.into())).unwrap();
+        }
+
+        let locals: HashMap<&'b silver::Ident, vmir::Temp> = std::iter::chain(args, rets)
+            .enumerate()
+            .map(|(idx, decl)| (&decl.0, idx + 2)) // skip the first 2 args which are the heaps
+            .collect();
+
+        Self {
+            args: exp_args,
+            insts: Vec::new(),
+            tc,
+            path_cond: None,
+            heap,
+            old_heap: Some(old_heap),
+            locals,
+            translator,
+        }
+    }
+
+    // pub fn new(
+    //     translator: &'a VmirTranslator,
+    //     locals: impl IntoIterator<Item = (&'b silver::IdnDecl, vmir::Type)>,
+    // ) -> Self {
+    //     let env: HashMap<&'b str, (NonMaxU32, vmir::Type)> = locals
+    //         .into_iter()
+    //         .enumerate()
+    //         .map(|(idx, (name, ty))| {
+    //             let idx = NonMaxU32::new(idx as u32).expect("Too many parameters");
+    //             (name.0 .0.as_str(), (idx, ty.into()))
+    //         })
+    //         .collect();
+    //
+    //     Self::with_env(translator, env)
+    // }
+
+    // pub fn with_env(
+    //     translator: &'a VmirTranslator,
+    //     env: HashMap<&'b str, (NonMaxU32, vmir::Type)>,
+    // ) -> Self {
+    //     Self {
+    //         env,
+    //         insts: Vec::new(),
+    //         tc: TypeChecker::new(),
+    //         heap: vmir::Literal::EmptyHeap.into(),
+    //         translator,
+    //     }
+    // }
 
     pub fn translate_exp(mut self, exp: &silver::ExpKind) -> vmir::HeapExp {
         let res_pure = self.translate_exp_inner(exp).unwrap();
@@ -73,7 +171,7 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
             .into_iter()
             .enumerate()
             .map(|(i, inst)| {
-                let temp = vmir::Temp::from(i).into();
+                let temp = vmir::Value::Temp(i);
                 let key = self.tc.get_var_key(&temp);
                 (inst, key)
             })
@@ -93,7 +191,7 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
             .collect();
 
         vmir::HeapExp {
-            input_types: vec![],  // TODO: populate from signature during translation
+            input_types: self.args,
             insts,
             res_pure,
             res_impure: self.heap,
@@ -102,9 +200,9 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
 
     /// Add an instruction and return the temporary holding its result
     fn add_inst(&mut self, kind: vmir::InstKind) -> vmir::Value {
-        let temp: vmir::Temp = self.insts.len().into();
+        let temp = self.insts.len() + self.args.len();
         self.insts.push(kind);
-        temp.into()
+        vmir::Value::Temp(temp)
     }
 
     fn add_heap_inst<F>(&mut self, f: F)
@@ -151,86 +249,34 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
             }
             silver::BinOp::Iff => {
                 // l <==> r  =>  l ? r : !r
-                let not_r = self.add_inst(vmir::InstKind::Unary(
-                    vmir::UnOp::Not,
-                    r.clone(),
-                ));
+                let not_r = self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, r.clone()));
                 self.add_inst(vmir::InstKind::Ternary(l, r, not_r))
             }
-            silver::BinOp::Eq => self.add_inst(vmir::InstKind::Binary(
-                vmir::BinOp::Eq,
-                l,
-                r,
-            )),
+            silver::BinOp::Eq => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Eq, l, r)),
             silver::BinOp::Neq => {
                 // l != r => !(l == r)
-                let l_eq_r = self.add_inst(vmir::InstKind::Binary(
-                    vmir::BinOp::Eq,
-                    l,
-                    r,
-                ));
-                self.add_inst(vmir::InstKind::Unary(
-                    vmir::UnOp::Not,
-                    l_eq_r,
-                ))
+                let l_eq_r = self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Eq, l, r));
+                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, l_eq_r))
             }
-            silver::BinOp::Lt => self.add_inst(vmir::InstKind::Binary(
-                vmir::BinOp::Lt,
-                l,
-                r,
-            )),
+            silver::BinOp::Lt => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, l, r)),
             silver::BinOp::Le => {
                 // l <= r => !(r < l)
-                let r_lt_l = self.add_inst(vmir::InstKind::Binary(
-                    vmir::BinOp::Lt,
-                    r,
-                    l,
-                ));
-                self.add_inst(vmir::InstKind::Unary(
-                    vmir::UnOp::Not,
-                    r_lt_l,
-                ))
+                let r_lt_l = self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, r, l));
+                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, r_lt_l))
             }
             silver::BinOp::Gt => {
                 // l > r => r < l
-                self.add_inst(vmir::InstKind::Binary(
-                    vmir::BinOp::Lt,
-                    r,
-                    l,
-                ))
+                self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, r, l))
             }
             silver::BinOp::Ge => {
                 // l >= r => !(l < r)
-                let l_lt_r = self.add_inst(vmir::InstKind::Binary(
-                    vmir::BinOp::Lt,
-                    l,
-                    r,
-                ));
-                self.add_inst(vmir::InstKind::Unary(
-                    vmir::UnOp::Not,
-                    l_lt_r,
-                ))
+                let l_lt_r = self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Lt, l, r));
+                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, l_lt_r))
             }
-            silver::BinOp::Plus => self.add_inst(vmir::InstKind::Binary(
-                vmir::BinOp::Plus,
-                l,
-                r,
-            )),
-            silver::BinOp::Minus => self.add_inst(vmir::InstKind::Binary(
-                vmir::BinOp::Minus,
-                l,
-                r,
-            )),
-            silver::BinOp::Mult => self.add_inst(vmir::InstKind::Binary(
-                vmir::BinOp::Mult,
-                l,
-                r,
-            )),
-            silver::BinOp::Div => self.add_inst(vmir::InstKind::Binary(
-                vmir::BinOp::Div,
-                l,
-                r,
-            )),
+            silver::BinOp::Plus => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Plus, l, r)),
+            silver::BinOp::Minus => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Minus, l, r)),
+            silver::BinOp::Mult => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Mult, l, r)),
+            silver::BinOp::Div => self.add_inst(vmir::InstKind::Binary(vmir::BinOp::Div, l, r)),
             _ => unimplemented!(),
         };
         let v_key = self.tc.get_var_key(&val);
@@ -283,12 +329,8 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
         let e = self.translate_exp_inner(exp)?;
         let e_key = self.tc.get_var_key(&e);
         let val = match op {
-            silver::UnOp::Not => {
-                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, e))
-            }
-            silver::UnOp::Neg => {
-                self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Neg, e))
-            }
+            silver::UnOp::Not => self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Not, e)),
+            silver::UnOp::Neg => self.add_inst(vmir::InstKind::Unary(vmir::UnOp::Neg, e)),
             silver::UnOp::Perm => self.add_inst(vmir::InstKind::Perm(self.heap.clone(), e)),
             _ => unimplemented!("Unsupported unary operator: {:?}", op),
         };
@@ -314,33 +356,22 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
         Ok(val)
     }
 
-    fn translate_ident(
-        &mut self,
-        ident: &silver::Ident,
-    ) -> Result<vmir::Value, TcErr<TcType>> {
-        let Some((local_idx, ty)) = self.env.get(ident.0.as_str()) else {
+    fn translate_ident(&mut self, ident: &silver::Ident) -> vmir::Value {
+        let Some(local_idx) = self.locals.get(ident) else {
             panic!("Undefined variable: {}", ident.0);
         };
-        let ty = ty.into();
-        let inst = vmir::InstKind::Read(vmir::Local(*local_idx));
-        let val = self.add_inst(inst);
-        let key = self.tc.get_var_key(&val);
-        self.tc.impose(key.concretizes_explicit(ty))?;
-        Ok(val)
+        vmir::Value::Temp(*local_idx)
     }
 
     /// Translate a Silver expression to VMIR SSA form
     /// Returns the Value representing the result and the inferred type
-    fn translate_exp_inner(
-        &mut self,
-        exp: &silver::ExpKind,
-    ) -> Result<vmir::Value, TcErr<TcType>> {
+    fn translate_exp_inner(&mut self, exp: &silver::ExpKind) -> Result<vmir::Value, TcErr<TcType>> {
         use silver::ExpKind;
 
         match exp {
             ExpKind::Const(const_) => self.translate_const(const_),
 
-            ExpKind::Ident(ident) => self.translate_ident(ident),
+            ExpKind::Ident(ident) => Ok(self.translate_ident(ident)),
 
             ExpKind::BinOp(op, left, right) => self.translate_binop(op, left, right),
 
@@ -348,6 +379,7 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
 
             ExpKind::Ternary(cond, then, else_) => {
                 let cond = self.translate_exp_inner(cond)?;
+                self.path_cond = Some(cond.clone());
                 let then = self.translate_exp_inner(then)?;
                 let else_ = self.translate_exp_inner(else_)?;
 
@@ -473,9 +505,7 @@ impl<'a, 'b> ExpTranslationContext<'a, 'b> {
         let amt_key = self.tc.get_var_key(&amt);
         self.tc.impose(amt_key.concretizes_explicit(TcType::Real))?;
 
-        self.add_heap_inst(|curr_heap| {
-            vmir::InstKind::PermOp(curr_heap, vmir::PermOp::Adjust(loc, amt))
-        });
+        self.add_heap_inst(|curr_heap| vmir::InstKind::Acc(curr_heap, loc, amt));
 
         // acc() expressions evaluate to true (bool) in the pure context
         Ok(vmir::Literal::Bool(true).into())
