@@ -32,6 +32,9 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_resource_exp, 'a, ResourceExp);
     walk_children!(walk_heap_exp, 'a, HeapExp);
     walk_children!(walk_exp, 'a, Exp);
+    walk_children!(walk_pure_exp, 'a, PureExp);
+    walk_children!(walk_assert_exp, 'a, AssertExp);
+    walk_children!(walk_ghost_exp, 'a, GhostExp);
     walk_children!(walk_exp_kind, 'a, ExpKind);
     walk_children!(walk_const, 'a, ConstKind);
     walk_children!(walk_const_heap_kind, 'a, ConstHeapKind);
@@ -100,6 +103,9 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_resource_exp, 'a, ResourceExp);
     walk_mut_children!(walk_mut_heap_exp, 'a, HeapExp);
     walk_mut_children!(walk_mut_exp, 'a, Exp);
+    walk_mut_children!(walk_mut_pure_exp, 'a, PureExp);
+    walk_mut_children!(walk_mut_assert_exp, 'a, AssertExp);
+    walk_mut_children!(walk_mut_ghost_exp, 'a, GhostExp);
     walk_mut_children!(walk_mut_exp_kind, 'a, ExpKind);
     walk_mut_children!(walk_mut_const, 'a, ConstKind);
     walk_mut_children!(walk_mut_const_heap_kind, 'a, ConstHeapKind);
@@ -302,6 +308,9 @@ walk_struct!(
 );
 walk_struct!(HeapExp, walk_heap_exp, walk_mut_heap_exp, exp);
 walk_box!(Exp, walk_exp, walk_mut_exp);
+walk_struct!(PureExp, walk_pure_exp, walk_mut_pure_exp, 0);
+walk_struct!(AssertExp, walk_assert_exp, walk_mut_assert_exp, 0);
+walk_struct!(GhostExp, walk_ghost_exp, walk_mut_ghost_exp, 0);
 walk_enum!(
     ExpKind,
     walk_exp_kind,

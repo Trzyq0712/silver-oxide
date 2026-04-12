@@ -121,10 +121,76 @@ pub struct ResourceExp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HeapExp {
-    pub exp: Exp,
+    pub exp: AssertExp,
 }
 
 pub type Exp = Box<ExpKind>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PureExp(pub Exp);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AssertExp(pub Exp);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GhostExp(pub Exp);
+
+impl From<Exp> for PureExp {
+    fn from(value: Exp) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Exp> for AssertExp {
+    fn from(value: Exp) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Exp> for GhostExp {
+    fn from(value: Exp) -> Self {
+        Self(value)
+    }
+}
+
+impl Deref for PureExp {
+    type Target = ExpKind;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl DerefMut for PureExp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
+}
+
+impl Deref for AssertExp {
+    type Target = ExpKind;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl DerefMut for AssertExp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
+}
+
+impl Deref for GhostExp {
+    type Target = ExpKind;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl DerefMut for GhostExp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExpKind {
@@ -258,9 +324,9 @@ pub enum ResAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
-    Assume(Exp),
-    Assert(Exp),
-    Refute(Exp),
+    Assume(AssertExp),
+    Assert(AssertExp),
+    Refute(AssertExp),
     Inhale(HeapExp),
     Exhale(HeapExp),
     Fold(AccExp),
@@ -271,8 +337,8 @@ pub enum Statement {
     QuasiHavoc(Option<Exp>, Exp),
     QuasiHavocAll(Vec<IdnDeclTyped>, Option<Exp>, Exp),
     Var(Vec<IdnDeclTyped>, Option<AssignRhs>),
-    While(Exp, Invariant, Vec<Decreases>, StmtBlock),
-    If(Exp, StmtBlock, Option<StmtBlock>),
+    While(PureExp, Invariant, Vec<Decreases>, StmtBlock),
+    If(PureExp, StmtBlock, Option<StmtBlock>),
     Package(AccExp, Option<StmtBlock>),
     Apply(AccExp),
     Assign(Vec<Exp>, AssignRhs),
@@ -281,7 +347,7 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssignRhs {
-    Exp(Exp),
+    Exp(PureExp),
     Call(Ident, Vec<Exp>),
     New(StarOrNames),
 }
@@ -396,3 +462,4 @@ pub struct Variant {
 pub struct AdtConstructor {
     pub signature: Signature,
 }
+use std::ops::{Deref, DerefMut};

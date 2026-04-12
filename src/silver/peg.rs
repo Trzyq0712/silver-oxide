@@ -245,9 +245,9 @@ peg::parser! {
         rule block_exp() -> ExpBlock = "{" _ e:exp() _ "}" { Block(e) }
 
         rule statement() -> Statement
-            = kw(<"assert">) _ e:exp() { Statement::Assert(e)}
-            / kw(<"refute">) _ e:exp() { Statement::Refute(e)}
-            / kw(<"assume">) _ e:exp() { Statement::Assume(e)}
+            = kw(<"assert">) _ e:exp() { Statement::Assert(e.into())}
+            / kw(<"refute">) _ e:exp() { Statement::Refute(e.into())}
+            / kw(<"assume">) _ e:exp() { Statement::Assume(e.into())}
             / kw(<"inhale">) _ e:exp() { Statement::Inhale(HeapExp::new(e))}
             / kw(<"exhale">) _ e:exp() { Statement::Exhale(HeapExp::new(e))}
             / kw(<"fold">) _ e:predicate_perm() { Statement::Fold(e)}
@@ -279,7 +279,7 @@ peg::parser! {
         rule while_statement() -> Statement = "while" _ "(" _ cond:exp() _ ")" _ spec:semied(<while_spec_item()>)* _ block:block()
             {
                 let c = Contract::from(spec);
-                Statement::While(cond, Invariant(c.precondition), c.decreases, block)
+                Statement::While(cond.into(), Invariant(c.precondition), c.decreases, block)
             }
 
         rule while_spec_item() -> PrePostDec = i:invariant() { PrePostDec::Pre(i) } / d:decreases() { d }
@@ -287,13 +287,13 @@ peg::parser! {
         rule invariant() -> Exp = "invariant" _ e:exp() { e }
 
         rule if_statement() -> Statement = "if" _ "(" _ cond:exp() _ ")" _ then:block() _ elsifs:(elsif_block()** _) _ else_:("else" _ else_:block() { else_})? {
-            let mut elsifs = [(cond, then)].into_iter().chain(elsifs).rev();
+            let mut elsifs = [(cond.into(), then)].into_iter().chain(elsifs).rev();
             let (cond, then) = elsifs.next().unwrap();
             elsifs.fold(Statement::If(cond, then, else_), |acc, (cond, then)| Statement::If(cond, then, Some(Block(vec![acc]))))
         }
 
-        rule elsif_block() -> (Exp, StmtBlock) =
-            "elseif" _ "(" _ exp:exp() _ ")" _ block:block() { (exp, block)}
+        rule elsif_block() -> (PureExp, StmtBlock) =
+            "elseif" _ "(" _ exp:exp() _ ")" _ block:block() { (exp.into(), block)}
 
         rule assign_stmt() -> Statement = tgts:(tgts:(assign_target() ++ comma()) _ ":=" { tgts })? _ rhs:assign_rhs()
             { Statement::Assign(tgts.unwrap_or_default(), rhs) }
@@ -305,7 +305,7 @@ peg::parser! {
             / "new" _ "(" _ args:(ident() ** comma()) _ ")" { AssignRhs::New(StarOrNames::Names(args))}
             / e:exp() { match *e {
                 ExpKind::FuncApp(id, args) => AssignRhs::Call(id, args),
-                _ => AssignRhs::Exp(e)
+                _ => AssignRhs::Exp(e.into())
             }}
 
         rule wand_statement() -> Statement =// "wand" _ name:ident() _ ":" _ exp:exp() { Statement::Wand(name, exp) } /

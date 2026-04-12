@@ -100,8 +100,8 @@ impl AdtConstructor {
 }
 
 impl HeapExp {
-    pub(crate) fn new(exp: Exp) -> Self {
-        Self { exp }
+    pub(crate) fn new(exp: impl Into<AssertExp>) -> Self {
+        Self { exp: exp.into() }
     }
 
     pub(super) fn conjoin(exp: Vec<Exp>) -> Option<Self> {
@@ -136,7 +136,8 @@ impl Contract {
                 PrePostDec::Post(e) => {
                     let new = match self.postcondition {
                         Some(mut post) => {
-                            post.exp = Box::new(ExpKind::BinOp(BinOp::And, post.exp, e));
+                            post.exp =
+                                AssertExp(Box::new(ExpKind::BinOp(BinOp::And, post.exp.0, e)));
                             post
                         }
                         None => HeapExp::new(e),
