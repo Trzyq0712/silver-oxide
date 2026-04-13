@@ -6,6 +6,8 @@ pub mod vmir;
 pub use silver::silver_parser;
 pub use util::*;
 
+use crate::vmir::AccInst;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,7 +83,7 @@ method test(x: Ref)
 
 #[test]
 fn test_heap_ternary_acc_permissions_are_path_conditionalized_with_branch_polarity() {
-    use vmir::{Declaration, InstKind, Literal, PureInst, Value};
+    use vmir::{Declaration, HeapInstKind, Literal, PureInst, Value};
 
     fn real(n: i64) -> Value {
         Literal::Real(num::BigInt::from(n).into()).into()
@@ -115,12 +117,12 @@ method test(path: Bool, x: Ref)
     let mut saw_negative = false;
 
     for inst in &requires.insts {
-        let InstKind::Acc(_, _, amt) = &inst.kind else {
+        let HeapInstKind::Acc(AccInst { perm, .. }) = &inst.kind else {
             continue;
         };
 
-        let Value::Temp(temp) = amt else {
-            panic!("expected path-conditionalized acc amount temp, got {amt:?}");
+        let Value::Temp(temp) = perm else {
+            panic!("expected path-conditionalized acc amount temp, got {perm:?}");
         };
         assert!(
             *temp >= arg_base,
@@ -128,7 +130,7 @@ method test(path: Bool, x: Ref)
         );
         let amt_inst = &requires.insts[*temp - arg_base];
 
-        let InstKind::Pure(PureInst::Ternary(cond, then_amt, else_amt)) = &amt_inst.kind else {
+        let HeapInstKind::Pure(PureInst::Ternary(cond, then_amt, else_amt)) = &amt_inst.kind else {
             panic!(
                 "acc amount should come from ternary, got {:?}",
                 amt_inst.kind

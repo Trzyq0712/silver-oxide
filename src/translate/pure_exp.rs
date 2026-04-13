@@ -181,48 +181,55 @@ impl<'a, B: PureExpBackend> PureExpTranslator<'a, B> {
                 self.backend
                     .emit_pure_inst(vmir::PureInst::Ternary(l, r, not_r))
             }
-            silver::BinOp::Eq => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Eq, l, r)),
+            silver::BinOp::Eq => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Eq, l, r))
+            }
             silver::BinOp::Neq => {
-                let l_eq_r = self
-                    .backend
-                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Eq, l, r));
+                let l_eq_r =
+                    self.backend
+                        .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Eq, l, r));
                 self.backend
                     .emit_pure_inst(vmir::PureInst::Unary(vmir::UnOp::Not, l_eq_r))
             }
-            silver::BinOp::Lt => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, l, r)),
+            silver::BinOp::Lt => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, l, r))
+            }
             silver::BinOp::Le => {
-                let r_lt_l = self
-                    .backend
-                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, r, l));
+                let r_lt_l =
+                    self.backend
+                        .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, r, l));
                 self.backend
                     .emit_pure_inst(vmir::PureInst::Unary(vmir::UnOp::Not, r_lt_l))
             }
-            silver::BinOp::Gt => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, r, l)),
+            silver::BinOp::Gt => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, r, l))
+            }
             silver::BinOp::Ge => {
-                let l_lt_r = self
-                    .backend
-                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, l, r));
+                let l_lt_r =
+                    self.backend
+                        .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Lt, l, r));
                 self.backend
                     .emit_pure_inst(vmir::PureInst::Unary(vmir::UnOp::Not, l_lt_r))
             }
-            silver::BinOp::Plus => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Plus, l, r)),
-            silver::BinOp::Minus => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Minus, l, r)),
-            silver::BinOp::Mult => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Mult, l, r)),
-            silver::BinOp::Div => self
-                .backend
-                .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Div, l, r)),
+            silver::BinOp::Plus => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Plus, l, r))
+            }
+            silver::BinOp::Minus => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Minus, l, r))
+            }
+            silver::BinOp::Mult => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Mult, l, r))
+            }
+            silver::BinOp::Div => {
+                self.backend
+                    .emit_pure_inst(vmir::PureInst::Binary(vmir::BinOp::Div, l, r))
+            }
             _ => unimplemented!(),
         };
         let v_key = self.backend.tc_mut().get_var_key(&val);
@@ -303,7 +310,10 @@ impl<'a, B: PureExpBackend> PureExpTranslator<'a, B> {
             silver::UnOp::Perm => {
                 let heap = self.backend.current_heap();
                 self.backend
-                    .emit_pure_inst(vmir::PureInst::Perm(heap, e))
+                    .emit_pure_inst(vmir::PureInst::Heap(vmir::HeapDepInst {
+                        heap,
+                        kind: vmir::HeapDepInstKind::Perm(e),
+                    }))
             }
             _ => unimplemented!("Unsupported unary operator: {:?}", op),
         };

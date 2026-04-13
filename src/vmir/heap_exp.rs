@@ -1,63 +1,24 @@
-use crate::vmir::{ty::Type, PureInst};
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BinOp {
-    Plus,
-    Minus,
-    Mult,
-    Div,
-    Mod,
-    Eq,
-    Lt,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum UnOp {
-    Not,
-    Neg,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Literal {
-    Int(num::BigInt),
-    Bool(bool),
-    Null,
-    Real(num::BigRational),
-    EmptyHeap,
-}
-
-pub type Temp = usize;
-
-/// Each value is either a temporary, or a constant literal.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Value {
-    Temp(Temp),
-    Literal(Literal),
-}
-
-impl From<Literal> for Value {
-    fn from(value: Literal) -> Self {
-        Self::Literal(value)
-    }
-}
+use crate::vmir::{ty::Type, PureInst, Value};
 
 /// A typed SSA instruction
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Inst {
-    pub kind: InstKind,
+pub struct HeapInst {
+    pub kind: HeapInstKind,
     pub ty: Type,
 }
 
-type Heap = Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum InstKind {
+pub enum HeapInstKind {
     Pure(PureInst),
+    Acc(AccInst),
+}
 
-    // Heap operations
-    /// Get the amount of permission held to a location in the given heap
-    Acc(Heap, Value, Value),
-    /// Dereference an address in the given heap
-    Deref(Heap, Value),
+/// Modify the heap by changing the amount of permission we have for an address
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AccInst {
+    pub heap: Value,
+    pub addr: Value,
+    pub perm: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -66,7 +27,7 @@ pub struct HeapExp {
     /// For requires: [heap, ...method_args]
     /// For ensures: [heap, old_heap, ...method_args, ...returns]
     pub input_types: Vec<Type>,
-    pub insts: Vec<Inst>,
+    pub insts: Vec<HeapInst>,
     /// The pure result - a boolean
     pub res_pure: Value,
     /// The impure part - a heap

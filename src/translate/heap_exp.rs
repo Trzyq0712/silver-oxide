@@ -7,7 +7,8 @@ use crate::{
         typecheck::{self, TcType},
         VmirTranslator,
     },
-    vmir, HashMap,
+    vmir::{self, AccInst},
+    HashMap,
 };
 
 impl TcVar for vmir::Value {}
@@ -31,7 +32,7 @@ pub struct HeapExpTranslCtxt<'a, 'b> {
     /// where n = len(args) - 1
     args: Vec<vmir::Type>,
     /// Current instruction list being built
-    insts: Vec<vmir::InstKind>,
+    insts: Vec<vmir::HeapInstKind>,
 
     tc: TypeChecker<typecheck::TcType, vmir::Value>,
 
@@ -128,35 +129,6 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         }
     }
 
-    // pub fn new(
-    //     translator: &'a VmirTranslator,
-    //     locals: impl IntoIterator<Item = (&'b silver::IdnDecl, vmir::Type)>,
-    // ) -> Self {
-    //     let env: HashMap<&'b str, (NonMaxU32, vmir::Type)> = locals
-    //         .into_iter()
-    //         .enumerate()
-    //         .map(|(idx, (name, ty))| {
-    //             let idx = NonMaxU32::new(idx as u32).expect("Too many parameters");
-    //             (name.0 .0.as_str(), (idx, ty.into()))
-    //         })
-    //         .collect();
-    //
-    //     Self::with_env(translator, env)
-    // }
-
-    // pub fn with_env(
-    //     translator: &'a VmirTranslator,
-    //     env: HashMap<&'b str, (NonMaxU32, vmir::Type)>,
-    // ) -> Self {
-    //     Self {
-    //         env,
-    //         insts: Vec::new(),
-    //         tc: TypeChecker::new(),
-    //         heap: vmir::Literal::EmptyHeap.into(),
-    //         translator,
-    //     }
-    // }
-
     pub fn translate_assert_exp(mut self, exp: &silver::HeapExp) -> vmir::HeapExp {
         let res_pure = self.translate_heap_exp_inner(exp).unwrap();
 
@@ -184,7 +156,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         // Convert instructions, resolving types using stored keys
         let insts = inst_key
             .into_iter()
-            .map(|(kind, key)| vmir::Inst {
+            .map(|(kind, key)| vmir::HeapInst {
                 kind,
                 ty: type_table[&key].clone(),
             })
@@ -232,7 +204,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
                 let then_key = self.tc.get_var_key(&then);
                 let else_key = self.tc.get_var_key(&else_);
 
-                let val = self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
+                let val = self.add_inst(vmir::HeapInstKind::Pure(vmir::PureInst::Ternary(
                     cond, then, else_,
                 )));
                 let val_key = self.tc.get_var_key(&val);
@@ -268,7 +240,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
     }
 
     /// Add an instruction and return the temporary holding its result
-    fn add_inst(&mut self, kind: vmir::InstKind) -> vmir::Value {
+    fn add_inst(&mut self, kind: vmir::HeapInstKind) -> vmir::Value {
         let temp = self.insts.len() + self.args.len();
         self.insts.push(kind);
         vmir::Value::Temp(temp)
@@ -276,7 +248,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
 
     fn add_heap_inst<F>(&mut self, f: F)
     where
-        F: FnOnce(vmir::Value) -> vmir::InstKind,
+        F: FnOnce(vmir::Value) -> vmir::HeapInstKind,
     {
         let prev_heap = self.heap.clone();
         let val = self.add_inst(f(prev_heap));
@@ -296,7 +268,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         let right_key = self.tc.get_var_key(&right);
 
         let false_ = vmir::Literal::Bool(false).into();
-        let val = self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
+        let val = self.add_inst(vmir::HeapInstKind::Pure(vmir::PureInst::Ternary(
             left, right, false_,
         )));
         let val_key = self.tc.get_var_key(&val);
@@ -350,7 +322,9 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
             self.match_type(ty, arg_key)?;
         }
 
-        let val = self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Call(func_id, args)));
+        let val = self.add_inst(vmir::HeapInstKind::Pure(vmir::PureInst::Call(
+            func_id, args,
+        )));
 
         // Add type constraint for return type
         let val_key = self.tc.get_var_key(&val);
@@ -374,16 +348,22 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
         &mut self,
         acc_exp: &silver::AccExp,
     ) -> Result<vmir::Value, TcErr<TcType>> {
-        let loc = self.translate_loc_exp(&acc_exp.acc)?;
-        let loc_key = self.tc.get_var_key(&loc);
+        let addr = self.translate_loc_exp(&acc_exp.acc)?;
+        let loc_key = self.tc.get_var_key(&addr);
         self.tc.impose(loc_key.concretizes_explicit(TcType::Addr))?;
 
         let amt = PureExpTranslator::new(self).translate_exp_kind(&acc_exp.perm)?;
         let amt_key = self.tc.get_var_key(&amt);
         self.tc.impose(amt_key.concretizes_explicit(TcType::Real))?;
-        let amt = self.conditionalize_perm_amount(amt)?;
+        let perm = self.conditionalize_perm_amount(amt)?;
 
-        self.add_heap_inst(|curr_heap| vmir::InstKind::Acc(curr_heap, loc, amt));
+        self.add_heap_inst(|curr_heap| {
+            vmir::HeapInstKind::Acc(AccInst {
+                heap: curr_heap,
+                addr,
+                perm,
+            })
+        });
 
         // acc() expressions evaluate to true (bool) in the pure context
         Ok(vmir::Literal::Bool(true).into())
@@ -404,12 +384,12 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
             let cond_key = self.tc.get_var_key(&cond);
 
             let next = match polarity {
-                Polarity::Positive => self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
-                    cond, perm, zero,
-                ))),
-                Polarity::Negative => self.add_inst(vmir::InstKind::Pure(vmir::PureInst::Ternary(
-                    cond, zero, perm,
-                ))),
+                Polarity::Positive => self.add_inst(vmir::HeapInstKind::Pure(
+                    vmir::PureInst::Ternary(cond, perm, zero),
+                )),
+                Polarity::Negative => self.add_inst(vmir::HeapInstKind::Pure(
+                    vmir::PureInst::Ternary(cond, zero, perm),
+                )),
             };
             let next_key = self.tc.get_var_key(&next);
 
@@ -441,7 +421,7 @@ impl<'a, 'b> PureExpBackend for HeapExpTranslCtxt<'a, 'b> {
     }
 
     fn emit_pure_inst(&mut self, inst: vmir::PureInst) -> vmir::Value {
-        self.add_inst(vmir::InstKind::Pure(inst))
+        self.add_inst(vmir::HeapInstKind::Pure(inst))
     }
 
     fn tc_mut(&mut self) -> &mut TypeChecker<TcType, vmir::Value> {
