@@ -3,58 +3,36 @@ use crate::vmir::ast::*;
 use crate::vmir::heap_exp;
 use crate::vmir::method as method_ir;
 use crate::vmir::method::HeapAssign;
-use crate::vmir::HeapDepInst;
+use crate::vmir::HeapDepInstKind;
 use crate::vmir::Type;
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
 
-/// Helper struct for displaying VMIR with access to the string interner
+/// Helper wrapper for interner-aware VMIR formatting.
 pub struct VmirDisplay<'a, T> {
-    item: &'a T,
+    item: T,
     interner: &'a Rodeo<MemberId>,
-    indent: usize,
 }
 
 impl<'a, T> VmirDisplay<'a, T> {
-    pub fn new(item: &'a T, interner: &'a Rodeo<MemberId>) -> Self {
-        Self {
-            item,
-            interner,
-            indent: 0,
-        }
+    pub fn new(item: T, interner: &'a Rodeo<MemberId>) -> Self {
+        Self { item, interner }
     }
 
-    pub fn with<U>(&self, item: &'a U) -> VmirDisplay<'a, U> {
+    pub fn with<U>(&self, item: U) -> VmirDisplay<'a, U> {
         VmirDisplay {
             item,
             interner: self.interner,
-            indent: self.indent,
         }
-    }
-
-    pub fn with_indent<U>(&self, item: &'a U) -> VmirDisplay<'a, U> {
-        VmirDisplay {
-            item,
-            interner: self.interner,
-            indent: self.indent + 1,
-        }
-    }
-
-    /// Write the current indentation (2 spaces per level)
-    fn write_indent(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for _ in 0..self.indent {
-            write!(f, "  ")?;
-        }
-        Ok(())
     }
 }
 
 impl Display for Program {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for item in self.decls.iter_enumerated() {
-            let display = VmirDisplay::new(&item, &self.interner);
-            writeln!(f, "{}", display)?;
-            writeln!(f)?; // Empty line between declarations
+            let display = VmirDisplay::new(item, &self.interner);
+            writeln!(f, "{display}")?;
+            writeln!(f)?;
         }
         Ok(())
     }
@@ -64,58 +42,35 @@ impl<'a> Display for VmirDisplay<'a, (MemberId, &'a Declaration)> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let (id, decl) = self.item;
         match decl {
-            Declaration::Domain(domain) => {
-                let name = self.interner.resolve(id);
-                write!(f, "domain {}", name)
-            }
+            Declaration::Domain(_) => write!(f, "domain {}", self.interner.resolve(&id)),
             Declaration::DomainElement => write!(f, "// DomainElement"),
-            Declaration::Function(func) => {
-                let display = self.with(func);
-                write!(f, "{}", display)
-            }
-            Declaration::Method(method) => {
-                let display = self.with(method);
-                write!(f, "{}", display)
-            }
-            Declaration::Resource(resource) => {
-                let display = self.with(resource);
-                write!(f, "{}", display)
-            }
-            Declaration::Adt(adt) => {
-                let name = self.interner.resolve(&adt.name);
-                write!(f, "adt {}", name)
-            }
+            Declaration::Function(func) => write!(f, "{}", self.with(func)),
+            Declaration::Method(method) => write!(f, "{}", self.with(method)),
+            Declaration::Resource(resource) => write!(f, "{}", self.with(resource)),
+            Declaration::Adt(adt) => write!(f, "adt {}", self.interner.resolve(&adt.name)),
             Declaration::AdtConstructor => write!(f, "// AdtConstructor"),
             Declaration::HeapExp(exp) => {
-                let name = self.interner.resolve(id);
-                writeln!(f, "heap_exp {name}")?;
+                writeln!(f, "heap_exp {}", self.interner.resolve(&id))?;
                 write!(f, "{}", self.with(exp))
             }
         }
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, Function> {
+impl<'a> Display for VmirDisplay<'a, &'a Function> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let name = self.interner.resolve(&self.item.name);
-
-        self.write_indent(f)?;
-        write!(f, "function {}", name)?;
-        write!(f, "(")?;
+        write!(f, "function {}(", self.interner.resolve(&self.item.name))?;
         for (i, arg) in self.item.signature.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(f, "{}", self.with(arg))?;
         }
-        write!(f, ")")?;
+        write!(f, "): {}", self.with(&self.item.signature.ret))?;
 
-        write!(f, ": {}", self.with(&self.item.signature.ret))?;
-
-        if let Some(ref _body) = self.item.body {
+        if self.item.body.is_some() {
             writeln!(f, " {{")?;
-            write!(f, "  // body")?;
-            writeln!(f)?;
+            writeln!(f, "  // body")?;
             write!(f, "}}")?;
         }
 
@@ -123,13 +78,9 @@ impl<'a> Display for VmirDisplay<'a, Function> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, Method> {
+impl<'a> Display for VmirDisplay<'a, &'a Method> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let name = self.interner.resolve(&self.item.name);
-
-        self.write_indent(f)?;
-        write!(f, "method {}", name)?;
-        write!(f, "(")?;
+        write!(f, "method {}(", self.interner.resolve(&self.item.name))?;
         for (i, arg) in self.item.signature.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
@@ -148,59 +99,24 @@ impl<'a> Display for VmirDisplay<'a, Method> {
             }
             write!(f, ")")?;
         }
-
-        writeln!(f)?;
-        // let contract_display = self.with_indent(&self.item.contract);
-        // writeln!(f, "{}", contract_display)?;
-        //
-        // if let Some(ref body) = self.item.body {
-        //     self.write_indent(f)?;
-        //     writeln!(f, "{{")?;
-        //     let body_display = self.with_indent(body);
-        //     // write!(f, "{}", body_display)?;
-        //     self.write_indent(f)?;
-        //     writeln!(f, "}}")?;
-        // }
-
         Ok(())
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, MethContract> {
+impl<'a> Display for VmirDisplay<'a, &'a Resource> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let requires = &self.item.requires;
-        self.write_indent(f)?;
-        writeln!(f, "requires")?;
-        write!(f, "{}", self.with_indent(requires))?;
-        let ensures = &self.item.ensures;
-        self.write_indent(f)?;
-        writeln!(f, "ensures")?;
-        write!(f, "{}", self.with_indent(ensures))?;
-        Ok(())
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, Resource> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let name = self.interner.resolve(&self.item.name);
-        let snapshot_name = self.interner.resolve(&self.item.snapshot);
-
-        self.write_indent(f)?;
-        write!(f, "resource {}", name)?;
-        write!(f, "(")?;
+        write!(f, "resource {}(", self.interner.resolve(&self.item.name))?;
         for (i, arg) in self.item.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(f, "{}", self.with(arg))?;
         }
-        write!(f, "): &{}", snapshot_name)?;
+        write!(f, "): &{}", self.interner.resolve(&self.item.snapshot))?;
 
-        if let Some(ref body) = self.item.body {
+        if let Some(body) = &self.item.body {
             writeln!(f, " {{")?;
-            let exp_display = self.with_indent(body);
-            write!(f, "{}", exp_display)?;
-            self.write_indent(f)?;
+            write!(f, "{}", self.with(body))?;
             write!(f, "}}")?;
         }
 
@@ -208,10 +124,8 @@ impl<'a> Display for VmirDisplay<'a, Resource> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, heap_exp::HeapExp> {
+impl<'a> Display for VmirDisplay<'a, &'a heap_exp::HeapExp> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // Display input signatures
-        self.write_indent(f)?;
         write!(f, "[")?;
         for (i, ty) in self.item.input_types.iter().enumerate() {
             if i > 0 {
@@ -221,9 +135,7 @@ impl<'a> Display for VmirDisplay<'a, heap_exp::HeapExp> {
         }
         writeln!(f, "]")?;
 
-        // Display the SSA instructions
         for (idx, heap_exp::HeapInst { kind, ty }) in self.item.insts.iter().enumerate() {
-            self.write_indent(f)?;
             writeln!(
                 f,
                 "e{}: {} := {}",
@@ -233,181 +145,82 @@ impl<'a> Display for VmirDisplay<'a, heap_exp::HeapExp> {
             )?;
         }
 
-        // Display the result
-        self.write_indent(f)?;
-        writeln!(
-            f,
-            "({}, {})",
-            self.with(&self.item.res_impure),
-            self.with(&self.item.res_pure)
-        )
+        writeln!(f, "({}, {})", self.item.res_impure, self.item.res_pure)
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, heap_exp::HeapInstKind> {
+impl<'a> Display for VmirDisplay<'a, &'a heap_exp::HeapInstKind> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             heap_exp::HeapInstKind::Pure(inst) => write!(f, "{}", self.with(inst)),
-            heap_exp::HeapInstKind::Acc(heap_exp::AccInst { heap, addr, perm }) => {
-                write!(
-                    f,
-                    "{} ** acc({}, {})",
-                    self.with(heap),
-                    self.with(addr),
-                    self.with(perm)
-                )
-            }
+            heap_exp::HeapInstKind::Acc(acc) => write!(f, "{acc}"),
         }
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, vmir::Value> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
-            vmir::Value::Temp(idx) => write!(f, "e{idx}"),
-            vmir::Value::Literal(lit) => {
-                write!(f, "{}", self.with(lit))
-            }
-        }
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, vmir::Literal> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
-            vmir::Literal::Int(i) => write!(f, "{}", i),
-            vmir::Literal::Bool(b) => write!(f, "{}", b),
-            vmir::Literal::Null => write!(f, "null"),
-            vmir::Literal::Real(r) => write!(f, "{}", r),
-            vmir::Literal::EmptyHeap => write!(f, "∅"),
-        }
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, method_ir::Method> {
+impl<'a> Display for VmirDisplay<'a, &'a method_ir::Method> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for (idx, method_ir::Inst { kind, ty }) in self.item.0.iter().enumerate() {
-            self.write_indent(f)?;
             writeln!(f, "e{idx}: {} := {}", self.with(ty), self.with(kind))?;
         }
         Ok(())
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, method_ir::InstKind> {
+impl<'a> Display for VmirDisplay<'a, &'a method_ir::InstKind> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             method_ir::InstKind::Fresh => write!(f, "fresh"),
             method_ir::InstKind::Pure(inst) => write!(f, "{}", self.with(inst)),
             method_ir::InstKind::HeapOp(op, member, args) => {
-                let method_name = self.interner.resolve(member);
-                write!(f, "{} {}(", self.with(op), method_name)?;
+                write!(f, "{} {}(", op, self.interner.resolve(member))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", self.with(arg))?;
+                    write!(f, "{arg}")?;
                 }
                 write!(f, ")")
             }
             method_ir::InstKind::HeapAssign(HeapAssign { heap, addr, val }) => {
-                write!(
-                    f,
-                    "*[{}]{} := {}",
-                    self.with(heap),
-                    self.with(addr),
-                    self.with(val)
-                )
+                write!(f, "*[{heap}]{addr} := {val}")
             }
         }
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, crate::vmir::PureInst> {
+impl<'a> Display for VmirDisplay<'a, &'a vmir::PureInst> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            crate::vmir::PureInst::Unary(op, val) => {
-                write!(f, "{op}{}", self.with(val))
+            vmir::PureInst::Unary(op, val) => write!(f, "{op}{val}"),
+            vmir::PureInst::Binary(op, lhs, rhs) => write!(f, "{lhs} {op} {rhs}"),
+            vmir::PureInst::Ternary(cond, then_val, else_val) => {
+                write!(f, "{cond} ? {then_val} : {else_val}")
             }
-            crate::vmir::PureInst::Binary(op, lhs, rhs) => {
-                write!(f, "{} {op} {}", self.with(lhs), self.with(rhs))
-            }
-            crate::vmir::PureInst::Ternary(cond, then_val, else_val) => {
-                write!(
-                    f,
-                    "{} ? {} : {}",
-                    self.with(cond),
-                    self.with(then_val),
-                    self.with(else_val)
-                )
-            }
-            crate::vmir::PureInst::Call(func_id, args) => {
-                let func_name = self.interner.resolve(func_id);
-                write!(f, "{}(", func_name)?;
+            vmir::PureInst::Call(func_id, args) => {
+                write!(f, "{}(", self.interner.resolve(func_id))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", self.with(arg))?;
+                    write!(f, "{arg}")?;
                 }
                 write!(f, ")")
             }
-            vmir::PureInst::Heap(HeapDepInst { heap, kind }) => match kind {
-                vmir::HeapDepInstKind::Perm(addr) => {
-                    write!(f, "perm[{}] {} ", self.with(heap), self.with(addr))
-                }
-                vmir::HeapDepInstKind::Deref(addr) => {
-                    write!(f, "*[{}] {}", self.with(heap), self.with(addr))
-                }
+            vmir::PureInst::Heap(heap_inst) => match &heap_inst.kind {
+                HeapDepInstKind::Perm(addr) => write!(f, "perm[{}] {addr}", heap_inst.heap),
+                HeapDepInstKind::Deref(addr) => write!(f, "*[{}] {addr}", heap_inst.heap),
             },
         }
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, method_ir::HeapOp> {
+impl<'a> Display for VmirDisplay<'a, &'a Type> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            method_ir::HeapOp::Inhale => write!(f, "inhale"),
-            method_ir::HeapOp::Exhale => write!(f, "exhale"),
-        }
-    }
-}
-
-// impl<'a> Display for VmirDisplay<'a, StmtBlock> {
-//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-//         for stmt in &self.item.0 {
-//             let stmt_display = self.with(stmt);
-//             writeln!(f, "{}", stmt_display)?;
-//         }
-//         Ok(())
-//     }
-// }
-
-impl<'a> Display for VmirDisplay<'a, Type> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
-            Type::Bool => write!(f, "Bool"),
-            Type::Int => write!(f, "Int"),
-            Type::Real => write!(f, "Real"),
-            Type::Ref => write!(f, "Ref"),
-            Type::Domain(id) => {
-                let name = self.interner.resolve(id);
-                write!(f, "{}", name)
-            }
+            Type::Domain(id) => write!(f, "{}", self.interner.resolve(id)),
             Type::Addr(ty) => write!(f, "&{}", self.with(ty.as_ref())),
-            Type::Heap => write!(f, "Heap"),
+            ty => write!(f, "{ty}"),
         }
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, IdnDecl> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.with(&self.item.0))
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, Ident> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.item.0)
     }
 }

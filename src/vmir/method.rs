@@ -1,4 +1,5 @@
 use crate::vmir::{MemberId, PureInst, Type, Value};
+use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Inst {
@@ -33,3 +34,47 @@ pub enum HeapOp {
 
 #[derive(Debug, Clone)]
 pub struct Method(pub Vec<Inst>);
+
+impl Display for HeapAssign {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "*[{}]{} := {}", self.heap, self.addr, self.val)
+    }
+}
+
+impl Display for HeapOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeapOp::Inhale => write!(f, "inhale"),
+            HeapOp::Exhale => write!(f, "exhale"),
+        }
+    }
+}
+
+impl Display for InstKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstKind::Fresh => write!(f, "fresh"),
+            InstKind::Pure(inst) => write!(f, "{inst}"),
+            InstKind::HeapOp(op, member, args) => {
+                write!(f, "{} p{}(", op, member.0)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
+            InstKind::HeapAssign(assign) => write!(f, "{assign}"),
+        }
+    }
+}
+
+impl Display for Method {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        for (idx, Inst { kind, ty }) in self.0.iter().enumerate() {
+            writeln!(f, "e{idx}: {ty} := {kind}")?;
+        }
+        Ok(())
+    }
+}

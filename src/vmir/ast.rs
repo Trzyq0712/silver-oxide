@@ -2,6 +2,7 @@ use crate::vmir::{heap_exp::HeapExp, Type};
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
 use nonmax::NonMaxU32;
+use std::fmt::{Display, Formatter};
 use typed_index_collections::TiVec;
 
 #[derive(Debug, From, Into, Eq, PartialEq, Hash, Clone, Copy)]
@@ -159,4 +160,68 @@ pub enum AssignTarget {
     Local(NonMaxU32),
     /// Anonymous temporary
     Temp(NonMaxU32),
+}
+
+impl Display for IdnDecl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Display for Ident {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Display for Function {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "function f{}(", self.name.0)?;
+        for (i, arg) in self.signature.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        write!(f, "): {}", self.signature.ret)
+    }
+}
+
+impl Display for Method {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "method m{}(", self.name.0)?;
+        for (i, arg) in self.signature.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        write!(f, ")")?;
+
+        if !self.signature.rets.is_empty() {
+            write!(f, " returns (")?;
+            for (i, ret) in self.signature.rets.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{ret}")?;
+            }
+            write!(f, ")")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Display for Resource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "resource r{}(", self.name.0)?;
+        for (i, arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        write!(f, "): &d{}", self.snapshot.0)
+    }
 }

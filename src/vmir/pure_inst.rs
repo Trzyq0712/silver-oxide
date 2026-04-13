@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
 
 use crate::vmir::MemberId;
 
@@ -87,6 +87,68 @@ impl Display for BinOp {
             BinOp::Mod => write!(f, "%"),
             BinOp::Eq => write!(f, "=="),
             BinOp::Lt => write!(f, "<"),
+        }
+    }
+}
+
+impl Display for Literal {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Literal::Int(i) => write!(f, "{i}"),
+            Literal::Bool(b) => write!(f, "{b}"),
+            Literal::Null => write!(f, "null"),
+            Literal::Real(r) => write!(f, "{r}"),
+            Literal::EmptyHeap => write!(f, "∅"),
+        }
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Temp(idx) => write!(f, "e{idx}"),
+            Value::Literal(lit) => write!(f, "{lit}"),
+        }
+    }
+}
+
+impl Display for HeapDepInstKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeapDepInstKind::Perm(addr) => write!(f, "perm {addr}"),
+            HeapDepInstKind::Deref(addr) => write!(f, "deref {addr}"),
+        }
+    }
+}
+
+impl Display for HeapDepInst {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            HeapDepInstKind::Perm(addr) => write!(f, "perm[{}] {addr}", self.heap),
+            HeapDepInstKind::Deref(addr) => write!(f, "*[{}] {addr}", self.heap),
+        }
+    }
+}
+
+impl Display for PureInst {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PureInst::Unary(op, val) => write!(f, "{op}{val}"),
+            PureInst::Binary(op, lhs, rhs) => write!(f, "{lhs} {op} {rhs}"),
+            PureInst::Ternary(cond, then_val, else_val) => {
+                write!(f, "{cond} ? {then_val} : {else_val}")
+            }
+            PureInst::Call(func_id, args) => {
+                write!(f, "f{}(", func_id.0)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
+            PureInst::Heap(inst) => write!(f, "{inst}"),
         }
     }
 }
