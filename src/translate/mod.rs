@@ -97,14 +97,24 @@ impl VmirTranslator {
             signatures: silver_symbols.signatures.clone(),
         };
         let mut translator = Self::new(vmir_symbols);
+        translator.intern_method_contract_symbols();
         normalized_program.walk(&mut translator);
 
         let decls = translator
             .globals
             .into_iter()
             .enumerate()
-            .map(|(idx, decl)| {
-                decl.unwrap_or_else(|| panic!("Declaration at index {} was not translated", idx))
+            .map(|(idx, decl)| match decl {
+                Some(decl) => decl,
+                None => {
+                    let memid = vmir::MemberId(idx);
+                    match translator.name_kinds[memid] {
+                        // Methods are represented through `<method>@requires` and
+                        // `<method>@ensures` heap-exp declarations only.
+                        DeclKind::Method => vmir::Declaration::DomainElement,
+                        _ => panic!("Declaration at index {} was not translated", idx),
+                    }
+                }
             })
             .collect();
 
@@ -134,6 +144,25 @@ impl VmirTranslator {
 
     pub(crate) fn name_kinds(&self) -> &TiVec<vmir::MemberId, DeclKind> {
         &self.name_kinds
+    }
+
+    fn intern_method_contract_symbols(&mut self) {
+        let method_ids = self.signatures.methods.keys().copied().collect::<Vec<_>>();
+
+        for method_id in method_ids {
+            let method_name = self.interner.resolve(&method_id).to_string();
+            for suffix in ["requires", "ensures"] {
+                let generated = format!("{method_name}@{suffix}");
+                if self.interner.get(generated.as_str()).is_some() {
+                    continue;
+                }
+
+                let member_id = self.interner.get_or_intern(generated.as_str());
+                debug_assert_eq!(member_id.into_usize(), self.globals.len());
+                self.globals.push(None);
+                self.name_kinds.push(DeclKind::HeapExp);
+            }
+        }
     }
 
     pub(crate) fn signatures(&self) -> &SignatureContext {
@@ -307,50 +336,22 @@ impl VmirTranslator {
         let sig = &method.signature;
         let ident = sig.name.0 .0.as_str();
 
-        let method_member_id = self
-            .interner
-            .get(ident)
-            .expect("Name should be pre-interned");
-
-        let args: Vec<_> = sig
-            .args
-            .iter()
-            .map(|arg| self.translate_type(arg.ty()))
-            .collect();
-
-        let rets: Vec<_> = sig
-            .ret
-            .iter()
-            .map(|ret| self.translate_type(ret.ty()))
-            .collect();
-
-        // TODO: Temporarily disabled method body translation
-        // let body = method
-        //     .body
-        //     .as_ref()
-        //     .map(|body_block| self.translate_method_body(body_block, &method.signature));
-        //
+        // Method interface is encoded via heap-exp declarations only.
         self.translate_method_contract(ident, &method.contract, &method.signature);
 
-        let vmir_method = vmir::Method {
-            name: method_member_id,
-            signature: vmir::MethSig { args, rets },
-            body: vmir::StmtBlock(vec![]),
-        };
-
-        if let Some(body) = &method.body {
+        let method = if let Some(body) = &method.body {
             let mut trans_ctxt = MethodTranslCtxt::new(self, &method.signature);
 
             for stmt in &body.0 {
                 trans_ctxt.translate_statement(stmt);
             }
 
-            let _method = trans_ctxt.finalize();
-            let vmir_display = vmir::display::VmirDisplay::new(&_method, &self.interner);
-            println!("Translated method body for {}:\n{}", ident, vmir_display);
-        }
-
-        self.add_decl(method_member_id, vmir::Declaration::Method(vmir_method));
+            trans_ctxt.finalize()
+        } else {
+            vmir::method::Method(vec![])
+        };
+        let memid = self.interner.get(sig.name.0 .0.as_str()).unwrap();
+        self.add_decl(memid, vmir::Declaration::Method(method));
     }
 
     fn add_decl(&mut self, memid: vmir::MemberId, decl: vmir::Declaration) {

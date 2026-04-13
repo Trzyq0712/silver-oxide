@@ -143,7 +143,7 @@ impl<'a, 'b> HeapExpTranslCtxt<'a, 'b> {
             .into_iter()
             .enumerate()
             .map(|(i, inst)| {
-                let temp = vmir::Value::Temp(i);
+                let temp = vmir::Value::Temp(i + self.args.len());
                 let key = self.tc.get_var_key(&temp);
                 (inst, key)
             })

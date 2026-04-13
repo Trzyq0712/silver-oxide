@@ -11,18 +11,120 @@ use crate::vmir::AccInst;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmir::{Declaration, HeapExp, HeapInstKind, Literal, PureInst, Type, Value};
+
+    fn heap_value_type(exp: &HeapExp, value: &Value) -> Option<Type> {
+        match value {
+            Value::Temp(t) if *t < exp.input_types.len() => Some(exp.input_types[*t].clone()),
+            Value::Temp(t) => exp
+                .insts
+                .get(*t - exp.input_types.len())
+                .map(|inst| inst.ty.clone()),
+            Value::Literal(Literal::Bool(_)) => Some(Type::Bool),
+            Value::Literal(Literal::Int(_)) => Some(Type::Int),
+            Value::Literal(Literal::Real(_)) => Some(Type::Real),
+            Value::Literal(Literal::Null) => Some(Type::Ref),
+            Value::Literal(Literal::EmptyHeap) => Some(Type::Heap),
+        }
+    }
 
     #[test]
-    fn test_simple_method_translation() {
+    fn test_simple_method_translation_uses_heapexp_contract_declarations() {
         let input = r#"
 method test(x: Int) returns (y: Int)
+  requires x > 0
+  ensures y == x
 {
   y := x
 }
 "#;
         let program = silver::silver_parser::sil_program(input).expect("Parse failed");
         let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
-        println!("{}", vmir);
+
+        let method_id = vmir
+            .interner
+            .get("test")
+            .expect("missing method declaration");
+        let requires_id = vmir
+            .interner
+            .get("test@requires")
+            .expect("missing requires declaration");
+        let ensures_id = vmir
+            .interner
+            .get("test@ensures")
+            .expect("missing ensures declaration");
+
+        assert!(matches!(vmir.decls[method_id], Declaration::DomainElement));
+
+        let Declaration::HeapExp(requires) = &vmir.decls[requires_id] else {
+            panic!("test@requires must be a heap expression");
+        };
+        assert_eq!(requires.input_types, vec![Type::Heap, Type::Int]);
+
+        let Declaration::HeapExp(ensures) = &vmir.decls[ensures_id] else {
+            panic!("test@ensures must be a heap expression");
+        };
+        assert_eq!(
+            ensures.input_types,
+            vec![Type::Heap, Type::Heap, Type::Int, Type::Int]
+        );
+    }
+
+    #[test]
+    fn test_requires_predicate_conjunction_keeps_heapexp_types_sound() {
+        let input = r#"
+predicate number(x: Ref)
+
+method add(this: Ref, other: Ref)
+  requires number(this) && number(other)
+{
+}
+"#;
+        let program = silver::silver_parser::sil_program(input).expect("Parse failed");
+        let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
+
+        let number_id = vmir
+            .interner
+            .get("number")
+            .expect("missing predicate function declaration");
+        let requires_id = vmir
+            .interner
+            .get("add@requires")
+            .expect("missing add@requires declaration");
+        let Declaration::HeapExp(requires) = &vmir.decls[requires_id] else {
+            panic!("add@requires must be a heap expression");
+        };
+
+        let mut saw_number_call = false;
+        let mut saw_acc = false;
+        for inst in &requires.insts {
+            match &inst.kind {
+                HeapInstKind::Pure(PureInst::Call(func_id, _)) if *func_id == number_id => {
+                    saw_number_call = true;
+                    assert!(
+                        matches!(inst.ty, Type::Addr(_)),
+                        "predicate call must produce address type, got {:?}",
+                        inst.ty
+                    );
+                }
+                HeapInstKind::Acc(_) => {
+                    saw_acc = true;
+                    assert_eq!(inst.ty, Type::Heap, "acc instruction must produce heap");
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_number_call,
+            "expected predicate function call(s) in requires"
+        );
+        assert!(saw_acc, "expected acc instruction(s) in requires");
+        assert_eq!(
+            heap_value_type(requires, &requires.res_pure),
+            Some(Type::Bool),
+            "final pure result should be Bool"
+        );
     }
 }
 

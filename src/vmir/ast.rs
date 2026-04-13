@@ -1,7 +1,6 @@
-use crate::vmir::{heap_exp::HeapExp, Type};
+use crate::vmir::{heap_exp::HeapExp, method::Method, Type};
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
-use nonmax::NonMaxU32;
 use std::fmt::{Display, Formatter};
 use typed_index_collections::TiVec;
 
@@ -37,13 +36,6 @@ pub enum Declaration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Method {
-    pub name: MemberId,
-    pub signature: MethSig,
-    pub body: StmtBlock,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub name: MemberId,
     pub args: Vec<Type>,
@@ -61,12 +53,6 @@ pub struct Signature {
 pub struct FuncSig {
     pub args: Vec<Type>,
     pub ret: Type,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MethSig {
-    pub args: Vec<Type>,
-    pub rets: Vec<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -132,35 +118,10 @@ impl FuncContract {
 pub struct ExpBlock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StmtBlock(pub Vec<Statement>);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdnDecl(pub Ident);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ident(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Statement {
-    // /// x, y := m(a, b, c)
-    // MethodCall(Vec<AssignTarget>, MemberId, Vec<Local>),
-    // /// Assign to a local or a temporary
-    // /// x := e
-    // /// x: T, e: T
-    // Assign(AssignTarget, HeapExp),
-    // /// Assign to a heap location
-    // /// x *= e
-    // /// x: &T, e: T
-    // HeapAssign(AssignTarget, HeapExp),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AssignTarget {
-    /// Named local variable
-    Local(NonMaxU32),
-    /// Anonymous temporary
-    Temp(NonMaxU32),
-}
 
 impl Display for IdnDecl {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -184,32 +145,6 @@ impl Display for Function {
             write!(f, "{arg}")?;
         }
         write!(f, "): {}", self.signature.ret)
-    }
-}
-
-impl Display for Method {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "method m{}(", self.name.0)?;
-        for (i, arg) in self.signature.args.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{arg}")?;
-        }
-        write!(f, ")")?;
-
-        if !self.signature.rets.is_empty() {
-            write!(f, " returns (")?;
-            for (i, ret) in self.signature.rets.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{ret}")?;
-            }
-            write!(f, ")")?;
-        }
-
-        Ok(())
     }
 }
 

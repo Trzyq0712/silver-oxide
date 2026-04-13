@@ -32,7 +32,7 @@ pub enum HeapOp {
     Exhale,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method(pub Vec<Inst>);
 
 impl Display for HeapAssign {

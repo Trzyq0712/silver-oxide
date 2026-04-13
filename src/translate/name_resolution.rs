@@ -158,8 +158,6 @@ where
     fn walk_method(&mut self, method: &'a silver::Method) {
         let name = &method.signature.name.0 .0;
         self.register_name(name, DeclKind::Method);
-        self.register_name(&format!("{name}@requires"), DeclKind::HeapExp);
-        self.register_name(&format!("{name}@ensures"), DeclKind::HeapExp);
     }
 
     fn walk_domain(&mut self, domain: &'a silver::Domain) {
