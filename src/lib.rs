@@ -1,6 +1,7 @@
 pub mod silver;
 pub mod translate;
 mod util;
+mod verify;
 // pub mod verify;
 pub mod vmir;
 pub use silver::silver_parser;

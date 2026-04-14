@@ -4,7 +4,7 @@ use lasso::{Key, Rodeo};
 use std::fmt::{Display, Formatter};
 use typed_index_collections::TiVec;
 
-#[derive(Debug, From, Into, Eq, PartialEq, Hash, Clone, Copy)]
+#[derive(Debug, From, Into, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct MemberId(pub usize);
 
 unsafe impl Key for MemberId {
