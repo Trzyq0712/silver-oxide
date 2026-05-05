@@ -24,7 +24,7 @@ pub enum DeclKind {
     Function,
     Predicate,
     Method,
-    HeapExp,
+    ContractCallable,
     Domain,
     DomainFunction,
     Adt,

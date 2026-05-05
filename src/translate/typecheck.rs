@@ -7,9 +7,8 @@ use rusttyc::{Constructable, TcKey, TcVar, TypeChecker};
 use std::collections::HashMap;
 use std::fmt;
 
-/// Type system for Silver expressions
-/// This represents the types in the Silver language with a lattice structure
-/// for rusttyc-based type checking
+pub type VmirTc = TypeChecker<TcType, vmir::Val>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TcType {
     /// Boolean type
@@ -26,7 +25,6 @@ pub enum TcType {
     Addr,
     /// Either an Int or Real
     Numeric,
-    Heap,
     /// Top type (supertype of all types)
     Top,
 }
@@ -42,6 +40,8 @@ impl fmt::Display for TypeErr {
 }
 
 impl std::error::Error for TypeErr {}
+
+impl TcVar for vmir::Val {}
 
 impl Variant for TcType {
     type Err = TypeErr;
@@ -75,7 +75,6 @@ impl Variant for TcType {
             (Addr, Addr) => Addr,
             (Int, Int) => Int,
             (Real, Real) => Real,
-            (Heap, Heap) => Heap,
 
             // Domains with same ID
             (Domain(id1), Domain(id2)) if id1 == id2 => Domain(id1),
@@ -119,7 +118,6 @@ impl Constructable for TcType {
                     .ok_or_else(|| TypeErr("AddrOf missing child type".to_string()))?;
                 VmirType::Addr(Box::new(inner.clone()))
             }
-            TcType::Heap => VmirType::Heap,
             TcType::Top => Err(TypeErr("Abstract type in VMIR".to_string()))?,
         })
     }
@@ -134,7 +132,6 @@ impl From<&VmirType> for TcType {
             VmirType::Ref => TcType::Ref,
             VmirType::Domain(id) => TcType::Domain(*id),
             VmirType::Addr(_) => TcType::Addr,
-            VmirType::Heap => TcType::Heap,
         }
     }
 }

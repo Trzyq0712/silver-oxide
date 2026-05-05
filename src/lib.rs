@@ -1,261 +1,214 @@
 pub mod silver;
 pub mod translate;
 mod util;
-mod verify;
-// pub mod verify;
 pub mod vmir;
 pub use silver::silver_parser;
 pub use util::*;
 
-use crate::vmir::AccInst;
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::vmir::{Declaration, HeapExp, HeapInstKind, Literal, PureInst, Type, Value};
+    use crate::{silver, translate, vmir};
 
-    fn heap_value_type(exp: &HeapExp, value: &Value) -> Option<Type> {
-        match value {
-            Value::Temp(t) if *t < exp.input_types.len() => Some(exp.input_types[*t].clone()),
-            Value::Temp(t) => exp
-                .insts
-                .get(*t - exp.input_types.len())
-                .map(|inst| inst.ty.clone()),
-            Value::Literal(Literal::Bool(_)) => Some(Type::Bool),
-            Value::Literal(Literal::Int(_)) => Some(Type::Int),
-            Value::Literal(Literal::Real(_)) => Some(Type::Real),
-            Value::Literal(Literal::Null) => Some(Type::Ref),
-            Value::Literal(Literal::EmptyHeap) => Some(Type::Heap),
+    #[test]
+    fn first_example_emits_method_contract_resources() {
+        let input = r#"
+predicate number(this: Ref)
+
+method assign(this: Ref, value: Int)
+  ensures number(this)
+
+method read(this: Ref) returns (val: Int)
+  requires number(this)
+  ensures number(this)
+
+method add(this: Ref, other: Ref) returns (res: Ref)
+  requires number(this) && number(other)
+  ensures number(this) && number(other) && number(res)
+{
+  var a: Int := read(this)
+  var b: Int := read(other)
+  var sum: Int := a + b
+  assign(res, sum)
+}
+"#;
+
+        let program = silver::silver_parser::sil_program(input).expect("parse failed");
+        let vmir = translate::VmirTranslator::translate(&program).expect("translation failed");
+
+        for name in [
+            "assign@ensures",
+            "read@requires",
+            "read@ensures",
+            "add@requires",
+            "add@ensures",
+        ] {
+            let id = vmir
+                .interner
+                .get(name)
+                .unwrap_or_else(|| panic!("missing resource name: {name}"));
+            assert!(
+                matches!(vmir.decls[id], vmir::Declaration::Resource(_)),
+                "{name} must be translated as Resource"
+            );
         }
+        assert!(
+            vmir.interner.get("assign@requires").is_none(),
+            "assign has no precondition, so assign@requires must not be generated"
+        );
     }
 
     #[test]
-    fn test_simple_method_translation_uses_heapexp_contract_declarations() {
+    fn add_method_uses_heap_arithmetic_and_checks_for_contract_application() {
         let input = r#"
-method test(x: Int) returns (y: Int)
-  requires x > 0
-  ensures y == x
+predicate number(this: Ref)
+
+method assign(this: Ref, value: Int)
+  ensures number(this)
+
+method read(this: Ref) returns (val: Int)
+  requires number(this)
+  ensures number(this)
+
+method add(this: Ref, other: Ref) returns (res: Ref)
+  requires number(this) && number(other)
+  ensures number(this) && number(other) && number(res)
 {
-  y := x
+  var a: Int := read(this)
+  var b: Int := read(other)
+  var sum: Int := a + b
+  assign(res, sum)
 }
 "#;
-        let program = silver::silver_parser::sil_program(input).expect("Parse failed");
-        let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
 
-        let method_id = vmir
-            .interner
-            .get("test")
-            .expect("missing method declaration");
-        let requires_id = vmir
-            .interner
-            .get("test@requires")
-            .expect("missing requires declaration");
+        let program = silver::silver_parser::sil_program(input).expect("parse failed");
+        let vmir = translate::VmirTranslator::translate(&program).expect("translation failed");
+        let add_id = vmir.interner.get("add").expect("missing add method");
+        let vmir::Declaration::Method(add) = &vmir.decls[add_id] else {
+            panic!("add declaration must be a method");
+        };
+
+        let saw_heap_add = add
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, vmir::Inst::Heap(vmir::HeapInst::Add(_, _))));
+        let saw_heap_sub = add
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, vmir::Inst::Heap(vmir::HeapInst::Sub(_, _))));
+        let saw_assume = add
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, vmir::Inst::Assume(_)));
+        let saw_assert = add
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, vmir::Inst::Assert(_)));
+
+        assert!(saw_heap_add, "expected heap addition in add translation");
+        assert!(saw_heap_sub, "expected heap subtraction in add translation");
+        assert!(saw_assume, "expected assume checks in add translation");
+        assert!(saw_assert, "expected assert checks in add translation");
+    }
+
+    #[test]
+    fn add_ensures_resource_builds_heap_via_acc_and_add_with_param_offset() {
+        let input = r#"
+predicate number(this: Ref)
+
+method add(this: Ref, other: Ref) returns (res: Ref)
+  requires number(this) && number(other)
+  ensures number(this) && number(other) && number(res)
+{
+}
+"#;
+        let program = silver::silver_parser::sil_program(input).expect("parse failed");
+        let vmir = translate::VmirTranslator::translate(&program).expect("translation failed");
         let ensures_id = vmir
             .interner
-            .get("test@ensures")
-            .expect("missing ensures declaration");
-
-        assert!(matches!(vmir.decls[method_id], Declaration::DomainElement));
-
-        let Declaration::HeapExp(requires) = &vmir.decls[requires_id] else {
-            panic!("test@requires must be a heap expression");
+            .get("add@ensures")
+            .expect("missing add@ensures");
+        let vmir::Declaration::Resource(ensures) = &vmir.decls[ensures_id] else {
+            panic!("add@ensures must be a resource");
         };
-        assert_eq!(requires.input_types, vec![Type::Heap, Type::Int]);
 
-        let Declaration::HeapExp(ensures) = &vmir.decls[ensures_id] else {
-            panic!("test@ensures must be a heap expression");
-        };
-        assert_eq!(
-            ensures.input_types,
-            vec![Type::Heap, Type::Heap, Type::Int, Type::Int]
+        assert_eq!(ensures.params.len(), 3);
+        assert!(
+            ensures
+                .insts
+                .iter()
+                .any(|i| matches!(i, vmir::Inst::Heap(vmir::HeapInst::Acc(_)))),
+            "add@ensures must contain acc heap construction"
         );
+        assert!(
+            ensures
+                .insts
+                .iter()
+                .any(|i| matches!(i, vmir::Inst::Heap(vmir::HeapInst::Add(_, _)))),
+            "add@ensures must contain heap additions"
+        );
+        match ensures.res.0 {
+            vmir::HeapVal::Temp(idx) => assert!(
+                idx >= ensures.params.len(),
+                "resource result heap temp must be offset after params"
+            ),
+            vmir::HeapVal::Empty => panic!("add@ensures must return constructed heap, not empty"),
+            vmir::HeapVal::Implicit => panic!("unexpected implicit heap result"),
+        }
     }
 
     #[test]
-    fn test_requires_predicate_conjunction_keeps_heapexp_types_sound() {
+    fn methods_without_body_do_not_emit_vmir_method_and_missing_contracts_do_not_emit_resources() {
         let input = r#"
-predicate number(x: Ref)
+method sig_only(a: Int)
 
-method add(this: Ref, other: Ref)
-  requires number(this) && number(other)
-{
-}
+method only_pre(x: Int)
+  requires x < 1
+
+method only_post(x: Int)
+  ensures x == x
 "#;
-        let program = silver::silver_parser::sil_program(input).expect("Parse failed");
-        let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
+        let program = silver::silver_parser::sil_program(input).expect("parse failed");
+        let vmir = translate::VmirTranslator::translate(&program).expect("translation failed");
 
-        let number_id = vmir
-            .interner
-            .get("number")
-            .expect("missing predicate function declaration");
-        let requires_id = vmir
-            .interner
-            .get("add@requires")
-            .expect("missing add@requires declaration");
-        let Declaration::HeapExp(requires) = &vmir.decls[requires_id] else {
-            panic!("add@requires must be a heap expression");
-        };
-
-        let mut saw_number_call = false;
-        let mut saw_acc = false;
-        for inst in &requires.insts {
-            match &inst.kind {
-                HeapInstKind::Pure(PureInst::Call(func_id, _)) if *func_id == number_id => {
-                    saw_number_call = true;
-                    assert!(
-                        matches!(inst.ty, Type::Addr(_)),
-                        "predicate call must produce address type, got {:?}",
-                        inst.ty
-                    );
-                }
-                HeapInstKind::Acc(_) => {
-                    saw_acc = true;
-                    assert_eq!(inst.ty, Type::Heap, "acc instruction must produce heap");
-                }
-                _ => {}
-            }
-        }
+        let sig_only = vmir.interner.get("sig_only").expect("missing sig_only");
+        assert!(
+            !matches!(vmir.decls[sig_only], vmir::Declaration::Method(_)),
+            "body-less methods must not emit VMIR Method declarations"
+        );
 
         assert!(
-            saw_number_call,
-            "expected predicate function call(s) in requires"
+            vmir.interner.get("sig_only@requires").is_none(),
+            "method without precondition should not emit @requires resource"
         );
-        assert!(saw_acc, "expected acc instruction(s) in requires");
-        assert_eq!(
-            heap_value_type(requires, &requires.res_pure),
-            Some(Type::Bool),
-            "final pure result should be Bool"
-        );
-    }
-}
-
-#[test]
-fn test_field_access_method() {
-    let input = std::fs::read_to_string("test_method.sil").expect("Failed to read file");
-    let program = silver::silver_parser::sil_program(&input).expect("Parse failed");
-    let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
-    println!("{}", vmir);
-}
-
-#[test]
-fn test_var_initialization() {
-    let input = r#"
-method test() returns (y: Int)
-{
-  var x: Int := 5
-  y := x
-}
-"#;
-    let program = silver::silver_parser::sil_program(input).expect("Parse failed");
-    let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
-    println!("{}", vmir);
-}
-
-#[test]
-fn test_field_assignment() {
-    let input = r#"
-field value: Int
-
-method test(this: Ref)
-{
-  this.value := 5
-}
-"#;
-    let program = silver::silver_parser::sil_program(input).expect("Parse failed");
-    let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
-    println!("{}", vmir);
-}
-
-#[test]
-fn test_heap_assertion_forms_translation_smoke() {
-    let input = r#"
-field f: Int
-
-method test(x: Ref)
-  requires true
-  requires acc(x.f)
-  requires acc(x.f) && acc(x.f)
-  requires x == null ? acc(x.f) : acc(x.f)
-{
-}
-"#;
-    let program = silver::silver_parser::sil_program(input).expect("Parse failed");
-    let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
-    println!("{}", vmir);
-}
-
-#[test]
-fn test_heap_ternary_acc_permissions_are_path_conditionalized_with_branch_polarity() {
-    use vmir::{Declaration, HeapInstKind, Literal, PureInst, Value};
-
-    fn real(n: i64) -> Value {
-        Literal::Real(num::BigInt::from(n).into()).into()
-    }
-
-    let input = r#"
-field f: Int
-
-method test(path: Bool, x: Ref)
-  requires path ? acc(x.f, write) : acc(x.f, write)
-{
-}
-"#;
-    let program = silver::silver_parser::sil_program(input).expect("Parse failed");
-    let vmir = translate::VmirTranslator::translate(&program).expect("Translation failed");
-
-    let requires_id = vmir
-        .interner
-        .get("test@requires")
-        .expect("missing requires declaration");
-    let Declaration::HeapExp(requires) = &vmir.decls[requires_id] else {
-        panic!("test@requires must be a heap expression");
-    };
-
-    let arg_base = requires.input_types.len();
-    let path_cond = Value::Temp(1);
-    let zero = real(0);
-    let one = real(1);
-
-    let mut saw_positive = false;
-    let mut saw_negative = false;
-
-    for inst in &requires.insts {
-        let HeapInstKind::Acc(AccInst { perm, .. }) = &inst.kind else {
-            continue;
-        };
-
-        let Value::Temp(temp) = perm else {
-            panic!("expected path-conditionalized acc amount temp, got {perm:?}");
-        };
         assert!(
-            *temp >= arg_base,
-            "acc amount temp should come from an instruction"
+            vmir.interner.get("sig_only@ensures").is_none(),
+            "method without postcondition should not emit @ensures resource"
         );
-        let amt_inst = &requires.insts[*temp - arg_base];
 
-        let HeapInstKind::Pure(PureInst::Ternary(cond, then_amt, else_amt)) = &amt_inst.kind else {
-            panic!(
-                "acc amount should come from ternary, got {:?}",
-                amt_inst.kind
-            );
-        };
-        assert_eq!(*cond, path_cond);
+        let only_pre_req = vmir
+            .interner
+            .get("only_pre@requires")
+            .expect("missing only_pre@requires");
+        assert!(matches!(
+            vmir.decls[only_pre_req],
+            vmir::Declaration::Resource(_)
+        ));
+        assert!(
+            vmir.interner.get("only_pre@ensures").is_none(),
+            "method without postcondition should not emit @ensures resource"
+        );
 
-        if *then_amt == one && *else_amt == zero {
-            saw_positive = true;
-        } else if *then_amt == zero && *else_amt == one {
-            saw_negative = true;
-        } else {
-            panic!("unexpected acc amount polarity ternary: then={then_amt:?}, else={else_amt:?}");
-        }
+        let only_post_ens = vmir
+            .interner
+            .get("only_post@ensures")
+            .expect("missing only_post@ensures");
+        assert!(matches!(
+            vmir.decls[only_post_ens],
+            vmir::Declaration::Resource(_)
+        ));
+        assert!(
+            vmir.interner.get("only_post@requires").is_none(),
+            "method without precondition should not emit @requires resource"
+        );
     }
-
-    assert!(
-        saw_positive,
-        "missing then-branch polarity (path ? perm : 0)"
-    );
-    assert!(
-        saw_negative,
-        "missing else-branch polarity (path ? 0 : perm)"
-    );
 }

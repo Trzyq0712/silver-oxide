@@ -1,43 +1,22 @@
-use crate::silver::walk::{AstWalkable, AstWalkerMut};
-use crate::translate::method::MethodTranslCtxt;
-use crate::translate::name_resolution::DeclKind;
-use crate::vmir;
-use crate::{silver, translate::heap_exp::HeapExpTranslCtxt};
+use crate::translate::{name_resolution::DeclKind, resource::MethodContractResources};
+use crate::vmir::{
+    self, Declaration, HeapInst, HeapVal, Inst, MemberId, PureInst, Resource, Type, Val,
+};
+use crate::{silver, HashMap};
 use lasso::{Key, Rodeo};
-use rusttyc::{TcErr, TcKey, TcVar, TypeChecker};
 use typed_index_collections::{ti_vec, TiVec};
 
-// TODO: Type Checking Phase
-// Currently, type inference is done inline during expression translation.
-// For more sophisticated type checking (especially with generics in domains),
-// consider adding rusttyc or a similar type checking library.
-// This would be a separate pass before translation:
-//   1. Name Resolution (current: NameCollector)
-//   2. Type Checking (future: using rusttyc or custom implementation)
-//   3. Translation to VMIR (current: VmirTranslator)
-//
-// Type checking would:
-//   - Verify all expressions are well-typed
-//   - Resolve type variables in generic domains
-//   - Check function call argument types
-//   - Infer missing type annotations
-//   - Build a type environment that translation can use
-
 pub mod heap_exp;
-pub mod method;
+pub mod inst;
 pub mod name_resolution;
 pub mod pure_exp;
+pub mod resource;
 pub mod signatures;
 pub mod typecheck;
+pub use typecheck::VmirTc;
+
 pub use name_resolution::{IdentifierError, NameCollector};
 pub use signatures::SignatureContext;
-
-#[derive(Debug, Clone)]
-pub struct SilverSymbols {
-    pub interner: Rodeo<vmir::MemberId>,
-    pub name_kinds: TiVec<vmir::MemberId, DeclKind>,
-    pub signatures: SignatureContext,
-}
 
 #[derive(Debug, Clone)]
 pub struct VmirSymbols {
@@ -48,1035 +27,527 @@ pub struct VmirSymbols {
 
 #[derive(Debug)]
 pub struct VmirTranslator {
-    globals: TiVec<vmir::MemberId, Option<vmir::Declaration>>,
+    decls: TiVec<vmir::MemberId, Option<vmir::Declaration>>,
     interner: Rodeo<vmir::MemberId>,
     name_kinds: TiVec<vmir::MemberId, DeclKind>,
     signatures: SignatureContext,
 }
 
 impl VmirTranslator {
-    /// Create a new translator with a pre-populated interner from name collection.
     pub fn new(symbols: VmirSymbols) -> Self {
-        let num_declarations = symbols.interner.len();
-        VmirTranslator {
-            // Preallocate the vector with None placeholders
-            globals: ti_vec![None; num_declarations],
+        let count = symbols.interner.len();
+        Self {
+            decls: ti_vec![None; count],
             interner: symbols.interner,
             name_kinds: symbols.name_kinds,
             signatures: symbols.signatures,
         }
     }
 
-    /// Translate a Silver program to VMIR.
-    /// This is a three-pass process:
-    /// 1. Collect and intern all names (detecting duplicates)
-    /// 2. Collect type signatures for all declarations
-    /// 3. Translate declarations using the full context
     pub fn translate(program: &silver::Program) -> Result<vmir::Program, Vec<IdentifierError>> {
-        // First pass: collect and intern all global names
         let collector = NameCollector::new();
         let (interner, name_kinds) = collector.collect(program)?;
-
-        // Normalize call RHS forms using declaration kinds before translation.
-        let mut normalized_program = program.clone();
-        normalize_assign_rhs_calls(&mut normalized_program, &interner, &name_kinds);
-        normalize_predicate_func_apps(&mut normalized_program, &interner, &name_kinds);
-
-        // Second pass: collect all Silver signatures from normalized AST.
-        let signatures = SignatureContext::collect(&normalized_program, &interner);
-        let silver_symbols = SilverSymbols {
-            interner: interner.clone(),
-            name_kinds: name_kinds.clone(),
-            signatures: signatures.clone(),
+        let signatures = SignatureContext::collect(program, &interner);
+        let symbols = VmirSymbols {
+            interner,
+            name_kinds,
+            signatures,
         };
-
-        // Third pass: translate with the VMIR symbol context.
-        let vmir_symbols = VmirSymbols {
-            interner: silver_symbols.interner.clone(),
-            name_kinds: silver_symbols.name_kinds.clone(),
-            signatures: silver_symbols.signatures.clone(),
-        };
-        let mut translator = Self::new(vmir_symbols);
-        translator.intern_method_contract_symbols();
-        normalized_program.walk(&mut translator);
+        let mut translator = Self::new(symbols);
+        translator.intern_method_contract_resources(program);
+        translator.translate_program(program);
 
         let decls = translator
-            .globals
+            .decls
             .into_iter()
             .enumerate()
-            .map(|(idx, decl)| match decl {
-                Some(decl) => decl,
-                None => {
-                    let memid = vmir::MemberId(idx);
-                    match translator.name_kinds[memid] {
-                        // Methods are represented through `<method>@requires` and
-                        // `<method>@ensures` heap-exp declarations only.
-                        DeclKind::Method => vmir::Declaration::DomainElement,
-                        _ => panic!("Declaration at index {} was not translated", idx),
-                    }
-                }
+            .map(|(idx, decl)| {
+                decl.unwrap_or_else(|| match translator.name_kinds[MemberId(idx)] {
+                    DeclKind::Domain => Declaration::Domain(vmir::Domain {}),
+                    DeclKind::Adt => Declaration::Adt(vmir::Adt {}),
+                    DeclKind::AdtConstructor => Declaration::AdtConstructor,
+                    _ => Declaration::DomainElement,
+                })
             })
             .collect();
-
         Ok(vmir::Program {
             decls,
             interner: translator.interner,
         })
     }
 
-    fn translate_type(&self, ty: &silver::Type) -> vmir::Type {
-        match ty {
-            silver::Type::Bool => vmir::Type::Bool,
-            silver::Type::Int => vmir::Type::Int,
-            silver::Type::Real => vmir::Type::Real,
-            silver::Type::Ref => vmir::Type::Ref,
-            silver::Type::Domain(ident, _) => vmir::Type::Domain(
-                self.interner
-                    .get(&ident.0)
-                    .expect("Domain name should be interned"),
-            ),
-        }
-    }
-
-    pub(crate) fn interner(&self) -> &Rodeo<vmir::MemberId> {
-        &self.interner
-    }
-
-    pub(crate) fn name_kinds(&self) -> &TiVec<vmir::MemberId, DeclKind> {
-        &self.name_kinds
-    }
-
-    fn intern_method_contract_symbols(&mut self) {
-        let method_ids = self.signatures.methods.keys().copied().collect::<Vec<_>>();
-
-        for method_id in method_ids {
-            let method_name = self.interner.resolve(&method_id).to_string();
-            for suffix in ["requires", "ensures"] {
-                let generated = format!("{method_name}@{suffix}");
-                if self.interner.get(generated.as_str()).is_some() {
-                    continue;
+    fn translate_program(&mut self, program: &silver::Program) {
+        for decl in &program.0 {
+            match decl {
+                silver::Declaration::Field(field) => self.translate_field(field),
+                silver::Declaration::Predicate(predicate) => self.translate_predicate(predicate),
+                silver::Declaration::Method(method) => self.translate_method(method),
+                silver::Declaration::Function(function) => self.translate_function(function),
+                silver::Declaration::Domain(domain) => {
+                    let id = self.interner.get(domain.name.0 .0.as_str()).unwrap();
+                    self.add_decl(id, Declaration::Domain(vmir::Domain {}));
                 }
-
-                let member_id = self.interner.get_or_intern(generated.as_str());
-                debug_assert_eq!(member_id.into_usize(), self.globals.len());
-                self.globals.push(None);
-                self.name_kinds.push(DeclKind::HeapExp);
+                silver::Declaration::Adt(adt) => {
+                    let id = self.interner.get(adt.name.0 .0.as_str()).unwrap();
+                    self.add_decl(id, Declaration::Adt(vmir::Adt {}));
+                }
+                _ => {}
             }
         }
     }
 
-    pub(crate) fn signatures(&self) -> &SignatureContext {
-        &self.signatures
+    fn intern_method_contract_resources(&mut self, program: &silver::Program) {
+        for decl in &program.0 {
+            let silver::Declaration::Method(method) = decl else {
+                continue;
+            };
+            let method_name = method.signature.name.0 .0.as_str();
+            let mut suffixes = Vec::new();
+            if method.contract.precondition.is_some() {
+                suffixes.push("requires");
+            }
+            if method.contract.postcondition.is_some() {
+                suffixes.push("ensures");
+            }
+            for suffix in suffixes {
+                let name = format!("{method_name}@{suffix}");
+                let id = self.interner.get_or_intern(name);
+                if id.into_usize() >= self.decls.len() {
+                    self.decls.push(None);
+                    self.name_kinds.push(DeclKind::ContractCallable);
+                }
+            }
+        }
+    }
+
+    fn add_decl(&mut self, id: MemberId, decl: Declaration) {
+        if id.into_usize() >= self.decls.len() {
+            while id.into_usize() >= self.decls.len() {
+                self.decls.push(None);
+                self.name_kinds.push(DeclKind::ContractCallable);
+            }
+        }
+        self.decls[id] = Some(decl);
+    }
+
+    fn method_contract_resource_id(&self, method_id: MemberId, suffix: &str) -> Option<MemberId> {
+        let method_name = self.interner.resolve(&method_id);
+        let name = format!("{method_name}@{suffix}");
+        let id = self.interner.get(name.as_str())?;
+        match self.decls.get(id).and_then(|d| d.as_ref()) {
+            Some(Declaration::Resource(_)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn translate_type(&self, ty: &silver::Type) -> Type {
+        match ty {
+            silver::Type::Bool => Type::Bool,
+            silver::Type::Int => Type::Int,
+            silver::Type::Real => Type::Real,
+            silver::Type::Ref => Type::Ref,
+            silver::Type::Domain(idn, _) => Type::Domain(
+                self.interner
+                    .get(idn.0.as_str())
+                    .unwrap_or_else(|| panic!("domain type not interned: {}", idn.0)),
+            ),
+        }
     }
 
     fn translate_field(&mut self, field: &silver::Field) {
-        // field v: Int -> function v(Ref): &Int
         let silver::Field(decl) = field;
-
-        let ident = decl.idn.0 .0.as_str();
-        // The name should already be interned from the first pass
-        let member_id = self
-            .interner
-            .get(ident)
-            .expect("Name should be pre-interned");
-
-        // For fields, we need to create a function signature with Ref as argument
-        let args = vec![self.translate_type(&silver::Type::Ref)];
+        let id = self.interner.get(decl.idn.0 .0.as_str()).unwrap();
         let ret = self.translate_type(&decl.ty);
-        // Field returns an address to the field type
-        let ret = vmir::Type::Addr(Box::new(ret));
-
-        let func = vmir::Function {
-            name: member_id,
-            signature: vmir::FuncSig { args, ret },
-            contract: vmir::FuncContract::empty(),
-            body: None,
-        };
-
-        // Insert at the correct index
-        assert!(
-            self.globals[member_id].is_none(),
-            "Declaration at index {} already exists",
-            member_id.into_usize()
+        self.add_decl(
+            id,
+            Declaration::Function(vmir::Function {
+                params: vec![Type::Ref],
+                ret: Type::Addr(Box::new(ret)),
+            }),
         );
-        self.globals[member_id] = Some(vmir::Declaration::Function(func));
     }
 
-    fn translate_predicate(&mut self, predicate: &silver::Predicate) {
-        // predicate pr(x: Ref, i: Int) { body } translates to:
-        // 1. function pr(x: Ref, i: Int): &pr@snap
-        //    An abstract function that maps the predicate arguments to a snapshot address
-        //    When dereferenced (* operator), evaluates to the snapshot
-        // 2. resource pr@heap(x: Ref, i: Int)
-        //    { body }
-        //    Effectively can be thought of as a macro that will auto-expand in a requires or
-        //    ensures clause
-        // 3. function pr@to_snap(x: Ref, i: Int): pr@snap
-        //      requires pr@heap(x, i)
-        //    { pr@snap(...) }
-        //    A function to construct the snapshot directly from the heap (from the unfolded predicate)
-        // 4. Is body present:
-        //    - Yes --> adt pr_snap { ... }  // TODO: translate body fields
-        //    - No  --> domain pr_snap { }
-
-        let sig = &predicate.signature;
-        let ident = sig.name.0 .0.as_str();
-
-        // Create snapshot type (domain or adt depending on whether body exists)
-        let snap_name = format!("{}@snap", ident);
-        let snap_id = self.interner.get_or_intern(&snap_name);
-
-        let snap_decl = match predicate.body {
-            None => {
-                let domain = vmir::Domain { name: snap_id };
-                vmir::Declaration::Domain(domain)
+    fn translate_predicate(&mut self, pred: &silver::Predicate) {
+        let pred_name = pred.signature.name.0 .0.as_str();
+        let pred_id = self.interner.get(pred_name).unwrap();
+        let snap_name = format!("{pred_name}@snap");
+        let snap_id = self.interner.get(snap_name.as_str()).unwrap_or_else(|| {
+            let id = self.interner.get_or_intern(snap_name);
+            if id.into_usize() >= self.decls.len() {
+                self.decls.push(None);
+                self.name_kinds.push(DeclKind::Domain);
             }
-            Some(ref _body) => {
-                // TODO: When translating the predicate body:
-                // 1. Create an ExpTranslationContext with predicate parameters as locals
-                // 2. Use translate_complete_exp to translate body.0 (the Exp)
-                // 3. Extract impures (acc expressions) to build the ADT snapshot
-                //
-                // Example:
-                // let vmir::exp = self.translate_complete_exp(&body.0);
-                // // vmir::exp.impures contains all acc(...) expressions
-                // // These become fields in the snapshot ADT
+            id
+        });
+        self.add_decl(snap_id, Declaration::Domain(vmir::Domain {}));
 
-                let adt = vmir::Adt { name: snap_id };
-                vmir::Declaration::Adt(adt)
-            }
-        };
-
-        // Store the snapshot declaration
-        let snap_member_id = snap_id;
-        assert!(
-            self.globals[snap_member_id].is_none(),
-            "Declaration at index {} already exists",
-            snap_member_id.into_usize()
-        );
-        self.globals[snap_member_id] = Some(snap_decl);
-
-        // Create a function for returning the snapshot address
-        let func_member_id = self
-            .interner
-            .get(ident)
-            .expect("Name should be pre-interned");
-
-        let args: Vec<_> = sig
+        let params = pred
+            .signature
             .args
             .iter()
             .map(|arg| self.translate_type(arg.ty()))
             .collect();
-
-        let ret = vmir::Type::Addr(Box::new(vmir::Type::Domain(snap_member_id)));
-
-        let func = vmir::Function {
-            name: func_member_id,
-            signature: vmir::FuncSig {
-                args: args.clone(),
-                ret,
-            },
-            contract: vmir::FuncContract::empty(),
-            body: None,
-        };
-        assert!(
-            self.globals[func_member_id].is_none(),
-            "Declaration at index {} already exists",
-            func_member_id.into_usize()
+        self.add_decl(
+            pred_id,
+            Declaration::Function(vmir::Function {
+                params,
+                ret: Type::Addr(Box::new(Type::Domain(snap_id))),
+            }),
         );
-        self.globals[func_member_id] = Some(vmir::Declaration::Function(func));
-
-        // Create the resource declaration for the predicate
-        let resource_name = format!("{}@heap", ident);
-        let resource_id = self.interner.get_or_intern(&resource_name);
-
-        let resource = vmir::Resource {
-            name: resource_id,
-            args,
-            snapshot: snap_member_id,
-            body: None,
-            // predicate
-            //     .body
-            //     .as_ref()
-            //     .map(|body| self.translate_impure_exp(&body.0.exp, &sig.args, &vmir::Type::Bool)),
-        };
-
-        assert!(
-            self.globals[resource_id].is_none(),
-            "Declaration at index {} already exists",
-            resource_id.into_usize()
-        );
-        self.globals[resource_id] = Some(vmir::Declaration::Resource(resource));
     }
-
-    // /// Translate a complete expression with predefined locals (e.g., for predicate bodies)
-    // fn translate_impure_exp<'a>(
-    //     &self,
-    //     exp: &silver::ExpKind,
-    //     env: impl IntoIterator<Item = &'a silver::ArgOrType>,
-    //     ty: &vmir::Type,
-    // ) -> vmir::HeapExp {
-    //     // Convert ArgOrType to (IdnDecl, Type) pairs
-    //     let locals = env.into_iter().filter_map(|arg| {
-    //         match arg {
-    //             silver::ArgOrType::Arg(typed) => {
-    //                 let vmir_ty = self.translate_type(&typed.ty);
-    //                 Some((&typed.idn, vmir_ty))
-    //             }
-    //             silver::ArgOrType::Type(_) => None, // Skip type-only parameters
-    //         }
-    //     });
-    //
-    //     let ctx = HeapExpTranslCtxt::new(self, locals);
-    //
-    //     ctx.translate_exp(exp)
-    // }
-
-    fn translate_method(&mut self, method: &silver::Method) {
-        let sig = &method.signature;
-        let ident = sig.name.0 .0.as_str();
-
-        // Method interface is encoded via heap-exp declarations only.
-        self.translate_method_contract(ident, &method.contract, &method.signature);
-
-        let method = if let Some(body) = &method.body {
-            let mut trans_ctxt = MethodTranslCtxt::new(self, &method.signature);
-
-            for stmt in &body.0 {
-                trans_ctxt.translate_statement(stmt);
-            }
-
-            trans_ctxt.finalize()
-        } else {
-            vmir::method::Method(vec![])
-        };
-        let memid = self.interner.get(sig.name.0 .0.as_str()).unwrap();
-        self.add_decl(memid, vmir::Declaration::Method(method));
-    }
-
-    fn add_decl(&mut self, memid: vmir::MemberId, decl: vmir::Declaration) {
-        assert!(
-            self.globals[memid].is_none(),
-            "Declaration at index {} already exists",
-            memid.into_usize()
-        );
-        self.globals[memid] = Some(decl);
-    }
-
-    /* Temporarily disabled method body translation
-        /// Translate a method body, collecting variable declarations and translating statements
-        fn translate_method_body(
-            &self,
-            body: &silver::StmtBlock,
-            signature: &silver::Signature,
-        ) -> vmir::StmtBlock {
-            // Prepare parameters (both args and return values) for MethodTranslationContext
-            let params = signature
-                .args
-                .iter()
-                .chain(signature.ret.iter())
-                .filter_map(|arg| match arg {
-                    silver::ArgOrType::Arg(decl_typed) => {
-                        Some((&decl_typed.idn, self.translate_type(&decl_typed.ty)))
-                    }
-                    silver::ArgOrType::Type(_) => None,
-                });
-
-            let mut ctx = MethodTranslationContext::new(self, params);
-
-            // Phase 1: Collect all variable declarations
-            self.collect_var_decls(&body.0, &mut ctx);
-
-            // Phase 2: Translate statements
-            for stmt in &body.0 {
-                self.translate_statement(stmt, &mut ctx);
-            }
-
-            vmir::StmtBlock(ctx.statements)
-        }
-
-        /// Recursively collect variable declarations from statements
-        fn collect_var_decls<'c>(
-            &self,
-            stmts: &'c [silver::Statement],
-            ctx: &mut MethodTranslationContext<'_, 'c>,
-        ) {
-            for stmt in stmts {
-                match stmt {
-                    silver::Statement::Var(decls, _init) => {
-                        // Allocate local for each declared variable
-                        for decl in decls {
-                            let name = decl.idn.0 .0.as_str();
-                            let ty = typecheck::TcType::from_vmir_type(&self.translate_type(&decl.ty));
-                            ctx.allocate_local(name, ty);
-                        }
-                    }
-                    silver::Statement::Block(block) => {
-                        self.collect_var_decls(&block.0, ctx);
-                    }
-                    silver::Statement::If(_cond, then_block, else_block) => {
-                        self.collect_var_decls(&then_block.0, ctx);
-                        if let Some(else_block) = else_block {
-                            self.collect_var_decls(&else_block.0, ctx);
-                        }
-                    }
-                    silver::Statement::While(_cond, _inv, _decr, body) => {
-                        self.collect_var_decls(&body.0, ctx);
-                    }
-                    _ => {
-                        // Other statements don't contain variable declarations
-                    }
-                }
-            }
-        }
-
-        /// Translate a single statement
-        fn translate_statement(&self, stmt: &silver::Statement, ctx: &mut MethodTranslationContext) {
-            match stmt {
-                silver::Statement::Assign(lhs_vec, rhs) => {
-                    self.translate_assign(lhs_vec, rhs, ctx);
-                }
-                silver::Statement::Var(decls, init) => {
-                    // Variable declarations are already collected
-                    // Only handle initialization if present
-                    if let Some(init_rhs) = init {
-                        // Generate assignment statement(s) for initialized variables
-                        // Silver allows: var x: Int, y: Int := expr1, expr2
-                        // We translate this to separate assignments
-                        let lhs_vec: Vec<_> = decls
-                            .iter()
-                            .map(|decl| {
-                                // Create an Ident expression for the declared variable
-                                Box::new(silver::ExpKind::Ident(decl.idn.0.clone()))
-                            })
-                            .collect();
-
-                        // Translate as a regular assignment
-                        self.translate_assign(&lhs_vec, init_rhs, ctx);
-                    }
-                }
-                _ => {
-                    // For now, we only support Assign and Var
-                    // Other statements will be added later
-                    panic!("Statement not yet supported: {:?}", stmt);
-                }
-            }
-        }
-
-        /// Translate an assignment statement
-        fn translate_assign(
-            &self,
-            lhs_vec: &[silver::Exp],
-            rhs: &silver::AssignRhs,
-            ctx: &mut MethodTranslationContext,
-        ) {
-            match rhs {
-                silver::AssignRhs::Exp(rhs_exp) => {
-                    // Simple assignment: lhs := rhs_exp
-                    assert_eq!(lhs_vec.len(), 1, "Multiple LHS not supported yet");
-                    let lhs = &lhs_vec[0];
-
-                    // Translate RHS expression
-                    let rhs_vmir = self.translate_stmt_exp(rhs_exp, ctx);
-
-                    // Determine assignment target
-                    let target = self.translate_assign_target(lhs, ctx);
-
-                    // Add assignment statement
-                    ctx.add_statement(vmir::Statement::Assign(target, rhs_vmir));
-                }
-                silver::AssignRhs::Call(method_name, args) => {
-                    // Method call: lhs := m(args)
-                    // Get method ID
-                    let method_id = self
-                        .interner
-                        .get(&method_name.0)
-                        .expect("Method name should be interned");
-
-                    // Translate arguments
-                    let arg_exps: Vec<_> = args
-                        .iter()
-                        .map(|arg| self.translate_stmt_exp(arg, ctx))
-                        .collect();
-
-                    // Translate LHS to locals/temps
-                    let lhs_locals: Vec<_> = lhs_vec
-                        .iter()
-                        .map(|lhs_exp| self.translate_method_call_target(lhs_exp, ctx))
-                        .collect();
-
-                    // Add method call statement
-                    ctx.add_statement(vmir::Statement::MethodCall(lhs_locals, method_id, arg_exps));
-                }
-                silver::AssignRhs::New(_) => {
-                    // TODO: Handle "new" statements
-                    panic!("'new' statement not yet supported");
-                }
-            }
-        }
-
-        /// Translate an expression in statement context (evaluate to expression with SSA)
-        fn translate_stmt_exp(
-            &self,
-            exp: &silver::Exp,
-            ctx: &MethodTranslationContext,
-        ) -> vmir::vmir::exp::Exp {
-            // Reuse ExpTranslationContext for expression translation
-            // We need to create a temporary collection that owns the IdnDecl instances
-            let locals_vec: Vec<(silver::IdnDecl, vmir::Type)> = ctx
-                .locals
-                .iter()
-                .map(|(name, (_idx, ty))| {
-                    let decl = silver::IdnDecl(silver::Ident((*name).to_string()));
-                    let vmir_ty = ty.to_vmir_type();
-                    (decl, vmir_ty)
-                })
-                .collect();
-
-            // Now create the iterator with references
-            let locals_for_exp = locals_vec.iter().map(|(decl, ty)| (decl, ty.clone()));
-
-            let mut exp_ctx = ExpTranslationContext::new(self, locals_for_exp);
-            let (result, _ty) = self.translate_exp(exp, &mut exp_ctx);
-            exp_ctx.finalize(result)
-        }
-
-        /// Translate an LHS expression to an AssignTarget
-        fn translate_assign_target(
-            &self,
-            lhs: &silver::Exp,
-            ctx: &mut MethodTranslationContext,
-        ) -> vmir::AssignTarget {
-            match lhs.as_ref() {
-                silver::ExpKind::Ident(name) => {
-                    // Simple variable assignment
-                    let (idx, _ty) = ctx
-                        .locals
-                        .get(name.0.as_str())
-                        .expect("Variable not found in locals");
-                    vmir::AssignTarget::Local(*idx)
-                }
-                silver::ExpKind::Field(_receiver, _field) => {
-                    // Field assignment: x.f := value
-                    // Translate to: *temp := value where temp = field_addr(x)
-
-                    // Get field address as an expression
-                    let field_addr_exp = self.translate_stmt_exp(lhs, ctx);
-
-                    // The result of the expression should be a temporary holding the address
-                    // Extract the temp from the expression result
-                    match field_addr_exp.res {
-                        vmir::vmir::exp::Value::Temp(temp_idx) => vmir::AssignTarget::Deref(temp_idx),
-                        _ => panic!("Field access should produce a temporary"),
-                    }
-                }
-                _ => panic!("Unsupported LHS expression: {:?}", lhs),
-            }
-        }
-
-        /// Translate an LHS expression for method call (must be a local or temp)
-        fn translate_method_call_target(
-            &self,
-            lhs: &silver::Exp,
-            ctx: &mut MethodTranslationContext,
-        ) -> vmir::Local {
-            match lhs.as_ref() {
-                silver::ExpKind::Ident(name) => {
-                    // Variable as method call target
-                    let (idx, _ty) = ctx
-                        .locals
-                        .get(name.0.as_str())
-                        .expect("Variable not found in locals");
-                    vmir::Local::Local(*idx)
-                }
-                _ => {
-                    // Complex expression - evaluate to a temporary first
-                    let exp_vmir = self.translate_stmt_exp(lhs, ctx);
-                    match exp_vmir.res {
-                        vmir::vmir::exp::Value::Temp(temp_idx) => vmir::Local::Temp(temp_idx),
-                        vmir::vmir::exp::Value::Local(local_idx) => vmir::Local::Local(local_idx),
-                        _ => panic!("Method call target must be a local or temp"),
-                    }
-                }
-            }
-        }
-    */
 
     fn translate_function(&mut self, function: &silver::Function) {
-        // Functions translate directly - just signatures for now, bodies later
-        let sig = &function.signature;
-        let contract = &function.contract;
-        let ident = sig.name.0 .0.as_str();
-
-        let func_member_id = self
+        let id = self
             .interner
-            .get(ident)
-            .expect("Name should be pre-interned");
-
-        let args: Vec<_> = sig
+            .get(function.signature.name.0 .0.as_str())
+            .unwrap();
+        let params = function
+            .signature
             .args
             .iter()
             .map(|arg| self.translate_type(arg.ty()))
-            .collect();
-        let ret = self.translate_type(sig.ret[0].ty());
+            .collect::<Vec<_>>();
+        let ret = function
+            .signature
+            .ret
+            .first()
+            .map(|r| self.translate_type(r.ty()))
+            .unwrap_or(Type::Bool);
+        self.add_decl(id, Declaration::Function(vmir::Function { params, ret }));
+    }
 
-        let func = vmir::Function {
-            name: func_member_id,
-            signature: vmir::FuncSig { args, ret },
-            contract: vmir::FuncContract::empty(), // TODO: translate function contract
-            body: None,                            // TODO: translate function body
-        };
+    fn translate_method(&mut self, method: &silver::Method) {
+        let method_name = method.signature.name.0 .0.as_str();
+        let method_id = self.interner.get(method_name).unwrap();
+        let MethodContractResources { requires, ensures } =
+            resource::translate_method_contracts(self, method_name, method);
+        let mut requires_id = None;
+        if let Some((id, requires_res)) = requires {
+            self.add_decl(id, Declaration::Resource(requires_res));
+            requires_id = Some(id);
+        }
+        let mut ensures_id = None;
+        if let Some((id, ensures_res)) = ensures {
+            self.add_decl(id, Declaration::Resource(ensures_res));
+            ensures_id = Some(id);
+        }
 
-        assert!(
-            self.globals[func_member_id].is_none(),
-            "Declaration at index {} already exists",
-            func_member_id.into_usize()
+        if method.body.is_none() {
+            return;
+        }
+
+        let mut builder = MethodBuilder::new(self);
+        for arg in &method.signature.args {
+            if let Some(idn) = arg.idn() {
+                let ty = self.translate_type(arg.ty());
+                let v = builder.emit_fresh(ty);
+                builder.bind(idn, v.clone());
+                builder.args.push(v);
+            }
+        }
+        for ret in &method.signature.ret {
+            if let Some(idn) = ret.idn() {
+                let ty = self.translate_type(ret.ty());
+                let v = builder.emit_fresh(ty);
+                builder.bind(idn, v.clone());
+                builder.rets.push(v);
+            }
+        }
+
+        if let Some(requires_id) = requires_id {
+            builder.apply_resource(requires_id, builder.args.clone(), ContractMode::AddAssume);
+        }
+        builder.entry_heap = builder.current_heap.clone();
+
+        let body = method.body.as_ref().unwrap();
+        for stmt in &body.0 {
+            builder.translate_statement(stmt);
+        }
+
+        if let Some(ensures_id) = ensures_id {
+            let mut ensure_args = builder.args.clone();
+            ensure_args.extend(builder.rets.clone());
+            builder.apply_resource(ensures_id, ensure_args, ContractMode::SubAssert);
+        }
+
+        self.add_decl(
+            method_id,
+            Declaration::Method(vmir::Method {
+                insts: builder.insts,
+            }),
         );
-        self.globals[func_member_id] = Some(vmir::Declaration::Function(func));
-    }
-
-    // fn translate_function_contract(
-    //     &self,
-    //     contract: &silver::Contract,
-    //     signature: &silver::Signature,
-    // ) -> vmir::FuncContract {
-    //     // Build requires input signature: [heap, ...args]
-    //     let mut requires_inputs = vec![vmir::Type::Heap];
-    //     for arg in &signature.args {
-    //         if let silver::ArgOrType::Arg(typed) = arg {
-    //             requires_inputs.push(self.translate_type(&typed.ty));
-    //         }
-    //     }
-    //
-    //     let requires = contract
-    //         .precondition
-    //         .as_ref()
-    //         .map(|pre| self.translate_impure_exp(&pre.exp, &signature.args, &vmir::Type::Bool));
-    //
-    //     // Build ensures input signature: [heap, old_heap, ...args]
-    //     let mut ensures_inputs = vec![vmir::Type::Heap, vmir::Type::Heap];
-    //     for arg in &signature.args {
-    //         if let silver::ArgOrType::Arg(typed) = arg {
-    //             ensures_inputs.push(self.translate_type(&typed.ty));
-    //         }
-    //     }
-    //
-    //     let ensures = contract
-    //         .postcondition
-    //         .as_ref()
-    //         .map(|post| self.translate_impure_exp(&post.exp, &signature.args, &vmir::Type::Bool));
-    //
-    //     vmir::FuncContract::with_inputs(requires, ensures, requires_inputs, ensures_inputs)
-    // }
-
-    fn translate_method_contract(
-        &mut self,
-        method: &str,
-        contract: &silver::Contract,
-        signature: &silver::Signature,
-    ) {
-        let true_assert_exp = silver::HeapExp::new(Box::new(silver::ExpKind::Const(
-            silver::ConstKind::Bool(true),
-        )));
-
-        let memid = self.interner.get(method).unwrap();
-
-        let requires = {
-            let ctxt = HeapExpTranslCtxt::new_for_requires(
-                self,
-                memid,
-                signature.args.iter().map(|a| a.idn().unwrap()),
-            );
-            ctxt.translate_assert_exp(
-                contract
-                    .precondition
-                    .as_ref()
-                    .map_or(&true_assert_exp, |pre| pre),
-            )
-        };
-        let ensures = {
-            let ctxt = HeapExpTranslCtxt::new_for_ensures(
-                self,
-                memid,
-                signature.args.iter().map(|a| a.idn().unwrap()),
-                signature.ret.iter().filter_map(|r| r.idn()),
-            );
-            ctxt.translate_assert_exp(
-                contract
-                    .postcondition
-                    .as_ref()
-                    .map_or(&true_assert_exp, |post| post),
-            )
-        };
-
-        let requires_memid = self.interner.get(format!("{method}@requires")).unwrap();
-        self.add_decl(requires_memid, vmir::Declaration::HeapExp(requires));
-        let ensures_memid = self.interner.get(format!("{method}@ensures")).unwrap();
-        self.add_decl(ensures_memid, vmir::Declaration::HeapExp(ensures));
     }
 }
 
-struct AssignRhsCallDisambiguator<'a> {
-    interner: &'a Rodeo<vmir::MemberId>,
-    name_kinds: &'a TiVec<vmir::MemberId, DeclKind>,
+#[derive(Debug, Clone, Copy)]
+enum ContractMode {
+    AddAssume,
+    SubAssert,
 }
 
-impl<'a> AstWalkerMut<'a> for AssignRhsCallDisambiguator<'_> {
-    fn walk_mut_assign_rhs(&mut self, rhs: &'a mut silver::AssignRhs) {
-        if let silver::AssignRhs::Call(name, args) = rhs {
-            let Some(memid) = self.interner.get(name.0.as_str()) else {
-                panic!("Unresolved call target: {}", name.0);
-            };
-            match self.name_kinds[memid] {
-                DeclKind::Method => {}
-                DeclKind::Function
-                | DeclKind::Field
-                | DeclKind::Predicate
-                | DeclKind::DomainFunction
-                | DeclKind::AdtConstructor => {
-                    *rhs = silver::AssignRhs::Exp(
-                        Box::new(silver::ExpKind::FuncApp(name.clone(), args.clone())).into(),
-                    );
+struct MethodBuilder<'a> {
+    translator: &'a VmirTranslator,
+    insts: Vec<Inst>,
+    env: HashMap<String, Val>,
+    next_temp: usize,
+    current_heap: HeapVal,
+    entry_heap: HeapVal,
+    args: Vec<Val>,
+    rets: Vec<Val>,
+}
+
+impl<'a> MethodBuilder<'a> {
+    fn new(translator: &'a VmirTranslator) -> Self {
+        Self {
+            translator,
+            insts: Vec::new(),
+            env: HashMap::new(),
+            next_temp: 0,
+            current_heap: HeapVal::Empty,
+            entry_heap: HeapVal::Empty,
+            args: Vec::new(),
+            rets: Vec::new(),
+        }
+    }
+
+    fn bind(&mut self, idn: &silver::IdnDecl, v: Val) {
+        self.env.insert(idn.0 .0.clone(), v);
+    }
+
+    fn emit_fresh(&mut self, ty: Type) -> Val {
+        let idx = self.next_temp;
+        self.next_temp += 1;
+        self.insts.push(Inst::Pure(ty, PureInst::Fresh));
+        Val::Temp(idx)
+    }
+
+    fn emit_pure(&mut self, ty: Type, pure: PureInst) -> Val {
+        let idx = self.next_temp;
+        self.next_temp += 1;
+        self.insts.push(Inst::Pure(ty, pure));
+        Val::Temp(idx)
+    }
+
+    fn emit_heap(&mut self, heap: HeapInst) -> HeapVal {
+        let idx = self.next_temp;
+        self.next_temp += 1;
+        self.insts.push(Inst::Heap(heap));
+        HeapVal::Temp(idx)
+    }
+
+    fn translate_statement(&mut self, stmt: &silver::Statement) {
+        match stmt {
+            silver::Statement::Var(decls, init) => {
+                for decl in decls {
+                    let v = self.emit_fresh(self.translator.translate_type(&decl.ty));
+                    self.bind(&decl.idn, v);
                 }
-                other => {
-                    panic!("Invalid call target kind for {}: {:?}", name.0, other);
+                if let Some(rhs) = init {
+                    let lhs = decls
+                        .iter()
+                        .map(|d| silver::AssignLhs::Ident(d.idn.0.clone()))
+                        .collect::<Vec<_>>();
+                    self.translate_assign(&lhs, rhs);
                 }
             }
-        }
-        rhs.walk_mut_children(self);
-    }
-}
-
-struct PredicateFuncAppDesugarer<'a> {
-    interner: &'a Rodeo<vmir::MemberId>,
-    name_kinds: &'a TiVec<vmir::MemberId, DeclKind>,
-}
-
-fn predicate_acc_from_func_app(
-    exp: &silver::ExpKind,
-    interner: &Rodeo<vmir::MemberId>,
-    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
-) -> Option<silver::AccExp> {
-    let silver::ExpKind::FuncApp(name, args) = exp else {
-        return None;
-    };
-    let Some(memid) = interner.get(name.0.as_str()) else {
-        panic!("Unresolved call target: {}", name.0);
-    };
-    if !matches!(name_kinds[memid], DeclKind::Predicate) {
-        return None;
-    }
-    Some(silver::AccExp {
-        acc: silver::LocAccess {
-            loc: Box::new(silver::ExpKind::FuncApp(name.clone(), args.clone())),
-        },
-        perm: silver::ExpKind::write(),
-    })
-}
-
-fn desugar_heap_pure_exp(
-    exp: &silver::Exp,
-    interner: &Rodeo<vmir::MemberId>,
-    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
-) -> silver::HeapExp {
-    match exp.as_ref() {
-        silver::ExpKind::BinOp(silver::BinOp::And, lhs, rhs) => {
-            let lhs = desugar_heap_pure_exp(lhs, interner, name_kinds);
-            let rhs = desugar_heap_pure_exp(rhs, interner, name_kinds);
-            let mut conjuncts = Vec::new();
-            match lhs.kind {
-                silver::HeapExpKind::Conjunction(cs) => conjuncts.extend(cs),
-                _ => conjuncts.push(lhs),
-            }
-            match rhs.kind {
-                silver::HeapExpKind::Conjunction(cs) => conjuncts.extend(cs),
-                _ => conjuncts.push(rhs),
-            }
-            silver::HeapExp {
-                kind: silver::HeapExpKind::Conjunction(conjuncts),
-            }
-        }
-        silver::ExpKind::BinOp(silver::BinOp::Implies, cond, rhs) => silver::HeapExp {
-            kind: silver::HeapExpKind::Ternary(
-                cond.clone(),
-                Box::new(desugar_heap_pure_exp(rhs, interner, name_kinds)),
-                Box::new(silver::HeapExp::new(silver::ExpKind::bool(true))),
-            ),
-        },
-        silver::ExpKind::Ternary(cond, then_exp, else_exp) => silver::HeapExp {
-            kind: silver::HeapExpKind::Ternary(
-                cond.clone(),
-                Box::new(desugar_heap_pure_exp(then_exp, interner, name_kinds)),
-                Box::new(desugar_heap_pure_exp(else_exp, interner, name_kinds)),
-            ),
-        },
-        other => {
-            if let Some(acc) = predicate_acc_from_func_app(other, interner, name_kinds) {
-                silver::HeapExp {
-                    kind: silver::HeapExpKind::Acc(acc),
-                }
-            } else {
-                silver::HeapExp::new(exp.clone())
-            }
+            silver::Statement::Assign(lhs, rhs) => self.translate_assign(lhs, rhs),
+            _ => {}
         }
     }
-}
 
-impl<'a> AstWalkerMut<'a> for PredicateFuncAppDesugarer<'_> {
-    fn walk_mut_heap_exp_kind(&mut self, kind: &'a mut silver::HeapExpKind) {
-        kind.walk_mut_children(self);
-        if let silver::HeapExpKind::Pure(exp) = kind {
-            *kind = desugar_heap_pure_exp(exp, self.interner, self.name_kinds).kind;
-        }
-    }
-}
-
-fn normalize_assign_rhs_calls(
-    program: &mut silver::Program,
-    interner: &Rodeo<vmir::MemberId>,
-    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
-) {
-    let mut pass = AssignRhsCallDisambiguator {
-        interner,
-        name_kinds,
-    };
-    program.walk_mut(&mut pass);
-}
-
-fn normalize_predicate_func_apps(
-    program: &mut silver::Program,
-    interner: &Rodeo<vmir::MemberId>,
-    name_kinds: &TiVec<vmir::MemberId, DeclKind>,
-) {
-    let mut pass = PredicateFuncAppDesugarer {
-        interner,
-        name_kinds,
-    };
-    program.walk_mut(&mut pass);
-}
-
-impl<'a> silver::walk::AstWalker<'a> for VmirTranslator {
-    fn walk_method(&mut self, method: &'a silver::Method) {
-        self.translate_method(method);
-        method.walk_children(self);
-    }
-
-    fn walk_field(&mut self, field: &'a silver::Field) {
-        self.translate_field(field);
-        field.walk_children(self);
-    }
-
-    fn walk_predicate(&mut self, pred: &'a silver::Predicate) {
-        self.translate_predicate(pred);
-        pred.walk_children(self);
-    }
-
-    fn walk_function(&mut self, func: &'a silver::Function) {
-        self.translate_function(func);
-        func.walk_children(self);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{normalize_assign_rhs_calls, normalize_predicate_func_apps, NameCollector};
-    use crate::silver::{self, Declaration, ExpKind, Statement};
-
-    #[test]
-    fn disambiguates_function_call_rhs_to_expression() {
-        let src = r#"
-function f(x: Int): Int
-{
-  x
-}
-
-method m(x: Int) returns (y: Int)
-{
-  y := f(x)
-}
-"#;
-        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
-        let collector = NameCollector::new();
-        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
-        normalize_assign_rhs_calls(&mut program, &interner, &kinds);
-
-        let method = program
-            .0
-            .iter()
-            .find_map(|decl| match decl {
-                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
-                _ => None,
-            })
-            .expect("method m not found");
-        let body = method.body.as_ref().expect("method body missing");
-        let Statement::Assign(_, rhs) = &body.0[0] else {
-            panic!("expected first statement to be assignment");
-        };
+    fn translate_assign(&mut self, lhs: &[silver::AssignLhs], rhs: &silver::AssignRhs) {
         match rhs {
-            silver::AssignRhs::Exp(exp) => match exp.as_ref() {
-                ExpKind::FuncApp(name, _) => assert_eq!(name.0, "f"),
-                _ => panic!("expected function application expression"),
-            },
-            _ => panic!("function call should be rewritten to expression rhs"),
-        }
-    }
-
-    #[test]
-    fn keeps_method_call_rhs_as_call() {
-        let src = r#"
-method callee(x: Int) returns (y: Int)
-{
-  y := x
-}
-
-method caller(x: Int) returns (y: Int)
-{
-  y := callee(x)
-}
-"#;
-        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
-        let collector = NameCollector::new();
-        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
-        normalize_assign_rhs_calls(&mut program, &interner, &kinds);
-
-        let method = program
-            .0
-            .iter()
-            .find_map(|decl| match decl {
-                Declaration::Method(method) if method.signature.name.0 .0 == "caller" => {
-                    Some(method)
-                }
-                _ => None,
-            })
-            .expect("method caller not found");
-        let body = method.body.as_ref().expect("method body missing");
-        let Statement::Assign(_, rhs) = &body.0[0] else {
-            panic!("expected first statement to be assignment");
-        };
-        match rhs {
-            silver::AssignRhs::Call(name, _) => assert_eq!(name.0, "callee"),
-            _ => panic!("method call should remain call rhs"),
-        }
-    }
-
-    #[test]
-    fn desugars_predicate_funcapp_in_heap_context_to_acc() {
-        let src = r#"
-predicate p(x: Ref)
-
-method m(x: Ref)
-  requires p(x)
-{
-}
-"#;
-        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
-        let collector = NameCollector::new();
-        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
-        normalize_predicate_func_apps(&mut program, &interner, &kinds);
-
-        let method = program
-            .0
-            .iter()
-            .find_map(|decl| match decl {
-                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
-                _ => None,
-            })
-            .expect("method m not found");
-
-        let pre = method
-            .contract
-            .precondition
-            .as_ref()
-            .expect("method precondition missing");
-
-        match &pre.kind {
-            silver::HeapExpKind::Acc(acc) => match acc.acc.loc.as_ref() {
-                ExpKind::FuncApp(name, _) => assert_eq!(name.0, "p"),
-                _ => panic!("expected predicate call location inside acc"),
-            },
-            _ => panic!("predicate precondition should desugar to heap acc"),
-        }
-    }
-
-    #[test]
-    fn keeps_function_funcapp_in_heap_context_as_pure() {
-        let src = r#"
-function f(x: Int): Bool
-{
-  true
-}
-
-method m(x: Int)
-  requires f(x)
-{
-}
-"#;
-        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
-        let collector = NameCollector::new();
-        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
-        normalize_predicate_func_apps(&mut program, &interner, &kinds);
-
-        let method = program
-            .0
-            .iter()
-            .find_map(|decl| match decl {
-                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
-                _ => None,
-            })
-            .expect("method m not found");
-
-        let pre = method
-            .contract
-            .precondition
-            .as_ref()
-            .expect("method precondition missing");
-
-        match &pre.kind {
-            silver::HeapExpKind::Pure(exp) => match exp.as_ref() {
-                ExpKind::FuncApp(name, _) => assert_eq!(name.0, "f"),
-                _ => panic!("expected function call in pure precondition"),
-            },
-            _ => panic!("function precondition should remain pure function application"),
-        }
-    }
-
-    #[test]
-    fn desugars_predicate_funcapps_inside_heap_conjunction() {
-        let src = r#"
-predicate number(x: Ref)
-
-method m(this: Ref, other: Ref)
-  requires number(this) && number(other)
-{
-}
-"#;
-        let mut program = silver::silver_parser::sil_program(src).expect("parse failed");
-        let collector = NameCollector::new();
-        let (interner, kinds) = collector.collect(&program).expect("name collect failed");
-        normalize_predicate_func_apps(&mut program, &interner, &kinds);
-
-        let method = program
-            .0
-            .iter()
-            .find_map(|decl| match decl {
-                Declaration::Method(method) if method.signature.name.0 .0 == "m" => Some(method),
-                _ => None,
-            })
-            .expect("method m not found");
-        let pre = method
-            .contract
-            .precondition
-            .as_ref()
-            .expect("method precondition missing");
-
-        match &pre.kind {
-            silver::HeapExpKind::Conjunction(parts) => {
-                assert_eq!(parts.len(), 2);
-                for part in parts {
-                    assert!(matches!(part.kind, silver::HeapExpKind::Acc(_)));
+            silver::AssignRhs::Exp(exp) => {
+                let v = self.translate_exp(exp);
+                if let [silver::AssignLhs::Ident(idn)] = lhs {
+                    self.env.insert(idn.0.clone(), v);
                 }
             }
-            _ => panic!("expected precondition to desugar into heap conjunction"),
+            silver::AssignRhs::Call(callee, args) => {
+                let callee_id = self.translator.interner.get(callee.0.as_str()).unwrap();
+                let arg_vals = args
+                    .iter()
+                    .map(|a| self.translate_exp(a))
+                    .collect::<Vec<_>>();
+                let mut lhs_vals = Vec::new();
+                for (lhs_item, ret_ty) in lhs
+                    .iter()
+                    .zip(self.translator.signatures.method_sig(callee_id).ret.iter())
+                {
+                    if let silver::AssignLhs::Ident(idn) = lhs_item {
+                        let v = self.emit_fresh(ret_ty.clone());
+                        self.env.insert(idn.0.clone(), v.clone());
+                        lhs_vals.push(v);
+                    }
+                }
+
+                if let Some(req_id) = self
+                    .translator
+                    .method_contract_resource_id(callee_id, "requires")
+                {
+                    self.apply_resource(req_id, arg_vals.clone(), ContractMode::SubAssert);
+                }
+
+                if let Some(ens_id) = self
+                    .translator
+                    .method_contract_resource_id(callee_id, "ensures")
+                {
+                    let mut ens_args = arg_vals;
+                    ens_args.extend(lhs_vals);
+                    self.apply_resource(ens_id, ens_args, ContractMode::AddAssume);
+                }
+            }
+            silver::AssignRhs::New(_) => {}
+        }
+    }
+
+    fn translate_exp(&mut self, exp: &silver::Exp) -> Val {
+        match exp.as_ref() {
+            silver::ExpKind::Const(c) => match c {
+                silver::ConstKind::Bool(b) => Val::Literal(vmir::Literal::Bool(*b)),
+                silver::ConstKind::Int(i) => Val::Literal(vmir::Literal::Int(i.clone())),
+                silver::ConstKind::Real(r) => Val::Literal(vmir::Literal::Real(r.clone())),
+                silver::ConstKind::Null => Val::Literal(vmir::Literal::Null),
+                _ => unimplemented!(),
+            },
+            silver::ExpKind::Ident(idn) => self.env.get(&idn.0).cloned().unwrap(),
+            silver::ExpKind::BinOp(silver::BinOp::Plus, l, r) => {
+                let lv = self.translate_exp(l);
+                let rv = self.translate_exp(r);
+                self.emit_pure(Type::Int, PureInst::Binary(vmir::BinOp::Plus, lv, rv))
+            }
+            _ => unimplemented!("unsupported method expression: {exp:?}"),
+        }
+    }
+
+    fn apply_resource(&mut self, resource_id: MemberId, args: Vec<Val>, mode: ContractMode) {
+        let Declaration::Resource(resource) = self.translator.decls[resource_id]
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "resource not translated: {}",
+                    self.translator.interner.resolve(&resource_id)
+                )
+            })
+        else {
+            panic!("expected resource declaration");
+        };
+        let (delta, cond) = self.materialize_resource(resource, &args);
+        self.current_heap = match mode {
+            ContractMode::AddAssume => {
+                self.emit_heap(HeapInst::Add(self.current_heap.clone(), delta))
+            }
+            ContractMode::SubAssert => {
+                self.emit_heap(HeapInst::Sub(self.current_heap.clone(), delta))
+            }
+        };
+        match mode {
+            ContractMode::AddAssume => self.insts.push(Inst::Assume(cond)),
+            ContractMode::SubAssert => self.insts.push(Inst::Assert(cond)),
+        }
+    }
+
+    fn materialize_resource(&mut self, resource: &Resource, args: &[Val]) -> (HeapVal, Val) {
+        let param_count = resource.params.len();
+        let mut val_map: HashMap<usize, Val> = HashMap::new();
+        let mut heap_map: HashMap<usize, HeapVal> = HashMap::new();
+        for (idx, arg) in args.iter().enumerate() {
+            val_map.insert(idx, arg.clone());
+        }
+
+        for (inst_idx, inst) in resource.insts.iter().enumerate() {
+            let old_idx = param_count + inst_idx;
+            match inst {
+                Inst::Pure(ty, pure) => {
+                    let pure = substitute_pure(pure, &val_map, &heap_map);
+                    let out = self.emit_pure(ty.clone(), pure);
+                    val_map.insert(old_idx, out);
+                }
+                Inst::Heap(heap_inst) => {
+                    let heap_inst = substitute_heap_inst(heap_inst, &val_map, &heap_map);
+                    let out = self.emit_heap(heap_inst);
+                    heap_map.insert(old_idx, out);
+                }
+                Inst::Assume(v) => self.insts.push(Inst::Assume(substitute_val(v, &val_map))),
+                Inst::Assert(v) => self.insts.push(Inst::Assert(substitute_val(v, &val_map))),
+                Inst::ResourceCall(call) => self.insts.push(Inst::ResourceCall(call.clone())),
+            }
+        }
+
+        (
+            substitute_heap(&resource.res.0, &heap_map),
+            substitute_val(&resource.res.1, &val_map),
+        )
+    }
+}
+
+fn substitute_val(v: &Val, vals: &HashMap<usize, Val>) -> Val {
+    match v {
+        Val::Literal(l) => Val::Literal(l.clone()),
+        Val::Temp(i) => vals.get(i).cloned().unwrap_or_else(|| Val::Temp(*i)),
+    }
+}
+
+fn substitute_heap(h: &HeapVal, heaps: &HashMap<usize, HeapVal>) -> HeapVal {
+    match h {
+        HeapVal::Temp(i) => heaps.get(i).cloned().unwrap_or_else(|| HeapVal::Temp(*i)),
+        HeapVal::Empty => HeapVal::Empty,
+        HeapVal::Implicit => HeapVal::Implicit,
+    }
+}
+
+fn substitute_pure(
+    pure: &PureInst,
+    vals: &HashMap<usize, Val>,
+    heaps: &HashMap<usize, HeapVal>,
+) -> PureInst {
+    match pure {
+        PureInst::Fresh => PureInst::Fresh,
+        PureInst::Unary(op, v) => PureInst::Unary(*op, substitute_val(v, vals)),
+        PureInst::Binary(op, l, r) => {
+            PureInst::Binary(*op, substitute_val(l, vals), substitute_val(r, vals))
+        }
+        PureInst::Ternary(c, t, e) => PureInst::Ternary(
+            substitute_val(c, vals),
+            substitute_val(t, vals),
+            substitute_val(e, vals),
+        ),
+        PureInst::Deref(h, loc) => {
+            PureInst::Deref(substitute_heap(h, heaps), substitute_val(loc, vals))
+        }
+        PureInst::Perm(h, loc) => {
+            PureInst::Perm(substitute_heap(h, heaps), substitute_val(loc, vals))
+        }
+        PureInst::FunctionCall(call) => PureInst::FunctionCall(vmir::FunctionCall {
+            func_id: call.func_id,
+            heap_ctx: substitute_heap(&call.heap_ctx, heaps),
+            args: call.args.iter().map(|v| substitute_val(v, vals)).collect(),
+        }),
+        PureInst::HeapSubset(lhs, rhs) => {
+            PureInst::HeapSubset(substitute_heap(lhs, heaps), substitute_heap(rhs, heaps))
+        }
+    }
+}
+
+fn substitute_heap_inst(
+    heap: &HeapInst,
+    vals: &HashMap<usize, Val>,
+    heaps: &HashMap<usize, HeapVal>,
+) -> HeapInst {
+    match heap {
+        HeapInst::Acc(acc) => HeapInst::Acc(vmir::Acc {
+            loc: substitute_val(&acc.loc, vals),
+            perm: substitute_val(&acc.perm, vals),
+        }),
+        HeapInst::Add(l, r) => HeapInst::Add(substitute_heap(l, heaps), substitute_heap(r, heaps)),
+        HeapInst::Sub(l, r) => HeapInst::Sub(substitute_heap(l, heaps), substitute_heap(r, heaps)),
+        HeapInst::Ternary(c, l, r) => HeapInst::Ternary(
+            substitute_val(c, vals),
+            substitute_heap(l, heaps),
+            substitute_heap(r, heaps),
+        ),
+        HeapInst::Assign(h, v) => {
+            HeapInst::Assign(substitute_heap(h, heaps), substitute_val(v, vals))
         }
     }
 }

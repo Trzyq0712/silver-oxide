@@ -1,30 +1,17 @@
 use egg::*;
 use num::{BigInt, BigRational};
+use std::fmt::{Display, Formatter};
 
 use crate::vmir::MemberId;
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum BinOp {
-    Plus,
-    Minus,
-    Mult,
-    Div,
-    Eq,
-    Lt,
-}
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum UnOp {
-    Neg,
-    Not,
-}
+use crate::vmir::{BinOp, UnOp};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum Symbolic {
+pub enum Symbolic {
     Fresh(egg::Symbol),
+    Null,
+    Bool(bool),
     Int(BigInt),
     Real(BigRational),
-    Bool(bool),
     Unary(UnOp, Id),
     Binary(BinOp, [Id; 2]),
     Ternary([Id; 3]),
@@ -32,8 +19,9 @@ enum Symbolic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Discriminant {
+pub enum Discriminant {
     Fresh(egg::Symbol),
+    Null,
     Int(BigInt),
     Real(BigRational),
     Bool(bool),
@@ -51,9 +39,10 @@ impl Language for Symbolic {
         use Symbolic as S;
         match self {
             S::Fresh(s) => D::Fresh(*s),
+            S::Null => D::Null,
+            S::Bool(b) => D::Bool(*b),
             S::Int(i) => D::Int(i.clone()),
             S::Real(r) => D::Real(r.clone()),
-            S::Bool(b) => D::Bool(*b),
             S::Unary(op, _) => D::Unary(*op),
             S::Binary(op, _) => D::Binary(*op),
             S::Ternary(_) => D::Ternary,
@@ -64,6 +53,7 @@ impl Language for Symbolic {
     fn matches(&self, other: &Self) -> bool {
         use Symbolic::*;
         match (self, other) {
+            (Null, Null) => true,
             (Fresh(s1), Fresh(s2)) => s1 == s2,
             (Int(i1), Int(i2)) => i1 == i2,
             (Real(r1), Real(r2)) => r1 == r2,
@@ -79,7 +69,7 @@ impl Language for Symbolic {
     fn children(&self) -> &[Id] {
         use Symbolic::*;
         match self {
-            Fresh(_) | Int(_) | Real(_) | Bool(_) => &[],
+            Fresh(_) | Null | Bool(_) | Int(_) | Real(_) => &[],
             Unary(_, id) => std::slice::from_ref(id),
             Binary(_, ids) => ids,
             Ternary(ids) => ids,
@@ -90,11 +80,38 @@ impl Language for Symbolic {
     fn children_mut(&mut self) -> &mut [Id] {
         use Symbolic::*;
         match self {
-            Fresh(_) | Int(_) | Real(_) | Bool(_) => &mut [],
+            Fresh(_) | Null | Bool(_) | Int(_) | Real(_) => &mut [],
             Unary(_, id) => std::slice::from_mut(id),
             Binary(_, ids) => ids,
             Ternary(ids) => ids,
             FuncApp(_, ids) => ids,
+        }
+    }
+}
+
+impl Display for Symbolic {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Symbolic::Fresh(sym) => write!(f, "{sym}"),
+            Symbolic::Null => write!(f, "null"),
+            Symbolic::Int(i) => write!(f, "{i}"),
+            Symbolic::Real(r) => write!(f, "{r}"),
+            Symbolic::Bool(b) => write!(f, "{b}"),
+            Symbolic::Unary(op, arg) => write!(f, "{op}{arg:?}"),
+            Symbolic::Binary(op, [lhs, rhs]) => write!(f, "({lhs:?} {op} {rhs:?})"),
+            Symbolic::Ternary([cond, then_, else_]) => {
+                write!(f, "({cond:?} ? {then_:?} : {else_:?})")
+            }
+            Symbolic::FuncApp(id, args) => {
+                write!(f, "f{}(", id.0)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg:?}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }

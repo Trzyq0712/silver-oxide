@@ -10,8 +10,6 @@ pub enum Type {
 
     Domain(MemberId),
     Addr(Box<Type>),
-
-    Heap,
 }
 
 impl Display for Type {
@@ -23,7 +21,6 @@ impl Display for Type {
             Type::Ref => write!(f, "Ref"),
             Type::Domain(id) => write!(f, "d{}", id.0),
             Type::Addr(ty) => write!(f, "&{ty}"),
-            Type::Heap => write!(f, "Heap"),
         }
     }
 }
