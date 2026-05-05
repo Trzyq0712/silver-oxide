@@ -2,7 +2,7 @@ use rusttyc::{TcErr, TcKey};
 
 use crate::{
     silver,
-    translate::{typecheck::TcType, VmirTc, VmirTranslator},
+    translate::{typecheck::TcType, VmirTc},
     vmir,
 };
 
@@ -23,7 +23,7 @@ pub trait PureExpBackend {
     fn tc_mut(&mut self) -> &mut VmirTc;
 
     /// Resolve the name of a global identifier.
-    fn resolve_name(&self, ident: &silver::Ident) -> Result<vmir::MemberId, ()>;
+    fn resolve_global(&self, ident: &silver::Ident) -> Result<vmir::MemberId, ()>;
 }
 
 pub struct PureExpTranslator<'a, B: PureExpBackend> {
@@ -190,7 +190,7 @@ impl<'a, B: PureExpBackend> PureExpTranslator<'a, B> {
         func_name: &silver::Ident,
         args: &[silver::Exp],
     ) -> Result<vmir::Val, TcErr<TcType>> {
-        let func_id = self.backend.resolve_name(func_name).unwrap();
+        let func_id = self.backend.resolve_global(func_name).unwrap();
 
         let args = args
             .iter()
@@ -322,7 +322,9 @@ impl<'a, B: PureExpBackend> PureExpTranslator<'a, B> {
                     .impose(v_key.concretizes_explicit(TcType::Bool))?;
             }
             silver::BinOp::Eq | silver::BinOp::Neq => {
-                self.backend.tc_mut().impose(l_key.equate_with(r_key))?;
+                if l_key != r_key {
+                    self.backend.tc_mut().impose(l_key.equate_with(r_key))?;
+                }
                 self.backend
                     .tc_mut()
                     .impose(v_key.concretizes_explicit(TcType::Bool))?;

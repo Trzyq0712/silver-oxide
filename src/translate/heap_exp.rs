@@ -111,7 +111,7 @@ impl<'a, B: HeapExpBackend> HeapExpTranslator<'a, B> {
         exp: &silver::HeapExpKind,
     ) -> (vmir::HeapVal, Option<vmir::Val>) {
         let (new_heap, val) = match exp {
-            silver::HeapExpKind::Pure(exp) => (input_heap, Some(self.translate_pure(exp))),
+            silver::HeapExpKind::Pure(exp) => self.translate_pure_heap(input_heap, exp.as_ref()),
             silver::HeapExpKind::Acc(acc) => self.translate_acc(input_heap, acc),
             silver::HeapExpKind::Conjunction(parts) => self.translate_conj(input_heap, parts),
             silver::HeapExpKind::Ternary(..) => unimplemented!("Need to support path conditions"),
@@ -121,5 +121,43 @@ impl<'a, B: HeapExpBackend> HeapExpTranslator<'a, B> {
             self.heap_ctx = new_heap;
         }
         (new_heap, val)
+    }
+
+    fn translate_pure_heap(
+        &mut self,
+        input_heap: vmir::HeapVal,
+        exp: &silver::ExpKind,
+    ) -> (vmir::HeapVal, Option<vmir::Val>) {
+        match exp {
+            silver::ExpKind::BinOp(silver::BinOp::And, left, right) => {
+                let (heap_l, cond_l) = self.translate_pure_heap(input_heap, left.as_ref());
+                let (heap_r, cond_r) = self.translate_pure_heap(heap_l, right.as_ref());
+                let cond = match (cond_l, cond_r) {
+                    (Some(l), Some(r)) => Some(self.backend.emit_pure(vmir::PureInst::Ternary(
+                        l,
+                        r,
+                        vmir::FALSE,
+                    ))),
+                    (Some(c), None) | (None, Some(c)) => Some(c),
+                    (None, None) => None,
+                };
+                (heap_r, cond)
+            }
+            silver::ExpKind::FuncApp(..) => {
+                let loc = self.translate_pure(&Box::new(exp.clone()));
+                let acc = self.backend.emit_heap(vmir::HeapInst::Acc(vmir::Acc {
+                    loc,
+                    perm: vmir::write(),
+                }));
+                (
+                    self.backend.emit_heap(vmir::HeapInst::Add(input_heap, acc)),
+                    None,
+                )
+            }
+            _ => (
+                input_heap,
+                Some(self.translate_pure(&Box::new(exp.clone()))),
+            ),
+        }
     }
 }

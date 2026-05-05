@@ -1,3 +1,4 @@
+use crate::translate::global_resolver::GlobalResolver;
 use crate::translate::{name_resolution::DeclKind, resource::MethodContractResources};
 use crate::vmir::{
     self, Declaration, HeapInst, HeapVal, Inst, MemberId, PureInst, Resource, Type, Val,
@@ -5,6 +6,9 @@ use crate::vmir::{
 use crate::{silver, HashMap};
 use lasso::{Key, Rodeo};
 use typed_index_collections::{ti_vec, TiVec};
+
+pub mod global_resolver;
+pub mod signature_resolver;
 
 pub mod heap_exp;
 pub mod inst;
@@ -16,45 +20,53 @@ pub mod typecheck;
 pub use typecheck::VmirTc;
 
 pub use name_resolution::{IdentifierError, NameCollector};
-pub use signatures::SignatureContext;
 
 #[derive(Debug, Clone)]
 pub struct VmirSymbols {
-    pub interner: Rodeo<vmir::MemberId>,
+    pub silver_interner: Rodeo<vmir::MemberId>,
+    pub vmir_interner: Rodeo<vmir::MemberId>,
     pub name_kinds: TiVec<vmir::MemberId, DeclKind>,
-    pub signatures: SignatureContext,
+    pub resolver: GlobalResolver,
 }
 
 #[derive(Debug)]
 pub struct VmirTranslator {
     decls: TiVec<vmir::MemberId, Option<vmir::Declaration>>,
-    interner: Rodeo<vmir::MemberId>,
+    silver_interner: Rodeo<vmir::MemberId>,
+    vmir_interner: Rodeo<vmir::MemberId>,
     name_kinds: TiVec<vmir::MemberId, DeclKind>,
-    signatures: SignatureContext,
+    pub(crate) resolver: GlobalResolver,
 }
 
 impl VmirTranslator {
     pub fn new(symbols: VmirSymbols) -> Self {
-        let count = symbols.interner.len();
+        let count = symbols.vmir_interner.len();
         Self {
             decls: ti_vec![None; count],
-            interner: symbols.interner,
+            silver_interner: symbols.silver_interner,
+            vmir_interner: symbols.vmir_interner,
             name_kinds: symbols.name_kinds,
-            signatures: symbols.signatures,
+            resolver: symbols.resolver,
         }
     }
 
     pub fn translate(program: &silver::Program) -> Result<vmir::Program, Vec<IdentifierError>> {
         let collector = NameCollector::new();
-        let (interner, name_kinds) = collector.collect(program)?;
-        let signatures = SignatureContext::collect(program, &interner);
+        let (silver_interner, mut name_kinds) = collector.collect(program)?;
+        let mut vmir_interner = silver_interner.clone();
+        let resolver = GlobalResolver::collect(
+            program,
+            silver_interner.clone(),
+            &mut vmir_interner,
+            &mut name_kinds,
+        );
         let symbols = VmirSymbols {
-            interner,
+            silver_interner,
+            vmir_interner,
             name_kinds,
-            signatures,
+            resolver,
         };
         let mut translator = Self::new(symbols);
-        translator.intern_method_contract_resources(program);
         translator.translate_program(program);
 
         let decls = translator
@@ -72,7 +84,7 @@ impl VmirTranslator {
             .collect();
         Ok(vmir::Program {
             decls,
-            interner: translator.interner,
+            interner: translator.vmir_interner,
         })
     }
 
@@ -84,38 +96,14 @@ impl VmirTranslator {
                 silver::Declaration::Method(method) => self.translate_method(method),
                 silver::Declaration::Function(function) => self.translate_function(function),
                 silver::Declaration::Domain(domain) => {
-                    let id = self.interner.get(domain.name.0 .0.as_str()).unwrap();
+                    let id = self.silver_interner.get(domain.name.0 .0.as_str()).unwrap();
                     self.add_decl(id, Declaration::Domain(vmir::Domain {}));
                 }
                 silver::Declaration::Adt(adt) => {
-                    let id = self.interner.get(adt.name.0 .0.as_str()).unwrap();
+                    let id = self.silver_interner.get(adt.name.0 .0.as_str()).unwrap();
                     self.add_decl(id, Declaration::Adt(vmir::Adt {}));
                 }
                 _ => {}
-            }
-        }
-    }
-
-    fn intern_method_contract_resources(&mut self, program: &silver::Program) {
-        for decl in &program.0 {
-            let silver::Declaration::Method(method) = decl else {
-                continue;
-            };
-            let method_name = method.signature.name.0 .0.as_str();
-            let mut suffixes = Vec::new();
-            if method.contract.precondition.is_some() {
-                suffixes.push("requires");
-            }
-            if method.contract.postcondition.is_some() {
-                suffixes.push("ensures");
-            }
-            for suffix in suffixes {
-                let name = format!("{method_name}@{suffix}");
-                let id = self.interner.get_or_intern(name);
-                if id.into_usize() >= self.decls.len() {
-                    self.decls.push(None);
-                    self.name_kinds.push(DeclKind::ContractCallable);
-                }
             }
         }
     }
@@ -130,16 +118,6 @@ impl VmirTranslator {
         self.decls[id] = Some(decl);
     }
 
-    fn method_contract_resource_id(&self, method_id: MemberId, suffix: &str) -> Option<MemberId> {
-        let method_name = self.interner.resolve(&method_id);
-        let name = format!("{method_name}@{suffix}");
-        let id = self.interner.get(name.as_str())?;
-        match self.decls.get(id).and_then(|d| d.as_ref()) {
-            Some(Declaration::Resource(_)) => Some(id),
-            _ => None,
-        }
-    }
-
     pub(crate) fn translate_type(&self, ty: &silver::Type) -> Type {
         match ty {
             silver::Type::Bool => Type::Bool,
@@ -147,7 +125,7 @@ impl VmirTranslator {
             silver::Type::Real => Type::Real,
             silver::Type::Ref => Type::Ref,
             silver::Type::Domain(idn, _) => Type::Domain(
-                self.interner
+                self.silver_interner
                     .get(idn.0.as_str())
                     .unwrap_or_else(|| panic!("domain type not interned: {}", idn.0)),
             ),
@@ -156,7 +134,7 @@ impl VmirTranslator {
 
     fn translate_field(&mut self, field: &silver::Field) {
         let silver::Field(decl) = field;
-        let id = self.interner.get(decl.idn.0 .0.as_str()).unwrap();
+        let id = self.silver_interner.get(decl.idn.0 .0.as_str()).unwrap();
         let ret = self.translate_type(&decl.ty);
         self.add_decl(
             id,
@@ -169,16 +147,9 @@ impl VmirTranslator {
 
     fn translate_predicate(&mut self, pred: &silver::Predicate) {
         let pred_name = pred.signature.name.0 .0.as_str();
-        let pred_id = self.interner.get(pred_name).unwrap();
+        let pred_id = self.silver_interner.get(pred_name).unwrap();
         let snap_name = format!("{pred_name}@snap");
-        let snap_id = self.interner.get(snap_name.as_str()).unwrap_or_else(|| {
-            let id = self.interner.get_or_intern(snap_name);
-            if id.into_usize() >= self.decls.len() {
-                self.decls.push(None);
-                self.name_kinds.push(DeclKind::Domain);
-            }
-            id
-        });
+        let snap_id = self.silver_interner.get(snap_name.as_str()).unwrap();
         self.add_decl(snap_id, Declaration::Domain(vmir::Domain {}));
 
         let params = pred
@@ -198,7 +169,7 @@ impl VmirTranslator {
 
     fn translate_function(&mut self, function: &silver::Function) {
         let id = self
-            .interner
+            .silver_interner
             .get(function.signature.name.0 .0.as_str())
             .unwrap();
         let params = function
@@ -218,9 +189,9 @@ impl VmirTranslator {
 
     fn translate_method(&mut self, method: &silver::Method) {
         let method_name = method.signature.name.0 .0.as_str();
-        let method_id = self.interner.get(method_name).unwrap();
+        let method_id = self.silver_interner.get(method_name).unwrap();
         let MethodContractResources { requires, ensures } =
-            resource::translate_method_contracts(self, method_name, method);
+            resource::translate_method_contracts(self, method_id, method);
         let mut requires_id = None;
         if let Some((id, requires_res)) = requires {
             self.add_decl(id, Declaration::Resource(requires_res));
@@ -364,16 +335,25 @@ impl<'a> MethodBuilder<'a> {
                 }
             }
             silver::AssignRhs::Call(callee, args) => {
-                let callee_id = self.translator.interner.get(callee.0.as_str()).unwrap();
+                let callee_id = self
+                    .translator
+                    .silver_interner
+                    .get(callee.0.as_str())
+                    .unwrap();
                 let arg_vals = args
                     .iter()
                     .map(|a| self.translate_exp(a))
                     .collect::<Vec<_>>();
+                let method_sig = self
+                    .translator
+                    .resolver
+                    .resolve_method_id(callee_id)
+                    .unwrap();
+                let ret_tys = method_sig.ret.clone();
+                let req_id = method_sig.precond;
+                let ens_id = method_sig.postcond;
                 let mut lhs_vals = Vec::new();
-                for (lhs_item, ret_ty) in lhs
-                    .iter()
-                    .zip(self.translator.signatures.method_sig(callee_id).ret.iter())
-                {
+                for (lhs_item, ret_ty) in lhs.iter().zip(ret_tys.iter()) {
                     if let silver::AssignLhs::Ident(idn) = lhs_item {
                         let v = self.emit_fresh(ret_ty.clone());
                         self.env.insert(idn.0.clone(), v.clone());
@@ -381,17 +361,11 @@ impl<'a> MethodBuilder<'a> {
                     }
                 }
 
-                if let Some(req_id) = self
-                    .translator
-                    .method_contract_resource_id(callee_id, "requires")
-                {
+                if let Some(req_id) = req_id {
                     self.apply_resource(req_id, arg_vals.clone(), ContractMode::SubAssert);
                 }
 
-                if let Some(ens_id) = self
-                    .translator
-                    .method_contract_resource_id(callee_id, "ensures")
-                {
+                if let Some(ens_id) = ens_id {
                     let mut ens_args = arg_vals;
                     ens_args.extend(lhs_vals);
                     self.apply_resource(ens_id, ens_args, ContractMode::AddAssume);
@@ -426,7 +400,7 @@ impl<'a> MethodBuilder<'a> {
             .unwrap_or_else(|| {
                 panic!(
                     "resource not translated: {}",
-                    self.translator.interner.resolve(&resource_id)
+                    self.translator.vmir_interner.resolve(&resource_id)
                 )
             })
         else {
