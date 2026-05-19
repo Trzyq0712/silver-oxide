@@ -117,7 +117,19 @@ pub struct Block<T>(pub T);
 pub type ExpBlock = Block<Exp>;
 pub type StmtBlock = Block<Vec<Statement>>;
 
-pub type Exp = Box<ExpKind>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InferenceType {
+    Unknown,
+    Infer(rusttyc::TcKey),
+    Computed(Type),
+    Impure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Exp {
+    pub ty: InferenceType,
+    pub kind: Box<ExpKind>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExpKind {

@@ -10,6 +10,21 @@ pub enum BuiltinType {
     Map,
 }
 
+impl Exp {
+    pub fn unknown(exp: ExpKind) -> Self {
+        Self {
+            ty: InferenceType::Unknown,
+            kind: Box::new(exp),
+        }
+    }
+    pub fn impure(exp: ExpKind) -> Self {
+        Self {
+            ty: InferenceType::Impure,
+            kind: Box::new(exp),
+        }
+    }
+}
+
 impl Ident {
     // pub fn set() -> Self {
     //     Self("Set".to_string())

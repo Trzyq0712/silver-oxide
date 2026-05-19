@@ -83,7 +83,7 @@ peg::parser! {
 
         rule acc_exp() -> AccExp
             = "acc" _ "(" _ loc:suffix_exp() _ perm:("," _ e:exp() { e })? _ ")" {
-                AccExp { loc: Box::new(loc), perm: perm.unwrap_or_else(ExpKind::write) }
+                AccExp { loc: Exp::impure(loc), perm: perm.unwrap_or_else(ExpKind::write) }
             }
 
         rule trigger() -> Trigger = "{" _ es:(exp() ** comma()) _ "}" { Trigger { exp: es } }
@@ -125,7 +125,7 @@ peg::parser! {
             / kw(<"null">) { ExpKind::Const(ConstKind::Null) }
             / kw(<"result">) { ExpKind::Result }
             / "(" _ e:exp_kind() _ ty:(":" _ ty:type_() { ty })? _ ")" { match ty {
-                Some(ty) => ExpKind::Ascribe(Box::new(e), ty),
+                Some(ty) => ExpKind::Ascribe(Exp::unknown(e), ty),
                 None => e
                 }
             }
@@ -159,58 +159,58 @@ peg::parser! {
 
 
         rule full_exp() -> ExpKind = precedence! {
-            x:@ z:(_ "?" _ z:exp() _ ":" _ {z}) y:(@) { ExpKind::Ternary(Box::new(x), z, Box::new(y)) }
+            x:@ z:(_ "?" _ z:exp() _ ":" _ {z}) y:(@) { ExpKind::Ternary(Exp::unknown(x), z, Exp::unknown(y)) }
             --
-            x:@ (_ "<==>" _) y:(@) { ExpKind::BinOp(BinOp::Iff, Box::new(x), Box::new(y)) }
+            x:@ (_ "<==>" _) y:(@) { ExpKind::BinOp(BinOp::Iff, Exp::unknown(x), Exp::unknown(y)) }
             --
-            x:@ (_ "==>" _) y:(@) { ExpKind::BinOp(BinOp::Implies, Box::new(x), Box::new(y)) }
+            x:@ (_ "==>" _) y:(@) { ExpKind::BinOp(BinOp::Implies, Exp::unknown(x), Exp::unknown(y)) }
             --
-            x:@ (_ "--*" _) y:(@) { ExpKind::MagicWand(Box::new(x), Box::new(y)) }
+            x:@ (_ "--*" _) y:(@) { ExpKind::MagicWand(Exp::unknown(x), Exp::unknown(y)) }
             --
-            x:@ (_ "||" _) y:(@) { ExpKind::BinOp(BinOp::Or, Box::new(x), Box::new(y)) }
+            x:@ (_ "||" _) y:(@) { ExpKind::BinOp(BinOp::Or, Exp::unknown(x), Exp::unknown(y)) }
             --
-            x:@ (_ "&&" _) y:(@) { ExpKind::BinOp(BinOp::And, Box::new(x), Box::new(y)) }
+            x:@ (_ "&&" _) y:(@) { ExpKind::BinOp(BinOp::And, Exp::unknown(x), Exp::unknown(y)) }
             --
-            x:@ (_ "!=" _) y:(@) { ExpKind::BinOp(BinOp::Neq, Box::new(x), Box::new(y)) }
-            x:@ (_ "==" _) y:(@) { ExpKind::BinOp(BinOp::Eq, Box::new(x), Box::new(y)) }
+            x:@ (_ "!=" _) y:(@) { ExpKind::BinOp(BinOp::Neq, Exp::unknown(x), Exp::unknown(y)) }
+            x:@ (_ "==" _) y:(@) { ExpKind::BinOp(BinOp::Eq, Exp::unknown(x), Exp::unknown(y)) }
             --
-            x:@ (_ "<=" _) y:(@) { ExpKind::BinOp(BinOp::Le, Box::new(x), Box::new(y)) }
-            x:@ (_ ">=" _) y:(@) { ExpKind::BinOp(BinOp::Ge, Box::new(x), Box::new(y)) }
-            x:@ (_ ">" _) y:(@) {  ExpKind::BinOp(BinOp::Gt, Box::new(x), Box::new(y)) }
-            x:@ (_ "<" _) y:(@) { ExpKind::BinOp(BinOp::Lt, Box::new(x), Box::new(y)) }
-            x:@ (_ "in" &(white_space() / "(") _) y:(@) { ExpKind::BinOp(BinOp::In, Box::new(x), Box::new(y))}
+            x:@ (_ "<=" _) y:(@) { ExpKind::BinOp(BinOp::Le, Exp::unknown(x), Exp::unknown(y)) }
+            x:@ (_ ">=" _) y:(@) { ExpKind::BinOp(BinOp::Ge, Exp::unknown(x), Exp::unknown(y)) }
+            x:@ (_ ">" _) y:(@) {  ExpKind::BinOp(BinOp::Gt, Exp::unknown(x), Exp::unknown(y)) }
+            x:@ (_ "<" _) y:(@) { ExpKind::BinOp(BinOp::Lt, Exp::unknown(x), Exp::unknown(y)) }
+            x:@ (_ "in" &(white_space() / "(") _) y:(@) { ExpKind::BinOp(BinOp::In, Exp::unknown(x), Exp::unknown(y))}
             --
-            x:(@) (_ "-" _) y:@ { ExpKind::BinOp(BinOp::Minus, Box::new(x), Box::new(y)) }
-            x:(@) (_ "+" _) y:@ { ExpKind::BinOp(BinOp::Plus, Box::new(x), Box::new(y)) }
-            x:(@) (_ "++" _) y:@ { ExpKind::BinOp(BinOp::Concat, Box::new(x), Box::new(y)) }
-            x:(@) (_ "union" white_space() _) y:@ { ExpKind::BinOp(BinOp::Union, Box::new(x), Box::new(y)) }
-            x:(@) (_ "setminus" white_space() _) y:@ { ExpKind::BinOp(BinOp::SetMinus, Box::new(x), Box::new(y))}
-            x:(@) (_ "intersection" white_space() _) y:@ { ExpKind::BinOp(BinOp::Intersection, Box::new(x), Box::new(y))}
-            x:(@) (_ "subset" white_space() _) y:@ { ExpKind::BinOp(BinOp::Subset, Box::new(x), Box::new(y))}
+            x:(@) (_ "-" _) y:@ { ExpKind::BinOp(BinOp::Minus, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "+" _) y:@ { ExpKind::BinOp(BinOp::Plus, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "++" _) y:@ { ExpKind::BinOp(BinOp::Concat, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "union" white_space() _) y:@ { ExpKind::BinOp(BinOp::Union, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "setminus" white_space() _) y:@ { ExpKind::BinOp(BinOp::SetMinus, Exp::unknown(x), Exp::unknown(y))}
+            x:(@) (_ "intersection" white_space() _) y:@ { ExpKind::BinOp(BinOp::Intersection, Exp::unknown(x), Exp::unknown(y))}
+            x:(@) (_ "subset" white_space() _) y:@ { ExpKind::BinOp(BinOp::Subset, Exp::unknown(x), Exp::unknown(y))}
             --
-            x:(@) (_ "*" _) y:@ { ExpKind::BinOp(BinOp::Mult, Box::new(x), Box::new(y)) }
-            x:(@) (_ "/" _) y:@ { ExpKind::BinOp(BinOp::Div, Box::new(x), Box::new(y)) }
-            x:(@) (_ "%" _) y:@ { ExpKind::BinOp(BinOp::Mod, Box::new(x), Box::new(y)) }
-            "-" _ x:@ { ExpKind::UnOp(UnOp::Neg, Box::new(x)) }
-            "!" _ x:@ { ExpKind::UnOp(UnOp::Not, Box::new(x)) }
+            x:(@) (_ "*" _) y:@ { ExpKind::BinOp(BinOp::Mult, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "/" _) y:@ { ExpKind::BinOp(BinOp::Div, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "%" _) y:@ { ExpKind::BinOp(BinOp::Mod, Exp::unknown(x), Exp::unknown(y)) }
+            "-" _ x:@ { ExpKind::UnOp(UnOp::Neg, Exp::unknown(x)) }
+            "!" _ x:@ { ExpKind::UnOp(UnOp::Not, Exp::unknown(x)) }
             --
-            x:@ i:(_ "." i:ident() {i}) { ExpKind::Field(Box::new(x), i) }
-            x:@ _ "[" _ s:seq_op() _ "]" _  { ExpKind::Index(Box::new(x), s) }
+            x:@ i:(_ "." i:ident() {i}) { ExpKind::Field(Exp::unknown(x), i) }
+            x:@ _ "[" _ s:seq_op() _ "]" _  { ExpKind::Index(Exp::unknown(x), s) }
             --
             a:atom() {a}
         }
 
         rule exp_kind() -> ExpKind = annotated(<full_exp()>)
 
-        pub(super) rule exp() -> Exp = e:exp_kind() { Box::new(e) }
+        pub(super) rule exp() -> Exp = e:exp_kind() { Exp::unknown(e) }
 
         rule suffix_exp() -> ExpKind = a:atom() _ suff:(("." id:ident() { Ok(id) } / "[" _ e:exp() _ "]" { Err(e) }) ** _)
             {
                 let mut res = a;
                 for s in suff {
                     match s {
-                        Ok(id) => res = ExpKind::Field(Box::new(res), id),
-                        Err(e) => res = ExpKind::Index(Box::new(res), IndexOp::Index(e))
+                        Ok(id) => res = ExpKind::Field(Exp::unknown(res), id),
+                        Err(e) => res = ExpKind::Index(Exp::unknown(res), IndexOp::Index(e))
                     }
                 }
                 res
@@ -297,7 +297,7 @@ peg::parser! {
         rule assign_rhs() -> AssignRhs =
               "new" _ "(" _ "*" _ ")" { AssignRhs::New(StarOrNames::Star) }
             / "new" _ "(" _ args:(ident() ** comma()) _ ")" { AssignRhs::New(StarOrNames::Names(args))}
-            / e:exp() { match *e {
+            / e:exp() { match *e.kind {
                 ExpKind::Call(Call { name, args, .. }) => AssignRhs::Call(Call { kind: None, name, args }),
                 _ => AssignRhs::Exp(e)
             }}
@@ -434,10 +434,10 @@ fn precedence_test() {
     let exp = silver_parser::exp("!r.b").unwrap();
     assert_eq!(
         exp,
-        Box::new(ExpKind::UnOp(
+        Exp::unknown(ExpKind::UnOp(
             UnOp::Not,
-            Box::new(ExpKind::Field(
-                Box::new(ExpKind::Ident(Ident::Raw("r".to_string()))),
+            Exp::unknown(ExpKind::Field(
+                Exp::unknown(ExpKind::Ident(Ident::Raw("r".to_string()))),
                 Ident::Raw("b".to_string())
             ))
         ))

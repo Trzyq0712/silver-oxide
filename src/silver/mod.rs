@@ -6,6 +6,7 @@ mod interner;
 mod r#macro;
 mod peg;
 mod std;
+mod typecheck;
 mod util;
 
 pub mod walk;

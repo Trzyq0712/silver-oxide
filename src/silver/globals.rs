@@ -109,6 +109,64 @@ impl From<GlobalSignature> for GlobalKind {
     }
 }
 
+impl GlobalSignature {
+    pub fn as_function(&self) -> Option<&FunctionSig> {
+        match self {
+            Self::Function(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn as_method(&self) -> Option<&MethodSig> {
+        match self {
+            Self::Method(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn as_predicate(&self) -> Option<&PredicateSig> {
+        match self {
+            Self::Predicate(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn as_field(&self) -> Option<&Type> {
+        match self {
+            Self::Field(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn as_domain(&self) -> Option<&DomainSig> {
+        match self {
+            Self::Domain(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn as_adt(&self) -> Option<&AdtSig> {
+        match self {
+            Self::Adt(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn as_adt_constructor(&self) -> Option<&AdtConstructorSig> {
+        match self {
+            Self::AdtConstructor(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub fn as_macro(&self) -> Option<&MacroSig> {
+        match self {
+            Self::ExpMacro(sig) | Self::StmtMacro(sig) => Some(sig),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DuplicateGlobalError {
     pub name: String,
@@ -149,82 +207,58 @@ pub struct Globals {
     pub symbol_table: HashMap<Spur, MemberId>,
 }
 
+/// A lightweight view into a successfully resolved global symbol.
+pub struct ResolvedSymbol<'a> {
+    globals: &'a Globals,
+    mid: MemberId,
+}
+
+impl<'a> ResolvedSymbol<'a> {
+    pub fn id(self) -> MemberId {
+        self.mid
+    }
+
+    pub fn signature(self) -> &'a GlobalSignature {
+        &self.globals.signatures[self.mid]
+    }
+
+    pub fn kind(self) -> GlobalKind {
+        self.signature().kind()
+    }
+
+    // These now naturally return Option<&T>
+    // because they delegate to the updated GlobalSignature methods.
+    pub fn as_function(self) -> Option<&'a FunctionSig> {
+        self.signature().as_function()
+    }
+    pub fn as_method(self) -> Option<&'a MethodSig> {
+        self.signature().as_method()
+    }
+    pub fn as_predicate(self) -> Option<&'a PredicateSig> {
+        self.signature().as_predicate()
+    }
+    pub fn as_field(self) -> Option<&'a Type> {
+        self.signature().as_field()
+    }
+    pub fn as_domain(self) -> Option<&'a DomainSig> {
+        self.signature().as_domain()
+    }
+    pub fn as_adt(self) -> Option<&'a AdtSig> {
+        self.signature().as_adt()
+    }
+    pub fn as_adt_constructor(self) -> Option<&'a AdtConstructorSig> {
+        self.signature().as_adt_constructor()
+    }
+    pub fn as_macro(self) -> Option<&'a MacroSig> {
+        self.signature().as_macro()
+    }
+}
+
 impl Globals {
-    pub fn lookup(&self, id: Spur) -> Option<MemberId> {
-        self.symbol_table.get(&id).copied()
-    }
-
-    pub fn signature(&self, id: MemberId) -> &GlobalSignature {
-        &self.signatures[id]
-    }
-
-    pub fn kind(&self, id: MemberId) -> GlobalKind {
-        self.signatures[id].kind()
-    }
-
-    #[cold]
-    #[track_caller]
-    fn type_mismatch(expected: &str) -> ! {
-        panic!(
-            "Compiler Bug: Expected MemberId to resolve to a {} signature",
-            expected
-        );
-    }
-
-    pub fn function_sig(&self, id: MemberId) -> &FunctionSig {
-        let GlobalSignature::Function(sig) = &self.signatures[id] else {
-            Self::type_mismatch("Function")
-        };
-        sig
-    }
-
-    pub fn method_sig(&self, id: MemberId) -> &MethodSig {
-        let GlobalSignature::Method(sig) = &self.signatures[id] else {
-            Self::type_mismatch("Method")
-        };
-        sig
-    }
-
-    pub fn predicate_sig(&self, id: MemberId) -> &PredicateSig {
-        let GlobalSignature::Predicate(sig) = &self.signatures[id] else {
-            Self::type_mismatch("Predicate")
-        };
-        sig
-    }
-
-    pub fn field_sig(&self, id: MemberId) -> &Type {
-        let GlobalSignature::Field(ty) = &self.signatures[id] else {
-            Self::type_mismatch("Field")
-        };
-        ty
-    }
-
-    pub fn domain_sig(&self, id: MemberId) -> &DomainSig {
-        let GlobalSignature::Domain(sig) = &self.signatures[id] else {
-            Self::type_mismatch("Domain")
-        };
-        sig
-    }
-
-    pub fn adt_sig(&self, id: MemberId) -> &AdtSig {
-        let GlobalSignature::Adt(sig) = &self.signatures[id] else {
-            Self::type_mismatch("ADT")
-        };
-        sig
-    }
-
-    pub fn adt_constructor_sig(&self, id: MemberId) -> &AdtConstructorSig {
-        let GlobalSignature::AdtConstructor(sig) = &self.signatures[id] else {
-            Self::type_mismatch("ADT Constructor")
-        };
-        sig
-    }
-
-    pub fn macro_sig(&self, id: MemberId) -> &MacroSig {
-        match &self.signatures[id] {
-            GlobalSignature::ExpMacro(sig) | GlobalSignature::StmtMacro(sig) => sig,
-            _ => Self::type_mismatch("Macro"),
-        }
+    pub fn resolve(&self, id: Spur) -> Option<ResolvedSymbol<'_>> {
+        self.symbol_table
+            .get(&id)
+            .map(|&mid| ResolvedSymbol { globals: self, mid })
     }
 }
 

@@ -25,7 +25,7 @@
 //!    down into an [`AssignRhs::Exp`] so it can be evaluated as a standard mathematical expression.
 
 use crate::silver::{
-    AssignRhs, Call, ExpCallKind, ExpKind, Globals, StmtCallKind,
+    AssignRhs, Call, Exp, ExpCallKind, ExpKind, Globals, StmtCallKind,
     globals::GlobalKind,
     interner::Interner,
     walk::{AstWalkable, AstWalkerMut},
@@ -74,48 +74,71 @@ impl<'i, 'g> CallResolver<'i, 'g> {
 
 impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
     fn walk_mut_assign_rhs(&mut self, rhs: &'_ mut AssignRhs) {
+        // Intercept bare identifiers being used as statement right-hand sides.
+        if let AssignRhs::Exp(exp) = rhs
+            && let ExpKind::Ident(name) = &*exp.kind
+            && Some(GlobalKind::StmtMacro) == self.globals.resolve(name.id()).map(|sym| sym.kind())
+        {
+            *rhs = AssignRhs::Call(crate::silver::Call {
+                kind: None, // Will be correctly tagged below
+                name: name.clone(),
+                args: Vec::new(),
+            });
+        }
+
         if let AssignRhs::Call(call) = rhs {
-            for arg in &mut call.args {
-                arg.walk_mut(self);
-            }
-
             let id = call.name.id();
-
-            let mut demote_to_exp = |exp_kind: ExpCallKind| {
-                AssignRhs::Exp(Box::new(ExpKind::Call(Call {
-                    kind: Some(exp_kind),
-                    name: call.name.clone(),
-                    args: std::mem::take(&mut call.args),
-                })))
-            };
-
             let call_tgt_name = || self.interner.resolve(&id).to_string();
 
-            // Updated to use the new Globals API: lookup -> kind
-            match self.globals.lookup(id).map(|mid| self.globals.kind(mid)) {
-                // STATEMENT CONTEXT
-                Some(GlobalKind::Method) => call.kind = Some(StmtCallKind::Method),
-                Some(GlobalKind::StmtMacro) => call.kind = Some(StmtCallKind::Macro),
+            if let Some(sym) = self.globals.resolve(id) {
+                match sym.kind() {
+                    // STATEMENT CONTEXT
+                    GlobalKind::Method => {
+                        call.kind = Some(StmtCallKind::Method);
+                        for arg in &mut call.args {
+                            arg.walk_mut(self);
+                        }
+                    }
+                    GlobalKind::StmtMacro => {
+                        call.kind = Some(StmtCallKind::Macro);
+                        for arg in &mut call.args {
+                            arg.walk_mut(self);
+                        }
+                    }
 
-                // EXPRESSION CONTEXT
-                Some(GlobalKind::Function) => *rhs = demote_to_exp(ExpCallKind::Function),
-                Some(GlobalKind::Predicate) => *rhs = demote_to_exp(ExpCallKind::Predicate),
-                Some(GlobalKind::ExpMacro) => *rhs = demote_to_exp(ExpCallKind::Macro),
-                Some(GlobalKind::AdtConstructor) => {
-                    *rhs = demote_to_exp(ExpCallKind::AdtConstructor)
-                }
+                    // EXPRESSION CONTEXT
+                    // Let `walk_mut_exp_call` handle specific kind resolution and arguments!
+                    GlobalKind::Function
+                    | GlobalKind::Predicate
+                    | GlobalKind::ExpMacro
+                    | GlobalKind::AdtConstructor => {
+                        let mut new_call = crate::silver::Call {
+                            kind: None,
+                            name: call.name.clone(),
+                            args: std::mem::take(&mut call.args),
+                        };
+                        self.walk_mut_exp_call(&mut new_call);
+                        *rhs = AssignRhs::Exp(Exp::unknown(ExpKind::Call(new_call)));
+                    }
 
-                // INVALID CALL TARGETS
-                Some(actual_kind) => {
-                    self.errors.push(CallResolutionError::NotCallable(
-                        call_tgt_name(),
-                        actual_kind,
-                    ));
+                    // INVALID CALL TARGETS
+                    actual_kind => {
+                        for arg in &mut call.args {
+                            arg.walk_mut(self);
+                        }
+                        self.errors.push(CallResolutionError::NotCallable(
+                            call_tgt_name(),
+                            actual_kind,
+                        ));
+                    }
                 }
-                None => {
-                    self.errors
-                        .push(CallResolutionError::UnresolvedCallable(call_tgt_name()));
+            } else {
+                // UNRESOLVED IDENTIFIER
+                for arg in &mut call.args {
+                    arg.walk_mut(self);
                 }
+                self.errors
+                    .push(CallResolutionError::UnresolvedCallable(call_tgt_name()));
             }
         } else {
             rhs.walk_mut_children(self);
@@ -128,39 +151,37 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
         }
 
         let id = call.name.id();
-
         let call_tgt_name = || self.interner.resolve(&id).to_string();
 
-        // Updated to use the new Globals API: lookup -> kind
-        match self.globals.lookup(id).map(|mid| self.globals.kind(mid)) {
-            // EXPRESSION CONTEXT: Valid callable targets
-            Some(GlobalKind::Function) => call.kind = Some(ExpCallKind::Function),
-            Some(GlobalKind::Predicate) => call.kind = Some(ExpCallKind::Predicate),
-            Some(GlobalKind::ExpMacro) => call.kind = Some(ExpCallKind::Macro),
-            Some(GlobalKind::AdtConstructor) => call.kind = Some(ExpCallKind::AdtConstructor),
+        if let Some(sym) = self.globals.resolve(id) {
+            match sym.kind() {
+                // EXPRESSION CONTEXT: Valid callable targets
+                GlobalKind::Function => call.kind = Some(ExpCallKind::Function),
+                GlobalKind::Predicate => call.kind = Some(ExpCallKind::Predicate),
+                GlobalKind::ExpMacro => call.kind = Some(ExpCallKind::Macro),
+                GlobalKind::AdtConstructor => call.kind = Some(ExpCallKind::AdtConstructor),
 
-            // INVALID: Trying to use a Statement inside an Expression!
-            Some(kind @ GlobalKind::Method) | Some(kind @ GlobalKind::StmtMacro) => {
-                self.errors
-                    .push(CallResolutionError::StatementCallInExpression(
+                // INVALID: Trying to use a Statement inside an Expression!
+                kind @ GlobalKind::Method | kind @ GlobalKind::StmtMacro => {
+                    self.errors
+                        .push(CallResolutionError::StatementCallInExpression(
+                            call_tgt_name(),
+                            kind,
+                        ));
+                }
+
+                // INVALID: Targets that cannot be called at all (Fields, Domains, etc.)
+                actual_kind => {
+                    self.errors.push(CallResolutionError::NotCallable(
                         call_tgt_name(),
-                        kind,
+                        actual_kind,
                     ));
+                }
             }
-
-            // INVALID: Targets that cannot be called at all (Fields, Domains, etc.)
-            Some(actual_kind) => {
-                self.errors.push(CallResolutionError::NotCallable(
-                    call_tgt_name(),
-                    actual_kind,
-                ));
-            }
-
-            // INVALID: Unknown identifier
-            None => {
-                self.errors
-                    .push(CallResolutionError::UnresolvedCallable(call_tgt_name()));
-            }
+        } else {
+            // UNRESOLVED IDENTIFIER
+            self.errors
+                .push(CallResolutionError::UnresolvedCallable(call_tgt_name()));
         }
     }
 
@@ -171,11 +192,11 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
             let id = name.id();
             // ONLY desugar Expression macros! Statement macros without args
             // should not be desugared into Exp nodes!
-            // Updated to use the new Globals API: lookup -> kind
-            if let Some(GlobalKind::ExpMacro) =
-                self.globals.lookup(id).map(|mid| self.globals.kind(mid))
+
+            if let Some(sym) = self.globals.resolve(id)
+                && sym.kind() == GlobalKind::ExpMacro
             {
-                *exp = ExpKind::Call(Call {
+                *exp = ExpKind::Call(crate::silver::Call {
                     kind: Some(ExpCallKind::Macro),
                     name: name.clone(),
                     args: Vec::new(),
