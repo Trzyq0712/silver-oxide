@@ -1,3 +1,5 @@
+use lasso::Spur;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Program(pub Vec<Declaration>);
 
@@ -22,7 +24,10 @@ pub enum DecreasesKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Ident(pub String);
+pub enum Ident {
+    Raw(String),
+    Interned(Spur),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IdnDecl(pub Ident);
@@ -109,74 +114,80 @@ impl ArgOrType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Block<T>(pub T);
 
-pub type HeapExpBlock = Block<HeapExp>;
 pub type ExpBlock = Block<Exp>;
 pub type StmtBlock = Block<Vec<Statement>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ResourceExp {
-    pub cond: Vec<(bool, Exp)>,
-    pub acc: AccExp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct HeapExp {
-    pub kind: HeapExpKind,
-}
-
-pub type PureExp = Box<ExpKind>;
-pub type Exp = PureExp;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HeapExpKind {
-    Pure(Exp),
-    Acc(AccExp),
-    Conjunction(Vec<HeapExp>),
-    MagicWand(Vec<HeapExp>),
-    Ternary(Exp, Box<HeapExp>, Box<HeapExp>),
-}
+pub type Exp = Box<ExpKind>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExpKind {
     Const(ConstKind),
+    /// x
+    Ident(Ident),
+    /// result keyword
     Result,
     // old(e) or old[label](e)
     Old(Option<Ident>, Exp),
     // e : Type
     Ascribe(Exp, Type),
+
+    /// op e
+    UnOp(UnOp, Exp),
+    /// e1 op e2
+    BinOp(BinOp, Exp, Exp),
+    /// c ? e1 : e2
+    Ternary(Exp, Exp, Exp),
+    /// let x == (e1) in e2
+    LetIn(IdnDecl, Exp, Exp),
+    /// e[e1]
+    Index(Exp, IndexOp),
+
+    /// acc(e1, 1/1)
+    Acc(AccExp),
+    /// e.f
+    Field(Exp, Ident),
+
+    /// Application of a function, predicate, macro, or adt constructor.
+    /// ident(e1, ..., en)
+    Call(Call<ExpCallKind>),
+
+    /// adt.member
+    AdtDestructor(Exp, Ident),
+    /// adt.isCons
+    AdtDiscriminator(Exp, Ident),
+
     /// unfolding(e) in E, and similarly for folding, applying, and packaging.
     HeapUpdate(HeapUpdateOp, AccExp, Exp),
     /// forall/exists x: T, y: U, ... :: { trigger } e
     Quantifier(QuantifierKind, Vec<IdnDeclTyped>, Vec<Trigger>, Exp),
-    /// let x == (e1) in e2
-    LetIn(IdnDecl, Exp, Exp),
     /// Quantified permissions. forperm x: T, y: U, ... [Perm] :: e1
     ForPerm(Vec<IdnDeclTyped>, ResAccess, Exp),
-    /// f(e1, e2, ..., en)
-    FuncApp(Ident, Vec<Exp>),
-    /// x
-    Ident(Ident),
-    /// e1 op e2
-    BinOp(BinOp, Exp, Exp),
     /// e1 --* e2
-    MagicWand(HeapExp, HeapExp),
-    /// c ? e1 : e2
-    Ternary(Exp, Exp, Exp),
-    /// e.f
-    Field(Exp, Ident),
-    /// e[e1]
-    Index(Exp, IndexOp),
-    /// op e
-    UnOp(UnOp, Exp),
-    /// adt.field
-    AdtDestructor(Exp, Ident),
-    /// Cons(...)
-    AdtConstructor(Ident, Vec<Exp>),
-    /// adt.isCons
-    AdtDiscriminator(Exp, Ident),
+    MagicWand(Exp, Exp),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExpCallKind {
+    Function,
+    Predicate,
+    AdtConstructor,
+    Macro,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StmtCallKind {
+    Method,
+    Macro,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Call<KnownCallKind> {
+    pub kind: Option<KnownCallKind>,
+    pub name: Ident,
+    pub args: Vec<Exp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstKind {
     Bool(bool),
     Int(num::BigInt),
@@ -184,15 +195,6 @@ pub enum ConstKind {
     Null,
     Epsilon,
     Wildcard,
-    Heap(ConstHeapKind),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ConstHeapKind {
-    /// The heap initialised from the precondition
-    Old,
-    /// An empty heap which has been initialised from a `HeapExp`
-    SelfFraming,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,7 +213,9 @@ pub enum QuantifierKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AccExp {
-    pub acc: LocAccess,
+    /// Either a field or a predicate call
+    pub loc: Exp,
+    /// The permission amount
     pub perm: Exp,
 }
 
@@ -233,7 +237,6 @@ pub enum BinOp {
     Mult,
     Div,
     Mod,
-    IntDiv,
     Union,
     SetMinus,
     Intersection,
@@ -247,9 +250,6 @@ pub enum BinOp {
 pub enum UnOp {
     Not,
     Neg,
-    IntToReal,
-    Abs,
-    Deref,
     Perm,
 }
 
@@ -260,29 +260,26 @@ pub struct Trigger {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResAccess {
-    Loc(LocAccess),
+    Loc(Exp),
     Exp(AccExp),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
-    Assume(HeapExp),
-    Assert(HeapExp),
-    Refute(HeapExp),
-    Inhale(HeapExp),
-    Exhale(HeapExp),
+    Assume(Exp),
+    Assert(Exp),
+    Refute(Exp),
+    Inhale(Exp),
+    Exhale(Exp),
     Fold(AccExp),
     Unfold(AccExp),
     Goto(Ident),
-    Label(IdnDecl, Invariant),
-    Havoc(LocAccess),
-    QuasiHavoc(Option<Exp>, Exp),
-    QuasiHavocAll(Vec<IdnDeclTyped>, Option<Exp>, Exp),
+    Label(IdnDecl, Vec<Invariant>),
     Var(Vec<IdnDeclTyped>, Option<AssignRhs>),
-    While(PureExp, Invariant, Vec<Decreases>, StmtBlock),
-    If(PureExp, StmtBlock, Option<StmtBlock>),
-    Package(AccExp, Option<StmtBlock>),
-    Apply(AccExp),
+    While(Exp, Vec<Invariant>, Vec<Decreases>, StmtBlock),
+    If(Exp, StmtBlock, Option<StmtBlock>),
+    // Package(AccExp, Option<StmtBlock>),
+    // Apply(AccExp),
     Assign(Vec<AssignLhs>, AssignRhs),
     Block(StmtBlock),
 }
@@ -295,8 +292,8 @@ pub enum AssignLhs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssignRhs {
-    Exp(PureExp),
-    Call(Ident, Vec<Exp>),
+    Exp(Exp),
+    Call(Call<StmtCallKind>),
     New(StarOrNames),
 }
 
@@ -316,20 +313,7 @@ pub enum IndexOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Invariant(pub Option<HeapExp>);
-
-#[allow(unused)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum WhileSpec {
-    Inv(Invariant),
-    Dec(Decreases),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LocAccess {
-    /// Must be either `Exp::Field` or `Exp::FuncApp`.
-    pub loc: Exp,
-}
+pub struct Invariant(pub Exp);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field(pub IdnDeclTyped);
@@ -350,8 +334,8 @@ pub struct Function {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Contract {
-    pub precondition: Option<HeapExp>,
-    pub postcondition: Option<HeapExp>,
+    pub precondition: Vec<Exp>,
+    pub postcondition: Vec<Exp>,
     pub decreases: Vec<Decreases>,
 }
 
@@ -375,13 +359,14 @@ pub enum Type {
     Int,
     Real,
     Ref,
+    Generic(Ident),
     Domain(Ident, Vec<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Predicate {
     pub signature: Signature,
-    pub body: Option<HeapExpBlock>,
+    pub body: Option<ExpBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

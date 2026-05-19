@@ -81,7 +81,7 @@ impl<'a> SignatureCollector<'a> {
 impl<'a, 'b> AstWalker<'b> for SignatureCollector<'a> {
     fn walk_field(&mut self, field: &'b silver::Field) {
         let silver::Field(decl) = field;
-        let name = &decl.idn.0 .0;
+        let name = &decl.idn.0.0;
 
         let field_id = self
             .interner
@@ -104,7 +104,7 @@ impl<'a, 'b> AstWalker<'b> for SignatureCollector<'a> {
 
     fn walk_function(&mut self, function: &'b silver::Function) {
         let sig = &function.signature;
-        let name = &sig.name.0 .0;
+        let name = &sig.name.0.0;
 
         let func_id = self
             .interner
@@ -130,7 +130,7 @@ impl<'a, 'b> AstWalker<'b> for SignatureCollector<'a> {
 
     fn walk_method(&mut self, method: &'b silver::Method) {
         let sig = &method.signature;
-        let name = &sig.name.0 .0;
+        let name = &sig.name.0.0;
 
         let method_id = self
             .interner
@@ -156,7 +156,7 @@ impl<'a, 'b> AstWalker<'b> for SignatureCollector<'a> {
 
     fn walk_predicate(&mut self, predicate: &'b silver::Predicate) {
         let sig = &predicate.signature;
-        let name = &sig.name.0 .0;
+        let name = &sig.name.0.0;
 
         let pred_id = self
             .interner

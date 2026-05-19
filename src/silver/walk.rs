@@ -1,10 +1,13 @@
+use lasso::Spur;
 use num::{BigInt, BigRational};
 
-use crate::{silver::ast::*, TiVec};
+use crate::silver::ast::*;
+
+type ExpCall = Call<ExpCallKind>;
+type StmtCall = Call<StmtCallKind>;
 
 macro_rules! walk_children {
     ($name:ident, $l:lifetime, $ty:ident) => {
-        /// Call `ast.walk_children(self)` to keep recursing.
         fn $name(&mut self, ast: &$l $ty) {
             ast.walk_children(self);
         }
@@ -27,15 +30,14 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_exp_or_block, 'a, ExpOrBlock);
     walk_children!(walk_idn_decl_typed, 'a, IdnDeclTyped);
     walk_children!(walk_arg_or_type, 'a, ArgOrType);
-    walk_children!(walk_heap_exp_block, 'a, HeapExpBlock);
     walk_children!(walk_exp_block, 'a, ExpBlock);
-    walk_children!(walk_resource_exp, 'a, ResourceExp);
-    walk_children!(walk_heap_exp, 'a, HeapExp);
     walk_children!(walk_exp, 'a, Exp);
-    walk_children!(walk_heap_exp_kind, 'a, HeapExpKind);
     walk_children!(walk_exp_kind, 'a, ExpKind);
+    walk_children!(walk_exp_call_kind, 'a, ExpCallKind);
+    walk_children!(walk_stmt_call_kind, 'a, StmtCallKind);
+    walk_children!(walk_exp_call, 'a, ExpCall);
+    walk_children!(walk_stmt_call, 'a, StmtCall);
     walk_children!(walk_const, 'a, ConstKind);
-    walk_children!(walk_const_heap_kind, 'a, ConstHeapKind);
     walk_children!(walk_heap_op_kind, 'a, HeapUpdateOp);
     walk_children!(walk_quantifier_kind, 'a, QuantifierKind);
     walk_children!(walk_acc_exp, 'a, AccExp);
@@ -50,8 +52,6 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_star_or_names, 'a, StarOrNames);
     walk_children!(walk_index_op, 'a, IndexOp);
     walk_children!(walk_invariant, 'a, Invariant);
-    walk_children!(walk_while_spec, 'a, WhileSpec);
-    walk_children!(walk_loc_access, 'a, LocAccess);
     walk_children!(walk_field, 'a, Field);
     walk_children!(walk_domain, 'a, Domain);
     walk_children!(walk_domain_function, 'a, DomainFunction);
@@ -64,12 +64,12 @@ pub trait AstWalker<'a>: Sized {
     walk_children!(walk_adt, 'a, Adt);
     walk_children!(walk_variant, 'a, Variant);
     walk_children!(walk_adt_constructor, 'a, AdtConstructor);
-    // walk_children!(walk_domain_element, 'a, DomainElement);
 
     walk_children!(walk_string, 'a, String);
     walk_children!(walk_bool, 'a, bool);
     walk_children!(walk_big_int, 'a, BigInt);
     walk_children!(walk_big_rational, 'a, BigRational);
+    walk_children!(walk_spur, 'a, Spur);
     walk_children!(walk_usize, 'a, usize);
 }
 
@@ -97,15 +97,14 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_exp_or_block, 'a, ExpOrBlock);
     walk_mut_children!(walk_mut_idn_decl_typed, 'a, IdnDeclTyped);
     walk_mut_children!(walk_mut_arg_or_type, 'a, ArgOrType);
-    walk_mut_children!(walk_mut_heap_exp_block, 'a, HeapExpBlock);
     walk_mut_children!(walk_mut_exp_block, 'a, ExpBlock);
-    walk_mut_children!(walk_mut_resource_exp, 'a, ResourceExp);
-    walk_mut_children!(walk_mut_heap_exp, 'a, HeapExp);
     walk_mut_children!(walk_mut_exp, 'a, Exp);
-    walk_mut_children!(walk_mut_heap_exp_kind, 'a, HeapExpKind);
     walk_mut_children!(walk_mut_exp_kind, 'a, ExpKind);
+    walk_mut_children!(walk_mut_exp_call_kind, 'a, ExpCallKind);
+    walk_mut_children!(walk_mut_stmt_call_kind, 'a, StmtCallKind);
+    walk_mut_children!(walk_mut_exp_call, 'a, ExpCall);
+    walk_mut_children!(walk_mut_stmt_call, 'a, StmtCall);
     walk_mut_children!(walk_mut_const, 'a, ConstKind);
-    walk_mut_children!(walk_mut_const_heap_kind, 'a, ConstHeapKind);
     walk_mut_children!(walk_mut_heap_op_kind, 'a, HeapUpdateOp);
     walk_mut_children!(walk_mut_quantifier_kind, 'a, QuantifierKind);
     walk_mut_children!(walk_mut_acc_exp, 'a, AccExp);
@@ -120,8 +119,6 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_star_or_names, 'a, StarOrNames);
     walk_mut_children!(walk_mut_index_op, 'a, IndexOp);
     walk_mut_children!(walk_mut_invariant, 'a, Invariant);
-    walk_mut_children!(walk_mut_while_spec, 'a, WhileSpec);
-    walk_mut_children!(walk_mut_loc_access, 'a, LocAccess);
     walk_mut_children!(walk_mut_field, 'a, Field);
     walk_mut_children!(walk_mut_domain, 'a, Domain);
     walk_mut_children!(walk_mut_domain_function, 'a, DomainFunction);
@@ -134,12 +131,12 @@ pub trait AstWalkerMut<'a>: Sized {
     walk_mut_children!(walk_mut_adt, 'a, Adt);
     walk_mut_children!(walk_mut_variant, 'a, Variant);
     walk_mut_children!(walk_mut_adt_constructor, 'a, AdtConstructor);
-    // walk_mut_children!(walk_mut_domain_element, 'a, DomainElement);
 
     walk_mut_children!(walk_mut_string, 'a, String);
     walk_mut_children!(walk_mut_bool, 'a, bool);
     walk_mut_children!(walk_mut_big_int, 'a, BigInt);
     walk_mut_children!(walk_mut_big_rational, 'a, BigRational);
+    walk_mut_children!(walk_mut_spur, 'a, Spur);
     walk_mut_children!(walk_mut_usize, 'a, usize);
 }
 
@@ -205,11 +202,9 @@ macro_rules! walk_box {
             fn walk_mut<'a>(&'a mut self, walker: &mut impl AstWalkerMut<'a>) {
                 walker.$walk_mut(self);
             }
-            #[allow(unused_variables)]
             fn walk_children<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
                 (**self).walk(walker);
             }
-            #[allow(unused_variables)]
             fn walk_mut_children<'a>(&'a mut self, walker: &mut impl AstWalkerMut<'a>) {
                 (**self).walk_mut(walker);
             }
@@ -235,7 +230,7 @@ walk_enum!(
     Underscore,
     Exp(e)
 );
-walk_struct!(Ident, walk_ident, walk_mut_ident, 0);
+walk_enum!(Ident, walk_ident, walk_mut_ident, Raw(s), Interned(spur));
 walk_struct!(IdnDecl, walk_idn_decl, walk_mut_idn_decl, 0);
 walk_enum!(
     Declaration,
@@ -290,55 +285,56 @@ walk_enum!(
     Arg(a),
     Type(t)
 );
-walk_struct!(
-    HeapExpBlock,
-    walk_heap_exp_block,
-    walk_mut_heap_exp_block,
-    0
-);
 walk_struct!(ExpBlock, walk_exp_block, walk_mut_exp_block, 0);
-walk_struct!(
-    ResourceExp,
-    walk_resource_exp,
-    walk_mut_resource_exp,
-    cond,
-    acc
-);
-walk_struct!(HeapExp, walk_heap_exp, walk_mut_heap_exp, kind);
 walk_box!(Exp, walk_exp, walk_mut_exp);
-walk_enum!(
-    HeapExpKind,
-    walk_heap_exp_kind,
-    walk_mut_heap_exp_kind,
-    Pure(e),
-    Acc(a),
-    Conjunction(es),
-    MagicWand(es),
-    Ternary(c, t, e)
-);
 walk_enum!(
     ExpKind,
     walk_exp_kind,
     walk_mut_exp_kind,
     Const(c),
+    Ident(i),
     Result,
     Old(i, e),
     Ascribe(e, t),
+    UnOp(op, e),
+    BinOp(op, l, r),
+    Ternary(c, t, e),
+    LetIn(i, e1, e2),
+    Index(e, op),
+    Acc(a),
+    Field(e, i),
+    Call(a),
+    AdtDestructor(e, i),
+    AdtDiscriminator(e, i),
     HeapUpdate(kind, acc_exp, e),
     Quantifier(kind, vars, triggers, e),
-    LetIn(i, e1, e2),
     ForPerm(vars, p, e),
-    FuncApp(i, args),
-    Ident(i),
-    BinOp(op, l, r),
-    MagicWand(l, r),
-    Ternary(c, t, e),
-    Field(e, i),
-    Index(e, op),
-    UnOp(op, e),
-    AdtDestructor(e, i),
-    AdtConstructor(i, args),
-    AdtDiscriminator(e, i)
+    MagicWand(l, r)
+);
+walk_enum!(
+    ExpCallKind,
+    walk_exp_call_kind,
+    walk_mut_exp_call_kind,
+    Function,
+    Predicate,
+    AdtConstructor,
+    Macro
+);
+walk_enum!(
+    StmtCallKind,
+    walk_stmt_call_kind,
+    walk_mut_stmt_call_kind,
+    Method,
+    Macro
+);
+walk_struct!(ExpCall, walk_exp_call, walk_mut_exp_call, kind, name, args);
+walk_struct!(
+    StmtCall,
+    walk_stmt_call,
+    walk_mut_stmt_call,
+    kind,
+    name,
+    args
 );
 walk_enum!(
     ConstKind,
@@ -349,17 +345,8 @@ walk_enum!(
     Real(r),
     Null,
     Epsilon,
-    Wildcard,
-    Heap(k)
+    Wildcard
 );
-walk_enum!(
-    ConstHeapKind,
-    walk_const_heap_kind,
-    walk_mut_const_heap_kind,
-    Old,
-    SelfFraming
-);
-
 walk_enum!(
     HeapUpdateOp,
     walk_heap_op_kind,
@@ -376,7 +363,7 @@ walk_enum!(
     Forall,
     Exists
 );
-walk_struct!(AccExp, walk_acc_exp, walk_mut_acc_exp, acc, perm);
+walk_struct!(AccExp, walk_acc_exp, walk_mut_acc_exp, loc, perm);
 walk_enum!(
     BinOp,
     walk_bin_op,
@@ -397,7 +384,6 @@ walk_enum!(
     Mult,
     Div,
     Mod,
-    IntDiv,
     Union,
     SetMinus,
     Intersection,
@@ -406,17 +392,7 @@ walk_enum!(
     Range,
     InhaleExhale
 );
-walk_enum!(
-    UnOp,
-    walk_un_op,
-    walk_mut_un_op,
-    Not,
-    Neg,
-    IntToReal,
-    Deref,
-    Abs,
-    Perm
-);
+walk_enum!(UnOp, walk_un_op, walk_mut_un_op, Not, Neg, Perm);
 walk_struct!(Trigger, walk_trigger, walk_mut_trigger, exp);
 walk_enum!(
     ResAccess,
@@ -430,23 +406,18 @@ walk_enum!(
     Statement,
     walk_statement,
     walk_mut_statement,
+    Assume(e),
     Assert(e),
     Refute(e),
-    Assume(e),
     Inhale(e),
     Exhale(e),
     Fold(e),
     Unfold(e),
     Goto(i),
     Label(i, invariants),
-    Havoc(l),
-    QuasiHavoc(e1, e2),
-    QuasiHavocAll(vars, e1, e2),
     Var(vars, e),
-    While(e, specs, decs, b),
+    While(e, invs, decs, b),
     If(e, then, else_),
-    Package(e, b),
-    Apply(e),
     Assign(lhs, rhs),
     Block(b)
 );
@@ -462,7 +433,7 @@ walk_enum!(
     walk_assign_rhs,
     walk_mut_assign_rhs,
     New(n),
-    Call(i, args),
+    Call(k),
     Exp(e)
 );
 walk_enum!(
@@ -483,14 +454,6 @@ walk_enum!(
     Assign(e1, e2)
 );
 walk_struct!(Invariant, walk_invariant, walk_mut_invariant, 0);
-walk_enum!(
-    WhileSpec,
-    walk_while_spec,
-    walk_mut_while_spec,
-    Inv(i),
-    Dec(d)
-);
-walk_struct!(LocAccess, walk_loc_access, walk_mut_loc_access, loc);
 walk_struct!(Field, walk_field, walk_mut_field, 0);
 walk_struct!(
     Domain,
@@ -566,20 +529,6 @@ walk_struct!(
     signature
 );
 
-// impl<T: AstWalkable> AstWalkable for Box<T> {
-//     fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
-//         self.walk_children(walker);
-//     }
-//     fn walk_mut<'a>(&'a mut self, walker: &mut impl AstWalkerMut<'a>) {
-//         self.walk_mut_children(walker);
-//     }
-//     fn walk_children<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
-//         (**self).walk(walker);
-//     }
-//     fn walk_mut_children<'a>(&'a mut self, walker: &mut impl AstWalkerMut<'a>) {
-//         (**self).walk_mut(walker);
-//     }
-// }
 impl<T: AstWalkable> AstWalkable for Vec<T> {
     fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
         self.walk_children(walker);
@@ -598,26 +547,7 @@ impl<T: AstWalkable> AstWalkable for Vec<T> {
         }
     }
 }
-impl<I: AstVisitable + From<usize>, T: AstWalkable> AstWalkable for TiVec<I, T> {
-    fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
-        self.walk_children(walker);
-    }
-    fn walk_mut<'a>(&'a mut self, walker: &mut impl AstWalkerMut<'a>) {
-        self.walk_mut_children(walker);
-    }
-    fn walk_children<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
-        for (i, item) in self.iter_enumerated() {
-            i.visit(walker);
-            item.walk(walker);
-        }
-    }
-    fn walk_mut_children<'a>(&'a mut self, walker: &mut impl AstWalkerMut<'a>) {
-        for (i, item) in self.iter_mut_enumerated() {
-            i.visit_mut(walker);
-            item.walk_mut(walker);
-        }
-    }
-}
+
 impl<T: AstWalkable> AstWalkable for Option<T> {
     fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
         self.walk_children(walker);
@@ -636,6 +566,7 @@ impl<T: AstWalkable> AstWalkable for Option<T> {
         }
     }
 }
+
 impl<T: AstWalkable, U: AstWalkable> AstWalkable for Result<T, U> {
     fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
         self.walk_children(walker);
@@ -656,6 +587,7 @@ impl<T: AstWalkable, U: AstWalkable> AstWalkable for Result<T, U> {
         }
     }
 }
+
 impl<T: AstWalkable, U: AstWalkable> AstWalkable for (T, U) {
     fn walk<'a>(&'a self, walker: &mut impl AstWalker<'a>) {
         self.walk_children(walker);
@@ -672,13 +604,10 @@ impl<T: AstWalkable, U: AstWalkable> AstWalkable for (T, U) {
         self.1.walk_mut(walker);
     }
 }
+
 walk_struct!(String, walk_string, walk_mut_string);
 walk_struct!(bool, walk_bool, walk_mut_bool);
 walk_struct!(BigInt, walk_big_int, walk_mut_big_int);
 walk_struct!(BigRational, walk_big_rational, walk_mut_big_rational);
+walk_struct!(Spur, walk_spur, walk_mut_spur);
 walk_struct!(usize, walk_usize, walk_mut_usize);
-
-pub trait AstVisitable {
-    fn visit<'a>(self, walker: &mut impl AstWalker<'a>);
-    fn visit_mut<'a>(self, walker: &mut impl AstWalkerMut<'a>);
-}

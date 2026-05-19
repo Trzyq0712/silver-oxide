@@ -101,12 +101,12 @@ impl<'a, K, V> Copy for PairAdapter<'a, K, V> {}
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Pair<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {:?}", self.0 .0, self.0 .1)
+        write!(f, "{:?}: {:?}", self.0.0, self.0.1)
     }
 }
 
 impl<K: fmt::Display, V: fmt::Display> fmt::Display for Pair<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.0 .0, self.0 .1)
+        write!(f, "{}: {}", self.0.0, self.0.1)
     }
 }

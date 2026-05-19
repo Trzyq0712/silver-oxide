@@ -1,3 +1,4 @@
+#![feature(never_type)]
 pub mod silver;
 pub mod translate;
 mod util;
@@ -209,6 +210,59 @@ method only_post(x: Int)
         assert!(
             vmir.interner.get("only_post@requires").is_none(),
             "method without precondition should not emit @requires resource"
+        );
+    }
+
+    #[test]
+    fn mixed_function_and_method_calls_translate_with_distinct_paths() {
+        let input = r#"
+predicate number(this: Ref)
+
+function inc(x: Int): Int
+
+method callee(this: Ref, x: Int) returns (y: Int)
+  requires number(this)
+  ensures number(this)
+
+method caller(this: Ref) returns (out: Int) {
+  var tmp: Int := inc(1)
+  out := callee(this, tmp)
+}
+"#;
+        let program = silver::silver_parser::sil_program(input).expect("parse failed");
+        let vmir = translate::VmirTranslator::translate(&program).expect("translation failed");
+        let caller_id = vmir.interner.get("caller").expect("missing caller method");
+        let inc_id = vmir.interner.get("inc").expect("missing inc function");
+        let vmir::Declaration::Method(caller) = &vmir.decls[caller_id] else {
+            panic!("caller declaration must be a method");
+        };
+
+        let saw_function_call = caller.insts.iter().any(|inst| {
+            matches!(
+                inst,
+                vmir::Inst::Pure(_, vmir::PureInst::FunctionCall(call)) if call.func_id == inc_id
+            )
+        });
+        let saw_method_precondition_check = caller
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, vmir::Inst::Assert(_)));
+        let saw_method_postcondition_assume = caller
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, vmir::Inst::Assume(_)));
+
+        assert!(
+            saw_function_call,
+            "caller must contain a function-call pure instruction for inc"
+        );
+        assert!(
+            saw_method_precondition_check,
+            "caller must assert callee precondition when translating method call"
+        );
+        assert!(
+            saw_method_postcondition_assume,
+            "caller must assume callee postcondition when translating method call"
         );
     }
 }

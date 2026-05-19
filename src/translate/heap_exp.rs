@@ -143,7 +143,7 @@ impl<'a, B: HeapExpBackend> HeapExpTranslator<'a, B> {
                 };
                 (heap_r, cond)
             }
-            silver::ExpKind::FuncApp(..) => {
+            silver::ExpKind::Call(..) => {
                 let loc = self.translate_pure(&Box::new(exp.clone()));
                 let acc = self.backend.emit_heap(vmir::HeapInst::Acc(vmir::Acc {
                     loc,

@@ -4,7 +4,7 @@ use crate::{
         heap::{Chunk, Heap},
         lang::Symbolic,
     },
-    vmir::{self, inst::InstKind, HeapInstKind},
+    vmir::{self, inst::InstKind},
 };
 
 pub fn verify_method(program: &vmir::Program, method_name: &str, method: &vmir::inst::Method) {
@@ -92,29 +92,7 @@ fn process_call(
                 .collect::<Vec<_>>();
             EvalValue::Id(ctx.add(Symbolic::FuncApp(member_id, args.into())))
         }
-        vmir::Declaration::Callable(callable) => {
-            if values.len() != callable.signature.args.len() {
-                panic!(
-                    "Call argument count mismatch for {member_name}: expected {}, got {}",
-                    callable.signature.args.len(),
-                    values.len()
-                );
-            }
-            if callable.signature.args.as_slice() != callable.body.input_types.as_slice() {
-                panic!(
-                    "Contract callable input mismatch: signature {:?} != body {:?}",
-                    &callable.signature.args, &callable.body.input_types
-                );
-            }
-            EvalValue::Heap(eval_contract_callable(
-                ctx,
-                callable.semantics,
-                &callable.body,
-                inst_res,
-                values,
-            ))
-        }
-        _ => panic!("Call expected function/contract callable member, got {member_name}"),
+        _ => panic!("Call expected function member, got {member_name}"),
     }
 }
 
@@ -194,67 +172,6 @@ fn process_heap_inst(
     }
 }
 
-fn eval_contract_callable(
-    ctx: &mut VerifyContext<'_>,
-    semantics: vmir::ContractCallableSemantics,
-    body: &vmir::ContractCallableBody,
-    outer_values: &[EvalValue],
-    args: &[vmir::Value],
-) -> Heap {
-    let mut values = args
-        .iter()
-        .zip(body.input_types.iter())
-        .map(|(arg, ty)| match ty {
-            vmir::Type::Heap => EvalValue::Heap(process_heap_value(outer_values, arg)),
-            _ => EvalValue::Id(process_value(ctx, outer_values, arg)),
-        })
-        .collect::<Vec<_>>();
-
-    for inst in &body.insts {
-        let res = match &inst.kind {
-            HeapInstKind::Pure(pure_inst) => {
-                EvalValue::Id(process_pure_inst(ctx, &values, pure_inst))
-            }
-            HeapInstKind::Acc(acc) => {
-                let prev_heap = process_heap_value(&values, &acc.heap);
-                let addr = process_value(ctx, &values, &acc.addr);
-                let delta_perm = process_value(ctx, &values, &acc.perm);
-                let next_perm = match semantics {
-                    vmir::ContractCallableSemantics::EnsuresInhale => {
-                        prev_heap.perm_at(addr).map_or(delta_perm, |p| {
-                            ctx.add(Symbolic::Binary(vmir::BinOp::Plus, [p, delta_perm]))
-                        })
-                    }
-                    vmir::ContractCallableSemantics::RequiresExhale => {
-                        prev_heap.perm_at(addr).map_or(delta_perm, |p| {
-                            ctx.add(Symbolic::Binary(vmir::BinOp::Minus, [p, delta_perm]))
-                        })
-                    }
-                };
-                let chunk_value = prev_heap
-                    .value_at(addr)
-                    .unwrap_or_else(|| ctx.fresh_symbolic_value("heap_effect"));
-                EvalValue::Heap(prev_heap.with_chunk(addr, Chunk::new(next_perm, chunk_value)))
-            }
-        };
-        values.push(res);
-    }
-
-    let cond = process_value(ctx, &values, &body.res_pure);
-    let true_ = ctx.add(Symbolic::Bool(true));
-    match semantics {
-        vmir::ContractCallableSemantics::RequiresExhale => {
-            // TODO: distinguish assert checking from assume when prover plumbing exists.
-            ctx.egraph.union(cond, true_);
-        }
-        vmir::ContractCallableSemantics::EnsuresInhale => {
-            ctx.egraph.union(cond, true_);
-        }
-    }
-
-    process_heap_value(&values, &body.res_heap)
-}
-
 fn process_heap_value(inst_res: &[EvalValue], value: &vmir::Value) -> Heap {
     match value {
         vmir::Value::Temp(i) => inst_res[*i].expect_heap().clone(),
@@ -321,119 +238,5 @@ pub fn process_value(
             vmir::Literal::Bool(b) => Symbolic::Bool(*b),
             vmir::Literal::Null => Symbolic::Null,
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use typed_index_collections::TiVec;
-
-    fn int(n: i64) -> vmir::Value {
-        vmir::Literal::Int(num::BigInt::from(n)).into()
-    }
-
-    fn real(n: i64) -> vmir::Value {
-        vmir::Literal::Real(num::BigInt::from(n).into()).into()
-    }
-
-    fn make_single_contract_callable_program(
-        interner: &mut lasso::Rodeo<vmir::MemberId>,
-        name: &str,
-        semantics: vmir::ContractCallableSemantics,
-    ) -> (vmir::Program, vmir::MemberId) {
-        let member_id = interner.get_or_intern(name);
-        assert_eq!(member_id.0, 0, "test expects first declaration slot");
-        let body = vmir::ContractCallableBody {
-            input_types: vec![vmir::Type::Heap],
-            insts: vec![vmir::HeapInst {
-                kind: vmir::HeapInstKind::Acc(vmir::AccInst {
-                    heap: vmir::Value::Temp(0),
-                    addr: int(7),
-                    perm: real(1),
-                }),
-                ty: vmir::Type::Heap,
-            }],
-            res_pure: vmir::Literal::Bool(true).into(),
-            res_heap: vmir::Value::Temp(1),
-        };
-        let mut decls = TiVec::new();
-        decls.push(vmir::Declaration::Callable(vmir::Callable {
-            name: member_id,
-            signature: vmir::ContractCallableSig {
-                args: body.input_types.clone(),
-            },
-            semantics,
-            body,
-        }));
-        (
-            vmir::Program {
-                decls,
-                interner: interner.clone(),
-            },
-            member_id,
-        )
-    }
-
-    #[test]
-    fn contract_callable_requires_uses_exhale_semantics() {
-        let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
-        let (program, member_id) = make_single_contract_callable_program(
-            &mut interner,
-            "callee@requires",
-            vmir::ContractCallableSemantics::RequiresExhale,
-        );
-        let mut ctx = VerifyContext::new(&program.interner);
-
-        let addr = ctx.add(Symbolic::Int(num::BigInt::from(7)));
-        let old_perm = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
-        let old_value = ctx.fresh_symbolic_value("v");
-        let seed_heap = Heap::empty().with_chunk(addr, Chunk::new(old_perm, old_value));
-        let inst_res = vec![EvalValue::Heap(seed_heap)];
-
-        let EvalValue::Heap(next_heap) = process_call(
-            &mut ctx,
-            &program,
-            &inst_res,
-            member_id,
-            &[vmir::Value::Temp(0)],
-        ) else {
-            panic!("expected heap result");
-        };
-        let perm = next_heap.perm_at(addr).expect("missing updated permission");
-        let one = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let expected = ctx.add(Symbolic::Binary(vmir::BinOp::Minus, [old_perm, one]));
-        assert_eq!(ctx.egraph.find(perm), ctx.egraph.find(expected));
-    }
-
-    #[test]
-    fn contract_callable_ensures_uses_inhale_semantics() {
-        let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
-        let (program, member_id) = make_single_contract_callable_program(
-            &mut interner,
-            "callee@ensures",
-            vmir::ContractCallableSemantics::EnsuresInhale,
-        );
-        let mut ctx = VerifyContext::new(&program.interner);
-
-        let addr = ctx.add(Symbolic::Int(num::BigInt::from(7)));
-        let old_perm = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
-        let old_value = ctx.fresh_symbolic_value("v");
-        let seed_heap = Heap::empty().with_chunk(addr, Chunk::new(old_perm, old_value));
-        let inst_res = vec![EvalValue::Heap(seed_heap)];
-
-        let EvalValue::Heap(next_heap) = process_call(
-            &mut ctx,
-            &program,
-            &inst_res,
-            member_id,
-            &[vmir::Value::Temp(0)],
-        ) else {
-            panic!("expected heap result");
-        };
-        let perm = next_heap.perm_at(addr).expect("missing updated permission");
-        let one = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let expected = ctx.add(Symbolic::Binary(vmir::BinOp::Plus, [old_perm, one]));
-        assert_eq!(ctx.egraph.find(perm), ctx.egraph.find(expected));
     }
 }

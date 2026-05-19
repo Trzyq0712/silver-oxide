@@ -14,7 +14,7 @@ pub use inst::{Inst, ResourceCall};
 pub use ty::Type;
 
 pub use heap::{Acc, HeapInst, HeapVal};
-pub use pure::{none, write, BinOp, FunctionCall, Literal, PureInst, UnOp, Val, FALSE, NULL, TRUE};
+pub use pure::{BinOp, FALSE, FunctionCall, Literal, NULL, PureInst, TRUE, UnOp, Val, none, write};
 
 pub use adt::Adt;
 pub use domain::Domain;

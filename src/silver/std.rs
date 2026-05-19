@@ -1,3 +1,5 @@
+use lasso::Spur;
+
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,31 +11,38 @@ pub enum BuiltinType {
 }
 
 impl Ident {
-    pub fn set() -> Self {
-        Self("Set".to_string())
-    }
+    // pub fn set() -> Self {
+    //     Self("Set".to_string())
+    // }
+    //
+    // pub fn multiset() -> Self {
+    //     Self("Multiset".to_string())
+    // }
+    //
+    // pub fn seq() -> Self {
+    //     Self("Seq".to_string())
+    // }
+    //
+    // pub fn map() -> Self {
+    //     Self("Map".to_string())
+    // }
 
-    pub fn multiset() -> Self {
-        Self("Multiset".to_string())
-    }
+    // pub fn builtin_type(&self) -> Option<BuiltinType> {
+    //     let bt = match self.0.as_str() {
+    //         "Set" => BuiltinType::Set,
+    //         "Multiset" => BuiltinType::Multiset,
+    //         "Seq" => BuiltinType::Seq,
+    //         "Map" => BuiltinType::Map,
+    //         _ => return None,
+    //     };
+    //     Some(bt)
+    // }
 
-    pub fn seq() -> Self {
-        Self("Seq".to_string())
-    }
-
-    pub fn map() -> Self {
-        Self("Map".to_string())
-    }
-
-    pub fn builtin_type(&self) -> Option<BuiltinType> {
-        let bt = match self.0.as_str() {
-            "Set" => BuiltinType::Set,
-            "Multiset" => BuiltinType::Multiset,
-            "Seq" => BuiltinType::Seq,
-            "Map" => BuiltinType::Map,
-            _ => return None,
-        };
-        Some(bt)
+    pub fn id(&self) -> Spur {
+        match self {
+            Self::Interned(id) => *id,
+            _ => panic!("Expected identifier to be interned"),
+        }
     }
 }
 

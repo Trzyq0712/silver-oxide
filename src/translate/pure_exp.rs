@@ -2,7 +2,7 @@ use rusttyc::{TcErr, TcKey};
 
 use crate::{
     silver,
-    translate::{typecheck::TcType, VmirTc},
+    translate::{VmirTc, typecheck::TcType},
     vmir,
 };
 
@@ -83,7 +83,7 @@ impl<'a, B: PureExpBackend> PureExpTranslator<'a, B> {
                     .impose(val_key.is_sym_meet_of(then_key, else_key))?;
                 Ok(val)
             }
-            ExpKind::FuncApp(func_name, args) => self.translate_func_app(func_name, args),
+            ExpKind::Call(func_name, args) => self.translate_func_app(func_name, args),
             ExpKind::Field(base, field_name) => {
                 self.translate_func_app(field_name, &[base.clone()])
             }

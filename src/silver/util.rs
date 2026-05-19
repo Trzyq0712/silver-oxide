@@ -99,63 +99,63 @@ impl AdtConstructor {
     }
 }
 
-impl HeapExp {
-    pub(crate) fn new(exp: Exp) -> Self {
-        Self {
-            kind: HeapExpKind::Pure(exp),
-        }
-    }
+// impl HeapExp {
+//     pub(crate) fn new(exp: Exp) -> Self {
+//         Self {
+//             kind: HeapExpKind::Pure(exp),
+//         }
+//     }
+//
+//     pub(super) fn conjoin(exps: Vec<HeapExp>) -> Option<Self> {
+//         if exps.is_empty() {
+//             None
+//         } else {
+//             Some(HeapExp {
+//                 kind: HeapExpKind::Conjunction(exps),
+//             })
+//         }
+//     }
+// }
 
-    pub(super) fn conjoin(exps: Vec<HeapExp>) -> Option<Self> {
-        if exps.is_empty() {
-            None
-        } else {
-            Some(HeapExp {
-                kind: HeapExpKind::Conjunction(exps),
-            })
-        }
-    }
-}
-
-impl From<Vec<PrePostDec>> for Contract {
-    fn from(value: Vec<PrePostDec>) -> Self {
-        let mut precondition = None;
-        let mut decreases = vec![];
-        for p in value {
-            match p {
-                PrePostDec::Pre(e) => precondition = ExpKind::conjoin(precondition, e),
-                PrePostDec::Decreases(d) => decreases.push(d),
-                _ => {}
-            }
-        }
-        Self {
-            precondition: precondition.map(HeapExp::new),
-            postcondition: None,
-            decreases,
-        }
-    }
-}
-
-impl Contract {
-    pub(super) fn add_posts(mut self, posts: Vec<PrePostDec>) -> Self {
-        for p in posts {
-            match p {
-                PrePostDec::Post(e) => {
-                    let new = match self.postcondition {
-                        Some(post) => {
-                            HeapExp::new(Box::new(ExpKind::BinOp(BinOp::And, post.into_exp(), e)))
-                        }
-                        None => HeapExp::new(e),
-                    };
-                    self.postcondition = Some(new);
-                }
-                PrePostDec::Decreases(d) => self.decreases.push(d),
-                _ => {}
-            }
-        }
-        self
-    }
-}
+// impl From<Vec<PrePostDec>> for Contract {
+//     fn from(value: Vec<PrePostDec>) -> Self {
+//         let mut precondition = None;
+//         let mut decreases = vec![];
+//         for p in value {
+//             match p {
+//                 PrePostDec::Pre(e) => precondition = ExpKind::conjoin(precondition, e),
+//                 PrePostDec::Decreases(d) => decreases.push(d),
+//                 _ => {}
+//             }
+//         }
+//         Self {
+//             precondition: precondition.map(HeapExp::new),
+//             postcondition: None,
+//             decreases,
+//         }
+//     }
+// }
+//
+// impl Contract {
+//     pub(super) fn add_posts(mut self, posts: Vec<PrePostDec>) -> Self {
+//         for p in posts {
+//             match p {
+//                 PrePostDec::Post(e) => {
+//                     let new = match self.postcondition {
+//                         Some(post) => {
+//                             HeapExp::new(Box::new(ExpKind::BinOp(BinOp::And, post.into_exp(), e)))
+//                         }
+//                         None => HeapExp::new(e),
+//                     };
+//                     self.postcondition = Some(new);
+//                 }
+//                 PrePostDec::Decreases(d) => self.decreases.push(d),
+//                 _ => {}
+//             }
+//         }
+//         self
+//     }
+// }
 
 impl Field {
     pub fn ty(&self) -> &Type {
@@ -183,51 +183,51 @@ impl ExpKind {
     }
 }
 
-impl HeapExp {
-    pub fn into_exp(self) -> Exp {
-        match self.kind {
-            HeapExpKind::Pure(exp) => exp,
-            HeapExpKind::Acc(_) => {
-                panic!("HeapExpKind::Acc cannot be converted into a pure ExpKind")
-            }
-            HeapExpKind::Conjunction(heap_exps) => heap_exps
-                .into_iter()
-                .fold(None, |acc, heap_exp| {
-                    ExpKind::conjoin(acc, heap_exp.into_exp())
-                })
-                .unwrap_or_else(|| Box::new(ExpKind::Const(ConstKind::Bool(true)))),
-            HeapExpKind::MagicWand(mut heap_exps) => {
-                let rhs = heap_exps
-                    .pop()
-                    .expect("magic wand must contain rhs heap expression");
-                let lhs = heap_exps
-                    .pop()
-                    .expect("magic wand must contain lhs heap expression");
-                assert!(
-                    heap_exps.is_empty(),
-                    "magic wand must contain exactly two heap expressions"
-                );
-                Box::new(ExpKind::MagicWand(lhs, rhs))
-            }
-            HeapExpKind::Ternary(cond, then_heap, else_heap) => Box::new(ExpKind::Ternary(
-                cond,
-                then_heap.into_exp(),
-                else_heap.into_exp(),
-            )),
-        }
-    }
-}
-
-impl ResourceExp {
-    pub fn loc(&self) -> Result<&Ident, (&HeapExp, &HeapExp)> {
-        match &*self.acc.acc.loc {
-            ExpKind::FuncApp(callee, ..) => Ok(callee),
-            ExpKind::MagicWand(lhs, rhs) => Err((lhs, rhs)),
-            _ => unreachable!(),
-        }
-    }
-}
-
+// impl HeapExp {
+//     pub fn into_exp(self) -> Exp {
+//         match self.kind {
+//             HeapExpKind::Pure(exp) => exp,
+//             HeapExpKind::Acc(_) => {
+//                 panic!("HeapExpKind::Acc cannot be converted into a pure ExpKind")
+//             }
+//             HeapExpKind::Conjunction(heap_exps) => heap_exps
+//                 .into_iter()
+//                 .fold(None, |acc, heap_exp| {
+//                     ExpKind::conjoin(acc, heap_exp.into_exp())
+//                 })
+//                 .unwrap_or_else(|| Box::new(ExpKind::Const(ConstKind::Bool(true)))),
+//             HeapExpKind::MagicWand(mut heap_exps) => {
+//                 let rhs = heap_exps
+//                     .pop()
+//                     .expect("magic wand must contain rhs heap expression");
+//                 let lhs = heap_exps
+//                     .pop()
+//                     .expect("magic wand must contain lhs heap expression");
+//                 assert!(
+//                     heap_exps.is_empty(),
+//                     "magic wand must contain exactly two heap expressions"
+//                 );
+//                 Box::new(ExpKind::MagicWand(lhs, rhs))
+//             }
+//             HeapExpKind::Ternary(cond, then_heap, else_heap) => Box::new(ExpKind::Ternary(
+//                 cond,
+//                 then_heap.into_exp(),
+//                 else_heap.into_exp(),
+//             )),
+//         }
+//     }
+// }
+//
+// impl ResourceExp {
+//     pub fn loc(&self) -> Result<&Ident, (&HeapExp, &HeapExp)> {
+//         match &*self.acc.acc.loc {
+//             ExpKind::Call(callee, ..) => Ok(callee),
+//             ExpKind::MagicWand(lhs, rhs) => Err((lhs, rhs)),
+//             _ => unreachable!(),
+//         }
+//     }
+// }
+//
 fn expect_args<'a>(args: &'a [ArgOrType]) -> impl Iterator<Item = &'a IdnDeclTyped> + 'a {
     args.iter().map(|arg| {
         let ArgOrType::Arg(arg) = arg else {

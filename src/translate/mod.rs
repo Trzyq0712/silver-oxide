@@ -1,41 +1,58 @@
-use crate::translate::global_resolver::GlobalResolver;
-use crate::translate::{name_resolution::DeclKind, resource::MethodContractResources};
+use crate::translate::global_resolver::{
+    DuplicateGlobalError, GlobalResolver, GlobalResolverBuilder,
+};
+use crate::translate::resource::MethodContractResources;
+use crate::translate::signature_resolver::{SignatureResolver, SignatureResolverBuilder};
 use crate::vmir::{
     self, Declaration, HeapInst, HeapVal, Inst, MemberId, PureInst, Resource, Type, Val,
 };
-use crate::{silver, HashMap};
-use lasso::{Key, Rodeo};
-use typed_index_collections::{ti_vec, TiVec};
+use crate::{HashMap, silver};
+use lasso::Key;
+use typed_index_collections::{TiVec, ti_vec};
 
 pub mod global_resolver;
 pub mod signature_resolver;
 
 pub mod heap_exp;
 pub mod inst;
-pub mod name_resolution;
 pub mod pure_exp;
 pub mod resource;
 pub mod signatures;
 pub mod typecheck;
 pub use typecheck::VmirTc;
 
-pub use name_resolution::{IdentifierError, NameCollector};
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifierError {
+    DuplicateName { name: String },
+    CallResolution { message: String },
+}
+
+impl std::fmt::Display for IdentifierError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdentifierError::DuplicateName { name } => {
+                write!(f, "Duplicate declaration: '{name}'")
+            }
+            IdentifierError::CallResolution { message } => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for IdentifierError {}
 
 #[derive(Debug, Clone)]
 pub struct VmirSymbols {
-    pub silver_interner: Rodeo<vmir::MemberId>,
-    pub vmir_interner: Rodeo<vmir::MemberId>,
-    pub name_kinds: TiVec<vmir::MemberId, DeclKind>,
+    pub vmir_interner: lasso::Rodeo<vmir::MemberId>,
     pub resolver: GlobalResolver,
+    pub signatures: SignatureResolver,
 }
 
 #[derive(Debug)]
 pub struct VmirTranslator {
     decls: TiVec<vmir::MemberId, Option<vmir::Declaration>>,
-    silver_interner: Rodeo<vmir::MemberId>,
-    vmir_interner: Rodeo<vmir::MemberId>,
-    name_kinds: TiVec<vmir::MemberId, DeclKind>,
+    vmir_interner: lasso::Rodeo<vmir::MemberId>,
     pub(crate) resolver: GlobalResolver,
+    pub(crate) signatures: SignatureResolver,
 }
 
 impl VmirTranslator {
@@ -43,44 +60,144 @@ impl VmirTranslator {
         let count = symbols.vmir_interner.len();
         Self {
             decls: ti_vec![None; count],
-            silver_interner: symbols.silver_interner,
             vmir_interner: symbols.vmir_interner,
-            name_kinds: symbols.name_kinds,
             resolver: symbols.resolver,
+            signatures: symbols.signatures,
         }
     }
 
     pub fn translate(program: &silver::Program) -> Result<vmir::Program, Vec<IdentifierError>> {
-        let collector = NameCollector::new();
-        let (silver_interner, mut name_kinds) = collector.collect(program)?;
-        let mut vmir_interner = silver_interner.clone();
-        let resolver = GlobalResolver::collect(
-            program,
-            silver_interner.clone(),
-            &mut vmir_interner,
-            &mut name_kinds,
-        );
+        let mut program = program.clone();
+        silver::resolve_call_kinds(&mut program).map_err(map_call_resolution_errors)?;
+
+        let mut global_builder = GlobalResolverBuilder::new();
+        for decl in &program.0 {
+            match decl {
+                silver::Declaration::Field(field) => {
+                    global_builder
+                        .add_field(field)
+                        .map_err(map_duplicate_error)?;
+                }
+                silver::Declaration::Function(function) => {
+                    global_builder
+                        .add_function(function)
+                        .map_err(map_duplicate_error)?;
+                }
+                silver::Declaration::Predicate(predicate) => {
+                    global_builder
+                        .add_predicate(predicate)
+                        .map_err(map_duplicate_error)?;
+                }
+                silver::Declaration::Method(method) => {
+                    global_builder
+                        .add_method(method)
+                        .map_err(map_duplicate_error)?;
+                }
+                silver::Declaration::Domain(domain) => {
+                    global_builder
+                        .add_domain(domain)
+                        .map_err(map_duplicate_error)?;
+                }
+                silver::Declaration::DomainElement(domain_elem) => {
+                    if let silver::DomainElementKind::Function(f) = &domain_elem.kind {
+                        global_builder
+                            .add_domain_function(f)
+                            .map_err(map_duplicate_error)?;
+                    }
+                }
+                silver::Declaration::Adt(adt) => {
+                    global_builder.add_adt(adt).map_err(map_duplicate_error)?;
+                }
+                silver::Declaration::AdtConstructor(ctor) => {
+                    global_builder
+                        .add_adt_constructor(ctor)
+                        .map_err(map_duplicate_error)?;
+                }
+                _ => {}
+            };
+        }
+        let (resolver, vmir_interner) = global_builder.finalize();
+
+        let mut sig_builder = SignatureResolverBuilder::new();
+        for decl in &program.0 {
+            match decl {
+                silver::Declaration::Field(field) => {
+                    let id = resolver.resolve_field(&field.0.idn.0).unwrap().id;
+                    let ret = translate_type_with_resolver(&resolver, &field.0.ty);
+                    sig_builder.add_function(id, vec![Type::Ref], Type::Addr(Box::new(ret)));
+                }
+                silver::Declaration::Function(function) => {
+                    let id = resolver
+                        .resolve_function(&function.signature.name.0)
+                        .unwrap()
+                        .id;
+                    let args = function
+                        .signature
+                        .args
+                        .iter()
+                        .map(|arg| translate_type_with_resolver(&resolver, arg.ty()))
+                        .collect::<Vec<_>>();
+                    let ret = function
+                        .signature
+                        .ret
+                        .first()
+                        .map(|r| translate_type_with_resolver(&resolver, r.ty()))
+                        .unwrap_or(Type::Bool);
+                    sig_builder.add_function(id, args, ret);
+                }
+                silver::Declaration::Predicate(pred) => {
+                    let resolved = resolver.resolve_predicate(&pred.signature.name.0).unwrap();
+                    let args = pred
+                        .signature
+                        .args
+                        .iter()
+                        .map(|arg| translate_type_with_resolver(&resolver, arg.ty()))
+                        .collect::<Vec<_>>();
+                    sig_builder.add_function(
+                        resolved.id,
+                        args,
+                        Type::Addr(Box::new(Type::Domain(resolved.snap))),
+                    );
+                }
+                silver::Declaration::Method(method) => {
+                    let resolved = resolver.resolve_method(&method.signature.name.0).unwrap();
+                    let args = method
+                        .signature
+                        .args
+                        .iter()
+                        .map(|arg| translate_type_with_resolver(&resolver, arg.ty()))
+                        .collect::<Vec<_>>();
+                    let ret = method
+                        .signature
+                        .ret
+                        .iter()
+                        .map(|r| translate_type_with_resolver(&resolver, r.ty()))
+                        .collect::<Vec<_>>();
+                    if let Some(req_id) = resolved.precond {
+                        sig_builder.add_resource(req_id, args.clone());
+                    }
+                    if let Some(ens_id) = resolved.postcond {
+                        let mut full = args;
+                        full.extend(ret);
+                        sig_builder.add_resource(ens_id, full);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let symbols = VmirSymbols {
-            silver_interner,
             vmir_interner,
-            name_kinds,
             resolver,
+            signatures: sig_builder.finalize(),
         };
         let mut translator = Self::new(symbols);
-        translator.translate_program(program);
+        translator.translate_program(&program);
 
         let decls = translator
             .decls
             .into_iter()
-            .enumerate()
-            .map(|(idx, decl)| {
-                decl.unwrap_or_else(|| match translator.name_kinds[MemberId(idx)] {
-                    DeclKind::Domain => Declaration::Domain(vmir::Domain {}),
-                    DeclKind::Adt => Declaration::Adt(vmir::Adt {}),
-                    DeclKind::AdtConstructor => Declaration::AdtConstructor,
-                    _ => Declaration::DomainElement,
-                })
-            })
+            .map(|decl| decl.unwrap_or(Declaration::DomainElement))
             .collect();
         Ok(vmir::Program {
             decls,
@@ -96,12 +213,28 @@ impl VmirTranslator {
                 silver::Declaration::Method(method) => self.translate_method(method),
                 silver::Declaration::Function(function) => self.translate_function(function),
                 silver::Declaration::Domain(domain) => {
-                    let id = self.silver_interner.get(domain.name.0 .0.as_str()).unwrap();
+                    let id = self.resolver.resolve_member_id(&domain.name.0).unwrap();
                     self.add_decl(id, Declaration::Domain(vmir::Domain {}));
                 }
+                silver::Declaration::DomainElement(domain_element) => {
+                    if let silver::DomainElementKind::Function(f) = &domain_element.kind {
+                        let id = self
+                            .resolver
+                            .resolve_member_id(&f.signature.name.0)
+                            .unwrap();
+                        self.add_decl(id, Declaration::DomainElement);
+                    }
+                }
                 silver::Declaration::Adt(adt) => {
-                    let id = self.silver_interner.get(adt.name.0 .0.as_str()).unwrap();
+                    let id = self.resolver.resolve_member_id(&adt.name.0).unwrap();
                     self.add_decl(id, Declaration::Adt(vmir::Adt {}));
+                }
+                silver::Declaration::AdtConstructor(ctor) => {
+                    let id = self
+                        .resolver
+                        .resolve_member_id(&ctor.signature.name.0)
+                        .unwrap();
+                    self.add_decl(id, Declaration::AdtConstructor);
                 }
                 _ => {}
             }
@@ -112,84 +245,72 @@ impl VmirTranslator {
         if id.into_usize() >= self.decls.len() {
             while id.into_usize() >= self.decls.len() {
                 self.decls.push(None);
-                self.name_kinds.push(DeclKind::ContractCallable);
             }
         }
         self.decls[id] = Some(decl);
     }
 
     pub(crate) fn translate_type(&self, ty: &silver::Type) -> Type {
-        match ty {
-            silver::Type::Bool => Type::Bool,
-            silver::Type::Int => Type::Int,
-            silver::Type::Real => Type::Real,
-            silver::Type::Ref => Type::Ref,
-            silver::Type::Domain(idn, _) => Type::Domain(
-                self.silver_interner
-                    .get(idn.0.as_str())
-                    .unwrap_or_else(|| panic!("domain type not interned: {}", idn.0)),
-            ),
-        }
+        translate_type_with_resolver(&self.resolver, ty)
     }
 
     fn translate_field(&mut self, field: &silver::Field) {
-        let silver::Field(decl) = field;
-        let id = self.silver_interner.get(decl.idn.0 .0.as_str()).unwrap();
-        let ret = self.translate_type(&decl.ty);
+        let id = self.resolver.resolve_field(&field.0.idn.0).unwrap().id;
+        let ret = self
+            .signatures
+            .resolve_function(id)
+            .unwrap_or_else(|_| panic!("missing field signature: {:?}", field.0.idn.0))
+            .ret
+            .clone();
         self.add_decl(
             id,
             Declaration::Function(vmir::Function {
                 params: vec![Type::Ref],
-                ret: Type::Addr(Box::new(ret)),
+                ret,
             }),
         );
     }
 
     fn translate_predicate(&mut self, pred: &silver::Predicate) {
-        let pred_name = pred.signature.name.0 .0.as_str();
-        let pred_id = self.silver_interner.get(pred_name).unwrap();
-        let snap_name = format!("{pred_name}@snap");
-        let snap_id = self.silver_interner.get(snap_name.as_str()).unwrap();
+        let resolved = self
+            .resolver
+            .resolve_predicate(&pred.signature.name.0)
+            .unwrap();
+        let pred_id = resolved.id;
+        let snap_id = resolved.snap;
         self.add_decl(snap_id, Declaration::Domain(vmir::Domain {}));
-
-        let params = pred
-            .signature
-            .args
-            .iter()
-            .map(|arg| self.translate_type(arg.ty()))
-            .collect();
+        let sig = self.signatures.resolve_function(pred_id).unwrap();
         self.add_decl(
             pred_id,
             Declaration::Function(vmir::Function {
-                params,
-                ret: Type::Addr(Box::new(Type::Domain(snap_id))),
+                params: sig.args.clone(),
+                ret: sig.ret.clone(),
             }),
         );
     }
 
     fn translate_function(&mut self, function: &silver::Function) {
         let id = self
-            .silver_interner
-            .get(function.signature.name.0 .0.as_str())
-            .unwrap();
-        let params = function
-            .signature
-            .args
-            .iter()
-            .map(|arg| self.translate_type(arg.ty()))
-            .collect::<Vec<_>>();
-        let ret = function
-            .signature
-            .ret
-            .first()
-            .map(|r| self.translate_type(r.ty()))
-            .unwrap_or(Type::Bool);
-        self.add_decl(id, Declaration::Function(vmir::Function { params, ret }));
+            .resolver
+            .resolve_function(&function.signature.name.0)
+            .unwrap()
+            .id;
+        let sig = self.signatures.resolve_function(id).unwrap();
+        self.add_decl(
+            id,
+            Declaration::Function(vmir::Function {
+                params: sig.args.clone(),
+                ret: sig.ret.clone(),
+            }),
+        );
     }
 
     fn translate_method(&mut self, method: &silver::Method) {
-        let method_name = method.signature.name.0 .0.as_str();
-        let method_id = self.silver_interner.get(method_name).unwrap();
+        let method_id = self
+            .resolver
+            .resolve_method(&method.signature.name.0)
+            .unwrap()
+            .id;
         let MethodContractResources { requires, ensures } =
             resource::translate_method_contracts(self, method_id, method);
         let mut requires_id = None;
@@ -282,7 +403,7 @@ impl<'a> MethodBuilder<'a> {
     }
 
     fn bind(&mut self, idn: &silver::IdnDecl, v: Val) {
-        self.env.insert(idn.0 .0.clone(), v);
+        self.env.insert(idn.0.0.clone(), v);
     }
 
     fn emit_fresh(&mut self, ty: Type) -> Val {
@@ -334,43 +455,41 @@ impl<'a> MethodBuilder<'a> {
                     self.env.insert(idn.0.clone(), v);
                 }
             }
-            silver::AssignRhs::Call(callee, args) => {
-                let callee_id = self
-                    .translator
-                    .silver_interner
-                    .get(callee.0.as_str())
-                    .unwrap();
-                let arg_vals = args
-                    .iter()
-                    .map(|a| self.translate_exp(a))
-                    .collect::<Vec<_>>();
-                let method_sig = self
-                    .translator
-                    .resolver
-                    .resolve_method_id(callee_id)
-                    .unwrap();
-                let ret_tys = method_sig.ret.clone();
-                let req_id = method_sig.precond;
-                let ens_id = method_sig.postcond;
-                let mut lhs_vals = Vec::new();
-                for (lhs_item, ret_ty) in lhs.iter().zip(ret_tys.iter()) {
-                    if let silver::AssignLhs::Ident(idn) = lhs_item {
-                        let v = self.emit_fresh(ret_ty.clone());
-                        self.env.insert(idn.0.clone(), v.clone());
-                        lhs_vals.push(v);
-                    }
-                }
-
-                if let Some(req_id) = req_id {
-                    self.apply_resource(req_id, arg_vals.clone(), ContractMode::SubAssert);
-                }
-
-                if let Some(ens_id) = ens_id {
-                    let mut ens_args = arg_vals;
-                    ens_args.extend(lhs_vals);
-                    self.apply_resource(ens_id, ens_args, ContractMode::AddAssume);
-                }
-            }
+            silver::AssignRhs::Call(..) => todo!(),
+            // silver::AssignRhs::Call(callee, args) => {
+            //     let callee_id = self
+            //         .translator
+            //         .resolver
+            //         .resolve_member_id(callee)
+            //         .unwrap_or_else(|_| panic!("unknown call target: {}", callee.0));
+            //     let arg_vals = args
+            //         .iter()
+            //         .map(|a| self.translate_exp(a))
+            //         .collect::<Vec<_>>();
+            //     let method_resolved = self
+            //         .translator
+            //         .resolver
+            //         .resolve_method_id(callee_id)
+            //         .unwrap();
+            //     let mut lhs_vals = Vec::new();
+            //     for (lhs_item, ret_ty) in lhs.iter().zip(method_sig.ret.iter()) {
+            //         if let silver::AssignLhs::Ident(idn) = lhs_item {
+            //             let v = self.emit_fresh(ret_ty.clone());
+            //             self.env.insert(idn.0.clone(), v.clone());
+            //             lhs_vals.push(v);
+            //         }
+            //     }
+            //
+            //     if let Some(req_id) = method_resolved.precond {
+            //         self.apply_resource(req_id, arg_vals.clone(), ContractMode::SubAssert);
+            //     }
+            //
+            //     if let Some(ens_id) = method_resolved.postcond {
+            //         let mut ens_args = arg_vals;
+            //         ens_args.extend(lhs_vals);
+            //         self.apply_resource(ens_id, ens_args, ContractMode::AddAssume);
+            //     }
+            // }
             silver::AssignRhs::New(_) => {}
         }
     }
@@ -385,6 +504,51 @@ impl<'a> MethodBuilder<'a> {
                 _ => unimplemented!(),
             },
             silver::ExpKind::Ident(idn) => self.env.get(&idn.0).cloned().unwrap(),
+            silver::ExpKind::Call(callee, args) => {
+                let func_id = self
+                    .translator
+                    .resolver
+                    .resolve_member_id(callee)
+                    .unwrap_or_else(|_| panic!("unknown function call target: {}", callee.0));
+                let sig = self
+                    .translator
+                    .signatures
+                    .resolve_function(func_id)
+                    .unwrap_or_else(|_| panic!("missing function signature for {}", callee.0));
+                let args = args
+                    .iter()
+                    .map(|a| self.translate_exp(a))
+                    .collect::<Vec<_>>();
+                self.emit_pure(
+                    sig.ret.clone(),
+                    PureInst::FunctionCall(vmir::FunctionCall {
+                        func_id,
+                        heap_ctx: self.current_heap.clone(),
+                        args,
+                    }),
+                )
+            }
+            silver::ExpKind::Field(base, field) => {
+                let field_id = self
+                    .translator
+                    .resolver
+                    .resolve_member_id(field)
+                    .unwrap_or_else(|_| panic!("unknown field access target: {}", field.0));
+                let sig = self
+                    .translator
+                    .signatures
+                    .resolve_function(field_id)
+                    .unwrap_or_else(|_| panic!("missing field signature for {}", field.0));
+                let base = self.translate_exp(base);
+                self.emit_pure(
+                    sig.ret.clone(),
+                    PureInst::FunctionCall(vmir::FunctionCall {
+                        func_id: field_id,
+                        heap_ctx: self.current_heap.clone(),
+                        args: vec![base],
+                    }),
+                )
+            }
             silver::ExpKind::BinOp(silver::BinOp::Plus, l, r) => {
                 let lv = self.translate_exp(l);
                 let rv = self.translate_exp(r);
@@ -523,5 +687,32 @@ fn substitute_heap_inst(
         HeapInst::Assign(h, v) => {
             HeapInst::Assign(substitute_heap(h, heaps), substitute_val(v, vals))
         }
+    }
+}
+
+fn map_duplicate_error(err: DuplicateGlobalError) -> Vec<IdentifierError> {
+    vec![IdentifierError::DuplicateName { name: err.0 }]
+}
+
+fn map_call_resolution_errors(errors: Vec<silver::CallResolutionError>) -> Vec<IdentifierError> {
+    errors
+        .into_iter()
+        .map(|e| IdentifierError::CallResolution {
+            message: e.to_string(),
+        })
+        .collect()
+}
+
+fn translate_type_with_resolver(resolver: &GlobalResolver, ty: &silver::Type) -> Type {
+    match ty {
+        silver::Type::Bool => Type::Bool,
+        silver::Type::Int => Type::Int,
+        silver::Type::Real => Type::Real,
+        silver::Type::Ref => Type::Ref,
+        silver::Type::Domain(idn, _) => Type::Domain(
+            resolver
+                .resolve_member_id(idn)
+                .unwrap_or_else(|_| panic!("domain type not interned: {}", idn.0)),
+        ),
     }
 }
