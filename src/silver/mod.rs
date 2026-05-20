@@ -1,6 +1,7 @@
 mod ast;
 mod call_resolver;
-mod final_ast;
+pub mod final_ast;
+mod final_display;
 mod globals;
 mod interner;
 mod r#macro;
@@ -13,5 +14,9 @@ pub mod walk;
 
 pub use ast::*;
 pub use call_resolver::*;
-pub use globals::Globals;
+pub use final_display::{Show, show};
+pub use globals::{Globals, GlobalsCollector};
+pub use interner::{IdentCollector, Interner};
+pub use r#macro::inline_macros;
 pub use peg::*;
+pub use typecheck::{TypeError, typecheck_program};

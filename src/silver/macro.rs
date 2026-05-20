@@ -3,7 +3,8 @@ use std::{collections::HashMap, fmt};
 use lasso::Spur;
 
 use crate::silver::{
-    AssignRhs, Define, ExpCallKind, ExpKind, ExpOrBlock, Program, Statement, StmtCallKind,
+    AssignLhs, AssignRhs, Define, ExpCallKind, ExpKind, ExpOrBlock, Program, Statement,
+    StmtCallKind,
     interner::Interner,
     walk::{AstWalkable, AstWalkerMut},
 };
@@ -139,7 +140,7 @@ impl<'i> MacroInliner<'i> {
     /// Helper to expand a statement macro into a list of statements
     fn expand_stmt_macro(
         &mut self,
-        lhs: &[crate::silver::Exp],
+        lhs: &[AssignLhs],
         call: &mut crate::silver::Call<StmtCallKind>,
     ) -> Option<Vec<Statement>> {
         let macro_id = call.name.id();
@@ -170,7 +171,7 @@ impl<'i> MacroInliner<'i> {
 
         let mut bindings = HashMap::new();
         for (param, arg) in macro_def.args.iter().zip(std::mem::take(&mut call.args)) {
-            bindings.insert(param.0.id(), *arg);
+            bindings.insert(param.0.id(), *arg.kind);
         }
 
         let mut substitutor = ParameterSubstitutor {
@@ -197,7 +198,7 @@ impl<'i> MacroInliner<'i> {
 
 impl<'i> AstWalkerMut<'_> for MacroInliner<'i> {
     // NEW: Intercept blocks to splice expanded macros directly into the statement list
-    fn walk_mut_block(&mut self, block: &mut crate::silver::Block) {
+    fn walk_mut_block(&mut self, block: &mut crate::silver::StmtBlock) {
         let mut new_stmts = Vec::new();
 
         for mut stmt in std::mem::take(&mut block.0) {
@@ -266,7 +267,7 @@ impl<'i> AstWalkerMut<'_> for MacroInliner<'i> {
 
             let mut bindings = HashMap::new();
             for (param, arg) in macro_def.args.iter().zip(std::mem::take(&mut call.args)) {
-                bindings.insert(param.0.id(), *arg);
+                bindings.insert(param.0.id(), *arg.kind);
             }
 
             let mut substitutor = ParameterSubstitutor {
@@ -281,7 +282,7 @@ impl<'i> AstWalkerMut<'_> for MacroInliner<'i> {
             expanded_exp.walk_mut(self);
             self.exit_expansion();
 
-            *exp = *expanded_exp;
+            *exp = *expanded_exp.kind;
         }
     }
 }

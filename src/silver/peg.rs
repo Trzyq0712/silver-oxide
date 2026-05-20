@@ -79,7 +79,7 @@ peg::parser! {
         /// Accessors
         rule res_access() -> ResAccess
             = e:acc_exp() { ResAccess::Exp(e) }
-            / e:suffix_exp() { ResAccess::Loc(Box::new(e)) }
+            / e:suffix_exp() { ResAccess::Loc(Exp::impure(e)) }
 
         rule acc_exp() -> AccExp
             = "acc" _ "(" _ loc:suffix_exp() _ perm:("," _ e:exp() { e })? _ ")" {

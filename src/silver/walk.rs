@@ -193,6 +193,7 @@ macro_rules! walk_enum {
     };
 }
 
+#[allow(unused_macros)]
 macro_rules! walk_box {
     ($name:ident, $walk:ident, $walk_mut:ident) => {
         impl AstWalkable for $name {
@@ -286,7 +287,7 @@ walk_enum!(
     Type(t)
 );
 walk_struct!(ExpBlock, walk_exp_block, walk_mut_exp_block, 0);
-walk_box!(Exp, walk_exp, walk_mut_exp);
+walk_struct!(Exp, walk_exp, walk_mut_exp, kind);
 walk_enum!(
     ExpKind,
     walk_exp_kind,
@@ -503,6 +504,7 @@ walk_enum!(
     Int,
     Real,
     Ref,
+    Generic(g),
     Domain(i, ts)
 );
 walk_struct!(

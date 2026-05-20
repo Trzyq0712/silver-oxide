@@ -85,7 +85,7 @@ impl ConstKind {
 
 impl From<ConstKind> for Exp {
     fn from(value: ConstKind) -> Self {
-        Box::new(ExpKind::Const(value))
+        Exp::impure(ExpKind::Const(value))
     }
 }
 

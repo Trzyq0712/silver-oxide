@@ -177,8 +177,8 @@ impl ExpKind {
     fn conjoin(acc: Option<Exp>, new: Exp) -> Option<Exp> {
         Some(match acc {
             None => new,
-            Some(t) if matches!(*t, ExpKind::Const(ConstKind::Bool(true))) => new,
-            Some(other) => Box::new(ExpKind::BinOp(BinOp::And, other, new)),
+            Some(t) if t.kind.is_true() => new,
+            Some(other) => Exp::impure(ExpKind::BinOp(BinOp::And, other, new)),
         })
     }
 }

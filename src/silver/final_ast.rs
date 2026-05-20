@@ -1,19 +1,20 @@
 use lasso::Spur;
 
-// ==========================================
-// 1. Core Primitives & Types
-// ==========================================
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program(pub Vec<Declaration>);
 
 /// A resolved identifier string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ident(pub Spur);
 
 /// An identifier bundled with its explicit type (e.g., `x: Int`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypedIdent {
     pub name: Ident,
     pub ty: Type,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum BuiltinCollection {
     Seq(Box<Type>),
     Set(Box<Type>),
@@ -21,6 +22,7 @@ pub enum BuiltinCollection {
     Map(Box<Type>, Box<Type>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Bool,
     Int,
@@ -30,11 +32,13 @@ pub enum Type {
     Domain(Ident, Vec<Type>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum UnOp {
     Not,
     Neg,
     Cardinality,
 }
+#[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
     Or,
     And,
@@ -53,6 +57,7 @@ pub enum BinOp {
     Mult,
     Div,
     Mod,
+
     In,
     Union,
     SetMinus,
@@ -62,6 +67,7 @@ pub enum BinOp {
     Range,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Bool(bool),
     Int(num::BigInt),
@@ -70,17 +76,15 @@ pub enum Literal {
     Wildcard,
 }
 
-// ==========================================
-// 2. Pure Expressions
-// ==========================================
-
 /// A pure expression bundled with its synthesized type.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypedPureExp<Ext> {
     pub ty: Type,
     pub exp: Box<PureExpKind<Ext>>,
 }
 
 /// A generic function or predicate call.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Call<Ext> {
     pub name: Ident,
     pub args: Vec<TypedPureExp<Ext>>,
@@ -88,6 +92,7 @@ pub struct Call<Ext> {
 
 /// The variants of a purely mathematical/logical expression.
 /// The `Ext` generic dictates which context-specific nodes are allowed.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PureExpKind<Ext> {
     Ident(Ident),
     Const(Literal),
@@ -115,13 +120,11 @@ pub enum PureExpKind<Ext> {
     Ext(Ext),
 }
 
-// ==========================================
-// 3. Spatial & Resource Expressions
-// ==========================================
-
 /// An expression that asserts or transfers heap resources.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpatialExp<PureExt>(pub Box<SpatialExpKind<PureExt>>);
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum SpatialExpKind<PureExt> {
     Implies(TypedPureExp<PureExt>, SpatialExp<PureExt>),
     Conj(SpatialExp<PureExt>, SpatialExp<PureExt>),
@@ -137,8 +140,10 @@ pub enum SpatialExpKind<PureExt> {
 }
 
 /// The valid targets for acc or perm queries.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResourceExp<PureExt>(pub Box<ResourceExpKind<PureExt>>);
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResourceExpKind<PureExt> {
     /// A mutable heap location: `e.f`
     Field(TypedPureExp<PureExt>, Ident),
@@ -147,41 +152,39 @@ pub enum ResourceExpKind<PureExt> {
 }
 
 /// A predicate call bundled with an explicit permission amount.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PredicateWithPerm<PureExt> {
     pub pred_call: Call<PureExt>,
     pub perm: TypedPureExp<PureExt>,
 }
 
-// ==========================================
-// 4. Context Extensions
-// ==========================================
-
 /// Extensions allowed *only* in pure function postconditions.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FuncEnsuresExt {
     Result,
     Old(TypedPureExp<FuncEnsuresExt>),
 }
 
 /// Extensions allowed *only* in method postconditions.
+#[derive(Debug, Clone, PartialEq)]
 pub enum MethodEnsuresExt {
     Old(TypedPureExp<MethodEnsuresExt>),
 }
 
 /// Extensions allowed *only* in imperative method bodies.
+#[derive(Debug, Clone, PartialEq)]
 pub enum MethodBodyExt {
     Old(Option<Spur>, TypedPureExp<MethodBodyExt>),
     Perm(ResourceExp<MethodBodyExt>),
 }
 
-// ==========================================
-// 5. Statements & Imperative Blocks
-// ==========================================
-
 pub type PureMethodExp = TypedPureExp<MethodBodyExt>;
 pub type SpatialMethodExp = SpatialExp<MethodBodyExt>;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct StmtBlock(pub Vec<Statement>);
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Assume(SpatialMethodExp),
     Assert(SpatialMethodExp),
@@ -197,6 +200,7 @@ pub enum Statement {
     Unfold(PredicateWithPerm<MethodBodyExt>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum AssignLhs {
     /// Field assignment to `e.f` where `e` is of type `Ref`.
     Field(PureMethodExp, Ident),
@@ -204,6 +208,7 @@ pub enum AssignLhs {
     Var(Ident),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum AssignRhs {
     /// E.g., `new(*)` or `new(f1, f2)`
     New(StarOrFields),
@@ -211,15 +216,13 @@ pub enum AssignRhs {
     Exp(PureMethodExp),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum StarOrFields {
     Star,
     Fields(Vec<Ident>),
 }
 
-// ==========================================
-// 6. Top-Level Declarations
-// ==========================================
-
+#[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
     Function(Function),
     Predicate(Predicate),
@@ -227,9 +230,11 @@ pub enum Declaration {
     Field(Field),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Field(pub TypedIdent);
 
 /// A purely mathematical function that cannot mutate state.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: Ident,
     pub params: Vec<TypedIdent>,
@@ -240,6 +245,7 @@ pub struct Function {
 }
 
 /// An imperative sub-routine that can mutate the heap.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Method {
     pub name: Ident,
     pub params: Vec<TypedIdent>,
@@ -250,6 +256,7 @@ pub struct Method {
 }
 
 /// A spatial macro representing a fraction of the heap.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Predicate {
     pub name: Ident,
     pub params: Vec<TypedIdent>,

@@ -205,3 +205,20 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
         }
     }
 }
+
+/// Resolve all call kinds in `program`, tagging generic call nodes with their
+/// semantic kind (function/predicate/method/macro) and demoting non-method
+/// assignment-call right-hand sides into expressions.
+pub fn resolve_call_kinds(
+    program: &mut crate::silver::Program,
+    interner: &Interner,
+    globals: &Globals,
+) -> Result<(), Vec<CallResolutionError>> {
+    let mut resolver = CallResolver::new(interner, globals);
+    program.walk_mut(&mut resolver);
+    if resolver.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(resolver.errors)
+    }
+}

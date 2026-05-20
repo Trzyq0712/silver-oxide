@@ -1,12 +1,16 @@
 #![feature(never_type)]
 pub mod silver;
-pub mod translate;
+// `translate` is outdated (built against the old split heap/pure silver AST) and
+// unlinked from the build. Kept on disk for reference when reimplementing VMIR
+// translation against the new unified `ExpKind`. Re-add `pub mod translate;` once ported.
+// pub mod translate;
 mod util;
 pub mod vmir;
 pub use silver::silver_parser;
 pub use util::*;
 
-#[cfg(test)]
+// Disabled: depends on the unlinked `translate` module. Re-enable with translate.
+#[cfg(any())]
 mod tests {
     use crate::{silver, translate, vmir};
 
