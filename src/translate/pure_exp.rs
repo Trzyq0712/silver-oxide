@@ -1,421 +1,222 @@
-use rusttyc::{TcErr, TcKey};
+//! Lower `final_ast::TypedPureExp<Ext>` into VMIR `PureInst` chains.
 
-use crate::{
-    silver,
-    translate::{VmirTc, typecheck::TcType},
-    vmir,
+use std::collections::HashMap;
+
+use lasso::Spur;
+
+use crate::silver::final_ast;
+use crate::translate::{Builder, TranslationError, lower_type};
+use crate::vmir::{
+    self, Context, FALSE, HeapInst, Inst, InstKind, Literal, PathCond, PureInst, TRUE, UnOp, Val,
 };
 
-pub trait PureExpBackend {
-    /// The current symbolic value of a variable.
-    fn resolve_var(&self, ident: &silver::Ident) -> Result<vmir::Val, ()>;
-
-    fn old_heap(&self, label: Option<&silver::Ident>) -> Result<vmir::HeapVal, ()>;
-
-    /// Emit a pure instruction, in return get back the register it
-    /// was saved to.
-    fn emit_pure(&mut self, pure: vmir::PureInst) -> vmir::Val;
-
-    /// Emit an assertion.
-    fn emit_assert(&mut self, check: vmir::Val);
-
-    /// Access to the typchecker for asserting type information
-    fn tc_mut(&mut self) -> &mut VmirTc;
-
-    /// Resolve the name of a global identifier.
-    fn resolve_global(&self, ident: &silver::Ident) -> Result<vmir::MemberId, ()>;
+/// A mutable sink for emitted instructions plus the running counters,
+/// parameterised by the body's `Context`. The choice of `C` controls which
+/// extension variants the caller is allowed to construct.
+pub(crate) struct Sink<C: Context> {
+    pub insts: Vec<Inst<C::HeapExt, C::InstExt>>,
+    pub val_base: usize,
+    pub val_count: usize,
+    pub heap_count: usize,
 }
 
-pub struct PureExpTranslator<'a, B: PureExpBackend> {
-    pub backend: &'a mut B,
-    /// The path condtition under which the current expression is being translated.
-    /// This is used for path-sensitive reasoning, i.e. emitting assertions.
-    /// An empty path condition is equivalent to `true`.
-    pub pc: Option<vmir::Val>,
-    pub heap: vmir::HeapVal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Polarity {
-    Positive,
-    Negative,
-}
-
-impl<'a, B: PureExpBackend> PureExpTranslator<'a, B> {
-    pub fn translate(&mut self, exp: &silver::PureExp) -> Result<vmir::Val, TcErr<TcType>> {
-        self.translate_exp_kind(exp.as_ref())
-    }
-
-    fn translate_exp_kind(&mut self, exp: &silver::ExpKind) -> Result<vmir::Val, TcErr<TcType>> {
-        use silver::ExpKind;
-        match exp {
-            ExpKind::Const(const_) => self.translate_const(const_),
-            ExpKind::Ident(ident) => Ok(self.backend.resolve_var(ident).unwrap()),
-            ExpKind::Old(label, exp) => {
-                let old_heap = self.backend.old_heap(label.as_ref()).unwrap();
-                self.with_heap(old_heap, |s| s.translate_exp_kind(exp))
-            }
-            ExpKind::BinOp(op, left, right) => self.translate_binop(op, left, right),
-            ExpKind::UnOp(op, e) => self.translate_unop(op, e),
-            ExpKind::Ternary(cond, then, else_) => {
-                let cond = self.translate_exp_kind(cond)?;
-                let then = self.with_pc(cond.clone(), Polarity::Positive, |s| {
-                    s.translate_exp_kind(then)
-                })?;
-                let else_ = self.with_pc(cond.clone(), Polarity::Negative, |s| {
-                    s.translate_exp_kind(else_)
-                })?;
-
-                let cond_key = self.backend.tc_mut().get_var_key(&cond);
-                let then_key = self.backend.tc_mut().get_var_key(&then);
-                let else_key = self.backend.tc_mut().get_var_key(&else_);
-
-                let val = self
-                    .backend
-                    .emit_pure(vmir::PureInst::Ternary(cond, then, else_));
-                let val_key = self.backend.tc_mut().get_var_key(&val);
-
-                self.backend
-                    .tc_mut()
-                    .impose(cond_key.concretizes_explicit(TcType::Bool))?;
-                self.backend
-                    .tc_mut()
-                    .impose(val_key.is_sym_meet_of(then_key, else_key))?;
-                Ok(val)
-            }
-            ExpKind::Call(func_name, args) => self.translate_func_app(func_name, args),
-            ExpKind::Field(base, field_name) => {
-                self.translate_func_app(field_name, &[base.clone()])
-            }
-            _ => unimplemented!("Expression translation: {:?}", exp),
+impl<C: Context> Sink<C> {
+    pub fn new(val_base: usize) -> Self {
+        Self {
+            insts: Vec::new(),
+            val_base,
+            val_count: 0,
+            heap_count: 0,
         }
     }
 
-    fn with_heap<R>(&mut self, heap: vmir::HeapVal, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.heap.clone();
-        self.heap = heap;
-        let res = f(self);
-        self.heap = prev;
-        res
+    pub fn next_val_temp(&mut self) -> Val {
+        let id = self.val_base + self.val_count;
+        self.val_count += 1;
+        Val::Temp(id)
     }
 
-    fn with_pc<R>(
-        &mut self,
-        cond: vmir::Val,
-        polarity: Polarity,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let curr_pc = self.pc.as_ref().unwrap_or(&vmir::TRUE);
-        let new_pc = self.backend.emit_pure(match polarity {
-            Polarity::Positive => vmir::PureInst::Ternary(cond, curr_pc.clone(), vmir::FALSE),
-            Polarity::Negative => vmir::PureInst::Ternary(cond, vmir::FALSE, curr_pc.clone()),
+    pub fn next_heap_temp(&mut self) -> vmir::HeapVal {
+        let id = self.heap_count;
+        self.heap_count += 1;
+        vmir::HeapVal::Temp(id)
+    }
+
+    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
+        let v = self.next_val_temp();
+        self.insts.push(Inst {
+            pc: PathCond::default(),
+            kind: InstKind::Pure(ty, inst),
         });
-        let saved_pc = self.pc.replace(new_pc);
-        let res = f(self);
-        self.pc = saved_pc;
-        res
+        v
     }
 
-    fn match_type(&mut self, ty: &vmir::Type, key: TcKey) -> Result<(), TcErr<TcType>> {
-        self.backend
-            .tc_mut()
-            .impose(key.concretizes_explicit(ty.into()))?;
-        match ty {
-            vmir::Type::Addr(inner) => {
-                let child = self.backend.tc_mut().get_child_key(key, 0)?;
-                self.match_type(inner, child)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn translate_const(&mut self, const_: &silver::ConstKind) -> Result<vmir::Val, TcErr<TcType>> {
-        let val = vmir::Val::Literal(match const_ {
-            silver::ConstKind::Bool(b) => vmir::Literal::Bool(*b),
-            silver::ConstKind::Int(i) => vmir::Literal::Int(i.clone()),
-            silver::ConstKind::Real(r) => vmir::Literal::Real(r.clone()),
-            silver::ConstKind::Null => vmir::Literal::Null,
-            _ => unimplemented!("Unsupported constant: {:?}", const_),
+    /// Push a heap instruction. `HeapInst<C::HeapExt>` constrains which
+    /// extension variants are even constructible at the call site; for
+    /// `Sink<ResourceCtx>` the `Ext` arm is unreachable because `!` has no
+    /// values.
+    pub fn emit_heap(&mut self, inst: HeapInst<C::HeapExt>) -> vmir::HeapVal {
+        let h = self.next_heap_temp();
+        self.insts.push(Inst {
+            pc: PathCond::default(),
+            kind: InstKind::Heap(inst),
         });
-        let ty = match const_ {
-            silver::ConstKind::Bool(_) => vmir::Type::Bool,
-            silver::ConstKind::Int(_) => vmir::Type::Int,
-            silver::ConstKind::Real(_) => vmir::Type::Real,
-            silver::ConstKind::Null => vmir::Type::Ref,
-            _ => unimplemented!(),
-        };
-        let key = self.backend.tc_mut().get_var_key(&val);
-        self.backend
-            .tc_mut()
-            .impose(key.concretizes_explicit((&ty).into()))?;
-        Ok(val)
+        h
     }
 
-    fn assert(&mut self, cond: vmir::Val) {
-        let check = if let Some(pc) = &self.pc {
-            self.backend
-                .emit_pure(vmir::PureInst::Ternary(pc.clone(), cond, vmir::TRUE))
-        } else {
-            cond
-        };
-
-        self.backend.emit_assert(check);
+    /// Push an instruction-kind extension. Bumps no counter; current
+    /// extensions (`MethodInstExt::Assume`/`Assert`) produce neither a
+    /// `Val` nor a `HeapVal`. For `Sink<ResourceCtx>` the parameter type is
+    /// `!`, so this method is uncallable.
+    pub fn emit_ext(&mut self, ext: C::InstExt) {
+        self.insts.push(Inst {
+            pc: PathCond::default(),
+            kind: InstKind::Ext(ext),
+        });
     }
+}
 
-    fn translate_field_access(
-        &mut self,
-        base: &silver::Exp,
-        field: &silver::Ident,
-    ) -> Result<vmir::Val, TcErr<TcType>> {
-        // 1. Emit a function call to the field-function to get the memory address
-        let addr = self.translate_func_app(field, &[base.clone()])?;
-        // 2. Assert that permission is positive under the current pc
-        let perm = self
-            .backend
-            .emit_pure(vmir::PureInst::Perm(self.heap.clone(), addr.clone()));
-        let positive =
-            self.backend
-                .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Lt, vmir::none(), perm));
-        self.assert(positive);
-        // 3. Perform a dereference
-        let val = self
-            .backend
-            .emit_pure(vmir::PureInst::Deref(self.heap.clone(), addr));
-
-        Ok(val)
-    }
-
-    fn translate_func_app(
-        &mut self,
-        func_name: &silver::Ident,
-        args: &[silver::Exp],
-    ) -> Result<vmir::Val, TcErr<TcType>> {
-        let func_id = self.backend.resolve_global(func_name).unwrap();
-
-        let args = args
-            .iter()
-            .map(|arg| self.translate_exp_kind(arg))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // let sig = self
-        //     .backend
-        //     .translator()
-        //     .signatures()
-        //     .function_sig(func_id)
-        //     .clone();
-
-        // for (arg, ty) in args.iter().zip(sig.args.iter()) {
-        //     let arg_key = self.backend.tc_mut().get_var_key(arg);
-        //     self.match_type(ty, arg_key)?;
-        // }
-
-        let func_call = vmir::FunctionCall {
-            func_id,
-            args,
-            heap_ctx: self.heap.clone(),
-        };
-        let val = self
-            .backend
-            .emit_pure(vmir::PureInst::FunctionCall(func_call));
-        // let val_key = self.backend.tc_mut().get_var_key(&val);
-        // self.match_type(&sig.ret, val_key)?;
-        Ok(val)
-    }
-
-    fn translate_binop(
-        &mut self,
-        op: &silver::BinOp,
-        left: &silver::ExpKind,
-        right: &silver::ExpKind,
-    ) -> Result<vmir::Val, TcErr<TcType>> {
-        let l = self.translate_exp_kind(left)?;
-        let r = self.translate_exp_kind(right)?;
-
-        let l_key = self.backend.tc_mut().get_var_key(&l);
-        let r_key = self.backend.tc_mut().get_var_key(&r);
-
-        let val = match op {
-            silver::BinOp::And => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Ternary(l, r, vmir::FALSE))
-            }
-            silver::BinOp::Or => self
-                .backend
-                .emit_pure(vmir::PureInst::Ternary(l, vmir::TRUE, r)),
-            silver::BinOp::Implies => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Ternary(l, r, vmir::TRUE))
-            }
-            silver::BinOp::Eq | silver::BinOp::Iff => self
-                .backend
-                .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Eq, l, r)),
-            silver::BinOp::Neq => {
-                let l_eq_r = self
-                    .backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Eq, l, r));
-                self.backend
-                    .emit_pure(vmir::PureInst::Unary(vmir::UnOp::Not, l_eq_r))
-            }
-            silver::BinOp::Lt => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Lt, l, r))
-            }
-            silver::BinOp::Le => {
-                let r_lt_l = self
-                    .backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Lt, r, l));
-                self.backend
-                    .emit_pure(vmir::PureInst::Unary(vmir::UnOp::Not, r_lt_l))
-            }
-            silver::BinOp::Gt => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Lt, r, l))
-            }
-            silver::BinOp::Ge => {
-                let l_lt_r = self
-                    .backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Lt, l, r));
-                self.backend
-                    .emit_pure(vmir::PureInst::Unary(vmir::UnOp::Not, l_lt_r))
-            }
-            silver::BinOp::Plus => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Plus, l, r))
-            }
-            silver::BinOp::Minus => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Minus, l, r))
-            }
-            silver::BinOp::Mult => {
-                self.backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Mult, l, r))
-            }
-            silver::BinOp::Div => {
-                let denom_zero = self.backend.emit_pure(vmir::PureInst::Binary(
-                    vmir::BinOp::Eq,
-                    r.clone(),
-                    vmir::none(),
-                ));
-                let denom_nonzero = self
-                    .backend
-                    .emit_pure(vmir::PureInst::Unary(vmir::UnOp::Not, denom_zero));
-                self.assert(denom_nonzero);
-                self.backend
-                    .emit_pure(vmir::PureInst::Binary(vmir::BinOp::Div, l, r))
-            }
-            _ => unimplemented!(),
-        };
-        let v_key = self.backend.tc_mut().get_var_key(&val);
-        match op {
-            silver::BinOp::And
-            | silver::BinOp::Or
-            | silver::BinOp::Implies
-            | silver::BinOp::Iff => {
-                self.backend
-                    .tc_mut()
-                    .impose(l_key.concretizes_explicit(TcType::Bool))?;
-                self.backend
-                    .tc_mut()
-                    .impose(r_key.concretizes_explicit(TcType::Bool))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::BinOp::Eq | silver::BinOp::Neq => {
-                if l_key != r_key {
-                    self.backend.tc_mut().impose(l_key.equate_with(r_key))?;
+pub(crate) fn lower<C: Context, Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink<C>,
+    exp: &final_ast::TypedPureExp<Ext>,
+) -> Result<Val, TranslationError> {
+    use final_ast::PureExpKind as P;
+    let ty = lower_type(&exp.ty);
+    match &*exp.exp {
+        P::Ident(id) => env
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&id.0).to_string())),
+        P::Const(lit) => Ok(Val::Literal(lower_literal(lit)?)),
+        P::Unary(op, x) => {
+            let v = lower(b, env, sink, x)?;
+            let vop = match op {
+                final_ast::UnOp::Not => UnOp::Not,
+                final_ast::UnOp::Neg => UnOp::Neg,
+                final_ast::UnOp::Cardinality => {
+                    return Err(TranslationError::Unsupported("cardinality"));
                 }
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::BinOp::Lt | silver::BinOp::Le | silver::BinOp::Gt | silver::BinOp::Ge => {
-                self.backend
-                    .tc_mut()
-                    .impose(l_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend
-                    .tc_mut()
-                    .impose(r_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend.tc_mut().impose(l_key.equate_with(r_key))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::BinOp::Plus | silver::BinOp::Minus => {
-                self.backend
-                    .tc_mut()
-                    .impose(l_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend
-                    .tc_mut()
-                    .impose(r_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.is_sym_meet_of(l_key, r_key))?;
-            }
-            silver::BinOp::Mult | silver::BinOp::Div => {
-                self.backend
-                    .tc_mut()
-                    .impose(l_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend
-                    .tc_mut()
-                    .impose(r_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Numeric))?;
-            }
-            _ => unimplemented!(),
+            };
+            Ok(sink.emit_pure(ty, PureInst::Unary(vop, v)))
         }
-        Ok(val)
+        P::Binary(op, l, r) => lower_binary(b, env, sink, ty, op, l, r),
+        P::Ternary { if_, then, else_ } => {
+            let c = lower(b, env, sink, if_)?;
+            let t = lower(b, env, sink, then)?;
+            let e = lower(b, env, sink, else_)?;
+            Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
+        }
+        P::Ext(ext) => Ext::lower_ext(b, env, sink, ext),
+        P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
+        P::FunctionCall(_) => Err(TranslationError::Unsupported("function call")),
+        P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
+        P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
+        P::AdtDestructor(_, _) => Err(TranslationError::Unsupported("ADT destructor")),
+        P::AdtDiscriminator(_, _) => Err(TranslationError::Unsupported("ADT discriminator")),
     }
+}
 
-    fn translate_unop(
-        &mut self,
-        op: &silver::UnOp,
-        exp: &silver::ExpKind,
-    ) -> Result<vmir::Val, TcErr<TcType>> {
-        let e = self.translate_exp_kind(exp)?;
-        let e_key = self.backend.tc_mut().get_var_key(&e);
-        let val = match op {
-            silver::UnOp::Not => self
-                .backend
-                .emit_pure(vmir::PureInst::Unary(vmir::UnOp::Not, e)),
-            silver::UnOp::Neg => self
-                .backend
-                .emit_pure(vmir::PureInst::Unary(vmir::UnOp::Neg, e)),
-            silver::UnOp::Perm => self
-                .backend
-                .emit_pure(vmir::PureInst::Perm(self.heap.clone(), e)),
-            _ => unimplemented!("Unsupported unary operator: {:?}", op),
-        };
-        let v_key = self.backend.tc_mut().get_var_key(&val);
-        match op {
-            silver::UnOp::Not => {
-                self.backend
-                    .tc_mut()
-                    .impose(e_key.concretizes_explicit(TcType::Bool))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Bool))?;
-            }
-            silver::UnOp::Neg => {
-                self.backend
-                    .tc_mut()
-                    .impose(e_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Numeric))?;
-                self.backend.tc_mut().impose(e_key.equate_with(v_key))?;
-            }
-            silver::UnOp::Perm => {
-                self.backend
-                    .tc_mut()
-                    .impose(e_key.concretizes_explicit(TcType::Addr))?;
-                self.backend
-                    .tc_mut()
-                    .impose(v_key.concretizes_explicit(TcType::Real))?;
-            }
-            _ => unimplemented!(),
+fn lower_binary<C: Context, Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink<C>,
+    ty: vmir::Type,
+    op: &final_ast::BinOp,
+    l: &final_ast::TypedPureExp<Ext>,
+    r: &final_ast::TypedPureExp<Ext>,
+) -> Result<Val, TranslationError> {
+    use final_ast::BinOp as B;
+    use vmir::BinOp as V;
+    let lv = lower(b, env, sink, l)?;
+    let rv = lower(b, env, sink, r)?;
+    Ok(match op {
+        B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
+        B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),
+        B::Mult => sink.emit_pure(ty, PureInst::Binary(V::Mult, lv, rv)),
+        B::Div => sink.emit_pure(ty, PureInst::Binary(V::Div, lv, rv)),
+        B::Mod => sink.emit_pure(ty, PureInst::Binary(V::Mod, lv, rv)),
+        B::Eq => sink.emit_pure(ty, PureInst::Binary(V::Eq, lv, rv)),
+        B::Lt => sink.emit_pure(ty, PureInst::Binary(V::Lt, lv, rv)),
+        // Desugarings:
+        B::Neq => {
+            let eq = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Eq, lv, rv));
+            sink.emit_pure(ty, PureInst::Unary(UnOp::Not, eq))
         }
-        Ok(val)
+        B::Le => {
+            // l <= r  <=>  !(r < l)
+            let gt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, rv, lv));
+            sink.emit_pure(ty, PureInst::Unary(UnOp::Not, gt))
+        }
+        B::Gt => sink.emit_pure(ty, PureInst::Binary(V::Lt, rv, lv)),
+        B::Ge => {
+            // l >= r  <=>  !(l < r)
+            let lt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, lv, rv));
+            sink.emit_pure(ty, PureInst::Unary(UnOp::Not, lt))
+        }
+        B::And => sink.emit_pure(ty, PureInst::Ternary(lv, rv, FALSE)),
+        B::Or => sink.emit_pure(ty, PureInst::Ternary(lv, TRUE, rv)),
+        B::Implies => sink.emit_pure(ty, PureInst::Ternary(lv, rv, TRUE)),
+        B::Iff => sink.emit_pure(ty, PureInst::Binary(V::Eq, lv, rv)),
+        B::In | B::Union | B::SetMinus | B::Intersection | B::Subset | B::Concat | B::Range => {
+            return Err(TranslationError::Unsupported("collection operator"));
+        }
+    })
+}
+
+pub(crate) fn lower_literal(lit: &final_ast::Literal) -> Result<Literal, TranslationError> {
+    match lit {
+        final_ast::Literal::Bool(b) => Ok(Literal::Bool(*b)),
+        final_ast::Literal::Int(n) => Ok(Literal::Int(n.clone())),
+        final_ast::Literal::Real(r) => Ok(Literal::Real(r.clone())),
+        final_ast::Literal::Null => Ok(Literal::Null),
+        final_ast::Literal::Wildcard => Err(TranslationError::Unsupported("wildcard literal")),
+    }
+}
+
+/// Per-context lowering of pure-expression extensions (`old`, `result`,
+/// `perm`, etc.). All currently unsupported in this minimal cut.
+pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
+    fn lower_ext<C: Context>(
+        b: &Builder<'_>,
+        env: &HashMap<Spur, Val>,
+        sink: &mut Sink<C>,
+        ext: &Self,
+    ) -> Result<Val, TranslationError>;
+}
+
+impl PureExt for ! {
+    fn lower_ext<C: Context>(
+        _b: &Builder<'_>,
+        _env: &HashMap<Spur, Val>,
+        _sink: &mut Sink<C>,
+        ext: &Self,
+    ) -> Result<Val, TranslationError> {
+        match *ext {}
+    }
+}
+
+impl PureExt for final_ast::MethodEnsuresExt {
+    fn lower_ext<C: Context>(
+        _b: &Builder<'_>,
+        _env: &HashMap<Spur, Val>,
+        _sink: &mut Sink<C>,
+        _ext: &Self,
+    ) -> Result<Val, TranslationError> {
+        Err(TranslationError::Unsupported("`old` in method ensures"))
+    }
+}
+
+impl PureExt for final_ast::MethodBodyExt {
+    fn lower_ext<C: Context>(
+        _b: &Builder<'_>,
+        _env: &HashMap<Spur, Val>,
+        _sink: &mut Sink<C>,
+        _ext: &Self,
+    ) -> Result<Val, TranslationError> {
+        Err(TranslationError::Unsupported(
+            "`old`/`perm` in method body",
+        ))
     }
 }
