@@ -1,7 +1,7 @@
 use lasso::Spur;
 use rusttyc::types::{Arity, Partial, Variant};
 use rusttyc::{Constructable, TcErr, TcKey, TypeChecker, VarlessTypeChecker};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::silver::{
     self,
@@ -13,6 +13,10 @@ use crate::silver::{
     globals::Globals,
     interner::Interner,
 };
+
+// ==========================================
+// 1. Type lattice
+// ==========================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SilverTcType {
@@ -77,7 +81,6 @@ impl Constructable for SilverTcType {
         Ok(match self {
             SilverTcType::Bool => Type::Bool,
             SilverTcType::Int => Type::Int,
-            // Unconstrained numerics default to Real
             SilverTcType::Real | SilverTcType::Numeric => Type::Real,
             SilverTcType::Ref => Type::Ref,
             SilverTcType::Top => {
@@ -96,6 +99,10 @@ fn type_to_tc(ty: &Type) -> SilverTcType {
         Type::Collection(_) | Type::Domain(..) => SilverTcType::Top,
     }
 }
+
+// ==========================================
+// 2. Error types
+// ==========================================
 
 #[derive(Debug, Clone)]
 pub enum TypeError {
@@ -116,6 +123,9 @@ pub enum TypeError {
     IllegalOldUsage,
     IllegalLabeledOldUsage,
     IllegalResultUsage,
+    UndefinedLabel(String),
+    ShadowedName(String),
+    WrongReturnCount { expected: usize, found: usize },
     Tc(TcErr<SilverTcType>),
     Other(String),
 }
@@ -157,156 +167,202 @@ impl std::fmt::Display for TypeError {
                 write!(f, "labeled `old` not allowed in this context")
             }
             TypeError::IllegalResultUsage => write!(f, "`result` not allowed in this context"),
+            TypeError::UndefinedLabel(name) => {
+                write!(f, "label `{name}` is not defined in this method")
+            }
+            TypeError::ShadowedName(name) => {
+                write!(f, "name `{name}` already declared in this scope")
+            }
+            TypeError::WrongReturnCount { expected, found } => {
+                write!(f, "assignment expects {expected} target(s) on LHS, found {found}")
+            }
             TypeError::Tc(e) => write!(f, "Constraint error: {e:?}"),
             TypeError::Other(msg) => write!(f, "{msg}"),
         }
     }
 }
 
-type SilverTc = VarlessTypeChecker<SilverTcType>;
+// ==========================================
+// 3. Context types
+// ==========================================
+
 type TypeTable = HashMap<TcKey, Type>;
 
-/// Per-declaration context. Params/return vars/`var` locals all carry concrete
-/// declared types, so each top-level expression is self-contained and is checked
-/// with its own fresh rusttyc `TypeChecker`. Each AST node's key is stored in its
-/// `silver::Exp.ty` (`Infer(key)`), so the build phase reads it back directly —
-/// no node→key side table.
-struct TcCtx<'g> {
+/// Persistent lexical environment for a declaration (function, method, or predicate).
+/// Holds only scope data: `locals` grows incrementally as params and `var` stmts are
+/// processed (so uses before declarations produce UndefinedVariable), and pre-collected
+/// `labels` (checked for presence only, not position/dominance). Type inference state
+/// lives in the ephemeral `ConstraintCtx` / `LoweringCtx`, never here.
+struct LocalEnv<'g> {
     globals: &'g Globals,
     interner: &'g Interner,
-    /// Declared-type environment for params, return vars and `var` locals.
-    /// Persists across the declaration's expressions.
     locals: HashMap<Spur, Type>,
-    result_ty: Option<Type>,
-
-    // ---- fresh per top-level expression (see `check`) ----
-    tc: SilverTc,
-    /// `let`-binders local to the current expression: their key in this checker.
-    let_bindings: HashMap<Spur, TcKey>,
-    /// `None` during the infer phase, `Some` during the build phase. When set,
-    /// `impose_*` are no-ops and node types are read from the table.
-    table: Option<TypeTable>,
+    labels: HashSet<Spur>,
 }
 
-impl<'g> TcCtx<'g> {
+impl<'g> LocalEnv<'g> {
     fn new(globals: &'g Globals, interner: &'g Interner) -> Self {
         Self {
             globals,
             interner,
             locals: HashMap::new(),
-            result_ty: None,
-            tc: TypeChecker::new(),
-            let_bindings: HashMap::new(),
-            table: None,
+            labels: HashSet::new(),
         }
     }
 
-    fn fresh_key(&mut self) -> TcKey {
-        self.tc.new_term_key()
-    }
-
-    fn in_build(&self) -> bool {
-        self.table.is_some()
-    }
-
-    fn impose_bound(&mut self, key: TcKey, ty: SilverTcType) -> Result<(), TypeError> {
-        if self.in_build() {
-            return Ok(());
+    fn add_local(&mut self, name: Spur, ty: Type) -> Result<(), TypeError> {
+        let s = self.interner.resolve(&name).to_string();
+        if self.globals.resolve(name).is_some() {
+            return Err(TypeError::ShadowedName(s));
         }
-        self.tc
-            .impose(key.concretizes_explicit(ty))
-            .map_err(TypeError::from)
-    }
-
-    fn impose_equate(&mut self, k1: TcKey, k2: TcKey) -> Result<(), TypeError> {
-        if self.in_build() {
-            return Ok(());
+        if self.locals.contains_key(&name) {
+            return Err(TypeError::ShadowedName(s));
         }
-        self.tc.impose(k1.equate_with(k2)).map_err(TypeError::from)
-    }
-
-    fn impose_meet(&mut self, key: TcKey, l: TcKey, r: TcKey) -> Result<(), TypeError> {
-        if self.in_build() {
-            return Ok(());
+        if self.labels.contains(&name) {
+            return Err(TypeError::ShadowedName(s));
         }
-        self.tc
-            .impose(key.is_sym_meet_of(l, r))
-            .map_err(TypeError::from)
-    }
-
-    /// Register a declared local (param/ret/var/quantifier binder).
-    fn add_local(&mut self, name: Spur, ty: Type) {
         self.locals.insert(name, ty);
+        Ok(())
     }
 
-    /// Resolve a node's key to its concrete type during the build phase.
-    fn resolved(&self, key: TcKey) -> Result<Type, TypeError> {
-        self.table
-            .as_ref()
-            .and_then(|t| t.get(&key).cloned())
-            .ok_or_else(|| TypeError::Other("unresolved type variable".to_string()))
+    fn add_label(&mut self, name: Spur) -> Result<(), TypeError> {
+        let s = self.interner.resolve(&name).to_string();
+        if self.locals.contains_key(&name) {
+            return Err(TypeError::ShadowedName(s));
+        }
+        if self.labels.contains(&name) {
+            return Err(TypeError::ShadowedName(s));
+        }
+        self.labels.insert(name);
+        Ok(())
     }
 
-    /// Run `build` over one self-contained top-level expression: an infer pass
-    /// (gather constraints, stamp `Infer(key)` into each node), solve, then a
-    /// build pass (read each node's key + the solved table). Locals/`result_ty`
-    /// persist across both passes.
-    fn check<T>(
-        &mut self,
-        mut build: impl FnMut(&mut TcCtx<'g>) -> Result<T, TypeError>,
-    ) -> Result<T, TypeError> {
-        // Infer phase.
-        self.tc = TypeChecker::new();
-        self.let_bindings.clear();
-        self.table = None;
-        build(self)?;
-
-        // Solve.
-        let tc = std::mem::replace(&mut self.tc, TypeChecker::new());
-        let table = tc.type_check().map_err(TypeError::from)?;
-
-        // Build phase.
-        self.table = Some(table);
-        let out = build(self);
-        self.table = None;
-        out
-    }
-
-    /// Check a top-level pure expression. `expected` seeds the root key with the
-    /// type demanded by the surrounding position (return type, param, `Ref`
-    /// base, bool condition, ...), letting context concretize e.g. `5/2`.
-    fn check_pure<Ext: PureExt>(
-        &mut self,
+    /// Typecheck a pure expression and lower it to `final_ast`.
+    /// `result_ty` enables the `result` keyword (function postconditions); pass `None`
+    /// for methods, predicates, and function bodies.
+    fn typecheck_pure<Ext: PureExt>(
+        &self,
         exp: &mut silver::Exp,
-        expected: Option<SilverTcType>,
+        expected: SilverTcType,
+        result_ty: Option<Type>,
     ) -> Result<TypedPureExp<Ext>, TypeError> {
-        self.check(|ctx| {
-            let (typed, key) = lower_pure_exp::<Ext>(exp, ctx)?;
-            if let Some(t) = expected.clone() {
-                ctx.impose_bound(key, t)?;
-            }
-            Ok(typed)
-        })
+        let mut c = ConstraintCtx::new(self, result_ty);
+        let root = c.constrain_pure(exp)?;
+        c.tc.impose(root.concretizes_explicit(expected))?;
+        let table = c.tc.type_check().map_err(TypeError::from)?;
+        LoweringCtx::new(self, &table).lower_pure::<Ext>(exp)
     }
 
-    /// Check a top-level spatial assertion (and all its independent pure leaves)
-    /// under a single fresh checker.
-    fn check_spatial<Ext: PureExt>(
-        &mut self,
+    /// Typecheck a spatial (assertion) expression and lower it to `final_ast`.
+    fn typecheck_spatial<Ext: PureExt>(
+        &self,
         exp: &mut silver::Exp,
     ) -> Result<SpatialExp<Ext>, TypeError> {
-        self.check(|ctx| lower_spatial_exp::<Ext>(exp, ctx))
+        let mut c = ConstraintCtx::new(self, None);
+        c.constrain_spatial(exp)?;
+        let table = c.tc.type_check().map_err(TypeError::from)?;
+        LoweringCtx::new(self, &table).lower_spatial::<Ext>(exp)
+    }
+
+    /// Typecheck a `acc(pred(..), perm)` location used by fold/unfold.
+    fn typecheck_pred_with_perm<Ext: PureExt>(
+        &self,
+        acc: &mut silver::AccExp,
+    ) -> Result<PredicateWithPerm<Ext>, TypeError> {
+        let mut c = ConstraintCtx::new(self, None);
+        c.constrain_resource(&mut acc.loc)?;
+        let pk = c.constrain_pure(&mut acc.perm)?;
+        c.tc
+            .impose(pk.concretizes_explicit(SilverTcType::Numeric))?;
+        let table = c.tc.type_check().map_err(TypeError::from)?;
+
+        let lowerer = LoweringCtx::new(self, &table);
+        let resource = lowerer.lower_resource::<Ext>(&acc.loc)?;
+        let perm = lowerer.lower_pure::<Ext>(&acc.perm)?;
+        let pred_call = match *resource.0 {
+            ResourceExpKind::PredicateCall(call) => call,
+            ResourceExpKind::Field(..) => {
+                return Err(TypeError::Other(
+                    "fold/unfold requires a predicate, not a field".to_string(),
+                ));
+            }
+        };
+        Ok(PredicateWithPerm { pred_call, perm })
     }
 }
 
+/// Phase 1: constraint generation. Walks `silver::Exp`, stamps a fresh `TcKey` onto every
+/// pure node (`exp.ty = Infer(key)`), and feeds rules into the `rusttyc` solver. Produces
+/// no `final_ast`; that is the lowering phase's job.
+struct ConstraintCtx<'a, 'g> {
+    env: &'a LocalEnv<'g>,
+    tc: VarlessTypeChecker<SilverTcType>,
+    /// Let-binders and quantifier binders local to the expression being walked.
+    let_bindings: HashMap<Spur, TcKey>,
+    /// Return type for the enclosing function, enabling `result`; None otherwise.
+    result_ty: Option<Type>,
+}
+
+impl<'a, 'g> ConstraintCtx<'a, 'g> {
+    fn new(env: &'a LocalEnv<'g>, result_ty: Option<Type>) -> Self {
+        Self {
+            env,
+            tc: TypeChecker::without_vars(),
+            let_bindings: HashMap::new(),
+            result_ty,
+        }
+    }
+}
+
+/// Phase 3: lowering. Reads the solved `TypeTable` and maps each `silver::Exp` into a
+/// `final_ast` node in one immutable pass. Stateless w.r.t. binders: every node's type is
+/// fetched from its stamped `TcKey`, so let/quantifier bindings need no bookkeeping here.
+struct LoweringCtx<'a, 'g> {
+    env: &'a LocalEnv<'g>,
+    table: &'a TypeTable,
+}
+
+impl<'a, 'g> LoweringCtx<'a, 'g> {
+    fn new(env: &'a LocalEnv<'g>, table: &'a TypeTable) -> Self {
+        Self { env, table }
+    }
+
+    fn resolved_ty(&self, exp: &silver::Exp) -> Result<Type, TypeError> {
+        match exp.ty {
+            silver::InferenceType::Infer(k) => self
+                .table
+                .get(&k)
+                .cloned()
+                .ok_or_else(|| TypeError::Other("unresolved type variable".to_string())),
+            _ => Err(TypeError::Other(
+                "expression was not assigned a type key".to_string(),
+            )),
+        }
+    }
+}
+
+// ==========================================
+// 4. PureExt trait
+// ==========================================
+
 trait PureExt: Sized {
-    fn lower_old(label: Option<Spur>, inner: TypedPureExp<Self>) -> Result<Self, TypeError>;
+    fn lower_old(
+        label: Option<Spur>,
+        inner: TypedPureExp<Self>,
+        known_labels: &HashSet<Spur>,
+        interner: &Interner,
+    ) -> Result<Self, TypeError>;
     fn lower_result() -> Result<Self, TypeError>;
     fn lower_perm(resource: ResourceExp<Self>) -> Result<Self, TypeError>;
 }
 
 impl PureExt for ! {
-    fn lower_old(_label: Option<Spur>, _inner: TypedPureExp<!>) -> Result<!, TypeError> {
+    fn lower_old(
+        _label: Option<Spur>,
+        _inner: TypedPureExp<!>,
+        _known_labels: &HashSet<Spur>,
+        _interner: &Interner,
+    ) -> Result<!, TypeError> {
         Err(TypeError::IllegalOldUsage)
     }
     fn lower_result() -> Result<!, TypeError> {
@@ -321,6 +377,8 @@ impl PureExt for FuncEnsuresExt {
     fn lower_old(
         label: Option<Spur>,
         inner: TypedPureExp<FuncEnsuresExt>,
+        _known_labels: &HashSet<Spur>,
+        _interner: &Interner,
     ) -> Result<FuncEnsuresExt, TypeError> {
         match label {
             Some(_) => Err(TypeError::IllegalLabeledOldUsage),
@@ -339,6 +397,8 @@ impl PureExt for MethodEnsuresExt {
     fn lower_old(
         label: Option<Spur>,
         inner: TypedPureExp<MethodEnsuresExt>,
+        _known_labels: &HashSet<Spur>,
+        _interner: &Interner,
     ) -> Result<MethodEnsuresExt, TypeError> {
         match label {
             Some(_) => Err(TypeError::IllegalLabeledOldUsage),
@@ -357,7 +417,16 @@ impl PureExt for MethodBodyExt {
     fn lower_old(
         label: Option<Spur>,
         inner: TypedPureExp<MethodBodyExt>,
+        known_labels: &HashSet<Spur>,
+        interner: &Interner,
     ) -> Result<MethodBodyExt, TypeError> {
+        if let Some(lbl) = label {
+            if !known_labels.contains(&lbl) {
+                return Err(TypeError::UndefinedLabel(
+                    interner.resolve(&lbl).to_string(),
+                ));
+            }
+        }
         Ok(MethodBodyExt::Old(label, inner))
     }
     fn lower_result() -> Result<MethodBodyExt, TypeError> {
@@ -367,6 +436,10 @@ impl PureExt for MethodBodyExt {
         Ok(MethodBodyExt::Perm(resource))
     }
 }
+
+// ==========================================
+// 5. Type translation helpers
+// ==========================================
 
 fn lower_type(ty: &silver::Type) -> Type {
     match ty {
@@ -392,510 +465,662 @@ fn write_perm<Ext: PureExt>() -> TypedPureExp<Ext> {
     }
 }
 
-fn is_numeric(t: &Type) -> bool {
-    matches!(t, Type::Int | Type::Real)
-}
+// ==========================================
+// 6. Contract helpers
+// ==========================================
 
-/// Eager compatibility used to drive diagnostics in the solve pass. Numeric
-/// types are mutually compatible here; rusttyc enforces the exact relation
-/// (e.g. it still rejects mixing `Int` and `Real` under `+`).
-fn compatible(a: &Type, b: &Type) -> bool {
-    a == b || (is_numeric(a) && is_numeric(b))
-}
-
-/// Eager type guess for an operation over two compatible operands. Real wins
-/// over Int; equal non-numeric types pass through. The authoritative type comes
-/// from rusttyc on the lowering pass.
-fn join(a: &Type, b: &Type) -> Type {
-    if a == b { a.clone() } else { Type::Real }
-}
-
-/// Both operands must be numeric. Returns the eager joined numeric type.
-fn require_numeric(l: &Type, r: &Type, ctx: &'static str) -> Result<Type, TypeError> {
-    if is_numeric(l) && is_numeric(r) {
-        Ok(join(l, r))
-    } else {
-        Err(TypeError::TypeMismatch {
-            expected: SilverTcType::Numeric,
-            found: type_to_tc(if is_numeric(l) { r } else { l }),
-            context: ctx,
-        })
-    }
-}
-
-/// Lower each contract clause as its own self-contained spatial expression
-/// (fresh checker) and conjoin them.
 fn combine_spatial<Ext: PureExt>(
     exps: &mut [silver::Exp],
-    ctx: &mut TcCtx,
+    ctx: &LocalEnv,
 ) -> Result<Option<SpatialExp<Ext>>, TypeError> {
     let mut iter = exps.iter_mut();
     let first = match iter.next() {
         None => return Ok(None),
-        Some(e) => ctx.check_spatial(e)?,
+        Some(e) => ctx.typecheck_spatial(e)?,
     };
     let combined = iter.try_fold(first, |acc, e| {
-        let next = ctx.check_spatial(e)?;
+        let next = ctx.typecheck_spatial(e)?;
         Ok::<_, TypeError>(SpatialExp(Box::new(SpatialExpKind::Conj(acc, next))))
     })?;
     Ok(Some(combined))
 }
 
-fn lower_pure_exp<Ext: PureExt>(
-    exp: &mut silver::Exp,
-    ctx: &mut TcCtx,
-) -> Result<(TypedPureExp<Ext>, TcKey), TypeError> {
-    // Infer phase: mint a key and stamp it into the node. Build phase: read the
-    // key the infer phase stamped.
-    let key = match &ctx.table {
-        None => {
-            let k = ctx.fresh_key();
-            exp.ty = silver::InferenceType::Infer(k);
-            k
+// ==========================================
+// 7. Phase 1 — constraint generation
+// ==========================================
+
+impl<'a, 'g> ConstraintCtx<'a, 'g> {
+    /// Walk a pure expression, stamp its node with a fresh key, impose its rules, and
+    /// return that key so callers can relate it to their own.
+    fn constrain_pure(&mut self, exp: &mut silver::Exp) -> Result<TcKey, TypeError> {
+        use silver::ExpKind;
+
+        let key = self.tc.new_term_key();
+        exp.ty = silver::InferenceType::Infer(key);
+
+        match exp.kind.as_mut() {
+            ExpKind::Const(c) => {
+                self.tc
+                    .impose(key.concretizes_explicit(type_to_tc(&const_type(c))))?;
+            }
+
+            ExpKind::Ident(ident) => {
+                let spur = ident.id();
+                if let Some(&binder_key) = self.let_bindings.get(&spur) {
+                    self.tc.impose(key.equate_with(binder_key))?;
+                } else {
+                    let ty = self.env.locals.get(&spur).cloned().ok_or_else(|| {
+                        TypeError::UndefinedVariable(self.env.interner.resolve(&spur).to_string())
+                    })?;
+                    self.tc.impose(key.concretizes_explicit(type_to_tc(&ty)))?;
+                }
+            }
+
+            ExpKind::Result => {
+                let ty = self.result_ty.clone().ok_or(TypeError::IllegalResultUsage)?;
+                self.tc.impose(key.concretizes_explicit(type_to_tc(&ty)))?;
+            }
+
+            ExpKind::Old(_label, inner) => {
+                let inner_key = self.constrain_pure(inner)?;
+                self.tc.impose(key.equate_with(inner_key))?;
+            }
+
+            ExpKind::Ascribe(inner, ascribed_ty) => {
+                let target = type_to_tc(&lower_type(ascribed_ty));
+                let inner_key = self.constrain_pure(inner)?;
+                self.tc.impose(inner_key.concretizes_explicit(target.clone()))?;
+                self.tc.impose(key.concretizes_explicit(target))?;
+            }
+
+            ExpKind::UnOp(op, inner) => self.constrain_unop(op, inner, key)?,
+
+            ExpKind::BinOp(op, left, right) => self.constrain_binop(op, left, right, key)?,
+
+            ExpKind::Ternary(cond, then, else_) => {
+                let cond_key = self.constrain_pure(cond)?;
+                self.tc.impose(cond_key.concretizes_explicit(SilverTcType::Bool))?;
+                let then_key = self.constrain_pure(then)?;
+                let else_key = self.constrain_pure(else_)?;
+                self.tc.impose(key.is_sym_meet_of(then_key, else_key))?;
+            }
+
+            ExpKind::LetIn(binder, value, body) => {
+                let value_key = self.constrain_pure(value)?;
+                let binder_spur = binder.0.id();
+                // Error if binder would shadow a currently in-scope name.
+                // Sibling scopes are fine: after the body, binder_spur is removed/restored.
+                if self.env.locals.contains_key(&binder_spur)
+                    || self.let_bindings.contains_key(&binder_spur)
+                {
+                    return Err(TypeError::ShadowedName(
+                        self.env.interner.resolve(&binder_spur).to_string(),
+                    ));
+                }
+                self.let_bindings.insert(binder_spur, value_key);
+                let body_key = self.constrain_pure(body)?;
+                self.let_bindings.remove(&binder_spur);
+                self.tc.impose(key.equate_with(body_key))?;
+            }
+
+            ExpKind::Call(call) => self.constrain_call(call, key)?,
+
+            ExpKind::Field(base, field_name) => self.constrain_field(base, field_name, key)?,
+
+            ExpKind::HeapUpdate(silver::HeapUpdateOp::Unfold, acc_exp, body) => {
+                self.constrain_resource(&mut acc_exp.loc)?;
+                self.constrain_pure(&mut acc_exp.perm)?;
+                let body_key = self.constrain_pure(body)?;
+                self.tc.impose(key.equate_with(body_key))?;
+            }
+
+            ExpKind::AdtDestructor(base, _field) => {
+                self.constrain_pure(base)?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+
+            ExpKind::AdtDiscriminator(base, _variant) => {
+                self.constrain_pure(base)?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+
+            ExpKind::Quantifier(_, bound_vars, _triggers, body) => {
+                // Treat quantifier binders like let-binders: impose their declared type,
+                // restore the previous bindings afterwards.
+                let mut prev_bindings = Vec::with_capacity(bound_vars.len());
+                for bv in bound_vars.iter() {
+                    let ty = lower_type(&bv.ty);
+                    let bk = self.tc.new_term_key();
+                    self.tc.impose(bk.concretizes_explicit(type_to_tc(&ty)))?;
+                    let prev = self.let_bindings.insert(bv.idn.0.id(), bk);
+                    prev_bindings.push((bv.idn.0.id(), prev));
+                }
+                let body_key = self.constrain_pure(body)?;
+                for (spur, prev) in prev_bindings {
+                    match prev {
+                        Some(p) => {
+                            self.let_bindings.insert(spur, p);
+                        }
+                        None => {
+                            self.let_bindings.remove(&spur);
+                        }
+                    }
+                }
+                self.tc.impose(body_key.concretizes_explicit(SilverTcType::Bool))?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+
+            _ => {
+                return Err(TypeError::Other(format!(
+                    "unsupported pure expression: {:?}",
+                    exp.kind
+                )));
+            }
         }
-        Some(_) => match exp.ty {
-            silver::InferenceType::Infer(k) => k,
-            _ => return Err(TypeError::Other("expression was not inferred".to_string())),
-        },
-    };
-    // Each `lower_pure_exp_kind` arm is responsible for constraining `key`.
-    let (eager_ty, kind) = lower_pure_exp_kind::<Ext>(exp, ctx, key)?;
-    // Build phase: take the rusttyc-resolved type; infer phase: the eager guess
-    // (only used to drive constraints/diagnostics).
-    let ty = if ctx.in_build() {
-        ctx.resolved(key)?
-    } else {
-        eager_ty
-    };
-    Ok((
-        TypedPureExp {
+
+        Ok(key)
+    }
+
+    fn constrain_unop(
+        &mut self,
+        op: &silver::UnOp,
+        inner: &mut silver::Exp,
+        key: TcKey,
+    ) -> Result<(), TypeError> {
+        match op {
+            silver::UnOp::Not => {
+                let inner_key = self.constrain_pure(inner)?;
+                self.tc.impose(inner_key.concretizes_explicit(SilverTcType::Bool))?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+            silver::UnOp::Neg => {
+                let inner_key = self.constrain_pure(inner)?;
+                self.tc.impose(inner_key.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(key.equate_with(inner_key))?;
+            }
+            silver::UnOp::Perm => {
+                self.constrain_resource(inner)?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Real))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn constrain_binop(
+        &mut self,
+        op: &silver::BinOp,
+        left: &mut silver::Exp,
+        right: &mut silver::Exp,
+        key: TcKey,
+    ) -> Result<(), TypeError> {
+        use silver::BinOp as SBinOp;
+
+        let lk = self.constrain_pure(left)?;
+        let rk = self.constrain_pure(right)?;
+
+        match op {
+            SBinOp::And | SBinOp::Or | SBinOp::Implies | SBinOp::Iff => {
+                self.tc.impose(lk.concretizes_explicit(SilverTcType::Bool))?;
+                self.tc.impose(rk.concretizes_explicit(SilverTcType::Bool))?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+            SBinOp::Eq | SBinOp::Neq => {
+                self.tc.impose(lk.equate_with(rk))?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+            SBinOp::Lt | SBinOp::Le | SBinOp::Gt | SBinOp::Ge => {
+                self.tc.impose(lk.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(rk.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(lk.equate_with(rk))?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Bool))?;
+            }
+            SBinOp::Plus | SBinOp::Minus | SBinOp::Mult | SBinOp::Mod => {
+                self.tc.impose(lk.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(rk.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(key.is_sym_meet_of(lk, rk))?;
+            }
+            SBinOp::Div => {
+                self.tc.impose(lk.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(rk.concretizes_explicit(SilverTcType::Numeric))?;
+                self.tc.impose(key.concretizes_explicit(SilverTcType::Numeric))?;
+            }
+            _ => {
+                return Err(TypeError::Other(format!(
+                    "unsupported binary operator: {op:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn constrain_call(
+        &mut self,
+        call: &mut silver::Call<silver::ExpCallKind>,
+        key: TcKey,
+    ) -> Result<(), TypeError> {
+        use silver::ExpCallKind;
+        let call_name = call.name.id();
+        let sym = self.env.globals.resolve(call_name).ok_or_else(|| {
+            TypeError::UndefinedVariable(self.env.interner.resolve(&call_name).to_string())
+        })?;
+
+        match call.kind.as_ref().expect("call kind must be resolved") {
+            ExpCallKind::Predicate => Err(TypeError::PredicateInPureContext(
+                self.env.interner.resolve(&call_name).to_string(),
+            )),
+            ExpCallKind::Function | ExpCallKind::AdtConstructor => {
+                let sig = sym.as_function().ok_or_else(|| {
+                    TypeError::Other(format!(
+                        "{} is not a function",
+                        self.env.interner.resolve(&call_name)
+                    ))
+                })?;
+                if sig.params.len() != call.args.len() {
+                    return Err(TypeError::WrongArgCount {
+                        name: self.env.interner.resolve(&call_name).to_string(),
+                        expected: sig.params.len(),
+                        found: call.args.len(),
+                    });
+                }
+                let ret_ty = lower_type(&sig.ret);
+                let expected_params: Vec<Type> = sig.params.iter().map(lower_type).collect();
+                for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
+                    let arg_key = self.constrain_pure(arg)?;
+                    self.tc.impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
+                }
+                self.tc.impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
+                Ok(())
+            }
+            ExpCallKind::Macro => Err(TypeError::Other(
+                "macro in expression (should have been inlined)".to_string(),
+            )),
+        }
+    }
+
+    fn constrain_field(
+        &mut self,
+        base: &mut silver::Exp,
+        field_name: &silver::Ident,
+        key: TcKey,
+    ) -> Result<(), TypeError> {
+        let field_id = field_name.id();
+        let sym = self.env.globals.resolve(field_id).ok_or_else(|| {
+            TypeError::Other(format!(
+                "unknown field: {}",
+                self.env.interner.resolve(&field_id)
+            ))
+        })?;
+        let field_ty = sym.as_field().ok_or_else(|| {
+            TypeError::Other(format!(
+                "{} is not a field",
+                self.env.interner.resolve(&field_id)
+            ))
+        })?;
+        let ret_ty = lower_type(field_ty);
+        let base_key = self.constrain_pure(base)?;
+        self.tc.impose(base_key.concretizes_explicit(SilverTcType::Ref))?;
+        self.tc.impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
+        Ok(())
+    }
+
+    fn constrain_resource(&mut self, exp: &mut silver::Exp) -> Result<(), TypeError> {
+        match exp.kind.as_mut() {
+            silver::ExpKind::Field(base, _field_name) => {
+                let base_key = self.constrain_pure(base)?;
+                self.tc.impose(base_key.concretizes_explicit(SilverTcType::Ref))?;
+                Ok(())
+            }
+            silver::ExpKind::Call(call) => match call.kind.as_ref().expect("call kind resolved") {
+                silver::ExpCallKind::Predicate => self.constrain_predicate_resource(call),
+                _ => Err(TypeError::Other(
+                    "resource position requires field or predicate call".to_string(),
+                )),
+            },
+            _ => Err(TypeError::Other(
+                "resource position requires field or predicate call".to_string(),
+            )),
+        }
+    }
+
+    fn constrain_predicate_resource(
+        &mut self,
+        call: &mut silver::Call<silver::ExpCallKind>,
+    ) -> Result<(), TypeError> {
+        let call_name = call.name.id();
+        let sym = self.env.globals.resolve(call_name).ok_or_else(|| {
+            TypeError::UndefinedVariable(self.env.interner.resolve(&call_name).to_string())
+        })?;
+        let sig = sym.as_predicate().ok_or_else(|| {
+            TypeError::Other(format!(
+                "{} is not a predicate",
+                self.env.interner.resolve(&call_name)
+            ))
+        })?;
+        if sig.params.len() != call.args.len() {
+            return Err(TypeError::WrongArgCount {
+                name: self.env.interner.resolve(&call_name).to_string(),
+                expected: sig.params.len(),
+                found: call.args.len(),
+            });
+        }
+        let expected_params: Vec<Type> = sig.params.iter().map(lower_type).collect();
+        for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
+            let arg_key = self.constrain_pure(arg)?;
+            self.tc.impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
+        }
+        Ok(())
+    }
+
+    fn constrain_spatial(&mut self, exp: &mut silver::Exp) -> Result<(), TypeError> {
+        use silver::ExpKind;
+
+        // A bare predicate call in assertion position is shorthand for full permission.
+        if let ExpKind::Call(call) = exp.kind.as_mut() {
+            if matches!(call.kind, Some(silver::ExpCallKind::Predicate)) {
+                return self.constrain_predicate_resource(call);
+            }
+        }
+
+        match exp.kind.as_mut() {
+            ExpKind::Acc(acc_exp) => {
+                self.constrain_resource(&mut acc_exp.loc)?;
+                let perm_key = self.constrain_pure(&mut acc_exp.perm)?;
+                self.tc.impose(perm_key.concretizes_explicit(SilverTcType::Numeric))?;
+                Ok(())
+            }
+            ExpKind::BinOp(silver::BinOp::And | silver::BinOp::InhaleExhale, l, r) => {
+                self.constrain_spatial(l)?;
+                self.constrain_spatial(r)
+            }
+            ExpKind::BinOp(silver::BinOp::Implies, l, r) => {
+                let cond_key = self.constrain_pure(l)?;
+                self.tc.impose(cond_key.concretizes_explicit(SilverTcType::Bool))?;
+                self.constrain_spatial(r)
+            }
+            ExpKind::Ternary(cond, then, else_) => {
+                let cond_key = self.constrain_pure(cond)?;
+                self.tc.impose(cond_key.concretizes_explicit(SilverTcType::Bool))?;
+                self.constrain_spatial(then)?;
+                self.constrain_spatial(else_)
+            }
+            _ => {
+                let pure_key = self.constrain_pure(exp)?;
+                self.tc.impose(pure_key.concretizes_explicit(SilverTcType::Bool))?;
+                Ok(())
+            }
+        }
+    }
+}
+
+// ==========================================
+// 8. Phase 3 — lowering to final_ast
+// ==========================================
+
+impl<'a, 'g> LoweringCtx<'a, 'g> {
+    fn lower_pure<Ext: PureExt>(
+        &self,
+        exp: &silver::Exp,
+    ) -> Result<TypedPureExp<Ext>, TypeError> {
+        let ty = self.resolved_ty(exp)?;
+        let kind = self.lower_pure_kind::<Ext>(exp)?;
+        Ok(TypedPureExp {
             ty,
             exp: Box::new(kind),
-        },
-        key,
-    ))
-}
+        })
+    }
 
-fn lower_pure_exp_kind<Ext: PureExt>(
-    exp: &mut silver::Exp,
-    ctx: &mut TcCtx,
-    key: TcKey,
-) -> Result<(Type, PureExpKind<Ext>), TypeError> {
-    use silver::ExpKind;
+    fn lower_pure_kind<Ext: PureExt>(
+        &self,
+        exp: &silver::Exp,
+    ) -> Result<PureExpKind<Ext>, TypeError> {
+        use silver::ExpKind;
 
-    match exp.kind.as_mut() {
-        ExpKind::Const(c) => {
-            let (ty, kind) = lower_const(c)?;
-            ctx.impose_bound(key, type_to_tc(&ty))?;
-            Ok((ty, kind))
-        }
+        match &*exp.kind {
+            ExpKind::Const(c) => Ok(PureExpKind::Const(lower_const_literal(c))),
 
-        ExpKind::Ident(ident) => {
-            let spur = ident.id();
-            let lowered = PureExpKind::Ident(lower_ident(ident));
-            // `let`-binder: equate with the binder's key (same checker).
-            if let Some(binder_key) = ctx.let_bindings.get(&spur).cloned() {
-                ctx.impose_equate(key, binder_key)?;
-                // Infer phase: placeholder — build phase uses ctx.resolved(key)
-                return Ok((Type::Bool, lowered));
+            ExpKind::Ident(ident) => Ok(PureExpKind::Ident(lower_ident(ident))),
+
+            ExpKind::Result => Ok(PureExpKind::Ext(Ext::lower_result()?)),
+
+            ExpKind::Old(label, inner) => {
+                let inner_exp = self.lower_pure::<Ext>(inner)?;
+                let label_spur = label.as_ref().map(|l| l.id());
+                let ext =
+                    Ext::lower_old(label_spur, inner_exp, &self.env.labels, self.env.interner)?;
+                Ok(PureExpKind::Ext(ext))
             }
-            // Declared local/param/ret: concrete type, seed the key.
-            let ty = ctx.locals.get(&spur).cloned().ok_or_else(|| {
-                TypeError::UndefinedVariable(ctx.interner.resolve(&spur).to_string())
-            })?;
-            ctx.impose_bound(key, type_to_tc(&ty))?;
-            Ok((ty, lowered))
-        }
 
-        ExpKind::Result => {
-            let ty = ctx.result_ty.clone().ok_or(TypeError::IllegalResultUsage)?;
-            ctx.impose_bound(key, type_to_tc(&ty))?;
-            let ext = Ext::lower_result()?;
-            Ok((ty, PureExpKind::Ext(ext)))
-        }
-
-        ExpKind::Old(label, inner) => {
-            let (inner_exp, inner_key) = lower_pure_exp::<Ext>(inner, ctx)?;
-            ctx.impose_equate(key, inner_key)?;
-            let ty = inner_exp.ty.clone();
-            let label_spur = label.as_ref().map(|l| l.id());
-            let ext = Ext::lower_old(label_spur, inner_exp)?;
-            Ok((ty, PureExpKind::Ext(ext)))
-        }
-
-        ExpKind::Ascribe(inner, ascribed_ty) => {
-            let target_ty = lower_type(ascribed_ty);
-            let (inner_exp, inner_key) = lower_pure_exp::<Ext>(inner, ctx)?;
-            ctx.impose_bound(inner_key, type_to_tc(&target_ty))?;
-            ctx.impose_bound(key, type_to_tc(&target_ty))?;
-            Ok((
-                target_ty.clone(),
-                PureExpKind::Ascribe(inner_exp, target_ty),
-            ))
-        }
-
-        ExpKind::UnOp(op, inner) => lower_unop::<Ext>(op, inner, ctx, key),
-
-        ExpKind::BinOp(op, left, right) => lower_binop::<Ext>(op, left, right, ctx, key),
-
-        ExpKind::Ternary(cond, then, else_) => {
-            let (cond_exp, cond_key) = lower_pure_exp::<Ext>(cond, ctx)?;
-            ctx.impose_bound(cond_key, SilverTcType::Bool)?;
-            if cond_exp.ty != Type::Bool {
-                return Err(TypeError::TypeMismatch {
-                    expected: SilverTcType::Bool,
-                    found: type_to_tc(&cond_exp.ty),
-                    context: "ternary condition",
-                });
+            ExpKind::Ascribe(inner, ascribed_ty) => {
+                let inner_exp = self.lower_pure::<Ext>(inner)?;
+                Ok(PureExpKind::Ascribe(inner_exp, lower_type(ascribed_ty)))
             }
-            let (then_exp, then_key) = lower_pure_exp::<Ext>(then, ctx)?;
-            let (else_exp, else_key) = lower_pure_exp::<Ext>(else_, ctx)?;
-            if !compatible(&then_exp.ty, &else_exp.ty) {
-                return Err(TypeError::TypeMismatch {
-                    expected: type_to_tc(&then_exp.ty),
-                    found: type_to_tc(&else_exp.ty),
-                    context: "ternary branches",
-                });
+
+            ExpKind::UnOp(op, inner) => self.lower_unop::<Ext>(op, inner),
+
+            ExpKind::BinOp(op, left, right) => {
+                let le = self.lower_pure::<Ext>(left)?;
+                let re = self.lower_pure::<Ext>(right)?;
+                Ok(PureExpKind::Binary(lower_bin_op(op), le, re))
             }
-            let ty = join(&then_exp.ty, &else_exp.ty);
-            ctx.impose_meet(key, then_key, else_key)?;
-            Ok((
-                ty,
-                PureExpKind::Ternary {
-                    if_: cond_exp,
-                    then: then_exp,
-                    else_: else_exp,
-                },
-            ))
-        }
 
-        ExpKind::LetIn(binder, value, body) => {
-            let (value_exp, value_key) = lower_pure_exp::<Ext>(value, ctx)?;
-            let binder_spur = binder.0.id();
-            let prev = ctx.let_bindings.insert(binder_spur, value_key);
-            let (body_exp, body_key) = lower_pure_exp::<Ext>(body, ctx)?;
-            match prev {
-                Some(p) => {
-                    ctx.let_bindings.insert(binder_spur, p);
-                }
-                None => {
-                    ctx.let_bindings.remove(&binder_spur);
-                }
+            ExpKind::Ternary(cond, then, else_) => Ok(PureExpKind::Ternary {
+                if_: self.lower_pure::<Ext>(cond)?,
+                then: self.lower_pure::<Ext>(then)?,
+                else_: self.lower_pure::<Ext>(else_)?,
+            }),
+
+            ExpKind::LetIn(binder, value, body) => Ok(PureExpKind::LetIn {
+                binder: Ident(binder.0.id()),
+                value: self.lower_pure::<Ext>(value)?,
+                exp: self.lower_pure::<Ext>(body)?,
+            }),
+
+            ExpKind::Call(call) => self.lower_call::<Ext>(call),
+
+            ExpKind::Field(base, field_name) => {
+                let base_exp = self.lower_pure::<Ext>(base)?;
+                Ok(PureExpKind::FunctionCall(Call {
+                    name: Ident(field_name.id()),
+                    args: vec![base_exp],
+                }))
             }
-            ctx.impose_equate(key, body_key)?;
-            let ty = body_exp.ty.clone();
-            Ok((
-                ty,
-                PureExpKind::LetIn {
-                    binder: Ident(binder_spur),
-                    value: value_exp,
-                    exp: body_exp,
-                },
-            ))
-        }
 
-        ExpKind::Call(call) => lower_call::<Ext>(call, ctx, key),
-
-        ExpKind::Field(base, field_name) => lower_field::<Ext>(base, field_name, ctx, key),
-
-        ExpKind::HeapUpdate(silver::HeapUpdateOp::Unfold, acc_exp, body) => {
-            let resource = lower_resource_exp::<Ext>(&mut acc_exp.loc, ctx)?;
-            let (perm_exp, _) = lower_pure_exp::<Ext>(&mut acc_exp.perm, ctx)?;
-            let pred_call = match *resource.0 {
-                ResourceExpKind::PredicateCall(call) => call,
-                ResourceExpKind::Field(..) => {
-                    return Err(TypeError::Other("cannot unfold a field".to_string()));
-                }
-            };
-            let (body_exp, body_key) = lower_pure_exp::<Ext>(body, ctx)?;
-            ctx.impose_equate(key, body_key)?;
-            let ty = body_exp.ty.clone();
-            Ok((
-                ty,
-                PureExpKind::Unfolding(
-                    PredicateWithPerm {
-                        pred_call,
-                        perm: perm_exp,
-                    },
+            ExpKind::HeapUpdate(silver::HeapUpdateOp::Unfold, acc_exp, body) => {
+                let resource = self.lower_resource::<Ext>(&acc_exp.loc)?;
+                let perm = self.lower_pure::<Ext>(&acc_exp.perm)?;
+                let pred_call = match *resource.0 {
+                    ResourceExpKind::PredicateCall(call) => call,
+                    ResourceExpKind::Field(..) => {
+                        return Err(TypeError::Other("cannot unfold a field".to_string()));
+                    }
+                };
+                let body_exp = self.lower_pure::<Ext>(body)?;
+                Ok(PureExpKind::Unfolding(
+                    PredicateWithPerm { pred_call, perm },
                     body_exp,
-                ),
-            ))
-        }
-
-        ExpKind::AdtDestructor(base, field) => {
-            let (base_exp, _) = lower_pure_exp::<Ext>(base, ctx)?;
-            ctx.impose_bound(key, SilverTcType::Bool)?;
-            Ok((
-                Type::Bool,
-                PureExpKind::AdtDestructor(base_exp, Ident(field.id())),
-            ))
-        }
-
-        ExpKind::AdtDiscriminator(base, variant) => {
-            let (base_exp, _) = lower_pure_exp::<Ext>(base, ctx)?;
-            ctx.impose_bound(key, SilverTcType::Bool)?;
-            Ok((
-                Type::Bool,
-                PureExpKind::AdtDiscriminator(base_exp, Ident(variant.id())),
-            ))
-        }
-
-        _ => Err(TypeError::Other(format!(
-            "unsupported pure expression: {:?}",
-            exp.kind
-        ))),
-    }
-}
-
-fn lower_const<Ext>(c: &silver::ConstKind) -> Result<(Type, PureExpKind<Ext>), TypeError> {
-    let (ty, lit) = match c {
-        silver::ConstKind::Bool(b) => (Type::Bool, Literal::Bool(*b)),
-        silver::ConstKind::Int(i) => (Type::Int, Literal::Int(i.clone())),
-        silver::ConstKind::Real(r) => (Type::Real, Literal::Real(r.clone())),
-        silver::ConstKind::Null => (Type::Ref, Literal::Null),
-        silver::ConstKind::Wildcard => (Type::Real, Literal::Wildcard),
-        silver::ConstKind::Epsilon => (
-            Type::Real,
-            Literal::Real(num::BigRational::new(
-                num::BigInt::from(0),
-                num::BigInt::from(1),
-            )),
-        ),
-    };
-    Ok((ty, PureExpKind::Const(lit)))
-}
-
-fn lower_call<Ext: PureExt>(
-    call: &mut silver::Call<silver::ExpCallKind>,
-    ctx: &mut TcCtx,
-    key: TcKey,
-) -> Result<(Type, PureExpKind<Ext>), TypeError> {
-    use silver::ExpCallKind;
-    let call_name = call.name.id();
-    let sym = ctx.globals.resolve(call_name).ok_or_else(|| {
-        TypeError::UndefinedVariable(ctx.interner.resolve(&call_name).to_string())
-    })?;
-
-    match call.kind.as_ref().expect("call kind must be resolved") {
-        ExpCallKind::Predicate => {
-            let name = ctx.interner.resolve(&call_name).to_string();
-            Err(TypeError::PredicateInPureContext(name))
-        }
-        ExpCallKind::Function | ExpCallKind::AdtConstructor => {
-            let sig = sym.as_function().ok_or_else(|| {
-                TypeError::Other(format!(
-                    "{} is not a function",
-                    ctx.interner.resolve(&call_name)
                 ))
-            })?;
-            if sig.params.len() != call.args.len() {
-                return Err(TypeError::WrongArgCount {
-                    name: ctx.interner.resolve(&call_name).to_string(),
-                    expected: sig.params.len(),
-                    found: call.args.len(),
-                });
             }
-            let ret_ty = lower_type(&sig.ret);
-            let expected_params: Vec<Type> = sig.params.iter().map(lower_type).collect();
-            let mut lowered_args = Vec::with_capacity(call.args.len());
-            for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
-                let (arg_exp, arg_key) = lower_pure_exp::<Ext>(arg, ctx)?;
-                if !compatible(&arg_exp.ty, expected) {
-                    return Err(TypeError::TypeMismatch {
-                        expected: type_to_tc(expected),
-                        found: type_to_tc(&arg_exp.ty),
-                        context: "function argument",
-                    });
+
+            ExpKind::AdtDestructor(base, field) => {
+                let base_exp = self.lower_pure::<Ext>(base)?;
+                Ok(PureExpKind::AdtDestructor(base_exp, Ident(field.id())))
+            }
+
+            ExpKind::AdtDiscriminator(base, variant) => {
+                let base_exp = self.lower_pure::<Ext>(base)?;
+                Ok(PureExpKind::AdtDiscriminator(base_exp, Ident(variant.id())))
+            }
+
+            // Quantifiers emitted as bool constant (proper final_ast support later).
+            ExpKind::Quantifier(..) => Ok(PureExpKind::Const(Literal::Bool(true))),
+
+            _ => Err(TypeError::Other(format!(
+                "unsupported pure expression: {:?}",
+                exp.kind
+            ))),
+        }
+    }
+
+    fn lower_unop<Ext: PureExt>(
+        &self,
+        op: &silver::UnOp,
+        inner: &silver::Exp,
+    ) -> Result<PureExpKind<Ext>, TypeError> {
+        match op {
+            silver::UnOp::Not => Ok(PureExpKind::Unary(UnOp::Not, self.lower_pure::<Ext>(inner)?)),
+            silver::UnOp::Neg => Ok(PureExpKind::Unary(UnOp::Neg, self.lower_pure::<Ext>(inner)?)),
+            silver::UnOp::Perm => {
+                let resource = self.lower_resource::<Ext>(inner)?;
+                Ok(PureExpKind::Ext(Ext::lower_perm(resource)?))
+            }
+        }
+    }
+
+    fn lower_call<Ext: PureExt>(
+        &self,
+        call: &silver::Call<silver::ExpCallKind>,
+    ) -> Result<PureExpKind<Ext>, TypeError> {
+        use silver::ExpCallKind;
+        let call_name = call.name.id();
+        match call.kind.as_ref().expect("call kind must be resolved") {
+            ExpCallKind::Predicate => Err(TypeError::PredicateInPureContext(
+                self.env.interner.resolve(&call_name).to_string(),
+            )),
+            ExpCallKind::Function | ExpCallKind::AdtConstructor => {
+                let mut args = Vec::with_capacity(call.args.len());
+                for arg in call.args.iter() {
+                    args.push(self.lower_pure::<Ext>(arg)?);
                 }
-                ctx.impose_bound(arg_key, type_to_tc(expected))?;
-                lowered_args.push(arg_exp);
-            }
-            ctx.impose_bound(key, type_to_tc(&ret_ty))?;
-            Ok((
-                ret_ty,
-                PureExpKind::FunctionCall(Call {
+                Ok(PureExpKind::FunctionCall(Call {
                     name: Ident(call_name),
-                    args: lowered_args,
-                }),
-            ))
+                    args,
+                }))
+            }
+            ExpCallKind::Macro => Err(TypeError::Other(
+                "macro in expression (should have been inlined)".to_string(),
+            )),
         }
-        ExpCallKind::Macro => Err(TypeError::Other(
-            "macro in expression (should have been inlined)".to_string(),
+    }
+
+    fn lower_resource<Ext: PureExt>(
+        &self,
+        exp: &silver::Exp,
+    ) -> Result<ResourceExp<Ext>, TypeError> {
+        match &*exp.kind {
+            silver::ExpKind::Field(base, field_name) => {
+                let base_exp = self.lower_pure::<Ext>(base)?;
+                Ok(ResourceExp(Box::new(ResourceExpKind::Field(
+                    base_exp,
+                    Ident(field_name.id()),
+                ))))
+            }
+            silver::ExpKind::Call(call) => match call.kind.as_ref().expect("call kind resolved") {
+                silver::ExpCallKind::Predicate => self.lower_predicate_resource::<Ext>(call),
+                _ => Err(TypeError::Other(
+                    "resource position requires field or predicate call".to_string(),
+                )),
+            },
+            _ => Err(TypeError::Other(
+                "resource position requires field or predicate call".to_string(),
+            )),
+        }
+    }
+
+    fn lower_predicate_resource<Ext: PureExt>(
+        &self,
+        call: &silver::Call<silver::ExpCallKind>,
+    ) -> Result<ResourceExp<Ext>, TypeError> {
+        let mut args = Vec::with_capacity(call.args.len());
+        for arg in call.args.iter() {
+            args.push(self.lower_pure::<Ext>(arg)?);
+        }
+        Ok(ResourceExp(Box::new(ResourceExpKind::PredicateCall(Call {
+            name: Ident(call.name.id()),
+            args,
+        }))))
+    }
+
+    fn lower_spatial<Ext: PureExt>(
+        &self,
+        exp: &silver::Exp,
+    ) -> Result<SpatialExp<Ext>, TypeError> {
+        use silver::ExpKind;
+
+        if let ExpKind::Call(call) = &*exp.kind {
+            if matches!(call.kind, Some(silver::ExpCallKind::Predicate)) {
+                let resource = self.lower_predicate_resource::<Ext>(call)?;
+                return Ok(SpatialExp(Box::new(SpatialExpKind::Acc(
+                    resource,
+                    write_perm(),
+                ))));
+            }
+        }
+
+        match &*exp.kind {
+            ExpKind::Acc(acc_exp) => {
+                let resource = self.lower_resource::<Ext>(&acc_exp.loc)?;
+                let perm_exp = self.lower_pure::<Ext>(&acc_exp.perm)?;
+                Ok(SpatialExp(Box::new(SpatialExpKind::Acc(resource, perm_exp))))
+            }
+
+            ExpKind::BinOp(silver::BinOp::And | silver::BinOp::InhaleExhale, l, r) => {
+                let ls = self.lower_spatial::<Ext>(l)?;
+                let rs = self.lower_spatial::<Ext>(r)?;
+                Ok(SpatialExp(Box::new(SpatialExpKind::Conj(ls, rs))))
+            }
+
+            ExpKind::BinOp(silver::BinOp::Implies, l, r) => {
+                let cond_exp = self.lower_pure::<Ext>(l)?;
+                let rs = self.lower_spatial::<Ext>(r)?;
+                Ok(SpatialExp(Box::new(SpatialExpKind::Implies(cond_exp, rs))))
+            }
+
+            ExpKind::Ternary(cond, then, else_) => {
+                let cond_exp = self.lower_pure::<Ext>(cond)?;
+                let then_s = self.lower_spatial::<Ext>(then)?;
+                let else_s = self.lower_spatial::<Ext>(else_)?;
+                Ok(SpatialExp(Box::new(SpatialExpKind::Ternary {
+                    if_: cond_exp,
+                    then: then_s,
+                    else_: else_s,
+                })))
+            }
+
+            _ => {
+                let pure_exp = self.lower_pure::<Ext>(exp)?;
+                Ok(SpatialExp(Box::new(SpatialExpKind::Pure(pure_exp))))
+            }
+        }
+    }
+}
+
+// ==========================================
+// 9. Constant lowering helpers
+// ==========================================
+
+/// Type of a literal, used during constraint generation (no `final_ast` produced).
+fn const_type(c: &silver::ConstKind) -> Type {
+    match c {
+        silver::ConstKind::Bool(_) => Type::Bool,
+        silver::ConstKind::Int(_) => Type::Int,
+        silver::ConstKind::Real(_) | silver::ConstKind::Wildcard | silver::ConstKind::Epsilon => {
+            Type::Real
+        }
+        silver::ConstKind::Null => Type::Ref,
+    }
+}
+
+fn lower_const_literal(c: &silver::ConstKind) -> Literal {
+    match c {
+        silver::ConstKind::Bool(b) => Literal::Bool(*b),
+        silver::ConstKind::Int(i) => Literal::Int(i.clone()),
+        silver::ConstKind::Real(r) => Literal::Real(r.clone()),
+        silver::ConstKind::Null => Literal::Null,
+        silver::ConstKind::Wildcard => Literal::Wildcard,
+        silver::ConstKind::Epsilon => Literal::Real(num::BigRational::new(
+            num::BigInt::from(0),
+            num::BigInt::from(1),
         )),
-    }
-}
-
-fn lower_field<Ext: PureExt>(
-    base: &mut silver::Exp,
-    field_name: &silver::Ident,
-    ctx: &mut TcCtx,
-    key: TcKey,
-) -> Result<(Type, PureExpKind<Ext>), TypeError> {
-    let field_id = field_name.id();
-    let sym = ctx.globals.resolve(field_id).ok_or_else(|| {
-        TypeError::Other(format!(
-            "unknown field: {}",
-            ctx.interner.resolve(&field_id)
-        ))
-    })?;
-    let field_ty = sym.as_field().ok_or_else(|| {
-        TypeError::Other(format!(
-            "{} is not a field",
-            ctx.interner.resolve(&field_id)
-        ))
-    })?;
-    let (base_exp, base_key) = lower_pure_exp::<Ext>(base, ctx)?;
-    if base_exp.ty != Type::Ref {
-        return Err(TypeError::FieldBaseNotRef);
-    }
-    ctx.impose_bound(base_key, SilverTcType::Ref)?;
-    let ret_ty = lower_type(field_ty);
-    ctx.impose_bound(key, type_to_tc(&ret_ty))?;
-    Ok((
-        ret_ty,
-        PureExpKind::FunctionCall(Call {
-            name: Ident(field_id),
-            args: vec![base_exp],
-        }),
-    ))
-}
-
-fn lower_unop<Ext: PureExt>(
-    op: &silver::UnOp,
-    inner: &mut silver::Exp,
-    ctx: &mut TcCtx,
-    key: TcKey,
-) -> Result<(Type, PureExpKind<Ext>), TypeError> {
-    match op {
-        silver::UnOp::Not => {
-            let (inner_exp, inner_key) = lower_pure_exp::<Ext>(inner, ctx)?;
-            if inner_exp.ty != Type::Bool {
-                return Err(TypeError::TypeMismatch {
-                    expected: SilverTcType::Bool,
-                    found: type_to_tc(&inner_exp.ty),
-                    context: "not operand",
-                });
-            }
-            ctx.impose_bound(inner_key, SilverTcType::Bool)?;
-            ctx.impose_bound(key, SilverTcType::Bool)?;
-            Ok((Type::Bool, PureExpKind::Unary(UnOp::Not, inner_exp)))
-        }
-        silver::UnOp::Neg => {
-            let (inner_exp, inner_key) = lower_pure_exp::<Ext>(inner, ctx)?;
-            let ty = match inner_exp.ty {
-                Type::Int => Type::Int,
-                Type::Real => Type::Real,
-                ref t => {
-                    return Err(TypeError::TypeMismatch {
-                        expected: SilverTcType::Numeric,
-                        found: type_to_tc(t),
-                        context: "negation operand",
-                    });
-                }
-            };
-            ctx.impose_bound(inner_key, SilverTcType::Numeric)?;
-            ctx.impose_equate(key, inner_key)?;
-            Ok((ty, PureExpKind::Unary(UnOp::Neg, inner_exp)))
-        }
-        silver::UnOp::Perm => {
-            let resource = lower_resource_exp::<Ext>(inner, ctx)?;
-            let ext = Ext::lower_perm(resource)?;
-            ctx.impose_bound(key, SilverTcType::Real)?;
-            Ok((Type::Real, PureExpKind::Ext(ext)))
-        }
-    }
-}
-
-fn lower_binop<Ext: PureExt>(
-    op: &silver::BinOp,
-    left: &mut silver::Exp,
-    right: &mut silver::Exp,
-    ctx: &mut TcCtx,
-    key: TcKey,
-) -> Result<(Type, PureExpKind<Ext>), TypeError> {
-    use silver::BinOp as SBinOp;
-
-    let (le, lk) = lower_pure_exp::<Ext>(left, ctx)?;
-    let (re, rk) = lower_pure_exp::<Ext>(right, ctx)?;
-
-    // Each arm fully constrains `key`; the eager `result_ty` is only a guess used
-    // for diagnostics on the solve pass — the stored type comes from rusttyc.
-    let (result_ty, fa_op) = match op {
-        SBinOp::And | SBinOp::Or | SBinOp::Implies | SBinOp::Iff => {
-            let name = bin_op_name(op);
-            check_bool(&le.ty, &re.ty, name)?;
-            ctx.impose_bound(lk, SilverTcType::Bool)?;
-            ctx.impose_bound(rk, SilverTcType::Bool)?;
-            ctx.impose_bound(key, SilverTcType::Bool)?;
-            (Type::Bool, lower_bin_op(op))
-        }
-        SBinOp::Eq | SBinOp::Neq => {
-            if !compatible(&le.ty, &re.ty) {
-                return Err(TypeError::TypeMismatch {
-                    expected: type_to_tc(&le.ty),
-                    found: type_to_tc(&re.ty),
-                    context: bin_op_name(op),
-                });
-            }
-            ctx.impose_equate(lk, rk)?;
-            ctx.impose_bound(key, SilverTcType::Bool)?;
-            (Type::Bool, lower_bin_op(op))
-        }
-        SBinOp::Lt | SBinOp::Le | SBinOp::Gt | SBinOp::Ge => {
-            require_numeric(&le.ty, &re.ty, bin_op_name(op))?;
-            ctx.impose_bound(lk, SilverTcType::Numeric)?;
-            ctx.impose_bound(rk, SilverTcType::Numeric)?;
-            ctx.impose_equate(lk, rk)?;
-            ctx.impose_bound(key, SilverTcType::Bool)?;
-            (Type::Bool, lower_bin_op(op))
-        }
-        SBinOp::Plus | SBinOp::Minus | SBinOp::Mult | SBinOp::Mod => {
-            let ty = require_numeric(&le.ty, &re.ty, bin_op_name(op))?;
-            ctx.impose_bound(lk, SilverTcType::Numeric)?;
-            ctx.impose_bound(rk, SilverTcType::Numeric)?;
-            // result == meet(lhs, rhs): Int·Int = Int, Real·Real = Real.
-            ctx.impose_meet(key, lk, rk)?;
-            (ty, lower_bin_op(op))
-        }
-        SBinOp::Div => {
-            // Real/perm division: result is abstract `Numeric`. Context may pin
-            // it to Int or Real; if nothing does, it defaults to Real (via
-            // `Constructable::construct`). Operands need not share a type.
-            require_numeric(&le.ty, &re.ty, "/")?;
-            ctx.impose_bound(lk, SilverTcType::Numeric)?;
-            ctx.impose_bound(rk, SilverTcType::Numeric)?;
-            ctx.impose_bound(key, SilverTcType::Numeric)?;
-            (Type::Real, BinOp::Div)
-        }
-        _ => {
-            return Err(TypeError::Other(format!(
-                "unsupported binary operator: {op:?}"
-            )));
-        }
-    };
-
-    Ok((result_ty, PureExpKind::Binary(fa_op, le, re)))
-}
-
-fn bin_op_name(op: &silver::BinOp) -> &'static str {
-    use silver::BinOp as S;
-    match op {
-        S::And => "&&",
-        S::Or => "||",
-        S::Implies => "==>",
-        S::Iff => "<==>",
-        S::Eq => "==",
-        S::Neq => "!=",
-        S::Lt => "<",
-        S::Le => "<=",
-        S::Gt => ">",
-        S::Ge => ">=",
-        S::Plus => "+",
-        S::Minus => "-",
-        S::Mult => "*",
-        S::Div => "/",
-        S::Mod => "%",
-        _ => "<binop>",
     }
 }
 
@@ -921,253 +1146,67 @@ fn lower_bin_op(op: &silver::BinOp) -> BinOp {
     }
 }
 
-fn check_bool(l: &Type, r: &Type, op: &'static str) -> Result<(), TypeError> {
-    if *l != Type::Bool {
-        return Err(TypeError::TypeMismatch {
-            expected: SilverTcType::Bool,
-            found: type_to_tc(l),
-            context: op,
-        });
-    }
-    if *r != Type::Bool {
-        return Err(TypeError::TypeMismatch {
-            expected: SilverTcType::Bool,
-            found: type_to_tc(r),
-            context: op,
-        });
-    }
-    Ok(())
-}
-
-// ==========================================
-// 8. lower_resource_exp
-// ==========================================
-
-fn lower_resource_exp<Ext: PureExt>(
-    exp: &mut silver::Exp,
-    ctx: &mut TcCtx,
-) -> Result<ResourceExp<Ext>, TypeError> {
-    match exp.kind.as_mut() {
-        silver::ExpKind::Field(base, field_name) => {
-            let field_id = field_name.id();
-            let (base_exp, base_key) = lower_pure_exp::<Ext>(base, ctx)?;
-            if base_exp.ty != Type::Ref {
-                return Err(TypeError::FieldBaseNotRef);
-            }
-            ctx.impose_bound(base_key, SilverTcType::Ref)?;
-            Ok(ResourceExp(Box::new(ResourceExpKind::Field(
-                base_exp,
-                Ident(field_id),
-            ))))
-        }
-        silver::ExpKind::Call(call) => {
-            let kind = call.kind.clone().expect("call kind resolved");
-            match kind {
-                silver::ExpCallKind::Predicate => lower_predicate_resource::<Ext>(call, ctx),
-                _ => Err(TypeError::Other(
-                    "resource position requires field or predicate call".to_string(),
-                )),
-            }
-        }
-        _ => Err(TypeError::Other(
-            "resource position requires field or predicate call".to_string(),
-        )),
-    }
-}
-
-/// Lower a predicate call appearing in a resource position to a typed
-/// `ResourceExpKind::PredicateCall`.
-fn lower_predicate_resource<Ext: PureExt>(
-    call: &mut silver::Call<silver::ExpCallKind>,
-    ctx: &mut TcCtx,
-) -> Result<ResourceExp<Ext>, TypeError> {
-    let call_name = call.name.id();
-    let sym = ctx.globals.resolve(call_name).ok_or_else(|| {
-        TypeError::UndefinedVariable(ctx.interner.resolve(&call_name).to_string())
-    })?;
-    let sig = sym.as_predicate().ok_or_else(|| {
-        TypeError::Other(format!(
-            "{} is not a predicate",
-            ctx.interner.resolve(&call_name)
-        ))
-    })?;
-    if sig.params.len() != call.args.len() {
-        return Err(TypeError::WrongArgCount {
-            name: ctx.interner.resolve(&call_name).to_string(),
-            expected: sig.params.len(),
-            found: call.args.len(),
-        });
-    }
-    let expected_params: Vec<Type> = sig.params.iter().map(lower_type).collect();
-    let mut lowered_args = Vec::with_capacity(call.args.len());
-    for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
-        let (arg_exp, arg_key) = lower_pure_exp::<Ext>(arg, ctx)?;
-        if !compatible(&arg_exp.ty, expected) {
-            return Err(TypeError::TypeMismatch {
-                expected: type_to_tc(expected),
-                found: type_to_tc(&arg_exp.ty),
-                context: "predicate argument",
-            });
-        }
-        ctx.impose_bound(arg_key, type_to_tc(expected))?;
-        lowered_args.push(arg_exp);
-    }
-    Ok(ResourceExp(Box::new(ResourceExpKind::PredicateCall(
-        Call {
-            name: Ident(call_name),
-            args: lowered_args,
-        },
-    ))))
-}
-
-// ==========================================
-// 9. lower_spatial_exp
-// ==========================================
-
-fn lower_spatial_exp<Ext: PureExt>(
-    exp: &mut silver::Exp,
-    ctx: &mut TcCtx,
-) -> Result<SpatialExp<Ext>, TypeError> {
-    use silver::ExpKind;
-
-    // Bare predicate call: desugar to acc(pred(args), write). Checked before the
-    // big match so we can take `call` mutably without re-borrowing `exp`.
-    if let ExpKind::Call(call) = exp.kind.as_mut() {
-        if matches!(call.kind, Some(silver::ExpCallKind::Predicate)) {
-            let resource = lower_predicate_resource::<Ext>(call, ctx)?;
-            return Ok(SpatialExp(Box::new(SpatialExpKind::Acc(
-                resource,
-                write_perm(),
-            ))));
-        }
-    }
-
-    match exp.kind.as_mut() {
-        ExpKind::Acc(acc_exp) => {
-            let resource = lower_resource_exp::<Ext>(&mut acc_exp.loc, ctx)?;
-            let (perm_exp, perm_key) = lower_pure_exp::<Ext>(&mut acc_exp.perm, ctx)?;
-            ctx.impose_bound(perm_key, SilverTcType::Numeric)?;
-            Ok(SpatialExp(Box::new(SpatialExpKind::Acc(
-                resource, perm_exp,
-            ))))
-        }
-
-        ExpKind::BinOp(silver::BinOp::And, l, r) => {
-            let ls = lower_spatial_exp::<Ext>(l, ctx)?;
-            let rs = lower_spatial_exp::<Ext>(r, ctx)?;
-            Ok(SpatialExp(Box::new(SpatialExpKind::Conj(ls, rs))))
-        }
-
-        ExpKind::BinOp(silver::BinOp::Implies, l, r) => {
-            let (cond_exp, cond_key) = lower_pure_exp::<Ext>(l, ctx)?;
-            ctx.impose_bound(cond_key, SilverTcType::Bool)?;
-            if cond_exp.ty != Type::Bool {
-                return Err(TypeError::TypeMismatch {
-                    expected: SilverTcType::Bool,
-                    found: type_to_tc(&cond_exp.ty),
-                    context: "spatial implication condition",
-                });
-            }
-            let rs = lower_spatial_exp::<Ext>(r, ctx)?;
-            Ok(SpatialExp(Box::new(SpatialExpKind::Implies(cond_exp, rs))))
-        }
-
-        ExpKind::BinOp(silver::BinOp::InhaleExhale, l, r) => {
-            let ls = lower_spatial_exp::<Ext>(l, ctx)?;
-            let rs = lower_spatial_exp::<Ext>(r, ctx)?;
-            Ok(SpatialExp(Box::new(SpatialExpKind::Conj(ls, rs))))
-        }
-
-        ExpKind::Ternary(cond, then, else_) => {
-            let (cond_exp, cond_key) = lower_pure_exp::<Ext>(cond, ctx)?;
-            ctx.impose_bound(cond_key, SilverTcType::Bool)?;
-            if cond_exp.ty != Type::Bool {
-                return Err(TypeError::TypeMismatch {
-                    expected: SilverTcType::Bool,
-                    found: type_to_tc(&cond_exp.ty),
-                    context: "spatial ternary condition",
-                });
-            }
-            let then_s = lower_spatial_exp::<Ext>(then, ctx)?;
-            let else_s = lower_spatial_exp::<Ext>(else_, ctx)?;
-            Ok(SpatialExp(Box::new(SpatialExpKind::Ternary {
-                if_: cond_exp,
-                then: then_s,
-                else_: else_s,
-            })))
-        }
-
-        _ => {
-            let (pure_exp, pure_key) = lower_pure_exp::<Ext>(exp, ctx)?;
-            ctx.impose_bound(pure_key, SilverTcType::Bool)?;
-            if pure_exp.ty != Type::Bool {
-                return Err(TypeError::TypeMismatch {
-                    expected: SilverTcType::Bool,
-                    found: type_to_tc(&pure_exp.ty),
-                    context: "spatial expression (expected bool or resource)",
-                });
-            }
-            Ok(SpatialExp(Box::new(SpatialExpKind::Pure(pure_exp))))
-        }
-    }
-}
-
 // ==========================================
 // 10. Statement lowering
 // ==========================================
 
+fn collect_labels(stmts: &[silver::Statement], labels: &mut HashSet<Spur>) {
+    for stmt in stmts {
+        match stmt {
+            silver::Statement::Label(decl, _) => {
+                labels.insert(decl.0.id());
+            }
+            silver::Statement::Block(block) => {
+                collect_labels(&block.0, labels);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn lower_statement(
     stmt: &mut silver::Statement,
-    ctx: &mut TcCtx,
+    ctx: &mut LocalEnv,
 ) -> Result<final_ast::Statement, TypeError> {
     use silver::Statement as S;
     match stmt {
-        S::Assume(e) => Ok(final_ast::Statement::Assume(ctx.check_spatial(e)?)),
-        S::Assert(e) => Ok(final_ast::Statement::Assert(ctx.check_spatial(e)?)),
-        S::Inhale(e) => Ok(final_ast::Statement::Inhale(ctx.check_spatial(e)?)),
-        S::Exhale(e) => Ok(final_ast::Statement::Exhale(ctx.check_spatial(e)?)),
+        S::Assume(e) => Ok(final_ast::Statement::Assume(ctx.typecheck_spatial(e)?)),
+        S::Assert(e) => Ok(final_ast::Statement::Assert(ctx.typecheck_spatial(e)?)),
+        S::Inhale(e) => Ok(final_ast::Statement::Inhale(ctx.typecheck_spatial(e)?)),
+        S::Exhale(e) => Ok(final_ast::Statement::Exhale(ctx.typecheck_spatial(e)?)),
 
-        S::Fold(acc) => Ok(final_ast::Statement::Fold(
-            ctx.check(|c| lower_acc_to_pred_with_perm(acc, c))?,
-        )),
+        S::Fold(acc) => Ok(final_ast::Statement::Fold(ctx.typecheck_pred_with_perm(acc)?)),
         S::Unfold(acc) => Ok(final_ast::Statement::Unfold(
-            ctx.check(|c| lower_acc_to_pred_with_perm(acc, c))?,
+            ctx.typecheck_pred_with_perm(acc)?,
         )),
 
         S::Var(decls, init) => {
             let mut typed_decls = Vec::with_capacity(decls.len());
             for d in decls.iter() {
                 let ty = lower_type(&d.ty);
-                ctx.add_local(d.idn.0.id(), ty.clone());
+                ctx.add_local(d.idn.0.id(), ty.clone())?;
                 typed_decls.push(TypedIdent {
                     name: Ident(d.idn.0.id()),
                     ty,
                 });
             }
-            // A single declared type provides context for the initialiser.
-            let seed = if decls.len() == 1 {
-                Some(type_to_tc(&lower_type(&decls[0].ty)))
-            } else {
-                None
-            };
+            let lhs_types: Vec<Type> = typed_decls.iter().map(|d| d.ty.clone()).collect();
             let lowered_rhs = init
                 .as_mut()
-                .map(|rhs| lower_assign_rhs(rhs, ctx, seed))
+                .map(|rhs| lower_rhs_against_lhs(rhs, ctx, &lhs_types))
                 .transpose()?;
             Ok(final_ast::Statement::Var(typed_decls, lowered_rhs))
         }
 
         S::Assign(lhs_list, rhs) => {
-            let seed = if lhs_list.len() == 1 {
-                assign_lhs_type(&lhs_list[0], ctx).map(|t| type_to_tc(&t))
-            } else {
-                None
-            };
-            let lowered_rhs = lower_assign_rhs(rhs, ctx, seed)?;
-            let lowered_lhs = lhs_list
+            // Lower LHS first — concrete types, never generic
+            let lowered_lhs_typed: Vec<(final_ast::AssignLhs, Type)> = lhs_list
                 .iter_mut()
-                .map(|lhs| lower_assign_lhs(lhs, ctx))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|lhs| lower_assign_lhs_typed(lhs, ctx))
+                .collect::<Result<_, _>>()?;
+            let lhs_types: Vec<Type> = lowered_lhs_typed.iter().map(|(_, ty)| ty.clone()).collect();
+            let lowered_rhs = lower_rhs_against_lhs(rhs, ctx, &lhs_types)?;
+            let lowered_lhs = lowered_lhs_typed.into_iter().map(|(lhs, _)| lhs).collect();
             Ok(final_ast::Statement::Assign(lowered_lhs, lowered_rhs))
         }
 
@@ -1182,77 +1221,68 @@ fn lower_statement(
     }
 }
 
-/// Concrete type of an assignment target, used to seed the rhs checker.
-fn assign_lhs_type(lhs: &silver::AssignLhs, ctx: &TcCtx) -> Option<Type> {
-    match lhs {
-        silver::AssignLhs::Ident(ident) => ctx.locals.get(&ident.id()).cloned(),
-        silver::AssignLhs::Field(_, field) => ctx
-            .globals
-            .resolve(field.id())
-            .and_then(|s| s.as_field().map(lower_type)),
-    }
-}
-
-fn lower_acc_to_pred_with_perm<Ext: PureExt>(
-    acc: &mut silver::AccExp,
-    ctx: &mut TcCtx,
-) -> Result<PredicateWithPerm<Ext>, TypeError> {
-    let resource = lower_resource_exp::<Ext>(&mut acc.loc, ctx)?;
-    let (perm_exp, perm_key) = lower_pure_exp::<Ext>(&mut acc.perm, ctx)?;
-    ctx.impose_bound(perm_key, SilverTcType::Numeric)?;
-    let pred_call = match *resource.0 {
-        ResourceExpKind::PredicateCall(call) => call,
-        ResourceExpKind::Field(..) => {
-            return Err(TypeError::Other(
-                "fold/unfold requires a predicate, not a field".to_string(),
-            ));
-        }
-    };
-    Ok(PredicateWithPerm {
-        pred_call,
-        perm: perm_exp,
-    })
-}
-
-fn lower_assign_lhs(
+fn lower_assign_lhs_typed(
     lhs: &mut silver::AssignLhs,
-    ctx: &mut TcCtx,
-) -> Result<final_ast::AssignLhs, TypeError> {
+    ctx: &mut LocalEnv,
+) -> Result<(final_ast::AssignLhs, Type), TypeError> {
     match lhs {
-        silver::AssignLhs::Ident(ident) => Ok(final_ast::AssignLhs::Var(Ident(ident.id()))),
+        silver::AssignLhs::Ident(ident) => {
+            let spur = ident.id();
+            let ty = ctx
+                .locals
+                .get(&spur)
+                .cloned()
+                .ok_or_else(|| TypeError::UndefinedVariable(ctx.interner.resolve(&spur).to_string()))?;
+            Ok((final_ast::AssignLhs::Var(Ident(spur)), ty))
+        }
         silver::AssignLhs::Field(base, field) => {
             let field_id = field.id();
-            let base_exp = ctx.check_pure::<MethodBodyExt>(base, Some(SilverTcType::Ref))?;
-            if base_exp.ty != Type::Ref {
-                return Err(TypeError::FieldBaseNotRef);
-            }
-            Ok(final_ast::AssignLhs::Field(base_exp, Ident(field_id)))
+            let field_ty = ctx
+                .globals
+                .resolve(field_id)
+                .and_then(|s| s.as_field())
+                .map(lower_type)
+                .ok_or_else(|| TypeError::Other("undefined field".to_string()))?;
+            let base_exp = ctx.typecheck_pure::<MethodBodyExt>(base, SilverTcType::Ref, None)?;
+            Ok((final_ast::AssignLhs::Field(base_exp, Ident(field_id)), field_ty))
         }
     }
 }
 
-fn lower_assign_rhs(
+/// Lower an assignment/var-init RHS, validating and constraining against `lhs_types`.
+/// Expression RHS: constrained to `lhs_types[0]` (must be single).
+/// New RHS: requires single `Ref` LHS.
+/// Method call RHS: arg and return types checked against signature.
+fn lower_rhs_against_lhs(
     rhs: &mut silver::AssignRhs,
-    ctx: &mut TcCtx,
-    seed: Option<SilverTcType>,
+    ctx: &mut LocalEnv,
+    lhs_types: &[Type],
 ) -> Result<final_ast::AssignRhs, TypeError> {
     match rhs {
         silver::AssignRhs::Exp(e) => {
-            let exp = ctx.check_pure::<MethodBodyExt>(e, seed)?;
+            if lhs_types.len() != 1 {
+                return Err(TypeError::WrongReturnCount {
+                    expected: 1,
+                    found: lhs_types.len(),
+                });
+            }
+            let exp = ctx.typecheck_pure::<MethodBodyExt>(e, type_to_tc(&lhs_types[0]), None)?;
             Ok(final_ast::AssignRhs::Exp(exp))
         }
-        silver::AssignRhs::Call(call) => {
-            let call_name = call.name.id();
-            let mut lowered_args = Vec::with_capacity(call.args.len());
-            for arg in call.args.iter_mut() {
-                lowered_args.push(ctx.check_pure::<MethodBodyExt>(arg, None)?);
-            }
-            Ok(final_ast::AssignRhs::MethodCall(Call {
-                name: Ident(call_name),
-                args: lowered_args,
-            }))
-        }
+
         silver::AssignRhs::New(fields) => {
+            if lhs_types.len() != 1 {
+                return Err(TypeError::WrongReturnCount {
+                    expected: 1,
+                    found: lhs_types.len(),
+                });
+            }
+            if lhs_types[0] != Type::Ref {
+                return Err(TypeError::Other(format!(
+                    "new(*) requires a Ref target, found {:?}",
+                    lhs_types[0]
+                )));
+            }
             let star_or_fields = match fields {
                 silver::StarOrNames::Star => final_ast::StarOrFields::Star,
                 silver::StarOrNames::Names(names) => {
@@ -1261,12 +1291,65 @@ fn lower_assign_rhs(
             };
             Ok(final_ast::AssignRhs::New(star_or_fields))
         }
+
+        silver::AssignRhs::Call(call) => {
+            let call_name = call.name.id();
+            // Clone sig to release borrow on ctx.globals before calling typecheck_pure.
+            let sig = ctx
+                .globals
+                .resolve(call_name)
+                .and_then(|s| s.as_method())
+                .cloned()
+                .ok_or_else(|| {
+                    TypeError::Other(format!(
+                        "method `{}` not found",
+                        ctx.interner.resolve(&call_name)
+                    ))
+                })?;
+
+            if sig.params.len() != call.args.len() {
+                return Err(TypeError::WrongArgCount {
+                    name: ctx.interner.resolve(&call_name).to_string(),
+                    expected: sig.params.len(),
+                    found: call.args.len(),
+                });
+            }
+            if sig.rets.len() != lhs_types.len() {
+                return Err(TypeError::WrongReturnCount {
+                    expected: sig.rets.len(),
+                    found: lhs_types.len(),
+                });
+            }
+            // Each LHS type must match the corresponding return type from the signature.
+            for (i, lhs_ty) in lhs_types.iter().enumerate() {
+                let ret_ty = lower_type(&sig.rets[i]);
+                if *lhs_ty != ret_ty {
+                    return Err(TypeError::Other(format!(
+                        "return {} of `{}`: expected {:?}, found {:?}",
+                        i,
+                        ctx.interner.resolve(&call_name),
+                        ret_ty,
+                        lhs_ty
+                    )));
+                }
+            }
+            // Each arg is constrained by the corresponding parameter type from the signature.
+            let mut lowered_args = Vec::with_capacity(call.args.len());
+            for (arg, param_ty) in call.args.iter_mut().zip(sig.params.iter()) {
+                let tc = type_to_tc(&lower_type(param_ty));
+                lowered_args.push(ctx.typecheck_pure::<MethodBodyExt>(arg, tc, None)?);
+            }
+            Ok(final_ast::AssignRhs::MethodCall(Call {
+                name: Ident(call_name),
+                args: lowered_args,
+            }))
+        }
     }
 }
 
 fn lower_stmt_block(
     stmts: &mut [silver::Statement],
-    ctx: &mut TcCtx,
+    ctx: &mut LocalEnv,
 ) -> Result<Vec<final_ast::Statement>, TypeError> {
     stmts.iter_mut().map(|s| lower_statement(s, ctx)).collect()
 }
@@ -1293,12 +1376,13 @@ fn collect_params(args: &[silver::ArgOrType]) -> Vec<TypedIdent> {
         .collect()
 }
 
-fn add_arg_locals(ctx: &mut TcCtx, args: &[silver::ArgOrType]) {
+fn add_arg_locals(ctx: &mut LocalEnv, args: &[silver::ArgOrType]) -> Result<(), TypeError> {
     for arg in args {
         if let silver::ArgOrType::Arg(decl) = arg {
-            ctx.add_local(decl.idn.0.id(), lower_type(&decl.ty));
+            ctx.add_local(decl.idn.0.id(), lower_type(&decl.ty))?;
         }
     }
+    Ok(())
 }
 
 fn typecheck_predicate(
@@ -1309,13 +1393,13 @@ fn typecheck_predicate(
     let name = Ident(pred.signature.name.0.id());
     let params = collect_params(&pred.signature.args);
 
-    let mut ctx = TcCtx::new(globals, interner);
-    add_arg_locals(&mut ctx, &pred.signature.args);
+    let mut ctx = LocalEnv::new(globals, interner);
+    add_arg_locals(&mut ctx, &pred.signature.args)?;
 
     let body = pred
         .body
         .as_mut()
-        .map(|b| ctx.check_spatial::<!>(&mut b.0))
+        .map(|b| ctx.typecheck_spatial::<!>(&mut b.0))
         .transpose()?;
 
     Ok(final_ast::Declaration::Predicate(final_ast::Predicate {
@@ -1330,46 +1414,46 @@ fn typecheck_function(
     globals: &Globals,
     interner: &Interner,
 ) -> Result<final_ast::Declaration, TypeError> {
-    let name = Ident(func.signature.name.0.id());
+    let func_spur = func.signature.name.0.id();
+    let name = Ident(func_spur);
     let params = collect_params(&func.signature.args);
-    let ret_ty = func
-        .signature
-        .ret
-        .first()
-        .map(|r| lower_type(r.ty()))
-        .unwrap_or(Type::Bool);
+    let ret_ty = globals
+        .resolve(func_spur)
+        .and_then(|s| s.as_function())
+        .map(|sig| lower_type(&sig.ret))
+        .ok_or_else(|| {
+            TypeError::Other(format!(
+                "internal: function `{}` not in globals",
+                interner.resolve(&func_spur)
+            ))
+        })?;
 
-    let mut ctx = TcCtx::new(globals, interner);
-    add_arg_locals(&mut ctx, &func.signature.args);
+    let mut ctx = LocalEnv::new(globals, interner);
+    add_arg_locals(&mut ctx, &func.signature.args)?;
 
-    let requires = combine_spatial::<!>(&mut func.contract.precondition, &mut ctx)?;
+    let requires = combine_spatial::<!>(&mut func.contract.precondition, &ctx)?;
 
-    // Return type provides context (forces e.g. `5/2` to the declared type).
+    // Body cannot mention `result` (only postconditions can): pass None.
     let body = func
         .body
         .as_mut()
-        .map(|b| {
-            let exp = ctx.check_pure::<!>(&mut b.0, Some(type_to_tc(&ret_ty)))?;
-            if !compatible(&exp.ty, &ret_ty) {
-                return Err(TypeError::TypeMismatch {
-                    expected: type_to_tc(&ret_ty),
-                    found: type_to_tc(&exp.ty),
-                    context: "function body return type",
-                });
-            }
-            Ok(exp)
-        })
+        .map(|b| ctx.typecheck_pure::<!>(&mut b.0, type_to_tc(&ret_ty), None))
         .transpose()?;
 
-    ctx.result_ty = Some(ret_ty.clone());
+    // Postconditions enable `result`, typed as the return type.
     let ensures = {
         let mut iter = func.contract.postcondition.iter_mut();
         match iter.next() {
             None => None,
             Some(e) => {
-                let first = ctx.check_pure::<FuncEnsuresExt>(e, Some(SilverTcType::Bool))?;
+                let first =
+                    ctx.typecheck_pure::<FuncEnsuresExt>(e, SilverTcType::Bool, Some(ret_ty.clone()))?;
                 let combined = iter.try_fold(first, |acc, e| {
-                    let next = ctx.check_pure::<FuncEnsuresExt>(e, Some(SilverTcType::Bool))?;
+                    let next = ctx.typecheck_pure::<FuncEnsuresExt>(
+                        e,
+                        SilverTcType::Bool,
+                        Some(ret_ty.clone()),
+                    )?;
                     Ok::<_, TypeError>(TypedPureExp {
                         ty: Type::Bool,
                         exp: Box::new(PureExpKind::Binary(BinOp::And, acc, next)),
@@ -1399,15 +1483,20 @@ fn typecheck_method(
     let params = collect_params(&method.signature.args);
     let rets = collect_params(&method.signature.ret);
 
-    let mut ctx = TcCtx::new(globals, interner);
-    add_arg_locals(&mut ctx, &method.signature.args);
+    let mut ctx = LocalEnv::new(globals, interner);
 
-    let requires = combine_spatial::<!>(&mut method.contract.precondition, &mut ctx)?;
+    // Collect all label names from the body before processing anything.
+    if let Some(body) = &method.body {
+        collect_labels(&body.0, &mut ctx.labels);
+    }
 
-    add_arg_locals(&mut ctx, &method.signature.ret);
+    add_arg_locals(&mut ctx, &method.signature.args)?;
 
-    let ensures =
-        combine_spatial::<MethodEnsuresExt>(&mut method.contract.postcondition, &mut ctx)?;
+    let requires = combine_spatial::<!>(&mut method.contract.precondition, &ctx)?;
+
+    add_arg_locals(&mut ctx, &method.signature.ret)?;
+
+    let ensures = combine_spatial::<MethodEnsuresExt>(&mut method.contract.postcondition, &ctx)?;
 
     let body = method
         .body
@@ -1475,8 +1564,8 @@ pub fn typecheck_program(
 mod tests {
     use super::*;
     use crate::silver::{
-        call_resolver::resolve_call_kinds, globals::GlobalsCollector, interner::IdentCollector,
-        r#macro::inline_macros, silver_parser, walk::AstWalkable,
+        self, call_resolver::resolve_call_kinds, globals::GlobalsCollector,
+        interner::IdentCollector, r#macro::inline_macros, silver_parser, walk::AstWalkable,
     };
 
     fn run_pipeline(input: &str) -> Result<final_ast::Program, Vec<TypeError>> {
@@ -1574,11 +1663,12 @@ function bad(a: Int, b: Bool): Int
 { a + b }
 "#,
         );
+        // Rusttyc catches this as a constraint error (Bool cannot meet Numeric).
         assert!(
-            result.as_ref().is_err_and(|errs| errs
-                .iter()
-                .any(|e| matches!(e, TypeError::TypeMismatch { .. }))),
-            "expected TypeMismatch, got: {result:?}"
+            result
+                .as_ref()
+                .is_err_and(|errs| errs.iter().any(|e| matches!(e, TypeError::Tc(_)))),
+            "expected type constraint error, got: {result:?}"
         );
     }
 
@@ -1641,5 +1731,133 @@ method m(x: Int) returns (r: Int)
                 .any(|e| matches!(e, TypeError::IllegalLabeledOldUsage))),
             "expected IllegalLabeledOldUsage, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn let_in_sibling_scopes_same_name_ok() {
+        let result = run_pipeline(
+            r#"
+function f(x: Int): Int
+{ (let a == (3) in a) + (let a == (3) in a) }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn let_in_nested_same_name_is_error() {
+        let result = run_pipeline(
+            r#"
+function f(x: Int): Int
+{ let a == (3) in (let a == (3) in a) }
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|errs| errs.iter().any(|e| matches!(e, TypeError::ShadowedName(_)))),
+            "expected ShadowedName, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn let_in_shadows_param_is_error() {
+        let result = run_pipeline(
+            r#"
+function f(x: Int): Int
+{ let x == (3) in x }
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|errs| errs.iter().any(|e| matches!(e, TypeError::ShadowedName(_)))),
+            "expected ShadowedName, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn expr_rhs_multi_lhs_is_error() {
+        let result = run_pipeline(
+            r#"
+method test()
+{
+  var x: Int
+  var y: Int
+  x, y := 1
+}
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|errs| errs
+                    .iter()
+                    .any(|e| matches!(e, TypeError::WrongReturnCount { expected: 1, found: 2 }))),
+            "expected WrongReturnCount, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn new_rhs_multi_lhs_is_error() {
+        let result = run_pipeline(
+            r#"
+method test()
+{
+  var x: Ref
+  var y: Ref
+  x, y := new(*)
+}
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|errs| errs
+                    .iter()
+                    .any(|e| matches!(e, TypeError::WrongReturnCount { expected: 1, found: 2 }))),
+            "expected WrongReturnCount, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn method_call_too_few_returns_is_error() {
+        let result = run_pipeline(
+            r#"
+method m(x: Int) returns (r: Int)
+
+method test(a: Int)
+{
+  var x: Int
+  var y: Int
+  x, y := m(a)
+}
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|errs| errs
+                    .iter()
+                    .any(|e| matches!(e, TypeError::WrongReturnCount { expected: 1, found: 2 }))),
+            "expected WrongReturnCount, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn method_call_multi_return_correct_count_is_ok() {
+        let result = run_pipeline(
+            r#"
+method m(x: Int) returns (r: Int, s: Int)
+
+method test(a: Int)
+{
+  var x: Int
+  var y: Int
+  x, y := m(a)
+}
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 }
