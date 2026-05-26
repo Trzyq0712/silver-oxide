@@ -1,6 +1,7 @@
 use crate::vmir::{
-    Adt, BinOp, Declaration, Domain, Function, HeapInst, HeapVal, Inst, MemberId, Method, Program,
-    PureInst, Resource, Type, UnOp, Val,
+    Adt, BinOp, Declaration, Domain, Function, HeapInst, HeapVal, Inst, InstKind, Lit, MemberId,
+    Method, MethodHeapExt, MethodInstExt, PathCond, Program, PureInst, Resource, ResourceBody,
+    Type, UnOp, Val,
 };
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
@@ -103,11 +104,22 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
             write!(f, ")")?;
         }
 
-        writeln!(f, " {{")?;
-        let base = self.item.params.len();
-        for (idx, inst) in self.item.insts.iter().enumerate() {
-            writeln!(f, "  e{}: {}", idx + base, self.with(inst))?;
+        match &self.item.body {
+            None => Ok(()),
+            Some(body) => {
+                writeln!(f, " {{")?;
+                write_inst_block(f, self, &body.insts, self.item.params.len())?;
+                writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
+                write!(f, "}}")
+            }
         }
+    }
+}
+
+impl<'a> Display for VmirDisplay<'a, &'a ResourceBody> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{{")?;
+        write_inst_block(f, self, &self.item.insts, 0)?;
         writeln!(f, "  result: ({}, {})", self.item.res.0, self.item.res.1)?;
         write!(f, "}}")
     }
@@ -116,22 +128,159 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
 impl<'a> Display for VmirDisplay<'a, &'a Method> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "{{")?;
-        for (idx, inst) in self.item.insts.iter().enumerate() {
-            writeln!(f, "  e{idx}: {}", self.with(inst))?;
-        }
+        write_inst_block(f, self, &self.item.insts, 0)?;
         write!(f, "}}")
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, &'a Inst> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
-            Inst::Assume(cond) => write!(f, "assume {cond}"),
-            Inst::Assert(cond) => write!(f, "assert {cond}"),
-            Inst::ResourceCall(_) => write!(f, "resource_call(/* opaque */)"),
-            Inst::Heap(inst) => write!(f, "{inst}"),
-            Inst::Pure(ty, inst) => write!(f, "{} := {}", self.with(ty), self.with(inst)),
+/// Rendering hook for the `HeapInst::Ext` payload. `MethodHeapExt` renders
+/// like a heap inst (bumps the heap counter); `!` is uninhabited.
+pub(crate) trait HeapExtRender {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
+}
+
+impl HeapExtRender for ! {
+    fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
+        match *self {}
+    }
+}
+
+impl HeapExtRender for MethodHeapExt {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            MethodHeapExt::Sub(l, r) => write!(f, "{l} - {r}"),
         }
+    }
+}
+
+/// Rendering hook for the `InstKind::Ext` payload. Implementors mutate the
+/// running val/heap counters per-variant (e.g. `ResourceCall` bumps both).
+pub(crate) trait InstExtRender {
+    fn render(
+        &self,
+        f: &mut Formatter<'_>,
+        pc: &PathCond,
+        val_idx: &mut usize,
+        heap_idx: &mut usize,
+        interner: &Rodeo<MemberId>,
+    ) -> fmt::Result;
+}
+
+impl InstExtRender for ! {
+    fn render(
+        &self,
+        _: &mut Formatter<'_>,
+        _: &PathCond,
+        _: &mut usize,
+        _: &mut usize,
+        _: &Rodeo<MemberId>,
+    ) -> fmt::Result {
+        match *self {}
+    }
+}
+
+impl InstExtRender for MethodInstExt {
+    fn render(
+        &self,
+        f: &mut Formatter<'_>,
+        pc: &PathCond,
+        val_idx: &mut usize,
+        heap_idx: &mut usize,
+        interner: &Rodeo<MemberId>,
+    ) -> fmt::Result {
+        match self {
+            MethodInstExt::Assume(v) => writeln!(f, "  {pc} assume {v}"),
+            MethodInstExt::Assert(v) => writeln!(f, "  {pc} assert {v}"),
+            MethodInstExt::ResourceCall(call) => {
+                write!(
+                    f,
+                    "  (h{heap_idx}, e{val_idx}) := {pc} call {}(",
+                    interner.resolve(&call.resource)
+                )?;
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                writeln!(f, ")")?;
+                *heap_idx += 1;
+                *val_idx += 1;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn write_inst_block<'a, T, H, K>(
+    f: &mut Formatter<'_>,
+    ctx: &VmirDisplay<'a, T>,
+    insts: &[Inst<H, K>],
+    val_base: usize,
+) -> fmt::Result
+where
+    H: HeapExtRender,
+    K: InstExtRender,
+{
+    let mut e_idx = val_base;
+    let mut h_idx = 0usize;
+    for inst in insts {
+        match &inst.kind {
+            InstKind::Pure(ty, pi) => {
+                writeln!(
+                    f,
+                    "  e{e_idx}: {} := {} {}",
+                    ctx.with(ty),
+                    inst.pc,
+                    ctx.with(pi)
+                )?;
+                e_idx += 1;
+            }
+            InstKind::Heap(hi) => {
+                write!(f, "  h{h_idx} := {} ", inst.pc)?;
+                write_heap_inst(f, hi)?;
+                writeln!(f)?;
+                h_idx += 1;
+            }
+            InstKind::Ext(ext) => {
+                ext.render(f, &inst.pc, &mut e_idx, &mut h_idx, ctx.interner)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_heap_inst<H: HeapExtRender>(
+    f: &mut Formatter<'_>,
+    inst: &HeapInst<H>,
+) -> fmt::Result {
+    match inst {
+        HeapInst::Acc(acc) => write!(f, "acc({}, {})", acc.loc, acc.perm),
+        HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
+        HeapInst::Ternary(cond, lhs, rhs) => write!(f, "{cond} ? {lhs} : {rhs}"),
+        HeapInst::Ext(ext) => ext.render(f),
+    }
+}
+
+impl Display for PathCond {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "<")?;
+        for (i, lit) in self.lits.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{lit}")?;
+        }
+        write!(f, ">")
+    }
+}
+
+impl Display for Lit {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if !self.polarity {
+            write!(f, "!")?;
+        }
+        write!(f, "{}", self.val)
     }
 }
 
@@ -147,19 +296,17 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
             PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
             PureInst::FunctionCall(call) => write!(f, "{}", self.with(call)),
-            PureInst::HeapSubset(lhs, rhs) => write!(f, "{lhs} ⊑ {rhs}"),
         }
     }
 }
 
 impl<'a> Display for VmirDisplay<'a, &'a FunctionCall> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}[{}](",
-            self.interner.resolve(&self.item.func_id),
-            self.item.heap_ctx
-        )?;
+        write!(f, "{}", self.interner.resolve(&self.item.func_id))?;
+        if let Some(heap) = &self.item.heap_ctx {
+            write!(f, "[{heap}]")?;
+        }
+        write!(f, "(")?;
         for (i, arg) in self.item.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
@@ -204,20 +351,8 @@ impl Display for HeapVal {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             HeapVal::Empty => write!(f, "empty"),
-            HeapVal::Implicit => write!(f, "_"),
+            HeapVal::Pre => write!(f, "pre"),
             HeapVal::Temp(i) => write!(f, "h{i}"),
-        }
-    }
-}
-
-impl Display for HeapInst {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            HeapInst::Acc(acc) => write!(f, "acc({}, {})", acc.loc, acc.perm),
-            HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
-            HeapInst::Sub(lhs, rhs) => write!(f, "{lhs} - {rhs}"),
-            HeapInst::Ternary(cond, lhs, rhs) => write!(f, "{cond} ? {lhs} : {rhs}"),
-            HeapInst::Assign(heap, val) => write!(f, "{heap} := {val}"),
         }
     }
 }

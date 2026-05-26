@@ -54,20 +54,22 @@ pub enum PureInst {
     Binary(BinOp, Val, Val),
     /// A ternary operation, if-then-else.
     Ternary(Val, Val, Val),
-    /// Dereference an address in a heap.
+    /// Dereference an address in a heap. Surface notation: `*[heap] addr`.
+    /// Combined with a `FunctionCall` returning `Addr<T>` it realises
+    /// `resource@snap`.
     Deref(HeapVal, Val),
     /// Query the permission amount of an address in a heap.
     Perm(HeapVal, Val),
-    /// Call a pure function.
+    /// Call a pure function. Field/predicate `addr` functions are ordinary
+    /// uninterpreted functions and use this variant.
     FunctionCall(FunctionCall),
-    /// Determine whether the first heap is a permission-subset of the second.
-    /// Used to decide whether a heap can be exhaled.
-    HeapSubset(HeapVal, HeapVal),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionCall {
     pub func_id: MemberId,
-    pub heap_ctx: HeapVal,
+    /// Heap context used to evaluate the call. `None` when the function has
+    /// no heap precondition (e.g. the auto-emitted `@addr` functions).
+    pub heap_ctx: Option<HeapVal>,
     pub args: Vec<Val>,
 }

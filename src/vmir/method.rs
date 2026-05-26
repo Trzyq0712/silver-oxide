@@ -1,6 +1,39 @@
-use crate::vmir::Inst;
+use crate::vmir::{Context, HeapVal, Inst, ResourceCall, Val};
+
+/// Method bodies allow everything resource bodies allow, plus a fixed set of
+/// statement-shaped extensions: heap subtraction (via [`MethodHeapExt`]),
+/// `Assume` / `Assert`, and `ResourceCall` (via [`MethodInstExt`]).
+pub struct MethodCtx;
+
+impl Context for MethodCtx {
+    type HeapExt = MethodHeapExt;
+    type InstExt = MethodInstExt;
+}
+
+/// Heap-instruction extensions that are only legal in method bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MethodHeapExt {
+    /// Heap subtraction. Illegal inside a resource body.
+    Sub(HeapVal, HeapVal),
+}
+
+/// Top-level instruction extensions that are only legal in method bodies.
+///
+/// `Assume` / `Assert` produce no temporary. `ResourceCall` produces a pair
+/// `(HeapVal::Temp, Val::Temp)` — the called resource's `(delta, bool)` —
+/// and bumps both temp counters. The target resource must have
+/// `body.is_some()`; calling an abstract resource is illegal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MethodInstExt {
+    Assume(Val),
+    Assert(Val),
+    ResourceCall(ResourceCall),
+}
+
+/// Concrete `Inst` for method bodies.
+pub type MethodInst = Inst<MethodHeapExt, MethodInstExt>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {
-    pub insts: Vec<Inst>,
+    pub insts: Vec<MethodInst>,
 }

@@ -10,7 +10,6 @@ mod ty;
 
 pub mod display;
 
-pub use inst::{Inst, ResourceCall};
 pub use ty::Type;
 
 pub use heap::{Acc, HeapInst, HeapVal};
@@ -19,8 +18,11 @@ pub use pure::{BinOp, FALSE, FunctionCall, Literal, NULL, PureInst, TRUE, UnOp, 
 pub use adt::Adt;
 pub use domain::Domain;
 pub use function::Function;
-pub use method::Method;
-pub use resource::Resource;
+pub use inst::{Context, Inst, InstKind, Lit, PathCond};
+pub use method::{Method, MethodCtx, MethodHeapExt, MethodInst, MethodInstExt};
+pub use resource::{
+    Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst,
+};
 
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
