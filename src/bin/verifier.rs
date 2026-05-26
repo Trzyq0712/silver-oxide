@@ -1,22 +1,27 @@
-use silver_oxide::{silver_parser, translate::VmirTranslator};
-use std::{error::Error, fs};
+//! Parse + typecheck + translate + verify.
+//!
+//! Usage: `cargo run --bin verifier -- cases/foo.vpr`
+
+use silver_oxide::pipeline;
+use std::{error::Error, path::Path};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let file = std::env::args().skip(1).next().unwrap_or_else(|| {
-        eprintln!("Usage: verifier <viper-file>");
-        std::process::exit(1);
-    });
+    let file = std::env::args()
+        .nth(1)
+        .ok_or("usage: verifier <file.vpr>")?;
 
-    let input = fs::read_to_string(&file)?;
-
-    println!("=== Parsing Viper program ===");
-    let silver_program = silver_parser::sil_program(&input)?;
-
-    println!("\n=== Translating to VMIR ===");
-    let vmir_program = VmirTranslator::translate(&silver_program).unwrap();
-
-    println!("{}", vmir_program);
-    println!("\n=== Verifier backend not wired for current VMIR ===");
+    match pipeline::run_file(Path::new(&file)) {
+        Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
+        Ok(results) if results.is_empty() => println!("[INFO] no method bodies to verify"),
+        Ok(results) => {
+            for (name, outcome) in &results {
+                match outcome {
+                    Ok(()) => println!("  [OK] {name}"),
+                    Err(e) => println!("  [FAIL] {name}: {e}"),
+                }
+            }
+        }
+    }
 
     Ok(())
 }

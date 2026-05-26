@@ -1,21 +1,40 @@
-use silver_oxide::{silver_parser, translate::VmirTranslator};
+//! Parse a Silver file, typecheck it, lower to VMIR, and print the resulting
+//! `vmir::Program`.
+//!
+//! Usage: `cargo run --bin translator -- cases/foo.vpr`
+
+use silver_oxide::silver::{
+    GlobalsCollector, IdentCollector, inline_macros, resolve_call_kinds, silver_parser,
+    typecheck_program, walk::AstWalkable,
+};
+use silver_oxide::translate;
 use std::{error::Error, fs};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let file = std::env::args().skip(1).next().unwrap();
-    let input = fs::read_to_string(file)?;
-    let program = silver_parser::sil_program(&input)?;
+    let file = std::env::args()
+        .nth(1)
+        .ok_or("usage: translator <file.vpr>")?;
+    let input = fs::read_to_string(&file)?;
 
-    println!("=== Silver AST ===");
-    println!("{:#?}", program);
+    let mut program = silver_parser::sil_program(&input)?;
 
-    let vmir_program = VmirTranslator::translate(&program).unwrap();
+    let mut ident_collector = IdentCollector::default();
+    program.walk_mut(&mut ident_collector);
+    let interner = ident_collector.finalize();
 
-    // println!("\n=== VMIR AST (Debug) ===");
-    // println!("{:#?}", vmir_program);
+    let mut globals_collector = GlobalsCollector::new(&interner);
+    program.walk(&mut globals_collector);
+    let globals = globals_collector.finalize().expect("globals error");
 
-    println!("\n=== VMIR AST (Display) ===");
-    println!("{}", vmir_program);
+    resolve_call_kinds(&mut program, &interner, &globals).expect("call resolution failed");
+    inline_macros(&mut program, &interner).expect("macro inlining failed");
 
+    let typed = typecheck_program(&mut program, &interner, &globals)
+        .map_err(|e| format!("typecheck failed: {e:?}"))?;
+
+    let vmir = translate::translate(&typed, &interner, &globals)
+        .map_err(|e| format!("translation failed: {e:?}"))?;
+
+    println!("{}", vmir);
     Ok(())
 }
