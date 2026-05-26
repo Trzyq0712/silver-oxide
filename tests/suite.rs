@@ -1,0 +1,135 @@
+use silver_oxide::pipeline;
+use std::path::{Path, PathBuf};
+
+fn cases_dir() -> PathBuf {
+    // Env var override for CI / unusual layouts.
+    if let Ok(dir) = std::env::var("SILVER_CASES_DIR") {
+        return PathBuf::from(dir);
+    }
+    // Walk up from CARGO_MANIFEST_DIR until we find a sibling `cases/` that
+    // contains the sentinel file. Handles both the normal project root and git
+    // worktrees nested several levels deep.
+    let mut search = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .expect("manifest dir");
+    for _ in 0..8 {
+        let candidate = search.join("cases");
+        if candidate.is_dir() && candidate.join("number_pred_simpler.vpr").exists() {
+            return candidate;
+        }
+        match search.parent() {
+            Some(p) => search = p.to_path_buf(),
+            None => break,
+        }
+    }
+    panic!(
+        "cases/ directory not found (searched up from {}); set SILVER_CASES_DIR",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn vpr_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|_| panic!("cannot read dir {}", dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("vpr"))
+        .collect();
+    files.sort();
+    files
+}
+
+fn file_name(p: &Path) -> &str {
+    p.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+}
+
+/// Passing cases: the full pipeline must succeed and every method must verify.
+#[test]
+fn passing_cases_all_verify() {
+    let dir = cases_dir().join("passing");
+    let files = vpr_files(&dir);
+    assert!(!files.is_empty(), "no .vpr files found in cases/passing/");
+
+    let mut ok = 0usize;
+    let mut total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for path in &files {
+        let name = file_name(path);
+        total += 1;
+        match pipeline::run_file(path) {
+            Err(e) => {
+                failures.push(format!("  [PIPELINE-ERROR] {name}: {e}"));
+            }
+            Ok(results) if results.is_empty() => {
+                failures.push(format!("  [NO-METHODS] {name}: no method bodies found"));
+            }
+            Ok(results) => {
+                let mut file_ok = true;
+                for (method, outcome) in &results {
+                    if let Err(e) = outcome {
+                        failures.push(format!("  [FAIL] {name}::{method}: {e}"));
+                        file_ok = false;
+                    }
+                }
+                if file_ok {
+                    ok += 1;
+                }
+            }
+        }
+    }
+
+    println!("=== passing/ ({ok}/{total} OK) ===");
+    for path in &files {
+        let name = file_name(path);
+        let msg = failures.iter().find(|f| f.contains(name));
+        match msg {
+            Some(f) => println!("{f}"),
+            None => println!("  [OK] {name}"),
+        }
+    }
+
+    assert!(failures.is_empty(), "{} passing case(s) not verified", failures.len());
+}
+
+/// Failing cases: the pipeline must either error or at least one method must
+/// fail verification. A case that unexpectedly fully verifies is a test failure.
+#[test]
+fn failing_cases_are_rejected() {
+    let dir = cases_dir().join("failing");
+    let files = vpr_files(&dir);
+    assert!(!files.is_empty(), "no .vpr files found in cases/failing/");
+
+    let mut ok = 0usize;
+    let mut total = 0usize;
+    let mut surprises: Vec<String> = Vec::new();
+
+    for path in &files {
+        let name = file_name(path);
+        total += 1;
+        let rejected = match pipeline::run_file(path) {
+            Err(e) => {
+                println!("  [PIPELINE-ERROR-OK] {name}: {e}");
+                true
+            }
+            Ok(results) => results.iter().any(|(_, r)| r.is_err()),
+        };
+        if rejected {
+            ok += 1;
+        } else {
+            surprises.push(format!("  [UNEXPECTED-OK] {name}: verified but expected rejection"));
+        }
+    }
+
+    println!("\n=== failing/ ({ok}/{total} correctly rejected) ===");
+    for s in &surprises {
+        println!("{s}");
+    }
+
+    assert!(
+        surprises.is_empty(),
+        "{} failing case(s) unexpectedly verified:\n{}",
+        surprises.len(),
+        surprises.join("\n")
+    );
+}
