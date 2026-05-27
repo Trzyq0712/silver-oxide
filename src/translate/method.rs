@@ -9,8 +9,8 @@ use crate::silver::final_ast;
 use crate::translate::pure_exp::{self, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstKind, MethodCtx, MethodHeapExt, MethodInstExt, PathCond,
-    PureInst, ResourceCall, Val,
+    self, HeapInst, HeapVal, Inst, InstKind, MethodCtx, MethodHeapExt, MethodHeapVal,
+    MethodInstExt, PathCond, PureInst, ResourceCall, Val,
 };
 
 pub(crate) fn lower_method(
@@ -36,7 +36,7 @@ pub(crate) fn lower_method(
         ret_vals.push(v);
     }
 
-    let mut current_heap = HeapVal::Empty;
+    let mut current_heap: MethodHeapVal = HeapVal::Empty;
 
     // Inhale this method's own precondition: call self@requires, add delta,
     // assume bool.
@@ -68,9 +68,9 @@ fn lower_stmt(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
-    current_heap: HeapVal,
+    current_heap: MethodHeapVal,
     stmt: &final_ast::Statement,
-) -> Result<HeapVal, TranslationError> {
+) -> Result<MethodHeapVal, TranslationError> {
     use final_ast::Statement as S;
     match stmt {
         S::Var(idents, None) => {
@@ -155,11 +155,11 @@ fn lower_method_call(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
-    current_heap: HeapVal,
+    current_heap: MethodHeapVal,
     call: &final_ast::Call<final_ast::MethodBodyExt>,
     ret_names: &[Spur],
     ret_types: &[vmir::Type],
-) -> Result<HeapVal, TranslationError> {
+) -> Result<MethodHeapVal, TranslationError> {
     // Lower argument expressions.
     let mut args: Vec<Val> = Vec::with_capacity(call.args.len());
     for a in &call.args {
@@ -205,7 +205,7 @@ fn emit_resource_call(
     sink: &mut Sink<MethodCtx>,
     resource: vmir::MemberId,
     args: Vec<Val>,
-) -> (HeapVal, Val) {
+) -> (MethodHeapVal, Val) {
     let h = sink.next_heap_temp();
     let v = sink.next_val_temp();
     sink.insts.push(Inst {

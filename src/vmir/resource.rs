@@ -1,14 +1,23 @@
 use crate::vmir::{Context, HeapVal, Inst, MemberId, Type, Val};
 
 /// Resource bodies admit no statement-shaped extensions: no heap
-/// subtraction, no `Assume`/`Assert`, nothing that would be a Viper
-/// statement.
+/// subtraction, no `Assume`/`Assert`, no `ResourceCall`. They *do* admit
+/// `HeapVal::CtxHeap(())` — the resource's precondition-heap reference
+/// when `requires.is_some()`.
 pub struct ResourceCtx;
 
 impl Context for ResourceCtx {
     type HeapExt = !;
     type InstExt = !;
+    type HeapValExt = ();
 }
+
+/// Concrete `HeapVal` for resource bodies — `CtxHeap(())` is constructible.
+pub type ResourceHeapVal = HeapVal<()>;
+
+/// Concrete `Inst` for resource bodies. Extension slots are uninhabited;
+/// the ctx-heap slot is `()`.
+pub type ResourceInst = Inst<!, !, ()>;
 
 /// A reusable unit of proof.
 ///
@@ -23,7 +32,7 @@ impl Context for ResourceCtx {
 ///
 /// A resource may have a precondition: another resource whose boolean is
 /// assumed inside this body and whose heap delta is addressable as
-/// [`HeapVal::Pre`].
+/// `HeapVal::CtxHeap(())`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub params: Vec<Type>,
@@ -34,11 +43,8 @@ pub struct Resource {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceBody {
     pub insts: Vec<ResourceInst>,
-    pub res: (HeapVal, Val),
+    pub res: (ResourceHeapVal, Val),
 }
-
-/// Concrete `Inst` for resource bodies. Extension slots are uninhabited.
-pub type ResourceInst = Inst<!, !>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceCall {

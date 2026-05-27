@@ -5,8 +5,8 @@ use crate::{
         lang::Symbolic,
     },
     vmir::{
-        self, Acc, BinOp, Declaration, HeapInst, HeapVal, InstKind, Literal, Method,
-        MethodHeapExt, MethodInstExt, PureInst, ResourceCall, ResourceInst, Val,
+        self, Acc, BinOp, Declaration, HeapInst, HeapVal, InstKind, Literal, Method, MethodHeapExt,
+        MethodHeapVal, MethodInstExt, PureInst, ResourceCall, ResourceHeapVal, ResourceInst, Val,
     },
 };
 
@@ -30,6 +30,9 @@ impl std::fmt::Display for VerifyError {
 struct EvalState {
     vals: Vec<egg::Id>,
     heaps: Vec<Heap>,
+    /// Set only inside a resource body whose owning `Resource` has a
+    /// `requires`. Referenced by `HeapVal::CtxHeap(())` operands inside
+    /// that body.
     pre_heap: Option<Heap>,
 }
 
@@ -49,18 +52,31 @@ impl EvalState {
         }
     }
 
-    fn get_heap(&self, hv: &HeapVal) -> Heap {
-        match hv {
-            HeapVal::Empty => Heap::empty(),
-            HeapVal::Pre => {
-                self.pre_heap.clone().expect("HeapVal::Pre outside resource with requires")
-            }
-            HeapVal::Temp(n) => self.heaps[*n].clone(),
-        }
-    }
-
     fn push_val(&mut self, id: egg::Id) { self.vals.push(id); }
     fn push_heap(&mut self, heap: Heap) { self.heaps.push(heap); }
+}
+
+/// Heap-fetch for method bodies. `CtxHeap` carries `!` here — uninhabited.
+fn get_heap_method(state: &EvalState, hv: &MethodHeapVal) -> Heap {
+    match hv {
+        HeapVal::Empty => Heap::empty(),
+        HeapVal::Temp(n) => state.heaps[*n].clone(),
+        HeapVal::CtxHeap(never) => match *never {},
+    }
+}
+
+/// Heap-fetch for resource bodies. `CtxHeap(())` resolves to the
+/// precondition heap delta (panics if accessed outside a resource with a
+/// `requires`).
+fn get_heap_resource(state: &EvalState, hv: &ResourceHeapVal) -> Heap {
+    match hv {
+        HeapVal::Empty => Heap::empty(),
+        HeapVal::Temp(n) => state.heaps[*n].clone(),
+        HeapVal::CtxHeap(()) => state
+            .pre_heap
+            .clone()
+            .expect("HeapVal::CtxHeap outside resource-body with requires"),
+    }
 }
 
 fn lit_to_sym(lit: &Literal) -> Symbolic {
@@ -76,7 +92,16 @@ fn zero_real(ctx: &mut VerifyContext<'_>) -> egg::Id {
     ctx.add(Symbolic::Real(num::BigInt::from(0).into()))
 }
 
-fn eval_pure_inst(ctx: &mut VerifyContext<'_>, state: &EvalState, pi: &PureInst) -> egg::Id {
+/// Evaluate a `PureInst<X>` given a context-specific heap-fetch.
+fn eval_pure_inst<X, F>(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    pi: &PureInst<X>,
+    get_heap: F,
+) -> egg::Id
+where
+    F: Fn(&EvalState, &HeapVal<X>) -> Heap,
+{
     match pi {
         PureInst::Fresh => ctx.fresh_symbolic_value("fresh"),
         PureInst::Unary(op, v) => {
@@ -95,12 +120,12 @@ fn eval_pure_inst(ctx: &mut VerifyContext<'_>, state: &EvalState, pi: &PureInst)
             ctx.add(Symbolic::Ternary([cond, then_, else_]))
         }
         PureInst::Deref(hv, loc) => {
-            let heap = state.get_heap(hv);
+            let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
             heap.value_at(addr).unwrap_or_else(|| ctx.fresh_symbolic_value("deref"))
         }
         PureInst::Perm(hv, loc) => {
-            let heap = state.get_heap(hv);
+            let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
@@ -119,46 +144,84 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, acc: &Acc, state: &EvalState) -> Heap {
     Heap::empty().with_chunk(addr, Chunk::new(perm, value))
 }
 
-fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
-    let mut result = h1.clone();
-    for (addr, chunk2) in h2.entries() {
-        if let Some(old_perm) = result.perm_at(addr) {
-            let new_perm = ctx.add(Symbolic::Binary(BinOp::Plus, [old_perm, chunk2.perm]));
-            let value = result.value_at(addr).unwrap();
-            result = result.with_chunk(addr, Chunk::new(new_perm, value));
+/// Re-key a heap's chunks under the egraph's current canonical ids. When
+/// two source addresses collapse to the same canonical id, merge their
+/// chunks: sum perms via a `Plus` e-node and union their values.
+fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
+    let mut out = Heap::empty();
+    let entries: Vec<(egg::Id, Chunk)> =
+        h.entries().map(|(addr, chunk)| (addr, chunk.clone())).collect();
+    for (addr, chunk) in entries {
+        let canon = ctx.egraph.find(addr);
+        if let Some(existing) = out.chunk(canon).cloned() {
+            let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [existing.perm, chunk.perm]));
+            ctx.egraph.union(existing.value, chunk.value);
+            out = out.with_chunk(canon, Chunk::new(perm, existing.value));
         } else {
-            result = result.with_chunk(addr, chunk2.clone());
+            out = out.with_chunk(canon, chunk);
         }
     }
-    result
+    out
 }
 
+/// Heap addition. Canonicalises both inputs first so chunks at e-class
+/// equivalent addresses merge. On collision, perms are summed and values
+/// are unioned in the egraph.
+fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
+    let c1 = canonicalize_heap(ctx, h1);
+    let c2 = canonicalize_heap(ctx, h2);
+    let mut out = c1;
+    let entries: Vec<(egg::Id, Chunk)> =
+        c2.entries().map(|(addr, chunk)| (addr, chunk.clone())).collect();
+    for (addr, chunk2) in entries {
+        if let Some(existing) = out.chunk(addr).cloned() {
+            let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [existing.perm, chunk2.perm]));
+            ctx.egraph.union(existing.value, chunk2.value);
+            out = out.with_chunk(addr, Chunk::new(perm, existing.value));
+        } else {
+            out = out.with_chunk(addr, chunk2);
+        }
+    }
+    out
+}
+
+/// Heap subtraction. Canonicalises both inputs first. Each canonical addr
+/// of `h2` must be present in `h1`; perms are subtracted, values unioned.
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
     h2: &Heap,
 ) -> Result<Heap, VerifyError> {
-    let mut result = h1.clone();
-    for (addr, chunk2) in h2.entries() {
-        let Some(old_perm) = result.perm_at(addr) else {
+    let c1 = canonicalize_heap(ctx, h1);
+    let c2 = canonicalize_heap(ctx, h2);
+    let mut out = c1;
+    let entries: Vec<(egg::Id, Chunk)> =
+        c2.entries().map(|(addr, chunk)| (addr, chunk.clone())).collect();
+    for (addr, chunk2) in entries {
+        let Some(existing) = out.chunk(addr).cloned() else {
             return Err(VerifyError::InsufficientPermission);
         };
-        let new_perm = ctx.add(Symbolic::Binary(BinOp::Minus, [old_perm, chunk2.perm]));
-        let value = result.value_at(addr).unwrap();
-        result = result.with_chunk(addr, Chunk::new(new_perm, value));
+        let perm = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+        ctx.egraph.union(existing.value, chunk2.value);
+        out = out.with_chunk(addr, Chunk::new(perm, existing.value));
     }
-    Ok(result)
+    Ok(out)
 }
 
 fn eval_resource_heap_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
-    inst: &HeapInst<!>,
+    inst: &HeapInst<!, ()>,
 ) -> Heap {
     match inst {
         HeapInst::Acc(acc) => heap_acc(ctx, acc, state),
-        HeapInst::Add(h1, h2) => heap_union(ctx, &state.get_heap(h1), &state.get_heap(h2)),
-        HeapInst::Ternary(_cond, h1, _h2) => state.get_heap(h1),
+        HeapInst::Add(h1, h2) => {
+            let l = get_heap_resource(state, h1);
+            let r = get_heap_resource(state, h2);
+            heap_union(ctx, &l, &r)
+        }
+        // TODO: condition-aware merge. Currently picks the then branch.
+        HeapInst::Ternary(_cond, h1, _h2) => get_heap_resource(state, h1),
         HeapInst::Ext(never) => match *never {},
     }
 }
@@ -170,7 +233,7 @@ fn eval_resource_body_inst(
 ) {
     match &inst.kind {
         InstKind::Pure(_ty, pi) => {
-            let id = eval_pure_inst(ctx, state, pi);
+            let id = eval_pure_inst(ctx, state, pi, get_heap_resource);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
@@ -181,6 +244,20 @@ fn eval_resource_body_inst(
     }
 }
 
+/// Evaluate a resource invocation as a **reusable proof**.
+///
+/// Contract: all of the body's structural facts (fresh values, chunk
+/// presences, value identities, the precondition's boolean) are added
+/// unconditionally to the caller's egraph. The function returns
+/// `(heap_delta, bool_handle)`. The *outer* boolean is **not** assumed or
+/// asserted inside this function — the caller decides whether to
+/// `egraph.union(bool_handle, true_id)` (inhale) or
+/// `egraph.rebuild(); assert find(bool_handle) == find(true_id)` (exhale).
+///
+/// The precondition (if `r.requires.is_some()`) is handled inside the body
+/// because the design spec says "precondition's boolean is assumed inside
+/// this body" (CLAUDE.md). That is a body-internal convention and is
+/// distinct from how the *outer* boolean is treated.
 fn eval_resource_call(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,
@@ -197,6 +274,9 @@ fn eval_resource_call(
 
     let mut res_state = EvalState::with_args(args);
 
+    // Inner precondition: body-internal "assumed inside this body" per
+    // CLAUDE.md. Stashing pre_heap makes HeapVal::CtxHeap(()) operands
+    // resolve; unioning pre_bool with `true_` realises the assume.
     if let Some((pre_id, pre_args)) = &r.requires {
         let pre_call = ResourceCall { resource: *pre_id, args: pre_args.clone() };
         let (pre_heap, pre_bool) = eval_resource_call(ctx, program, &res_state, &pre_call)?;
@@ -209,7 +289,7 @@ fn eval_resource_call(
         eval_resource_body_inst(ctx, &mut res_state, inst);
     }
 
-    let result_heap = res_state.get_heap(&body.res.0);
+    let result_heap = get_heap_resource(&res_state, &body.res.0);
     let result_bool = res_state.get_val(ctx, &body.res.1);
     Ok((result_heap, result_bool))
 }
@@ -217,14 +297,21 @@ fn eval_resource_call(
 fn eval_method_heap_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
-    inst: &HeapInst<MethodHeapExt>,
+    inst: &HeapInst<MethodHeapExt, !>,
 ) -> Result<Heap, VerifyError> {
     match inst {
         HeapInst::Acc(acc) => Ok(heap_acc(ctx, acc, state)),
-        HeapInst::Add(h1, h2) => Ok(heap_union(ctx, &state.get_heap(h1), &state.get_heap(h2))),
-        HeapInst::Ternary(_cond, h1, _h2) => Ok(state.get_heap(h1)),
+        HeapInst::Add(h1, h2) => {
+            let l = get_heap_method(state, h1);
+            let r = get_heap_method(state, h2);
+            Ok(heap_union(ctx, &l, &r))
+        }
+        // TODO: condition-aware merge. Currently picks the then branch.
+        HeapInst::Ternary(_cond, h1, _h2) => Ok(get_heap_method(state, h1)),
         HeapInst::Ext(MethodHeapExt::Sub(h1, h2)) => {
-            heap_subtract(ctx, &state.get_heap(h1), &state.get_heap(h2))
+            let l = get_heap_method(state, h1);
+            let r = get_heap_method(state, h2);
+            heap_subtract(ctx, &l, &r)
         }
     }
 }
@@ -237,7 +324,7 @@ fn eval_method_inst(
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(_ty, pi) => {
-            let id = eval_pure_inst(ctx, state, pi);
+            let id = eval_pure_inst(ctx, state, pi, get_heap_method);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
@@ -270,7 +357,7 @@ fn eval_method_inst(
 
 pub fn verify_method(
     program: &vmir::Program,
-    method_name: &str,
+    _method_name: &str,
     method: &Method,
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner);
@@ -281,4 +368,102 @@ pub fn verify_method(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify::lang::Symbolic;
+
+    fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
+        VerifyContext::new(interner)
+    }
+
+    #[test]
+    fn heap_union_merges_egg_equivalent_addresses() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        // Two distinct addr e-nodes that we'll later union.
+        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
+        let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
+        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
+        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
+        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+        let h2 = Heap::empty().with_chunk(b, Chunk::new(p2, v2));
+
+        // Make a and b e-class equivalent.
+        ctx.egraph.union(a, b);
+        ctx.egraph.rebuild();
+
+        let merged = heap_union(&mut ctx, &h1, &h2);
+
+        // After canonicalisation both chunks live under a single key.
+        let canon = ctx.egraph.find(a);
+        let chunk = merged.chunk(canon).expect("merged chunk missing");
+
+        // Perm should be the e-node `p1 + p2`.
+        let expected_perm =
+            ctx.add(Symbolic::Binary(BinOp::Plus, [p1, p2]));
+        ctx.egraph.rebuild();
+        assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
+
+        // v1 and v2 should now be in the same e-class.
+        assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
+
+        // And only one chunk in the merged heap.
+        assert_eq!(merged.entries().count(), 1);
+    }
+
+    #[test]
+    fn heap_subtract_canonical_match() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
+        let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
+        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
+        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
+        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+        let h2 = Heap::empty().with_chunk(b, Chunk::new(p2, v2));
+
+        ctx.egraph.union(a, b);
+        ctx.egraph.rebuild();
+
+        let result = heap_subtract(&mut ctx, &h1, &h2).expect("subtract should succeed");
+
+        let canon = ctx.egraph.find(a);
+        let chunk = result.chunk(canon).expect("result chunk missing");
+        let expected_perm =
+            ctx.add(Symbolic::Binary(BinOp::Minus, [p1, p2]));
+        ctx.egraph.rebuild();
+        assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
+    }
+
+    #[test]
+    fn heap_subtract_missing_addr_fails() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
+        let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
+        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
+
+        let h1 = Heap::empty();
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+        // a and b are *not* unioned.
+        let _ = b;
+
+        let err = heap_subtract(&mut ctx, &h1, &h2)
+            .err()
+            .expect("subtract from empty must fail");
+        assert!(matches!(err, VerifyError::InsufficientPermission));
+    }
 }

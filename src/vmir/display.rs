@@ -133,6 +133,24 @@ impl<'a> Display for VmirDisplay<'a, &'a Method> {
     }
 }
 
+/// Rendering hook for the `HeapVal::CtxHeap` payload. `()` (resource ctx)
+/// prints `ctx`; `!` (method ctx) is uninhabited.
+pub(crate) trait CtxHeapRender {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
+}
+
+impl CtxHeapRender for () {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "ctx")
+    }
+}
+
+impl CtxHeapRender for ! {
+    fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
+        match *self {}
+    }
+}
+
 /// Rendering hook for the `HeapInst::Ext` payload. `MethodHeapExt` renders
 /// like a heap inst (bumps the heap counter); `!` is uninhabited.
 pub(crate) trait HeapExtRender {
@@ -212,15 +230,16 @@ impl InstExtRender for MethodInstExt {
     }
 }
 
-fn write_inst_block<'a, T, H, K>(
+fn write_inst_block<'a, T, H, K, X>(
     f: &mut Formatter<'_>,
     ctx: &VmirDisplay<'a, T>,
-    insts: &[Inst<H, K>],
+    insts: &[Inst<H, K, X>],
     val_base: usize,
 ) -> fmt::Result
 where
     H: HeapExtRender,
     K: InstExtRender,
+    X: CtxHeapRender,
 {
     let mut e_idx = val_base;
     let mut h_idx = 0usize;
@@ -250,10 +269,11 @@ where
     Ok(())
 }
 
-fn write_heap_inst<H: HeapExtRender>(
-    f: &mut Formatter<'_>,
-    inst: &HeapInst<H>,
-) -> fmt::Result {
+fn write_heap_inst<H, X>(f: &mut Formatter<'_>, inst: &HeapInst<H, X>) -> fmt::Result
+where
+    H: HeapExtRender,
+    X: CtxHeapRender,
+{
     match inst {
         HeapInst::Acc(acc) => write!(f, "acc({}, {})", acc.loc, acc.perm),
         HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
@@ -284,7 +304,10 @@ impl Display for Lit {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
+impl<'a, X> Display for VmirDisplay<'a, &'a PureInst<X>>
+where
+    X: CtxHeapRender,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             PureInst::Fresh => write!(f, "fresh"),
@@ -300,7 +323,10 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, &'a FunctionCall> {
+impl<'a, X> Display for VmirDisplay<'a, &'a FunctionCall<X>>
+where
+    X: CtxHeapRender,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.interner.resolve(&self.item.func_id))?;
         if let Some(heap) = &self.item.heap_ctx {
@@ -347,12 +373,12 @@ impl Display for Literal {
     }
 }
 
-impl Display for HeapVal {
+impl<X: CtxHeapRender> Display for HeapVal<X> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             HeapVal::Empty => write!(f, "empty"),
-            HeapVal::Pre => write!(f, "pre"),
             HeapVal::Temp(i) => write!(f, "h{i}"),
+            HeapVal::CtxHeap(x) => x.render(f),
         }
     }
 }

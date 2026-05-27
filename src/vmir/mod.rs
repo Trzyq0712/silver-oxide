@@ -19,9 +19,9 @@ pub use adt::Adt;
 pub use domain::Domain;
 pub use function::Function;
 pub use inst::{Context, Inst, InstKind, Lit, PathCond};
-pub use method::{Method, MethodCtx, MethodHeapExt, MethodInst, MethodInstExt};
+pub use method::{Method, MethodCtx, MethodHeapExt, MethodHeapVal, MethodInst, MethodInstExt};
 pub use resource::{
-    Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst,
+    Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceHeapVal, ResourceInst,
 };
 
 use derive_more::{From, Into};

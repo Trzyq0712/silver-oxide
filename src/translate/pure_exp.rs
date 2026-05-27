@@ -7,14 +7,15 @@ use lasso::Spur;
 use crate::silver::final_ast;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, Context, FALSE, HeapInst, Inst, InstKind, Literal, PathCond, PureInst, TRUE, UnOp, Val,
+    self, Context, FALSE, HeapInst, HeapVal, Inst, InstKind, Literal, PathCond, PureInst, TRUE,
+    UnOp, Val,
 };
 
 /// A mutable sink for emitted instructions plus the running counters,
 /// parameterised by the body's `Context`. The choice of `C` controls which
 /// extension variants the caller is allowed to construct.
 pub(crate) struct Sink<C: Context> {
-    pub insts: Vec<Inst<C::HeapExt, C::InstExt>>,
+    pub insts: Vec<Inst<C::HeapExt, C::InstExt, C::HeapValExt>>,
     pub val_base: usize,
     pub val_count: usize,
     pub heap_count: usize,
@@ -36,13 +37,13 @@ impl<C: Context> Sink<C> {
         Val::Temp(id)
     }
 
-    pub fn next_heap_temp(&mut self) -> vmir::HeapVal {
+    pub fn next_heap_temp(&mut self) -> HeapVal<C::HeapValExt> {
         let id = self.heap_count;
         self.heap_count += 1;
-        vmir::HeapVal::Temp(id)
+        HeapVal::Temp(id)
     }
 
-    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
+    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst<C::HeapValExt>) -> Val {
         let v = self.next_val_temp();
         self.insts.push(Inst {
             pc: PathCond::default(),
@@ -51,11 +52,14 @@ impl<C: Context> Sink<C> {
         v
     }
 
-    /// Push a heap instruction. `HeapInst<C::HeapExt>` constrains which
-    /// extension variants are even constructible at the call site; for
-    /// `Sink<ResourceCtx>` the `Ext` arm is unreachable because `!` has no
-    /// values.
-    pub fn emit_heap(&mut self, inst: HeapInst<C::HeapExt>) -> vmir::HeapVal {
+    /// Push a heap instruction. `HeapInst<C::HeapExt, C::HeapValExt>`
+    /// constrains which variants are constructible: in `Sink<ResourceCtx>`
+    /// the `Ext` arm is uninhabited (`!`); in `Sink<MethodCtx>` the
+    /// `HeapVal::CtxHeap` operand is uninhabited.
+    pub fn emit_heap(
+        &mut self,
+        inst: HeapInst<C::HeapExt, C::HeapValExt>,
+    ) -> HeapVal<C::HeapValExt> {
         let h = self.next_heap_temp();
         self.insts.push(Inst {
             pc: PathCond::default(),
@@ -64,10 +68,8 @@ impl<C: Context> Sink<C> {
         h
     }
 
-    /// Push an instruction-kind extension. Bumps no counter; current
-    /// extensions (`MethodInstExt::Assume`/`Assert`) produce neither a
-    /// `Val` nor a `HeapVal`. For `Sink<ResourceCtx>` the parameter type is
-    /// `!`, so this method is uncallable.
+    /// Push an instruction-kind extension. For `Sink<ResourceCtx>` the
+    /// parameter type is `!`, so this method is uncallable.
     pub fn emit_ext(&mut self, ext: C::InstExt) {
         self.insts.push(Inst {
             pc: PathCond::default(),

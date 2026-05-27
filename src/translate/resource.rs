@@ -8,7 +8,8 @@ use crate::silver::final_ast;
 use crate::translate::pure_exp::{self, PureExt, Sink};
 use crate::translate::{Builder, TranslationError};
 use crate::vmir::{
-    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, TRUE, Type, Val,
+    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, ResourceHeapVal,
+    TRUE, Type, Val,
 };
 
 pub(crate) fn lower_spatial_never(
@@ -51,7 +52,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<ResourceCtx>,
     exp: &final_ast::SpatialExp<Ext>,
-) -> Result<(HeapVal, Option<Val>), TranslationError> {
+) -> Result<(ResourceHeapVal, Option<Val>), TranslationError> {
     use final_ast::SpatialExpKind as S;
     match &*exp.0 {
         S::Acc(res, perm) => {
@@ -113,7 +114,7 @@ fn lower_acc<Ext: PureExt>(
     sink: &mut Sink<ResourceCtx>,
     res: &final_ast::ResourceExp<Ext>,
     perm: &final_ast::TypedPureExp<Ext>,
-) -> Result<HeapVal, TranslationError> {
+) -> Result<ResourceHeapVal, TranslationError> {
     use final_ast::ResourceExpKind as R;
     let perm_val = lower_perm(b, env, sink, perm)?;
     match &*res.0 {

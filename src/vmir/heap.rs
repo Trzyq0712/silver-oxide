@@ -1,24 +1,26 @@
 use crate::vmir::Val;
 
+/// Heap-typed value. Generic over `X`, the context's "ctx-heap" slot.
+///
+/// - `ResourceCtx` fills `X = ()` — `CtxHeap(())` is constructible and
+///   represents the resource's precondition heap delta (when the resource
+///   has a `requires`).
+/// - `MethodCtx` fills `X = !` — `CtxHeap` is uninhabited; method bodies
+///   have no context-heap concept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HeapVal {
+pub enum HeapVal<X> {
     /// The empty heap.
     Empty,
-    /// The heap delta of the resource's `requires` precondition. Only legal
-    /// inside a `Resource` whose `requires.is_some()`.
-    Pre,
     /// A heap-typed temporary produced by an earlier heap instruction.
     Temp(usize),
+    /// Context heap. Resource-only.
+    CtxHeap(X),
 }
 
-/// Heap instructions shared between resource and method bodies.
-///
-/// `X` is the context extension slot. Operations that are *not* legal inside a
-/// resource body (currently only heap subtraction) live in `X` rather than as
-/// a top-level variant. A resource body instantiates `X = !`, making `Ext`
-/// unconstructible; a method body fills `X` with [`MethodHeapExt`].
+/// Heap instructions. `S` is the context's heap-instruction extension slot;
+/// `X` is the ctx-heap slot threaded through `HeapVal<X>` operands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HeapInst<X> {
+pub enum HeapInst<S, X> {
     /// Single-chunk heap holding `perm` permission to `loc`. The location is
     /// an `Addr<T>` value produced by a call to the resource's auto-emitted
     /// `@addr` uninterpreted function (works uniformly for fields and
@@ -26,11 +28,11 @@ pub enum HeapInst<X> {
     Acc(Acc),
     /// Heap union. May produce equalities between merged chunks under the
     /// instruction's path condition.
-    Add(HeapVal, HeapVal),
+    Add(HeapVal<X>, HeapVal<X>),
     /// Conditional heap: `cond ? then : else`.
-    Ternary(Val, HeapVal, HeapVal),
+    Ternary(Val, HeapVal<X>, HeapVal<X>),
     /// Context-specific extensions (e.g. method-only heap subtraction).
-    Ext(X),
+    Ext(S),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
