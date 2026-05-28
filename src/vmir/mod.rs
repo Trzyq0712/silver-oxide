@@ -19,7 +19,7 @@ pub use adt::Adt;
 pub use domain::Domain;
 pub use function::{Function, FunctionCall};
 pub use inst::{Inst, InstContext, InstKind, PathConds, Polarity};
-pub use method::{Assign, HeapExt, InstExt, Method, MethodCtx, MethodInst};
+pub use method::{Assign, HeapExt, InstExt, Method, MethodCtx, MethodInst, PureExt};
 pub use resource::{
     Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst, ResourcePureExt,
 };

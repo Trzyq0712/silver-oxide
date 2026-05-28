@@ -5,6 +5,7 @@ pub struct MethodCtx;
 impl InstContext for MethodCtx {
     type InstExt = InstExt;
     type HeapExt = HeapExt;
+    type PureExt = PureExt;
 }
 
 /// Method-specific instruction extensions.
@@ -22,6 +23,13 @@ pub enum HeapExt {
     /// SIDECOND: The heap location must have at least `write` amount of
     /// permission.
     Assign(HeapVal, Assign),
+}
+
+/// Method-specific pure-instruction extensions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PureExt {
+    /// Query the permission amount of an address in a heap.
+    Perm(HeapVal, Val),
 }
 
 /// Assign a value to a heap location.

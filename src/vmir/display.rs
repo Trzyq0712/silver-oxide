@@ -1,7 +1,7 @@
 use crate::vmir::{
     Acc, Adt, Assign, BinOp, Declaration, Domain, Function, FunctionCall, HeapExt, HeapInst,
     HeapVal, Inst, InstContext, InstExt, InstKind, Literal, MemberId, Method, PathConds, Polarity,
-    Program, PureInst, Resource, ResourceBody, ResourcePureExt, Type, Val,
+    Program, PureExt, PureInst, Resource, ResourceBody, ResourcePureExt, Type, Val,
 };
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
@@ -156,6 +156,14 @@ impl PureExtRender for ResourcePureExt {
                 }
                 write!(f, ")")
             }
+        }
+    }
+}
+
+impl PureExtRender for PureExt {
+    fn render(&self, f: &mut Formatter<'_>, _: &Rodeo<MemberId>) -> fmt::Result {
+        match self {
+            PureExt::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
         }
     }
 }
@@ -319,7 +327,6 @@ where
                 write!(f, "{cond} ? {then_val} : {else_val}")
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
-            PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
             PureInst::FunctionCall(heap, call) => {
                 write!(f, "{}[{heap}](", self.interner.resolve(&call.function))?;
                 for (i, arg) in call.args.iter().enumerate() {

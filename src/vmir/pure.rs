@@ -54,8 +54,6 @@ pub enum PureInst<P> {
     /// SIDECOND: The heap must hold non-zero permission to the location
     /// under the given path condition.
     Deref(HeapVal, Val),
-    /// Query the permission amount of an address in a heap.
-    Perm(HeapVal, Val),
     /// Call a pure function in the given heap.
     /// SIDECOND: The function's precondition must be satisfied.
     FunctionCall(HeapVal, FunctionCall),

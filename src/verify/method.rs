@@ -139,11 +139,6 @@ where
             heap.value_at(addr)
                 .unwrap_or_else(|| ctx.fresh_symbolic_value("deref"))
         }
-        PureInst::Perm(hv, loc) => {
-            let heap = get_heap(state, hv);
-            let addr = state.get_val(ctx, loc);
-            heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
-        }
         PureInst::FunctionCall(_heap, fc) => {
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add(Symbolic::FuncApp(fc.function, args.into()))
@@ -173,6 +168,22 @@ fn eval_resource_pure_ext(
         ResourcePureExt::CtxFunctionCall(call) => {
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add(Symbolic::FuncApp(call.function, args.into()))
+        }
+    }
+}
+
+/// Pure-ext evaluator for method bodies. Handles `PureExt::Perm`:
+/// permission-amount query in the given heap.
+fn eval_method_pure_ext(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    ext: &vmir::PureExt,
+) -> egg::Id {
+    match ext {
+        vmir::PureExt::Perm(hv, loc) => {
+            let heap = get_heap(state, hv);
+            let addr = state.get_val(ctx, loc);
+            heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
     }
 }
@@ -382,7 +393,7 @@ fn eval_method_inst(
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(_ty, pi) => {
-            let id = eval_pure_inst(ctx, state, pi, |_, _, never| match *never {});
+            let id = eval_pure_inst(ctx, state, pi, eval_method_pure_ext);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
