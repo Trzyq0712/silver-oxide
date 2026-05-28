@@ -133,19 +133,29 @@ impl<'a> Display for VmirDisplay<'a, &'a Method> {
 
 /// Rendering hook for the `PureInst::Ext` payload.
 pub(crate) trait PureExtRender {
-    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
+    fn render(&self, f: &mut Formatter<'_>, interner: &Rodeo<MemberId>) -> fmt::Result;
 }
 
 impl PureExtRender for ! {
-    fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
+    fn render(&self, _: &mut Formatter<'_>, _: &Rodeo<MemberId>) -> fmt::Result {
         match *self {}
     }
 }
 
 impl PureExtRender for ResourcePureExt {
-    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn render(&self, f: &mut Formatter<'_>, interner: &Rodeo<MemberId>) -> fmt::Result {
         match self {
             ResourcePureExt::CtxDeref(addr) => write!(f, "*[ctx] {addr}"),
+            ResourcePureExt::CtxFunctionCall(call) => {
+                write!(f, "{}[ctx](", interner.resolve(&call.function))?;
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -310,27 +320,18 @@ where
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
             PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
-            PureInst::FunctionCall(call) => write!(f, "{}", self.with(call)),
-            PureInst::Ext(ext) => ext.render(f),
-        }
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, &'a FunctionCall> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}[{}](",
-            self.interner.resolve(&self.item.function),
-            self.item.ctx_heap
-        )?;
-        for (i, arg) in self.item.args.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
+            PureInst::FunctionCall(heap, call) => {
+                write!(f, "{}[{heap}](", self.interner.resolve(&call.function))?;
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
             }
-            write!(f, "{arg}")?;
+            PureInst::Ext(ext) => ext.render(f, self.interner),
         }
-        write!(f, ")")
     }
 }
 

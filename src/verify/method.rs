@@ -144,7 +144,7 @@ where
             let addr = state.get_val(ctx, loc);
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
-        PureInst::FunctionCall(fc) => {
+        PureInst::FunctionCall(_heap, fc) => {
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add(Symbolic::FuncApp(fc.function, args.into()))
         }
@@ -169,6 +169,10 @@ fn eval_resource_pure_ext(
                 .expect("CtxDeref outside resource-body with requires");
             pre.value_at(addr_id)
                 .unwrap_or_else(|| ctx.fresh_symbolic_value("ctx_deref"))
+        }
+        ResourcePureExt::CtxFunctionCall(call) => {
+            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
+            ctx.add(Symbolic::FuncApp(call.function, args.into()))
         }
     }
 }

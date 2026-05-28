@@ -368,7 +368,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         let mut saw_acc = false;
         for inst in &body.insts {
             match &inst.kind {
-                vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
+                vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(_, fc))
                     if fc.function == addr_id =>
                 {
                     saw_addr_call = true;

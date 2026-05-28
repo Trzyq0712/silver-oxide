@@ -56,9 +56,9 @@ pub enum PureInst<P> {
     Deref(HeapVal, Val),
     /// Query the permission amount of an address in a heap.
     Perm(HeapVal, Val),
-    /// Call a pure function.
+    /// Call a pure function in the given heap.
     /// SIDECOND: The function's precondition must be satisfied.
-    FunctionCall(FunctionCall),
+    FunctionCall(HeapVal, FunctionCall),
     /// Context-specific pure-instruction extensions.
     Ext(P),
 }

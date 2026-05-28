@@ -11,8 +11,10 @@ impl InstContext for ResourceCtx {
 pub enum ResourcePureExt {
     /// Dereference an address in the resource's context (precondition) heap.
     /// SIDECOND: the context heap must have positive permission amount
-    /// fot this location.
+    /// for this location.
     CtxDeref(Val),
+    /// Call a function evaluated in the resource's context heap.
+    CtxFunctionCall(crate::vmir::FunctionCall),
 }
 
 pub type ResourceInst = Inst<ResourceCtx>;

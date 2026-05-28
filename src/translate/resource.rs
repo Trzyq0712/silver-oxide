@@ -132,11 +132,13 @@ fn lower_acc<Ext: PureExt>(
             let ret_ty = Type::Addr(Box::new(silver_type_to_vmir(&field_ty)));
             let addr = sink.emit_pure(
                 ret_ty,
-                PureInst::FunctionCall(FunctionCall {
-                    function: addr_fn,
-                    ctx_heap: HeapVal::Empty,
-                    args: vec![base_val],
-                }),
+                PureInst::FunctionCall(
+                    HeapVal::Empty,
+                    FunctionCall {
+                        function: addr_fn,
+                        args: vec![base_val],
+                    },
+                ),
             );
             Ok(sink.emit_heap(HeapInst::Acc(Acc {
                 loc: addr,
@@ -158,11 +160,13 @@ fn lower_acc<Ext: PureExt>(
             let ret_ty = Type::Addr(Box::new(Type::Domain(snap_id)));
             let addr = sink.emit_pure(
                 ret_ty,
-                PureInst::FunctionCall(FunctionCall {
-                    function: addr_fn,
-                    ctx_heap: HeapVal::Empty,
-                    args,
-                }),
+                PureInst::FunctionCall(
+                    HeapVal::Empty,
+                    FunctionCall {
+                        function: addr_fn,
+                        args,
+                    },
+                ),
             );
             Ok(sink.emit_heap(HeapInst::Acc(Acc {
                 loc: addr,
