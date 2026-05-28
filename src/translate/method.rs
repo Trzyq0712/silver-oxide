@@ -37,26 +37,33 @@ pub(crate) fn lower_method(
     }
 
     let mut current_heap: HeapVal = HeapVal::Empty;
+    // Captures the heap delta produced by the method's `@requires`
+    // resource. The `@ensures` resource is evaluated against this heap so
+    // its body can refer to entry-state values (e.g. via `old(...)`).
+    let mut pre_heap: HeapVal = HeapVal::Empty;
 
     // Inhale this method's own precondition: call self@requires, add delta,
     // assume bool.
     if let Some(&req_id) = b.method_requires.get(&m.name.0) {
-        let (h_pre, b_pre) = emit_resource_call(&mut sink, req_id, param_vals.clone());
+        let (h_pre, b_pre) =
+            emit_resource_call(&mut sink, req_id, current_heap, param_vals.clone());
         let h_new = sink.emit_heap(HeapInst::Add(current_heap, h_pre));
         sink.emit_ext(InstExt::Assume(b_pre));
         current_heap = h_new;
+        pre_heap = h_pre;
     }
 
     for stmt in &body.0 {
         current_heap = lower_stmt(b, &mut env, &mut sink, current_heap, stmt)?;
     }
 
-    // Exhale this method's own postcondition: call self@ensures, sub delta,
-    // assert bool.
+    // Exhale this method's own postcondition: call self@ensures with the
+    // precondition's heap as ctx (so old/CtxDeref see entry-state values),
+    // sub delta, assert bool.
     if let Some(&ens_id) = b.method_ensures.get(&m.name.0) {
         let mut ens_args = param_vals;
         ens_args.extend(ret_vals);
-        let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, ens_args);
+        let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, pre_heap, ens_args);
         let _h_new = sink.emit_heap(HeapInst::Sub(current_heap, h_post));
         sink.emit_ext(InstExt::Assert(b_post));
     }
@@ -171,7 +178,7 @@ fn lower_method_call(
 
     // Exhale precondition (if present): call m@requires, sub delta, assert bool.
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
-        let (h_pre, b_pre) = emit_resource_call(sink, req_id, args.clone());
+        let (h_pre, b_pre) = emit_resource_call(sink, req_id, heap, args.clone());
         let h_new = sink.emit_heap(HeapInst::Sub(heap, h_pre));
         sink.emit_ext(InstExt::Assert(b_pre));
         heap = h_new;
@@ -189,7 +196,7 @@ fn lower_method_call(
     if let Some(&ens_id) = b.method_ensures.get(&call.name.0) {
         let mut ens_args = args.clone();
         ens_args.extend(ret_vals.iter().cloned());
-        let (h_post, b_post) = emit_resource_call(sink, ens_id, ens_args);
+        let (h_post, b_post) = emit_resource_call(sink, ens_id, heap, ens_args);
         let h_new = sink.emit_heap(HeapInst::Add(heap, h_post));
         sink.emit_ext(InstExt::Assume(b_post));
         heap = h_new;
@@ -205,13 +212,18 @@ fn lower_method_call(
 fn emit_resource_call(
     sink: &mut Sink<MethodCtx>,
     resource: vmir::MemberId,
+    ctx_heap: HeapVal,
     args: Vec<Val>,
 ) -> (HeapVal, Val) {
     let h = sink.next_heap_temp();
     let v = sink.next_val_temp();
     sink.insts.push(Inst {
         pc: PathConds::default(),
-        kind: InstKind::Ext(InstExt::ResourceCall(ResourceCall { resource, args })),
+        kind: InstKind::Ext(InstExt::ResourceCall(ResourceCall {
+            resource,
+            ctx_heap,
+            args,
+        })),
     });
     (h, v)
 }

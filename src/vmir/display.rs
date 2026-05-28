@@ -213,8 +213,9 @@ impl InstExtRender for InstExt {
             InstExt::ResourceCall(call) => {
                 write!(
                     f,
-                    "  (h{heap_idx}, e{val_idx}) := {pc} call {}(",
-                    interner.resolve(&call.resource)
+                    "  (h{heap_idx}, e{val_idx}) := {pc} call {}[{}](",
+                    interner.resolve(&call.resource),
+                    call.ctx_heap,
                 )?;
                 for (i, arg) in call.args.iter().enumerate() {
                     if i > 0 {

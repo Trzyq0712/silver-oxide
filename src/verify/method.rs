@@ -357,19 +357,9 @@ fn eval_resource_call(
 
     let mut res_state = EvalState::with_args(args);
 
-    // Inner precondition: body-internal "assumed inside this body" per
-    // CLAUDE.md. Stashing pre_heap makes CtxDeref operands resolve;
-    // unioning pre_bool with `true_` realises the assume.
-    if let Some((pre_id, pre_args)) = &r.requires {
-        let pre_call = ResourceCall {
-            resource: *pre_id,
-            args: pre_args.clone(),
-        };
-        let (pre_heap, pre_bool) = eval_resource_call(ctx, program, &res_state, &pre_call)?;
-        let true_ = ctx.add(Symbolic::Bool(true));
-        ctx.egraph.union(pre_bool, true_);
-        res_state.pre_heap = Some(pre_heap);
-    }
+    // Caller-supplied ctx heap; readable inside the body via
+    // `PureInst::Ext(CtxDeref(_))`.
+    res_state.pre_heap = Some(get_heap(caller_state, &call.ctx_heap));
 
     for inst in &body.insts {
         eval_resource_body_inst(ctx, &mut res_state, inst)?;

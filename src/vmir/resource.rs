@@ -1,4 +1,4 @@
-use crate::vmir::{Inst, InstContext, MemberId, Type, Val};
+use crate::vmir::{HeapVal, Inst, InstContext, MemberId, Type, Val};
 
 pub struct ResourceCtx;
 
@@ -36,5 +36,6 @@ pub struct ResourceBody {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceCall {
     pub resource: MemberId,
+    pub ctx_heap: HeapVal,
     pub args: Vec<Val>,
 }
