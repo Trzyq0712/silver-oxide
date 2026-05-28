@@ -17,10 +17,12 @@ pub enum HeapVal<X> {
     CtxHeap(X),
 }
 
-/// Heap instructions. `S` is the context's heap-instruction extension slot;
-/// `X` is the ctx-heap slot threaded through `HeapVal<X>` operands.
+/// Heap instructions. `X` is the ctx-heap slot threaded through
+/// `HeapVal<X>` operands. `Sub` is legal in both resource and method
+/// bodies; in a resource it may fail at verify time with
+/// `InsufficientPermission`, which propagates out of the resource call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HeapInst<S, X> {
+pub enum HeapInst<X> {
     /// Single-chunk heap holding `perm` permission to `loc`. The location is
     /// an `Addr<T>` value produced by a call to the resource's auto-emitted
     /// `@addr` uninterpreted function (works uniformly for fields and
@@ -29,10 +31,10 @@ pub enum HeapInst<S, X> {
     /// Heap union. May produce equalities between merged chunks under the
     /// instruction's path condition.
     Add(HeapVal<X>, HeapVal<X>),
+    /// Heap subtraction.
+    Sub(HeapVal<X>, HeapVal<X>),
     /// Conditional heap: `cond ? then : else`.
     Ternary(Val, HeapVal<X>, HeapVal<X>),
-    /// Context-specific extensions (e.g. method-only heap subtraction).
-    Ext(S),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

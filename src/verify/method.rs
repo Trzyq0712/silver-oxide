@@ -5,8 +5,8 @@ use crate::{
         lang::Symbolic,
     },
     vmir::{
-        self, Acc, BinOp, Declaration, HeapInst, HeapVal, InstKind, Literal, Method, MethodHeapExt,
-        MethodHeapVal, MethodInstExt, PureInst, ResourceCall, ResourceHeapVal, ResourceInst, Val,
+        self, Acc, BinOp, Declaration, HeapInst, HeapVal, InstKind, Literal, Method, MethodHeapVal,
+        MethodInstExt, PureInst, ResourceCall, ResourceHeapVal, ResourceInst, Val,
     },
 };
 
@@ -90,6 +90,19 @@ fn lit_to_sym(lit: &Literal) -> Symbolic {
 
 fn zero_real(ctx: &mut VerifyContext<'_>) -> egg::Id {
     ctx.add(Symbolic::Real(num::BigInt::from(0).into()))
+}
+
+/// Best-effort literal extraction: scan the e-class for a `Symbolic::Real`
+/// node. Returns the first one found. Used by heap arithmetic to fold
+/// concrete-perm operations and detect zero/negative permission.
+fn extract_real_literal(ctx: &VerifyContext<'_>, id: egg::Id) -> Option<num::BigRational> {
+    let canon = ctx.egraph.find(id);
+    for node in &ctx.egraph[canon].nodes {
+        if let Symbolic::Real(r) = node {
+            return Some(r.clone());
+        }
+    }
+    None
 }
 
 /// Evaluate a `PureInst<X>` given a context-specific heap-fetch.
@@ -186,7 +199,13 @@ fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
 }
 
 /// Heap subtraction. Canonicalises both inputs first. Each canonical addr
-/// of `h2` must be present in `h1`; perms are subtracted, values unioned.
+/// of `h2` must be present in `h1` with sufficient permission. When both
+/// existing and subtracted perms are concrete `Real` literals, the
+/// arithmetic is folded: negative result → `InsufficientPermission`, zero
+/// → chunk dropped, positive → chunk kept with the literal remainder. If
+/// either perm is not a literal, falls back to emitting a `Minus` e-node
+/// and keeping the chunk (sound only up to egraph rewriting that may later
+/// canonicalise the perm).
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
@@ -197,32 +216,65 @@ fn heap_subtract(
     let mut out = c1;
     let entries: Vec<(egg::Id, Chunk)> =
         c2.entries().map(|(addr, chunk)| (addr, chunk.clone())).collect();
+    let zero = num::BigRational::from(num::BigInt::from(0));
     for (addr, chunk2) in entries {
         let Some(existing) = out.chunk(addr).cloned() else {
             return Err(VerifyError::InsufficientPermission);
         };
-        let perm = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
-        ctx.egraph.union(existing.value, chunk2.value);
-        out = out.with_chunk(addr, Chunk::new(perm, existing.value));
+        match (
+            extract_real_literal(ctx, existing.perm),
+            extract_real_literal(ctx, chunk2.perm),
+        ) {
+            (Some(r1), Some(r2)) => {
+                let diff = r1 - r2;
+                if diff < zero {
+                    return Err(VerifyError::InsufficientPermission);
+                }
+                ctx.egraph.union(existing.value, chunk2.value);
+                if diff == zero {
+                    out = out.without_chunk(addr);
+                } else {
+                    let perm = ctx.add(Symbolic::Real(diff));
+                    out = out.with_chunk(addr, Chunk::new(perm, existing.value));
+                }
+            }
+            _ => {
+                let perm =
+                    ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+                ctx.egraph.union(existing.value, chunk2.value);
+                out = out.with_chunk(addr, Chunk::new(perm, existing.value));
+            }
+        }
     }
     Ok(out)
 }
 
-fn eval_resource_heap_inst(
+/// Evaluate a heap inst in any context. The ctx-heap operand resolution
+/// is delegated to `get_heap`. `Sub` may fail with
+/// `InsufficientPermission` regardless of context.
+fn eval_heap_inst<X, F>(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
-    inst: &HeapInst<!, ()>,
-) -> Heap {
+    inst: &HeapInst<X>,
+    get_heap: F,
+) -> Result<Heap, VerifyError>
+where
+    F: Fn(&EvalState, &HeapVal<X>) -> Heap,
+{
     match inst {
-        HeapInst::Acc(acc) => heap_acc(ctx, acc, state),
+        HeapInst::Acc(acc) => Ok(heap_acc(ctx, acc, state)),
         HeapInst::Add(h1, h2) => {
-            let l = get_heap_resource(state, h1);
-            let r = get_heap_resource(state, h2);
-            heap_union(ctx, &l, &r)
+            let l = get_heap(state, h1);
+            let r = get_heap(state, h2);
+            Ok(heap_union(ctx, &l, &r))
+        }
+        HeapInst::Sub(h1, h2) => {
+            let l = get_heap(state, h1);
+            let r = get_heap(state, h2);
+            heap_subtract(ctx, &l, &r)
         }
         // TODO: condition-aware merge. Currently picks the then branch.
-        HeapInst::Ternary(_cond, h1, _h2) => get_heap_resource(state, h1),
-        HeapInst::Ext(never) => match *never {},
+        HeapInst::Ternary(_cond, h1, _h2) => Ok(get_heap(state, h1)),
     }
 }
 
@@ -230,18 +282,19 @@ fn eval_resource_body_inst(
     ctx: &mut VerifyContext<'_>,
     state: &mut EvalState,
     inst: &ResourceInst,
-) {
+) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(_ty, pi) => {
             let id = eval_pure_inst(ctx, state, pi, get_heap_resource);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
-            let heap = eval_resource_heap_inst(ctx, state, hi);
+            let heap = eval_heap_inst(ctx, state, hi, get_heap_resource)?;
             state.push_heap(heap);
         }
         InstKind::Ext(never) => match *never {},
     }
+    Ok(())
 }
 
 /// Evaluate a resource invocation as a **reusable proof**.
@@ -286,34 +339,12 @@ fn eval_resource_call(
     }
 
     for inst in &body.insts {
-        eval_resource_body_inst(ctx, &mut res_state, inst);
+        eval_resource_body_inst(ctx, &mut res_state, inst)?;
     }
 
     let result_heap = get_heap_resource(&res_state, &body.res.0);
     let result_bool = res_state.get_val(ctx, &body.res.1);
     Ok((result_heap, result_bool))
-}
-
-fn eval_method_heap_inst(
-    ctx: &mut VerifyContext<'_>,
-    state: &EvalState,
-    inst: &HeapInst<MethodHeapExt, !>,
-) -> Result<Heap, VerifyError> {
-    match inst {
-        HeapInst::Acc(acc) => Ok(heap_acc(ctx, acc, state)),
-        HeapInst::Add(h1, h2) => {
-            let l = get_heap_method(state, h1);
-            let r = get_heap_method(state, h2);
-            Ok(heap_union(ctx, &l, &r))
-        }
-        // TODO: condition-aware merge. Currently picks the then branch.
-        HeapInst::Ternary(_cond, h1, _h2) => Ok(get_heap_method(state, h1)),
-        HeapInst::Ext(MethodHeapExt::Sub(h1, h2)) => {
-            let l = get_heap_method(state, h1);
-            let r = get_heap_method(state, h2);
-            heap_subtract(ctx, &l, &r)
-        }
-    }
 }
 
 fn eval_method_inst(
@@ -328,7 +359,7 @@ fn eval_method_inst(
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
-            let heap = eval_method_heap_inst(ctx, state, hi)?;
+            let heap = eval_heap_inst(ctx, state, hi, get_heap_method)?;
             state.push_heap(heap);
         }
         InstKind::Ext(ext) => match ext {
@@ -373,10 +404,29 @@ pub fn verify_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::silver::{
+        GlobalsCollector, IdentCollector, inline_macros, resolve_call_kinds, silver_parser,
+        typecheck_program, walk::AstWalkable,
+    };
+    use crate::translate;
     use crate::verify::lang::Symbolic;
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
         VerifyContext::new(interner)
+    }
+
+    fn lower(input: &str) -> vmir::Program {
+        let mut program = silver_parser::sil_program(input).expect("parse");
+        let mut ic = IdentCollector::default();
+        program.walk_mut(&mut ic);
+        let interner = ic.finalize();
+        let mut gc = GlobalsCollector::new(&interner);
+        program.walk(&mut gc);
+        let globals = gc.finalize().expect("globals");
+        resolve_call_kinds(&mut program, &interner, &globals).expect("call kinds");
+        inline_macros(&mut program, &interner).expect("macros");
+        let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck");
+        translate::translate(&typed, &interner, &globals).expect("translate")
     }
 
     #[test]
@@ -423,15 +473,17 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
+        // h1 has perm 2 at addr a; h2 wants perm 1 at addr b. After
+        // unioning a≡b, subtract leaves perm 1 at canonical addr.
         let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
         let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
-        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
         let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
+        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
         let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
         let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let h2 = Heap::empty().with_chunk(b, Chunk::new(p2, v2));
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p2, v1));
+        let h2 = Heap::empty().with_chunk(b, Chunk::new(p1, v2));
 
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
@@ -440,10 +492,50 @@ mod tests {
 
         let canon = ctx.egraph.find(a);
         let chunk = result.chunk(canon).expect("result chunk missing");
-        let expected_perm =
-            ctx.add(Symbolic::Binary(BinOp::Minus, [p1, p2]));
+        let expected_perm = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
         ctx.egraph.rebuild();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
+        // v1 and v2 unified.
+        assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
+    }
+
+    #[test]
+    fn heap_subtract_exact_match_drops_chunk() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
+        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
+        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v2));
+
+        let result = heap_subtract(&mut ctx, &h1, &h2).expect("subtract should succeed");
+
+        let canon = ctx.egraph.find(a);
+        assert!(result.chunk(canon).is_none(), "zero-perm chunk must be dropped");
+    }
+
+    #[test]
+    fn heap_subtract_over_consume_fails() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
+        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
+        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
+        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p2, v2));
+
+        let err = heap_subtract(&mut ctx, &h1, &h2)
+            .err()
+            .expect("over-consumption must fail");
+        assert!(matches!(err, VerifyError::InsufficientPermission));
     }
 
     #[test]
@@ -465,5 +557,51 @@ mod tests {
             .err()
             .expect("subtract from empty must fail");
         assert!(matches!(err, VerifyError::InsufficientPermission));
+    }
+
+    /// Constant-fold analysis collapses `1 - 1` into the same e-class as
+    /// the literal `0`.
+    #[test]
+    fn const_fold_folds_subtraction() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let one = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let diff = ctx.add(Symbolic::Binary(BinOp::Minus, [one, one]));
+        ctx.egraph.rebuild();
+
+        let zero = ctx.add(Symbolic::Real(num::BigInt::from(0).into()));
+        assert_eq!(ctx.egraph.find(diff), ctx.egraph.find(zero));
+    }
+
+    /// Caller has `requires number(this)` (1 permission). Calls
+    /// `consume(this)` twice, each of which requires `number(this)`. The
+    /// second call must fail with `InsufficientPermission` — the predicate
+    /// has already been exhaled by the first call.
+    #[test]
+    fn double_consume_predicate_should_fail() {
+        let input = r#"
+predicate number(this: Ref)
+
+method consume(this: Ref)
+    requires number(this)
+
+method caller(this: Ref)
+    requires number(this)
+{
+    consume(this)
+    consume(this)
+}
+"#;
+        let program = lower(input);
+        let caller_id = program.interner.get("caller").expect("caller method");
+        let vmir::Declaration::Method(caller) = &program.decls[caller_id] else {
+            panic!("caller must be a Method");
+        };
+        let result = verify_method(&program, "caller", caller);
+        assert!(
+            matches!(result, Err(VerifyError::InsufficientPermission)),
+            "expected InsufficientPermission, got {result:?}"
+        );
     }
 }

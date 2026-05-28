@@ -2,12 +2,10 @@ use crate::vmir::{Context, HeapVal, Inst, ResourceCall, Val};
 
 /// Method bodies allow everything resource bodies allow except the
 /// `CtxHeap` constructor, plus a fixed set of statement-shaped extensions:
-/// heap subtraction (via [`MethodHeapExt`]), `Assume` / `Assert`, and
-/// `ResourceCall` (via [`MethodInstExt`]).
+/// `Assume` / `Assert` and `ResourceCall` (via [`MethodInstExt`]).
 pub struct MethodCtx;
 
 impl Context for MethodCtx {
-    type HeapExt = MethodHeapExt;
     type InstExt = MethodInstExt;
     type HeapValExt = !;
 }
@@ -15,13 +13,6 @@ impl Context for MethodCtx {
 /// Concrete `HeapVal` for method bodies. The `CtxHeap` variant is
 /// unconstructible (`!`-payload).
 pub type MethodHeapVal = HeapVal<!>;
-
-/// Heap-instruction extensions that are only legal in method bodies.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MethodHeapExt {
-    /// Heap subtraction. Illegal inside a resource body.
-    Sub(MethodHeapVal, MethodHeapVal),
-}
 
 /// Top-level instruction extensions that are only legal in method bodies.
 ///
@@ -37,7 +28,7 @@ pub enum MethodInstExt {
 }
 
 /// Concrete `Inst` for method bodies.
-pub type MethodInst = Inst<MethodHeapExt, MethodInstExt, !>;
+pub type MethodInst = Inst<MethodInstExt, !>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {

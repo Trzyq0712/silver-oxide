@@ -9,8 +9,8 @@ use crate::silver::final_ast;
 use crate::translate::pure_exp::{self, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstKind, MethodCtx, MethodHeapExt, MethodHeapVal,
-    MethodInstExt, PathCond, PureInst, ResourceCall, Val,
+    self, HeapInst, HeapVal, Inst, InstKind, MethodCtx, MethodHeapVal, MethodInstExt, PathCond,
+    PureInst, ResourceCall, Val,
 };
 
 pub(crate) fn lower_method(
@@ -57,7 +57,7 @@ pub(crate) fn lower_method(
         let mut ens_args = param_vals;
         ens_args.extend(ret_vals);
         let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, ens_args);
-        let _h_new = sink.emit_heap(HeapInst::Ext(MethodHeapExt::Sub(current_heap, h_post)));
+        let _h_new = sink.emit_heap(HeapInst::Sub(current_heap, h_post));
         sink.emit_ext(MethodInstExt::Assert(b_post));
     }
 
@@ -171,7 +171,7 @@ fn lower_method_call(
     // Exhale precondition (if present): call m@requires, sub delta, assert bool.
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
         let (h_pre, b_pre) = emit_resource_call(sink, req_id, args.clone());
-        let h_new = sink.emit_heap(HeapInst::Ext(MethodHeapExt::Sub(heap, h_pre)));
+        let h_new = sink.emit_heap(HeapInst::Sub(heap, h_pre));
         sink.emit_ext(MethodInstExt::Assert(b_pre));
         heap = h_new;
     }

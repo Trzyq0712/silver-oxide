@@ -1,13 +1,12 @@
 use crate::vmir::{Context, HeapVal, Inst, MemberId, Type, Val};
 
-/// Resource bodies admit no statement-shaped extensions: no heap
-/// subtraction, no `Assume`/`Assert`, no `ResourceCall`. They *do* admit
-/// `HeapVal::CtxHeap(())` — the resource's precondition-heap reference
-/// when `requires.is_some()`.
+/// Resource bodies admit no statement-shaped extensions: no `Assume`/
+/// `Assert`, no `ResourceCall`. They *do* admit `HeapVal::CtxHeap(())` —
+/// the resource's precondition-heap reference when `requires.is_some()` —
+/// and the shared heap operations (`Acc`, `Add`, `Sub`, `Ternary`).
 pub struct ResourceCtx;
 
 impl Context for ResourceCtx {
-    type HeapExt = !;
     type InstExt = !;
     type HeapValExt = ();
 }
@@ -15,9 +14,9 @@ impl Context for ResourceCtx {
 /// Concrete `HeapVal` for resource bodies — `CtxHeap(())` is constructible.
 pub type ResourceHeapVal = HeapVal<()>;
 
-/// Concrete `Inst` for resource bodies. Extension slots are uninhabited;
+/// Concrete `Inst` for resource bodies. Extension slot is uninhabited;
 /// the ctx-heap slot is `()`.
-pub type ResourceInst = Inst<!, !, ()>;
+pub type ResourceInst = Inst<!, ()>;
 
 /// A reusable unit of proof.
 ///

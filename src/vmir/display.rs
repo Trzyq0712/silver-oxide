@@ -1,7 +1,6 @@
 use crate::vmir::{
     Adt, BinOp, Declaration, Domain, Function, HeapInst, HeapVal, Inst, InstKind, Lit, MemberId,
-    Method, MethodHeapExt, MethodInstExt, PathCond, Program, PureInst, Resource, ResourceBody,
-    Type, UnOp, Val,
+    Method, MethodInstExt, PathCond, Program, PureInst, Resource, ResourceBody, Type, UnOp, Val,
 };
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
@@ -151,26 +150,6 @@ impl CtxHeapRender for ! {
     }
 }
 
-/// Rendering hook for the `HeapInst::Ext` payload. `MethodHeapExt` renders
-/// like a heap inst (bumps the heap counter); `!` is uninhabited.
-pub(crate) trait HeapExtRender {
-    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
-}
-
-impl HeapExtRender for ! {
-    fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl HeapExtRender for MethodHeapExt {
-    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            MethodHeapExt::Sub(l, r) => write!(f, "{l} - {r}"),
-        }
-    }
-}
-
 /// Rendering hook for the `InstKind::Ext` payload. Implementors mutate the
 /// running val/heap counters per-variant (e.g. `ResourceCall` bumps both).
 pub(crate) trait InstExtRender {
@@ -230,14 +209,13 @@ impl InstExtRender for MethodInstExt {
     }
 }
 
-fn write_inst_block<'a, T, H, K, X>(
+fn write_inst_block<'a, T, K, X>(
     f: &mut Formatter<'_>,
     ctx: &VmirDisplay<'a, T>,
-    insts: &[Inst<H, K, X>],
+    insts: &[Inst<K, X>],
     val_base: usize,
 ) -> fmt::Result
 where
-    H: HeapExtRender,
     K: InstExtRender,
     X: CtxHeapRender,
 {
@@ -269,16 +247,12 @@ where
     Ok(())
 }
 
-fn write_heap_inst<H, X>(f: &mut Formatter<'_>, inst: &HeapInst<H, X>) -> fmt::Result
-where
-    H: HeapExtRender,
-    X: CtxHeapRender,
-{
+fn write_heap_inst<X: CtxHeapRender>(f: &mut Formatter<'_>, inst: &HeapInst<X>) -> fmt::Result {
     match inst {
         HeapInst::Acc(acc) => write!(f, "acc({}, {})", acc.loc, acc.perm),
         HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
+        HeapInst::Sub(lhs, rhs) => write!(f, "{lhs} - {rhs}"),
         HeapInst::Ternary(cond, lhs, rhs) => write!(f, "{cond} ? {lhs} : {rhs}"),
-        HeapInst::Ext(ext) => ext.render(f),
     }
 }
 

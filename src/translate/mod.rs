@@ -387,9 +387,9 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         assert!(
             kinds.iter().any(|k| matches!(
                 k,
-                vmir::InstKind::Heap(vmir::HeapInst::Ext(vmir::MethodHeapExt::Sub(_, _)))
+                vmir::InstKind::Heap(vmir::HeapInst::Sub(_, _))
             )),
-            "add body must contain MethodHeapExt::Sub"
+            "add body must contain HeapInst::Sub"
         );
         assert!(
             kinds

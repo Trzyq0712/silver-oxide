@@ -1,5 +1,6 @@
 use crate::vmir;
 
+mod analysis;
 mod context;
 mod heap;
 pub mod lang;

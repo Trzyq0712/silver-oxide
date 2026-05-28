@@ -15,7 +15,7 @@ use crate::vmir::{
 /// parameterised by the body's `Context`. The choice of `C` controls which
 /// extension variants the caller is allowed to construct.
 pub(crate) struct Sink<C: Context> {
-    pub insts: Vec<Inst<C::HeapExt, C::InstExt, C::HeapValExt>>,
+    pub insts: Vec<Inst<C::InstExt, C::HeapValExt>>,
     pub val_base: usize,
     pub val_count: usize,
     pub heap_count: usize,
@@ -52,14 +52,11 @@ impl<C: Context> Sink<C> {
         v
     }
 
-    /// Push a heap instruction. `HeapInst<C::HeapExt, C::HeapValExt>`
-    /// constrains which variants are constructible: in `Sink<ResourceCtx>`
-    /// the `Ext` arm is uninhabited (`!`); in `Sink<MethodCtx>` the
-    /// `HeapVal::CtxHeap` operand is uninhabited.
-    pub fn emit_heap(
-        &mut self,
-        inst: HeapInst<C::HeapExt, C::HeapValExt>,
-    ) -> HeapVal<C::HeapValExt> {
+    /// Push a heap instruction. `HeapInst<C::HeapValExt>` constrains the
+    /// reachable ctx-heap operand: in `Sink<MethodCtx>` the
+    /// `HeapVal::CtxHeap` arm is uninhabited; in `Sink<ResourceCtx>` it is
+    /// `()`-constructible.
+    pub fn emit_heap(&mut self, inst: HeapInst<C::HeapValExt>) -> HeapVal<C::HeapValExt> {
         let h = self.next_heap_temp();
         self.insts.push(Inst {
             pc: PathCond::default(),

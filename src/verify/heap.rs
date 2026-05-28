@@ -41,6 +41,12 @@ impl Heap {
         }
     }
 
+    pub fn without_chunk(&self, addr: egg::Id) -> Self {
+        Self {
+            chunks: self.chunks.without(&addr),
+        }
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = (egg::Id, &Chunk)> {
         self.chunks.iter().map(|(addr, chunk)| (*addr, chunk))
     }
