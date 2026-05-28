@@ -9,8 +9,8 @@ use crate::silver::final_ast;
 use crate::translate::pure_exp::{self, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstKind, MethodCtx, MethodHeapVal, MethodInstExt, PathCond,
-    PureInst, ResourceCall, Val,
+    self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PathConds, PureInst, ResourceCall,
+    Val,
 };
 
 pub(crate) fn lower_method(
@@ -36,14 +36,14 @@ pub(crate) fn lower_method(
         ret_vals.push(v);
     }
 
-    let mut current_heap: MethodHeapVal = HeapVal::Empty;
+    let mut current_heap: HeapVal = HeapVal::Empty;
 
     // Inhale this method's own precondition: call self@requires, add delta,
     // assume bool.
     if let Some(&req_id) = b.method_requires.get(&m.name.0) {
         let (h_pre, b_pre) = emit_resource_call(&mut sink, req_id, param_vals.clone());
         let h_new = sink.emit_heap(HeapInst::Add(current_heap, h_pre));
-        sink.emit_ext(MethodInstExt::Assume(b_pre));
+        sink.emit_ext(InstExt::Assume(b_pre));
         current_heap = h_new;
     }
 
@@ -58,7 +58,7 @@ pub(crate) fn lower_method(
         ens_args.extend(ret_vals);
         let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, ens_args);
         let _h_new = sink.emit_heap(HeapInst::Sub(current_heap, h_post));
-        sink.emit_ext(MethodInstExt::Assert(b_post));
+        sink.emit_ext(InstExt::Assert(b_post));
     }
 
     Ok(vmir::Method { insts: sink.insts })
@@ -68,9 +68,9 @@ fn lower_stmt(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
-    current_heap: MethodHeapVal,
+    current_heap: HeapVal,
     stmt: &final_ast::Statement,
-) -> Result<MethodHeapVal, TranslationError> {
+) -> Result<HeapVal, TranslationError> {
     use final_ast::Statement as S;
     match stmt {
         S::Var(idents, None) => {
@@ -137,7 +137,8 @@ fn lower_stmt(
             env.insert(name, v);
             Ok(current_heap)
         }
-        S::Assign(_, final_ast::AssignRhs::New(_)) | S::Var(_, Some(final_ast::AssignRhs::New(_))) => {
+        S::Assign(_, final_ast::AssignRhs::New(_))
+        | S::Var(_, Some(final_ast::AssignRhs::New(_))) => {
             Err(TranslationError::Unsupported("new(...)"))
         }
         S::If(_, _, _) => Err(TranslationError::Unsupported("if statement")),
@@ -155,11 +156,11 @@ fn lower_method_call(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
-    current_heap: MethodHeapVal,
+    current_heap: HeapVal,
     call: &final_ast::Call<final_ast::MethodBodyExt>,
     ret_names: &[Spur],
     ret_types: &[vmir::Type],
-) -> Result<MethodHeapVal, TranslationError> {
+) -> Result<HeapVal, TranslationError> {
     // Lower argument expressions.
     let mut args: Vec<Val> = Vec::with_capacity(call.args.len());
     for a in &call.args {
@@ -172,7 +173,7 @@ fn lower_method_call(
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
         let (h_pre, b_pre) = emit_resource_call(sink, req_id, args.clone());
         let h_new = sink.emit_heap(HeapInst::Sub(heap, h_pre));
-        sink.emit_ext(MethodInstExt::Assert(b_pre));
+        sink.emit_ext(InstExt::Assert(b_pre));
         heap = h_new;
     }
 
@@ -190,7 +191,7 @@ fn lower_method_call(
         ens_args.extend(ret_vals.iter().cloned());
         let (h_post, b_post) = emit_resource_call(sink, ens_id, ens_args);
         let h_new = sink.emit_heap(HeapInst::Add(heap, h_post));
-        sink.emit_ext(MethodInstExt::Assume(b_post));
+        sink.emit_ext(InstExt::Assume(b_post));
         heap = h_new;
     }
 
@@ -205,12 +206,12 @@ fn emit_resource_call(
     sink: &mut Sink<MethodCtx>,
     resource: vmir::MemberId,
     args: Vec<Val>,
-) -> (MethodHeapVal, Val) {
+) -> (HeapVal, Val) {
     let h = sink.next_heap_temp();
     let v = sink.next_val_temp();
     sink.insts.push(Inst {
-        pc: PathCond::default(),
-        kind: InstKind::Ext(MethodInstExt::ResourceCall(ResourceCall { resource, args })),
+        pc: PathConds::default(),
+        kind: InstKind::Ext(InstExt::ResourceCall(ResourceCall { resource, args })),
     });
     (h, v)
 }

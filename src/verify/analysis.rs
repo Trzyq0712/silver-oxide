@@ -12,7 +12,7 @@ use egg::{Analysis, DidMerge, EGraph, Id};
 use num::{BigInt, BigRational, Zero};
 
 use crate::verify::lang::Symbolic;
-use crate::vmir::{BinOp, UnOp};
+use crate::vmir::BinOp;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstVal {
@@ -38,10 +38,6 @@ impl Analysis<Symbolic> for ConstFold {
                 let lc = egraph[*l].data.clone()?;
                 let rc = egraph[*r].data.clone()?;
                 eval_binary(*op, &lc, &rc)
-            }
-            Symbolic::Unary(op, x) => {
-                let xc = egraph[*x].data.clone()?;
-                eval_unary(*op, &xc)
             }
             Symbolic::Ternary([c, t, e]) => match egraph[*c].data.as_ref()? {
                 ConstVal::Bool(true) => egraph[*t].data.clone(),
@@ -100,12 +96,3 @@ fn eval_binary(op: BinOp, l: &ConstVal, r: &ConstVal) -> Option<ConstVal> {
     }
 }
 
-fn eval_unary(op: UnOp, x: &ConstVal) -> Option<ConstVal> {
-    use ConstVal::*;
-    match (op, x) {
-        (UnOp::Not, Bool(b)) => Some(Bool(!b)),
-        (UnOp::Neg, Int(i)) => Some(Int(-i)),
-        (UnOp::Neg, Real(r)) => Some(Real(-r)),
-        _ => None,
-    }
-}

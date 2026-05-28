@@ -1,34 +1,40 @@
-use crate::vmir::{Context, HeapVal, Inst, ResourceCall, Val};
+use crate::vmir::{HeapVal, Inst, InstContext, ResourceCall, Val};
 
-/// Method bodies allow everything resource bodies allow except the
-/// `CtxHeap` constructor, plus a fixed set of statement-shaped extensions:
-/// `Assume` / `Assert` and `ResourceCall` (via [`MethodInstExt`]).
 pub struct MethodCtx;
 
-impl Context for MethodCtx {
-    type InstExt = MethodInstExt;
-    type HeapValExt = !;
+impl InstContext for MethodCtx {
+    type InstExt = InstExt;
+    type HeapExt = HeapExt;
 }
 
-/// Concrete `HeapVal` for method bodies. The `CtxHeap` variant is
-/// unconstructible (`!`-payload).
-pub type MethodHeapVal = HeapVal<!>;
-
-/// Top-level instruction extensions that are only legal in method bodies.
-///
-/// `Assume` / `Assert` produce no temporary. `ResourceCall` produces a pair
-/// `(HeapVal::Temp, Val::Temp)` — the called resource's `(delta, bool)` —
-/// and bumps both temp counters. The target resource must have
-/// `body.is_some()`; calling an abstract resource is illegal.
+/// Method-specific instruction extensions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MethodInstExt {
+pub enum InstExt {
     Assume(Val),
     Assert(Val),
     ResourceCall(ResourceCall),
 }
 
+/// Method-specific heap-instruction extensions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HeapExt {
+    /// Assign a value to a heap location in a given heap.
+    /// SIDECOND: The heap location must have at least `write` amount of
+    /// permission.
+    Assign(HeapVal, Assign),
+}
+
+/// Assign a value to a heap location.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Assign {
+    /// Location to assign to.
+    pub loc: Val,
+    /// Value to assign.
+    pub val: Val,
+}
+
 /// Concrete `Inst` for method bodies.
-pub type MethodInst = Inst<MethodInstExt, !>;
+pub type MethodInst = Inst<MethodCtx>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {

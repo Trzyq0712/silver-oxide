@@ -134,6 +134,7 @@ impl<'a> Builder<'a> {
         let addr_fn = vmir::Function {
             params: p.params.iter().map(|p| lower_type(&p.ty)).collect(),
             ret: vmir::Type::Addr(Box::new(vmir::Type::Domain(snap_id))),
+            body: None,
         };
         self.set_decl(addr_id, vmir::Declaration::Function(addr_fn));
         self.pred_snap.insert(p.name.0, snap_id);
@@ -146,6 +147,7 @@ impl<'a> Builder<'a> {
         let addr_fn = vmir::Function {
             params: vec![vmir::Type::Ref],
             ret: vmir::Type::Addr(Box::new(lower_type(&f.0.ty))),
+            body: None,
         };
         self.set_decl(addr_id, vmir::Declaration::Function(addr_fn));
         self.field_addr.insert(f.0.name.0, addr_id);
@@ -328,7 +330,10 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         let vmir::Declaration::Resource(pred) = &p.decls[pred_id] else {
             panic!("number must be a Resource");
         };
-        assert!(pred.body.is_none(), "abstract predicate must have body=None");
+        assert!(
+            pred.body.is_none(),
+            "abstract predicate must have body=None"
+        );
 
         // Method contracts.
         for name in [
@@ -364,7 +369,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         for inst in &body.insts {
             match &inst.kind {
                 vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-                    if fc.func_id == addr_id =>
+                    if fc.function == addr_id =>
                 {
                     saw_addr_call = true;
                 }
@@ -385,10 +390,9 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         };
         let kinds: Vec<_> = add.insts.iter().map(|i| &i.kind).collect();
         assert!(
-            kinds.iter().any(|k| matches!(
-                k,
-                vmir::InstKind::Heap(vmir::HeapInst::Sub(_, _))
-            )),
+            kinds
+                .iter()
+                .any(|k| matches!(k, vmir::InstKind::Heap(vmir::HeapInst::Sub(_, _)))),
             "add body must contain HeapInst::Sub"
         );
         assert!(
@@ -400,19 +404,19 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         assert!(
             kinds
                 .iter()
-                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::MethodInstExt::Assert(_)))),
+                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::InstExt::Assert(_)))),
             "add body must contain MethodInstExt::Assert"
         );
         assert!(
             kinds
                 .iter()
-                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::MethodInstExt::Assume(_)))),
+                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::InstExt::Assume(_)))),
             "add body must contain MethodInstExt::Assume"
         );
         assert!(
             kinds
                 .iter()
-                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::MethodInstExt::ResourceCall(_)))),
+                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::InstExt::ResourceCall(_)))),
             "add body must contain a ResourceCall"
         );
 

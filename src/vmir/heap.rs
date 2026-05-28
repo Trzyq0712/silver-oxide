@@ -1,42 +1,34 @@
 use crate::vmir::Val;
 
-/// Heap-typed value. Generic over `X`, the context's "ctx-heap" slot.
-///
-/// - `ResourceCtx` fills `X = ()` — `CtxHeap(())` is constructible and
-///   represents the resource's precondition heap delta (when the resource
-///   has a `requires`).
-/// - `MethodCtx` fills `X = !` — `CtxHeap` is uninhabited; method bodies
-///   have no context-heap concept.
+/// Heap-typed value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HeapVal<X> {
+pub enum HeapVal {
     /// The empty heap.
     Empty,
     /// A heap-typed temporary produced by an earlier heap instruction.
     Temp(usize),
-    /// Context heap. Resource-only.
-    CtxHeap(X),
 }
 
-/// Heap instructions. `X` is the ctx-heap slot threaded through
-/// `HeapVal<X>` operands. `Sub` is legal in both resource and method
-/// bodies; in a resource it may fail at verify time with
-/// `InsufficientPermission`, which propagates out of the resource call.
+/// Heap instructions. All heap instructions produce new heaps. `H` is the
+/// context's heap-instruction extension slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HeapInst<X> {
-    /// Single-chunk heap holding `perm` permission to `loc`. The location is
-    /// an `Addr<T>` value produced by a call to the resource's auto-emitted
-    /// `@addr` uninterpreted function (works uniformly for fields and
-    /// predicates).
+pub enum HeapInst<H> {
+    /// Single-chunk heap holding `perm` permission to `loc`.
+    /// Initially, the location holds a fresh symbolic value.
     Acc(Acc),
-    /// Heap union. May produce equalities between merged chunks under the
-    /// instruction's path condition.
-    Add(HeapVal<X>, HeapVal<X>),
-    /// Heap subtraction.
-    Sub(HeapVal<X>, HeapVal<X>),
-    /// Conditional heap: `cond ? then : else`.
-    Ternary(Val, HeapVal<X>, HeapVal<X>),
+    /// Heap addition (union).
+    Add(HeapVal, HeapVal),
+    /// Heap subtraction (difference). Subtracts the permission amounts of
+    /// the second heap from the first.
+    Sub(HeapVal, HeapVal),
+    /// Conditional heap: `cond ? then : else`. All heap values and permission
+    /// amounts get conditionally selected based on the value of `cond`.
+    Ternary(Val, HeapVal, HeapVal),
+    /// Context-specific heap-instruction extensions.
+    Ext(H),
 }
 
+/// Access to a location with a certain permission amount.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Acc {
     /// Location to gain access to.

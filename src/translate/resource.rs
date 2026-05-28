@@ -8,8 +8,7 @@ use crate::silver::final_ast;
 use crate::translate::pure_exp::{self, PureExt, Sink};
 use crate::translate::{Builder, TranslationError};
 use crate::vmir::{
-    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, ResourceHeapVal,
-    TRUE, Type, Val,
+    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, TRUE, Type, Val,
 };
 
 pub(crate) fn lower_spatial_never(
@@ -52,7 +51,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<ResourceCtx>,
     exp: &final_ast::SpatialExp<Ext>,
-) -> Result<(ResourceHeapVal, Option<Val>), TranslationError> {
+) -> Result<(HeapVal, Option<Val>), TranslationError> {
     use final_ast::SpatialExpKind as S;
     match &*exp.0 {
         S::Acc(res, perm) => {
@@ -114,31 +113,28 @@ fn lower_acc<Ext: PureExt>(
     sink: &mut Sink<ResourceCtx>,
     res: &final_ast::ResourceExp<Ext>,
     perm: &final_ast::TypedPureExp<Ext>,
-) -> Result<ResourceHeapVal, TranslationError> {
+) -> Result<HeapVal, TranslationError> {
     use final_ast::ResourceExpKind as R;
     let perm_val = lower_perm(b, env, sink, perm)?;
     match &*res.0 {
         R::Field(base, fname) => {
             let base_val = pure_exp::lower(b, env, sink, base)?;
-            let &addr_fn = b
-                .field_addr
-                .get(&fname.0)
-                .ok_or_else(|| TranslationError::UnknownIdent(
-                    b.interner.resolve(&fname.0).to_string(),
-                ))?;
+            let &addr_fn = b.field_addr.get(&fname.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
+            })?;
             let field_ty = b
                 .globals
                 .resolve(fname.0)
                 .and_then(|s| s.as_field().cloned())
-                .ok_or_else(|| TranslationError::UnknownIdent(
-                    b.interner.resolve(&fname.0).to_string(),
-                ))?;
+                .ok_or_else(|| {
+                    TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
+                })?;
             let ret_ty = Type::Addr(Box::new(silver_type_to_vmir(&field_ty)));
             let addr = sink.emit_pure(
                 ret_ty,
                 PureInst::FunctionCall(FunctionCall {
-                    func_id: addr_fn,
-                    heap_ctx: None,
+                    function: addr_fn,
+                    ctx_heap: HeapVal::Empty,
                     args: vec![base_val],
                 }),
             );
@@ -148,12 +144,9 @@ fn lower_acc<Ext: PureExt>(
             })))
         }
         R::PredicateCall(call) => {
-            let &addr_fn = b
-                .pred_addr
-                .get(&call.name.0)
-                .ok_or_else(|| TranslationError::UnknownIdent(
-                    b.interner.resolve(&call.name.0).to_string(),
-                ))?;
+            let &addr_fn = b.pred_addr.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
             let &snap_id = b
                 .pred_snap
                 .get(&call.name.0)
@@ -166,8 +159,8 @@ fn lower_acc<Ext: PureExt>(
             let addr = sink.emit_pure(
                 ret_ty,
                 PureInst::FunctionCall(FunctionCall {
-                    func_id: addr_fn,
-                    heap_ctx: None,
+                    function: addr_fn,
+                    ctx_heap: HeapVal::Empty,
                     args,
                 }),
             );

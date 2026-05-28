@@ -13,15 +13,15 @@ pub mod display;
 pub use ty::Type;
 
 pub use heap::{Acc, HeapInst, HeapVal};
-pub use pure::{BinOp, FALSE, FunctionCall, Literal, NULL, PureInst, TRUE, UnOp, Val, none, write};
+pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::Adt;
 pub use domain::Domain;
-pub use function::Function;
-pub use inst::{Context, Inst, InstKind, Lit, PathCond};
-pub use method::{Method, MethodCtx, MethodHeapVal, MethodInst, MethodInstExt};
+pub use function::{Function, FunctionCall};
+pub use inst::{Inst, InstContext, InstKind, PathConds, Polarity};
+pub use method::{Assign, HeapExt, InstExt, Method, MethodCtx, MethodInst};
 pub use resource::{
-    Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceHeapVal, ResourceInst,
+    Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst, ResourcePureExt,
 };
 
 use derive_more::{From, Into};

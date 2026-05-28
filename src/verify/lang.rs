@@ -2,8 +2,8 @@ use egg::*;
 use num::{BigInt, BigRational};
 use std::fmt::{Display, Formatter};
 
+use crate::vmir::BinOp;
 use crate::vmir::MemberId;
-use crate::vmir::{BinOp, UnOp};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
@@ -12,7 +12,6 @@ pub enum Symbolic {
     Bool(bool),
     Int(BigInt),
     Real(BigRational),
-    Unary(UnOp, Id),
     Binary(BinOp, [Id; 2]),
     Ternary([Id; 3]),
     FuncApp(MemberId, Box<[Id]>),
@@ -25,7 +24,6 @@ pub enum Discriminant {
     Int(BigInt),
     Real(BigRational),
     Bool(bool),
-    Unary(UnOp),
     Binary(BinOp),
     Ternary,
     FuncApp(MemberId),
@@ -43,7 +41,6 @@ impl Language for Symbolic {
             S::Bool(b) => D::Bool(*b),
             S::Int(i) => D::Int(i.clone()),
             S::Real(r) => D::Real(r.clone()),
-            S::Unary(op, _) => D::Unary(*op),
             S::Binary(op, _) => D::Binary(*op),
             S::Ternary(_) => D::Ternary,
             S::FuncApp(id, _) => D::FuncApp(*id),
@@ -58,7 +55,6 @@ impl Language for Symbolic {
             (Int(i1), Int(i2)) => i1 == i2,
             (Real(r1), Real(r2)) => r1 == r2,
             (Bool(b1), Bool(b2)) => b1 == b2,
-            (Unary(op1, _), Unary(op2, _)) => op1 == op2,
             (Binary(op1, _), Binary(op2, _)) => op1 == op2,
             (Ternary(_), Ternary(_)) => true,
             (FuncApp(id1, args1), FuncApp(id2, args2)) => id1 == id2 && args1.len() == args2.len(),
@@ -70,7 +66,6 @@ impl Language for Symbolic {
         use Symbolic::*;
         match self {
             Fresh(_) | Null | Bool(_) | Int(_) | Real(_) => &[],
-            Unary(_, id) => std::slice::from_ref(id),
             Binary(_, ids) => ids,
             Ternary(ids) => ids,
             FuncApp(_, ids) => ids,
@@ -81,7 +76,6 @@ impl Language for Symbolic {
         use Symbolic::*;
         match self {
             Fresh(_) | Null | Bool(_) | Int(_) | Real(_) => &mut [],
-            Unary(_, id) => std::slice::from_mut(id),
             Binary(_, ids) => ids,
             Ternary(ids) => ids,
             FuncApp(_, ids) => ids,
@@ -97,7 +91,6 @@ impl Display for Symbolic {
             Symbolic::Int(i) => write!(f, "{i}"),
             Symbolic::Real(r) => write!(f, "{r}"),
             Symbolic::Bool(b) => write!(f, "{b}"),
-            Symbolic::Unary(op, arg) => write!(f, "{op}{arg:?}"),
             Symbolic::Binary(op, [lhs, rhs]) => write!(f, "({lhs:?} {op} {rhs:?})"),
             Symbolic::Ternary([cond, then_, else_]) => {
                 write!(f, "({cond:?} ? {then_:?} : {else_:?})")

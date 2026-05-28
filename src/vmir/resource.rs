@@ -1,37 +1,25 @@
-use crate::vmir::{Context, HeapVal, Inst, MemberId, Type, Val};
+use crate::vmir::{Inst, InstContext, MemberId, Type, Val};
 
-/// Resource bodies admit no statement-shaped extensions: no `Assume`/
-/// `Assert`, no `ResourceCall`. They *do* admit `HeapVal::CtxHeap(())` —
-/// the resource's precondition-heap reference when `requires.is_some()` —
-/// and the shared heap operations (`Acc`, `Add`, `Sub`, `Ternary`).
 pub struct ResourceCtx;
 
-impl Context for ResourceCtx {
-    type InstExt = !;
-    type HeapValExt = ();
+impl InstContext for ResourceCtx {
+    type PureExt = ResourcePureExt;
 }
 
-/// Concrete `HeapVal` for resource bodies — `CtxHeap(())` is constructible.
-pub type ResourceHeapVal = HeapVal<()>;
+/// Pure-instruction extensions only legal in resource bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResourcePureExt {
+    /// Dereference an address in the resource's context (precondition) heap.
+    /// SIDECOND: the context heap must have positive permission amount
+    /// fot this location.
+    CtxDeref(Val),
+}
 
-/// Concrete `Inst` for resource bodies. Extension slot is uninhabited;
-/// the ctx-heap slot is `()`.
-pub type ResourceInst = Inst<!, ()>;
+pub type ResourceInst = Inst<ResourceCtx>;
 
 /// A reusable unit of proof.
 ///
-/// A resource computes a heap delta and a boolean condition. It is consumed at
-/// call sites either by *inhale* (add the delta to the ambient heap and assume
-/// the boolean) or by *exhale* (subtract the delta and assert the boolean).
-/// Inhale and exhale themselves are performed in the method body; they are
-/// not instructions inside a resource body.
-///
-/// `body` is `None` for **abstract** resources (e.g. an abstract predicate
-/// declaration). Abstract resources may not be the target of a `ResourceCall`.
-///
-/// A resource may have a precondition: another resource whose boolean is
-/// assumed inside this body and whose heap delta is addressable as
-/// `HeapVal::CtxHeap(())`.
+/// A resource computes a heap delta and a boolean condition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub params: Vec<Type>,
@@ -42,7 +30,7 @@ pub struct Resource {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceBody {
     pub insts: Vec<ResourceInst>,
-    pub res: (ResourceHeapVal, Val),
+    pub res: (crate::vmir::HeapVal, Val),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

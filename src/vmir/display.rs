@@ -1,11 +1,10 @@
 use crate::vmir::{
-    Adt, BinOp, Declaration, Domain, Function, HeapInst, HeapVal, Inst, InstKind, Lit, MemberId,
-    Method, MethodInstExt, PathCond, Program, PureInst, Resource, ResourceBody, Type, UnOp, Val,
+    Acc, Adt, Assign, BinOp, Declaration, Domain, Function, FunctionCall, HeapExt, HeapInst,
+    HeapVal, Inst, InstContext, InstExt, InstKind, Literal, MemberId, Method, PathConds, Polarity,
+    Program, PureInst, Resource, ResourceBody, ResourcePureExt, Type, Val,
 };
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
-
-use super::pure::{FunctionCall, Literal};
 
 /// Helper wrapper for interner-aware VMIR formatting.
 pub struct VmirDisplay<'a, T> {
@@ -132,21 +131,44 @@ impl<'a> Display for VmirDisplay<'a, &'a Method> {
     }
 }
 
-/// Rendering hook for the `HeapVal::CtxHeap` payload. `()` (resource ctx)
-/// prints `ctx`; `!` (method ctx) is uninhabited.
-pub(crate) trait CtxHeapRender {
+/// Rendering hook for the `PureInst::Ext` payload.
+pub(crate) trait PureExtRender {
     fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
 }
 
-impl CtxHeapRender for () {
-    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "ctx")
+impl PureExtRender for ! {
+    fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
+        match *self {}
     }
 }
 
-impl CtxHeapRender for ! {
+impl PureExtRender for ResourcePureExt {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourcePureExt::CtxDeref(addr) => write!(f, "*[ctx] {addr}"),
+        }
+    }
+}
+
+/// Rendering hook for the `HeapInst::Ext` payload. Implementors are
+/// responsible for emitting the right-hand-side of `h{i} := <pc> ...`.
+pub(crate) trait HeapExtRender {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
+}
+
+impl HeapExtRender for ! {
     fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
         match *self {}
+    }
+}
+
+impl HeapExtRender for HeapExt {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            HeapExt::Assign(heap, Assign { loc, val }) => {
+                write!(f, "assign[{heap}] {loc} := {val}")
+            }
+        }
     }
 }
 
@@ -156,7 +178,7 @@ pub(crate) trait InstExtRender {
     fn render(
         &self,
         f: &mut Formatter<'_>,
-        pc: &PathCond,
+        pc: &PathConds,
         val_idx: &mut usize,
         heap_idx: &mut usize,
         interner: &Rodeo<MemberId>,
@@ -167,7 +189,7 @@ impl InstExtRender for ! {
     fn render(
         &self,
         _: &mut Formatter<'_>,
-        _: &PathCond,
+        _: &PathConds,
         _: &mut usize,
         _: &mut usize,
         _: &Rodeo<MemberId>,
@@ -176,19 +198,19 @@ impl InstExtRender for ! {
     }
 }
 
-impl InstExtRender for MethodInstExt {
+impl InstExtRender for InstExt {
     fn render(
         &self,
         f: &mut Formatter<'_>,
-        pc: &PathCond,
+        pc: &PathConds,
         val_idx: &mut usize,
         heap_idx: &mut usize,
         interner: &Rodeo<MemberId>,
     ) -> fmt::Result {
         match self {
-            MethodInstExt::Assume(v) => writeln!(f, "  {pc} assume {v}"),
-            MethodInstExt::Assert(v) => writeln!(f, "  {pc} assert {v}"),
-            MethodInstExt::ResourceCall(call) => {
+            InstExt::Assume(v) => writeln!(f, "  {pc} assume {v}"),
+            InstExt::Assert(v) => writeln!(f, "  {pc} assert {v}"),
+            InstExt::ResourceCall(call) => {
                 write!(
                     f,
                     "  (h{heap_idx}, e{val_idx}) := {pc} call {}(",
@@ -209,15 +231,16 @@ impl InstExtRender for MethodInstExt {
     }
 }
 
-fn write_inst_block<'a, T, K, X>(
+fn write_inst_block<'a, T, C: InstContext>(
     f: &mut Formatter<'_>,
     ctx: &VmirDisplay<'a, T>,
-    insts: &[Inst<K, X>],
+    insts: &[Inst<C>],
     val_base: usize,
 ) -> fmt::Result
 where
-    K: InstExtRender,
-    X: CtxHeapRender,
+    C::InstExt: InstExtRender,
+    C::PureExt: PureExtRender,
+    C::HeapExt: HeapExtRender,
 {
     let mut e_idx = val_base;
     let mut h_idx = 0usize;
@@ -247,45 +270,39 @@ where
     Ok(())
 }
 
-fn write_heap_inst<X: CtxHeapRender>(f: &mut Formatter<'_>, inst: &HeapInst<X>) -> fmt::Result {
+fn write_heap_inst<H: HeapExtRender>(f: &mut Formatter<'_>, inst: &HeapInst<H>) -> fmt::Result {
     match inst {
-        HeapInst::Acc(acc) => write!(f, "acc({}, {})", acc.loc, acc.perm),
+        HeapInst::Acc(Acc { loc, perm }) => write!(f, "acc({loc}, {perm})"),
         HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
         HeapInst::Sub(lhs, rhs) => write!(f, "{lhs} - {rhs}"),
         HeapInst::Ternary(cond, lhs, rhs) => write!(f, "{cond} ? {lhs} : {rhs}"),
+        HeapInst::Ext(ext) => ext.render(f),
     }
 }
 
-impl Display for PathCond {
+impl Display for PathConds {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "<")?;
-        for (i, lit) in self.lits.iter().enumerate() {
+        for (i, (val, pol)) in self.lits.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{lit}")?;
+            if matches!(pol, Polarity::Negative) {
+                write!(f, "!")?;
+            }
+            write!(f, "{val}")?;
         }
         write!(f, ">")
     }
 }
 
-impl Display for Lit {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if !self.polarity {
-            write!(f, "!")?;
-        }
-        write!(f, "{}", self.val)
-    }
-}
-
-impl<'a, X> Display for VmirDisplay<'a, &'a PureInst<X>>
+impl<'a, P> Display for VmirDisplay<'a, &'a PureInst<P>>
 where
-    X: CtxHeapRender,
+    P: PureExtRender,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             PureInst::Fresh => write!(f, "fresh"),
-            PureInst::Unary(op, arg) => write!(f, "{op}{arg}"),
             PureInst::Binary(op, lhs, rhs) => write!(f, "{lhs} {op} {rhs}"),
             PureInst::Ternary(cond, then_val, else_val) => {
                 write!(f, "{cond} ? {then_val} : {else_val}")
@@ -293,20 +310,19 @@ where
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
             PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
             PureInst::FunctionCall(call) => write!(f, "{}", self.with(call)),
+            PureInst::Ext(ext) => ext.render(f),
         }
     }
 }
 
-impl<'a, X> Display for VmirDisplay<'a, &'a FunctionCall<X>>
-where
-    X: CtxHeapRender,
-{
+impl<'a> Display for VmirDisplay<'a, &'a FunctionCall> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.interner.resolve(&self.item.func_id))?;
-        if let Some(heap) = &self.item.heap_ctx {
-            write!(f, "[{heap}]")?;
-        }
-        write!(f, "(")?;
+        write!(
+            f,
+            "{}[{}](",
+            self.interner.resolve(&self.item.function),
+            self.item.ctx_heap
+        )?;
         for (i, arg) in self.item.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
@@ -347,12 +363,11 @@ impl Display for Literal {
     }
 }
 
-impl<X: CtxHeapRender> Display for HeapVal<X> {
+impl Display for HeapVal {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             HeapVal::Empty => write!(f, "empty"),
             HeapVal::Temp(i) => write!(f, "h{i}"),
-            HeapVal::CtxHeap(x) => x.render(f),
         }
     }
 }
@@ -367,16 +382,6 @@ impl Display for BinOp {
             BinOp::Mod => "%",
             BinOp::Eq => "==",
             BinOp::Lt => "<",
-        };
-        write!(f, "{op}")
-    }
-}
-
-impl Display for UnOp {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let op = match self {
-            UnOp::Not => "!",
-            UnOp::Neg => "-",
         };
         write!(f, "{op}")
     }

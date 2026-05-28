@@ -7,21 +7,21 @@ use lasso::Spur;
 use crate::silver::final_ast;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, Context, FALSE, HeapInst, HeapVal, Inst, InstKind, Literal, PathCond, PureInst, TRUE,
-    UnOp, Val,
+    self, FALSE, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds, PureInst,
+    TRUE, Val,
 };
 
 /// A mutable sink for emitted instructions plus the running counters,
-/// parameterised by the body's `Context`. The choice of `C` controls which
-/// extension variants the caller is allowed to construct.
-pub(crate) struct Sink<C: Context> {
-    pub insts: Vec<Inst<C::InstExt, C::HeapValExt>>,
+/// parameterised by the body's `InstContext`. The choice of `C` controls
+/// which extension variants the caller is allowed to construct.
+pub(crate) struct Sink<C: InstContext> {
+    pub insts: Vec<Inst<C>>,
     pub val_base: usize,
     pub val_count: usize,
     pub heap_count: usize,
 }
 
-impl<C: Context> Sink<C> {
+impl<C: InstContext> Sink<C> {
     pub fn new(val_base: usize) -> Self {
         Self {
             insts: Vec::new(),
@@ -37,29 +37,25 @@ impl<C: Context> Sink<C> {
         Val::Temp(id)
     }
 
-    pub fn next_heap_temp(&mut self) -> HeapVal<C::HeapValExt> {
+    pub fn next_heap_temp(&mut self) -> HeapVal {
         let id = self.heap_count;
         self.heap_count += 1;
         HeapVal::Temp(id)
     }
 
-    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst<C::HeapValExt>) -> Val {
+    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst<C::PureExt>) -> Val {
         let v = self.next_val_temp();
         self.insts.push(Inst {
-            pc: PathCond::default(),
+            pc: PathConds::default(),
             kind: InstKind::Pure(ty, inst),
         });
         v
     }
 
-    /// Push a heap instruction. `HeapInst<C::HeapValExt>` constrains the
-    /// reachable ctx-heap operand: in `Sink<MethodCtx>` the
-    /// `HeapVal::CtxHeap` arm is uninhabited; in `Sink<ResourceCtx>` it is
-    /// `()`-constructible.
-    pub fn emit_heap(&mut self, inst: HeapInst<C::HeapValExt>) -> HeapVal<C::HeapValExt> {
+    pub fn emit_heap(&mut self, inst: HeapInst<C::HeapExt>) -> HeapVal {
         let h = self.next_heap_temp();
         self.insts.push(Inst {
-            pc: PathCond::default(),
+            pc: PathConds::default(),
             kind: InstKind::Heap(inst),
         });
         h
@@ -69,13 +65,13 @@ impl<C: Context> Sink<C> {
     /// parameter type is `!`, so this method is uncallable.
     pub fn emit_ext(&mut self, ext: C::InstExt) {
         self.insts.push(Inst {
-            pc: PathCond::default(),
+            pc: PathConds::default(),
             kind: InstKind::Ext(ext),
         });
     }
 }
 
-pub(crate) fn lower<C: Context, Ext: PureExt>(
+pub(crate) fn lower<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
@@ -91,14 +87,16 @@ pub(crate) fn lower<C: Context, Ext: PureExt>(
         P::Const(lit) => Ok(Val::Literal(lower_literal(lit)?)),
         P::Unary(op, x) => {
             let v = lower(b, env, sink, x)?;
-            let vop = match op {
-                final_ast::UnOp::Not => UnOp::Not,
-                final_ast::UnOp::Neg => UnOp::Neg,
-                final_ast::UnOp::Cardinality => {
-                    return Err(TranslationError::Unsupported("cardinality"));
-                }
-            };
-            Ok(sink.emit_pure(ty, PureInst::Unary(vop, v)))
+            match op {
+                // !v  =  v ? false : true
+                final_ast::UnOp::Not => Ok(sink.emit_pure(ty, PureInst::Ternary(v, FALSE, TRUE))),
+                // -v  =  0 - v
+                final_ast::UnOp::Neg => Ok(sink.emit_pure(
+                    ty.clone(),
+                    PureInst::Binary(vmir::BinOp::Minus, zero_literal(&ty), v),
+                )),
+                final_ast::UnOp::Cardinality => Err(TranslationError::Unsupported("cardinality")),
+            }
         }
         P::Binary(op, l, r) => lower_binary(b, env, sink, ty, op, l, r),
         P::Ternary { if_, then, else_ } => {
@@ -117,7 +115,7 @@ pub(crate) fn lower<C: Context, Ext: PureExt>(
     }
 }
 
-fn lower_binary<C: Context, Ext: PureExt>(
+fn lower_binary<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
@@ -141,18 +139,18 @@ fn lower_binary<C: Context, Ext: PureExt>(
         // Desugarings:
         B::Neq => {
             let eq = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Eq, lv, rv));
-            sink.emit_pure(ty, PureInst::Unary(UnOp::Not, eq))
+            sink.emit_pure(ty, PureInst::Ternary(eq, FALSE, TRUE))
         }
         B::Le => {
             // l <= r  <=>  !(r < l)
             let gt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, rv, lv));
-            sink.emit_pure(ty, PureInst::Unary(UnOp::Not, gt))
+            sink.emit_pure(ty, PureInst::Ternary(gt, FALSE, TRUE))
         }
         B::Gt => sink.emit_pure(ty, PureInst::Binary(V::Lt, rv, lv)),
         B::Ge => {
             // l >= r  <=>  !(l < r)
             let lt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, lv, rv));
-            sink.emit_pure(ty, PureInst::Unary(UnOp::Not, lt))
+            sink.emit_pure(ty, PureInst::Ternary(lt, FALSE, TRUE))
         }
         B::And => sink.emit_pure(ty, PureInst::Ternary(lv, rv, FALSE)),
         B::Or => sink.emit_pure(ty, PureInst::Ternary(lv, TRUE, rv)),
@@ -162,6 +160,17 @@ fn lower_binary<C: Context, Ext: PureExt>(
             return Err(TranslationError::Unsupported("collection operator"));
         }
     })
+}
+
+/// Type-appropriate zero used to desugar arithmetic negation `-v` as
+/// `Binary(Minus, 0, v)`. Non-numeric types panic; upstream typechecking
+/// rejects them before lowering.
+pub(crate) fn zero_literal(ty: &vmir::Type) -> Val {
+    match ty {
+        vmir::Type::Int => Val::Literal(Literal::Int(num::BigInt::from(0))),
+        vmir::Type::Real => Val::Literal(Literal::Real(num::BigInt::from(0).into())),
+        other => panic!("Neg on non-numeric type {other:?}"),
+    }
 }
 
 pub(crate) fn lower_literal(lit: &final_ast::Literal) -> Result<Literal, TranslationError> {
@@ -177,7 +186,7 @@ pub(crate) fn lower_literal(lit: &final_ast::Literal) -> Result<Literal, Transla
 /// Per-context lowering of pure-expression extensions (`old`, `result`,
 /// `perm`, etc.). All currently unsupported in this minimal cut.
 pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
-    fn lower_ext<C: Context>(
+    fn lower_ext<C: InstContext>(
         b: &Builder<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink<C>,
@@ -186,7 +195,7 @@ pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
 }
 
 impl PureExt for ! {
-    fn lower_ext<C: Context>(
+    fn lower_ext<C: InstContext>(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
         _sink: &mut Sink<C>,
@@ -197,7 +206,7 @@ impl PureExt for ! {
 }
 
 impl PureExt for final_ast::MethodEnsuresExt {
-    fn lower_ext<C: Context>(
+    fn lower_ext<C: InstContext>(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
         _sink: &mut Sink<C>,
@@ -208,14 +217,12 @@ impl PureExt for final_ast::MethodEnsuresExt {
 }
 
 impl PureExt for final_ast::MethodBodyExt {
-    fn lower_ext<C: Context>(
+    fn lower_ext<C: InstContext>(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
         _sink: &mut Sink<C>,
         _ext: &Self,
     ) -> Result<Val, TranslationError> {
-        Err(TranslationError::Unsupported(
-            "`old`/`perm` in method body",
-        ))
+        Err(TranslationError::Unsupported("`old`/`perm` in method body"))
     }
 }
