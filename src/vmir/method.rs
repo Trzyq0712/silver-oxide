@@ -100,10 +100,9 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a InstExt)>
             InstExt::ResourceCall(call) => {
                 write!(
                     f,
-                    "  (h{h_idx}, e{e_idx}) := {}call {}[{}](",
+                    "  (h{h_idx}, e{e_idx}) := {}call {}(",
                     PcPrefix(pc),
                     self.interner.resolve(&call.resource),
-                    call.ctx_heap,
                 )?;
                 for (i, arg) in call.args.iter().enumerate() {
                     if i > 0 {
@@ -111,7 +110,7 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a InstExt)>
                     }
                     write!(f, "{arg}")?;
                 }
-                writeln!(f, ")")
+                writeln!(f, ")[{}]", call.ctx_heap)
             }
         }
     }

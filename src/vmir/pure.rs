@@ -128,14 +128,14 @@ impl<'a, P: PureExtRender> Display for VmirDisplay<'a, &'a PureInst<P>> {
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
             PureInst::FunctionCall(heap, call) => {
-                write!(f, "{}[{heap}](", self.interner.resolve(&call.function))?;
+                write!(f, "{}(", self.interner.resolve(&call.function))?;
                 for (i, arg) in call.args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{arg}")?;
                 }
-                write!(f, ")")
+                write!(f, ")[{heap}]")
             }
             PureInst::Ext(ext) => ext.render(f, self.interner),
         }

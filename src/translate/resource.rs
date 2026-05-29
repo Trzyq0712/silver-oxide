@@ -11,14 +11,21 @@ use crate::vmir::{
     self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, TRUE, Type, Val,
 };
 
+/// Lower a resource body. `initial_heap` is the body's starting heap
+/// reference; pass `HeapVal::Empty` when the owning `Resource.requires`
+/// is `None`, and `HeapVal::Temp(0)` (with `heap_base = 1`) once the
+/// resource has its own precondition resource. `heap_base` is the first
+/// heap counter the body's emitted heap insts will use.
 pub(crate) fn lower_spatial_never(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     exp: &final_ast::SpatialExp<!>,
     val_base: usize,
+    initial_heap: HeapVal,
+    heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
-    let mut sink = Sink::<ResourceCtx>::new(val_base);
-    let (h, bv) = lower_spatial::<!>(b, env, &mut sink, HeapVal::Empty, exp)?;
+    let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
+    let (h, bv) = lower_spatial::<!>(b, env, &mut sink, initial_heap, exp)?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -30,10 +37,12 @@ pub(crate) fn lower_spatial_ensures(
     env: &HashMap<Spur, Val>,
     exp: &final_ast::SpatialExp<final_ast::MethodEnsuresExt>,
     val_base: usize,
+    initial_heap: HeapVal,
+    heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
-    let mut sink = Sink::<ResourceCtx>::new(val_base);
+    let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
     let (h, bv) =
-        lower_spatial::<final_ast::MethodEnsuresExt>(b, env, &mut sink, HeapVal::Empty, exp)?;
+        lower_spatial::<final_ast::MethodEnsuresExt>(b, env, &mut sink, initial_heap, exp)?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -57,27 +66,28 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     use final_ast::SpatialExpKind as S;
     match &*exp.0 {
         S::Acc(res, perm) => {
-            let h = lower_acc(b, env, sink, heap, res, perm)?;
-            Ok((h, None))
+            let delta = lower_acc(b, env, sink, heap, res, perm)?;
+            let h_out = sink.emit_heap(HeapInst::Add(heap, delta));
+            Ok((h_out, None))
         }
         S::Conj(l, r) => {
-            let (h_l, b_l) = lower_spatial(b, env, sink, heap, l)?;
-            let (h_r, b_r) = lower_spatial(b, env, sink, h_l, r)?;
-            let h_sum = sink.emit_heap(HeapInst::Add(h_l, h_r));
+            let (h_mid, b_l) = lower_spatial(b, env, sink, heap, l)?;
+            let (h_out, b_r) = lower_spatial(b, env, sink, h_mid, r)?;
+
             let b_sum = match (b_l, b_r) {
                 (None, None) => None,
                 (Some(v), None) | (None, Some(v)) => Some(v),
-                // b_l && b_r  =  b_l ? b_r : false
                 (Some(vl), Some(vr)) => {
                     Some(sink.emit_pure(Type::Bool, PureInst::Ternary(vl, vr, FALSE)))
                 }
             };
-            Ok((h_sum, b_sum))
+
+            Ok((h_out, b_sum))
         }
         S::Implies(cond, body) => {
             let c = pure_exp::lower(b, env, sink, heap, cond)?;
             let (h_b, b_b) = lower_spatial(b, env, sink, heap, body)?;
-            let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_b, HeapVal::Empty));
+            let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_b, heap));
             // c ==> b_b  =  c ? b_b : true. When body has no boolean, the
             // whole implication is trivially true.
             let bv = b_b.map(|v| sink.emit_pure(Type::Bool, PureInst::Ternary(c, v, TRUE)));
@@ -104,7 +114,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
         }
         S::Pure(p) => {
             let v = pure_exp::lower(b, env, sink, heap, p)?;
-            Ok((HeapVal::Empty, Some(v)))
+            Ok((heap, Some(v)))
         }
     }
 }

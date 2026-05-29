@@ -6,7 +6,7 @@ use crate::{
     },
     vmir::{
         self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstExt, InstKind,
-        Literal, Method, MethodInst, PureInst, ResourceCall, ResourceInst, ResourcePureExt, Val,
+        Literal, Method, MethodInst, PureInst, ResourceCall, ResourceInst, Val,
     },
 };
 
@@ -35,9 +35,6 @@ impl std::fmt::Display for VerifyError {
 struct EvalState {
     vals: Vec<egg::Id>,
     heaps: Vec<Heap>,
-    /// Set only inside a resource body whose owning `Resource` has a
-    /// `requires`. Read by `ResourcePureExt::CtxDeref(addr)` operands.
-    pre_heap: Option<Heap>,
 }
 
 impl EvalState {
@@ -45,7 +42,6 @@ impl EvalState {
         Self {
             vals: Vec::new(),
             heaps: Vec::new(),
-            pre_heap: None,
         }
     }
 
@@ -53,7 +49,6 @@ impl EvalState {
         Self {
             vals: args,
             heaps: Vec::new(),
-            pre_heap: None,
         }
     }
 
@@ -73,8 +68,9 @@ impl EvalState {
 }
 
 /// Heap-fetch is monomorphic — `HeapVal` carries no ctx-heap variant. The
-/// precondition-heap concept lives in
-/// `PureInst::Ext(ResourcePureExt::CtxDeref(_))`.
+/// caller-supplied ctx heap of a resource body lives at
+/// `state.heaps[0]` by convention (mirroring how params occupy the
+/// initial `vals` slots).
 fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
     match hv {
         HeapVal::Empty => Heap::empty(),
@@ -144,31 +140,6 @@ where
             ctx.add(Symbolic::FuncApp(fc.function, args.into()))
         }
         PureInst::Ext(ext) => eval_ext(ctx, state, ext),
-    }
-}
-
-/// Pure-ext evaluator for resource bodies. Handles `CtxDeref(addr)`:
-/// looks up `addr` in the precondition heap; falls back to fresh if
-/// absent.
-fn eval_resource_pure_ext(
-    ctx: &mut VerifyContext<'_>,
-    state: &EvalState,
-    ext: &ResourcePureExt,
-) -> egg::Id {
-    match ext {
-        ResourcePureExt::CtxDeref(addr) => {
-            let addr_id = state.get_val(ctx, addr);
-            let pre = state
-                .pre_heap
-                .as_ref()
-                .expect("CtxDeref outside resource-body with requires");
-            pre.value_at(addr_id)
-                .unwrap_or_else(|| ctx.fresh_symbolic_value("ctx_deref"))
-        }
-        ResourcePureExt::CtxFunctionCall(call) => {
-            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add(Symbolic::FuncApp(call.function, args.into()))
-        }
     }
 }
 
@@ -334,7 +305,7 @@ fn eval_resource_body_inst(
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(_ty, pi) => {
-            let id = eval_pure_inst(ctx, state, pi, eval_resource_pure_ext);
+            let id = eval_pure_inst(ctx, state, pi, |_, _, never| match *never {});
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
@@ -372,9 +343,9 @@ fn eval_resource_call(
 
     let mut res_state = EvalState::with_args(args);
 
-    // Caller-supplied ctx heap; readable inside the body via
-    // `PureInst::Ext(CtxDeref(_))`.
-    res_state.pre_heap = Some(get_heap(caller_state, &call.ctx_heap));
+    // Caller-supplied ctx heap occupies the body's `HeapVal::Temp(0)`
+    // slot, mirroring how params occupy `Val::Temp(0..n_params)`.
+    res_state.push_heap(get_heap(caller_state, &call.ctx_heap));
 
     for inst in &body.insts {
         eval_resource_body_inst(ctx, &mut res_state, inst)?;

@@ -190,7 +190,14 @@ impl<'a> Builder<'a> {
             for (i, p) in m.params.iter().enumerate() {
                 env.insert(p.name.0, vmir::Val::Temp(i));
             }
-            let body = resource::lower_spatial_never(self, &env, requires, params.len())?;
+            let body = resource::lower_spatial_never(
+                self,
+                &env,
+                requires,
+                params.len(),
+                vmir::HeapVal::Empty,
+                0,
+            )?;
             self.set_decl(
                 req_id,
                 vmir::Declaration::Resource(vmir::Resource {
@@ -213,12 +220,31 @@ impl<'a> Builder<'a> {
             for (i, r) in m.rets.iter().enumerate() {
                 env.insert(r.name.0, vmir::Val::Temp(m.params.len() + i));
             }
-            let body = resource::lower_spatial_ensures(self, &env, ensures, params.len())?;
+            // m@ensures's precondition resource is m@requires (when present).
+            // When set, the ensures body sees the requires delta at
+            // `HeapVal::Temp(0)` and its own emitted heap counters start at 1.
+            let (resource_requires, initial_heap, heap_base) =
+                match self.method_requires.get(&m.name.0).copied() {
+                    Some(req_id) => {
+                        let req_args: Vec<vmir::Val> =
+                            (0..m.params.len()).map(vmir::Val::Temp).collect();
+                        (Some((req_id, req_args)), vmir::HeapVal::Temp(0), 1)
+                    }
+                    None => (None, vmir::HeapVal::Empty, 0),
+                };
+            let body = resource::lower_spatial_ensures(
+                self,
+                &env,
+                ensures,
+                params.len(),
+                initial_heap,
+                heap_base,
+            )?;
             self.set_decl(
                 ens_id,
                 vmir::Declaration::Resource(vmir::Resource {
                     params,
-                    requires: None,
+                    requires: resource_requires,
                     body: Some(body),
                 }),
             );

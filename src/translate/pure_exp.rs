@@ -22,12 +22,12 @@ pub(crate) struct Sink<C: InstContext> {
 }
 
 impl<C: InstContext> Sink<C> {
-    pub fn new(val_base: usize) -> Self {
+    pub fn new(val_base: usize, heap_base: usize) -> Self {
         Self {
             insts: Vec::new(),
             val_base,
             val_count: 0,
-            heap_count: 0,
+            heap_count: heap_base,
         }
     }
 
@@ -102,12 +102,14 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
         }
         P::Field(base, id) => {
             let base = lower(b, env, sink, heap, base)?;
-            let field_fn = b.field_addr[&id.0];
+            let &field_fn = b.field_addr.get(&id.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&id.0).to_string())
+            })?;
             let addr_ty = vmir::Type::Addr(Box::new(ty.clone()));
             let field_addr = sink.emit_pure(
                 addr_ty,
                 PureInst::FunctionCall(
-                    heap,
+                    HeapVal::Empty,
                     FunctionCall {
                         function: field_fn,
                         args: vec![base],

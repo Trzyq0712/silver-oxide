@@ -20,9 +20,7 @@ pub use domain::Domain;
 pub use function::{Function, FunctionCall};
 pub use inst::{Bumps, Inst, InstContext, InstKind, PathConds, Polarity, UsesPc};
 pub use method::{Assign, HeapExt, InstExt, Method, MethodCtx, MethodInst, PureExt};
-pub use resource::{
-    Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst, ResourcePureExt,
-};
+pub use resource::{Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst};
 
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
