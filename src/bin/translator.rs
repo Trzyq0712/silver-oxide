@@ -4,7 +4,7 @@
 //! Usage: `cargo run --bin translator -- cases/foo.vpr`
 
 use silver_oxide::silver::{
-    GlobalsCollector, IdentCollector, inline_macros, resolve_call_kinds, silver_parser,
+    GlobalsCollector, IdentCollector, inline_macros, disambiguate, silver_parser,
     typecheck_program, walk::AstWalkable,
 };
 use silver_oxide::translate;
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     program.walk(&mut globals_collector);
     let globals = globals_collector.finalize().expect("globals error");
 
-    resolve_call_kinds(&mut program, &interner, &globals).expect("call resolution failed");
+    disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
     inline_macros(&mut program, &interner).expect("macro inlining failed");
 
     let typed = typecheck_program(&mut program, &interner, &globals)

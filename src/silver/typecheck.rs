@@ -919,10 +919,7 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
 
             ExpKind::Field(base, field_name) => {
                 let base_exp = self.lower_pure::<Ext>(base)?;
-                Ok(PureExpKind::FunctionCall(Call {
-                    name: Ident(field_name.id()),
-                    args: vec![base_exp],
-                }))
+                Ok(PureExpKind::Field(base_exp, Ident(field_name.id())))
             }
 
             ExpKind::HeapUpdate(silver::HeapUpdateOp::Unfold, acc_exp, body) => {
@@ -1564,7 +1561,7 @@ pub fn typecheck_program(
 mod tests {
     use super::*;
     use crate::silver::{
-        self, call_resolver::resolve_call_kinds, globals::GlobalsCollector,
+        self, disambiguator::disambiguate, globals::GlobalsCollector,
         interner::IdentCollector, r#macro::inline_macros, silver_parser, walk::AstWalkable,
     };
 
@@ -1576,7 +1573,7 @@ mod tests {
         let mut globals_collector = GlobalsCollector::new(&interner);
         program.walk(&mut globals_collector);
         let globals = globals_collector.finalize().expect("globals error");
-        resolve_call_kinds(&mut program, &interner, &globals).expect("call resolution failed");
+        disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
         inline_macros(&mut program, &interner).expect("macro inline failed");
         typecheck_program(&mut program, &interner, &globals)
     }

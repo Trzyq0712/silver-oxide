@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::silver::{
-    GlobalsCollector, IdentCollector, inline_macros, resolve_call_kinds, typecheck_program,
+    GlobalsCollector, IdentCollector, inline_macros, disambiguate, typecheck_program,
     walk::AstWalkable,
 };
 use crate::{silver_parser, translate, verify};
@@ -45,7 +45,7 @@ pub fn run_file(path: &Path) -> Result<Vec<verify::MethodResult>, PipelineError>
         .finalize()
         .map_err(|e| PipelineError::Typecheck(format!("{e:?}")))?;
 
-    resolve_call_kinds(&mut program, &interner, &globals)
+    disambiguate(&mut program, &interner, &globals)
         .map_err(|e| PipelineError::Typecheck(format!("{e:?}")))?;
     inline_macros(&mut program, &interner)
         .map_err(|e| PipelineError::Typecheck(format!("{e:?}")))?;

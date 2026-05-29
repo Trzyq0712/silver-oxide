@@ -106,6 +106,8 @@ pub enum PureExpKind<Ext> {
     /// Evaluates `exp` under the temporary unfolding of the predicate.
     Unfolding(PredicateWithPerm<Ext>, TypedPureExp<Ext>),
     FunctionCall(Call<Ext>),
+    /// Heap field access: `e.f` where `f` is a Silver `field` declaration.
+    Field(TypedPureExp<Ext>, Ident),
     LetIn {
         binder: Ident,
         value: TypedPureExp<Ext>,

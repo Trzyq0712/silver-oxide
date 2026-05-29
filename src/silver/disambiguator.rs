@@ -1,28 +1,24 @@
-//! Call Resolution Pass
+//! Disambiguation Pass
 //!
-//! This module is responsible for resolving the concrete semantic types of all invocations
-//! within a Silver program.
+//! Resolves syntactic ambiguities in the parsed Silver AST against the
+//! pre-computed [`Globals`].
 //!
-//! Because Silver's grammar features syntactic ambiguities, the parser creates generic
-//! call nodes for all function-like invocations (e.g., `f(x)`). Furthermore, it greedily
-//! parses all assignment-call right-hand sides (e.g., `y := f(x)`) as [`AssignRhs::Call`].
+//! The Silver grammar leaves several constructs ambiguous on the way out of
+//! the parser; this pass classifies them by looking up the names they
+//! reference:
 //!
-//! The `CallResolver` performs a mutable, bottom-up traversal of the AST, querying
-//! the pre-computed [`Globals`] interner to definitively categorize these syntactic constructs
-//! into their correct semantic representations.
+//! * Generic call nodes `f(x)` get tagged with the callee's kind
+//!   (function, predicate, method, macro, ADT constructor).
+//! * `AssignRhs::Call` is demoted to `AssignRhs::Exp` when the target is
+//!   not actually a statement-shaped callee (function/predicate/macro/…).
+//! * Bare `Ident` nodes get desugared into zero-argument macro calls
+//!   when the identifier resolves to an expression macro.
+//! * Field accesses `e.f` are validated against the globals table — `f`
+//!   must resolve to a Viper field. (ADT-destructor recognition is
+//!   deferred until the globals collector tracks destructor names.)
 //!
-//! # Responsibilities
-//!
-//! 1. **Expression call resolution**: Evaluates generic expression call nodes and tags them.
-//!
-//! 2. **Macro Desugaring**: Evaluates bare [`ExpKind::Ident`] nodes. If the identifier corresponds
-//!    to a parameterless global macro, it physically replaces the identifier node with a
-//!    zero-argument [`ExpKind::App`] node tagged as a macro.
-//!
-//! 3. **Statement vs. expression lowering**: Evaluates [`AssignRhs::Call`] nodes generated
-//!    by the parser. If the target is a genuine imperative `Method`, it remains a statement-level
-//!    assignment. If the target is a function, predicate, or macro, the assignment is "demoted"
-//!    down into an [`AssignRhs::Exp`] so it can be evaluated as a standard mathematical expression.
+//! All in-place rewrites happen under `walk_mut_*`; errors are collected
+//! and reported in bulk.
 
 use crate::silver::{
     AssignRhs, Call, Exp, ExpCallKind, ExpKind, Globals, StmtCallKind,
@@ -32,37 +28,45 @@ use crate::silver::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CallResolutionError {
+pub enum DisambiguationError {
     UnresolvedCallable(String),
     StatementCallInExpression(String, GlobalKind),
     NotCallable(String, GlobalKind),
+    UnknownField(String),
+    NotAField(String, GlobalKind),
 }
 
-impl std::fmt::Display for CallResolutionError {
+impl std::fmt::Display for DisambiguationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CallResolutionError::UnresolvedCallable(name) => {
+            DisambiguationError::UnresolvedCallable(name) => {
                 write!(f, "cannot find callable `{name}`")
             }
-            CallResolutionError::StatementCallInExpression(name, kind) => {
+            DisambiguationError::StatementCallInExpression(name, kind) => {
                 write!(f, "{kind} `{name}` cannot be called inside an expression")
             }
-            CallResolutionError::NotCallable(name, kind) => {
+            DisambiguationError::NotCallable(name, kind) => {
                 write!(f, "cannot call `{name}` because it is a {kind}")
+            }
+            DisambiguationError::UnknownField(name) => {
+                write!(f, "unknown field `{name}`")
+            }
+            DisambiguationError::NotAField(name, kind) => {
+                write!(f, "`{name}` is a {kind}, not a field")
             }
         }
     }
 }
 
-impl std::error::Error for CallResolutionError {}
+impl std::error::Error for DisambiguationError {}
 
-struct CallResolver<'i, 'g> {
+struct Disambiguator<'i, 'g> {
     interner: &'i Interner,
     globals: &'g Globals,
-    errors: Vec<CallResolutionError>,
+    errors: Vec<DisambiguationError>,
 }
 
-impl<'i, 'g> CallResolver<'i, 'g> {
+impl<'i, 'g> Disambiguator<'i, 'g> {
     fn new(interner: &'i Interner, globals: &'g Globals) -> Self {
         Self {
             interner,
@@ -72,7 +76,7 @@ impl<'i, 'g> CallResolver<'i, 'g> {
     }
 }
 
-impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
+impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
     fn walk_mut_assign_rhs(&mut self, rhs: &'_ mut AssignRhs) {
         // Intercept bare identifiers being used as statement right-hand sides.
         if let AssignRhs::Exp(exp) = rhs
@@ -126,7 +130,7 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
                         for arg in &mut call.args {
                             arg.walk_mut(self);
                         }
-                        self.errors.push(CallResolutionError::NotCallable(
+                        self.errors.push(DisambiguationError::NotCallable(
                             call_tgt_name(),
                             actual_kind,
                         ));
@@ -138,7 +142,7 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
                     arg.walk_mut(self);
                 }
                 self.errors
-                    .push(CallResolutionError::UnresolvedCallable(call_tgt_name()));
+                    .push(DisambiguationError::UnresolvedCallable(call_tgt_name()));
             }
         } else {
             rhs.walk_mut_children(self);
@@ -164,7 +168,7 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
                 // INVALID: Trying to use a Statement inside an Expression!
                 kind @ GlobalKind::Method | kind @ GlobalKind::StmtMacro => {
                     self.errors
-                        .push(CallResolutionError::StatementCallInExpression(
+                        .push(DisambiguationError::StatementCallInExpression(
                             call_tgt_name(),
                             kind,
                         ));
@@ -172,7 +176,7 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
 
                 // INVALID: Targets that cannot be called at all (Fields, Domains, etc.)
                 actual_kind => {
-                    self.errors.push(CallResolutionError::NotCallable(
+                    self.errors.push(DisambiguationError::NotCallable(
                         call_tgt_name(),
                         actual_kind,
                     ));
@@ -181,44 +185,69 @@ impl<'i, 'g> AstWalkerMut<'_> for CallResolver<'i, 'g> {
         } else {
             // UNRESOLVED IDENTIFIER
             self.errors
-                .push(CallResolutionError::UnresolvedCallable(call_tgt_name()));
+                .push(DisambiguationError::UnresolvedCallable(call_tgt_name()));
         }
     }
 
     fn walk_mut_exp_kind(&mut self, exp: &'_ mut ExpKind) {
         exp.walk_mut_children(self);
 
-        if let ExpKind::Ident(name) = exp {
-            let id = name.id();
-            // ONLY desugar Expression macros! Statement macros without args
-            // should not be desugared into Exp nodes!
-
-            if let Some(sym) = self.globals.resolve(id)
-                && sym.kind() == GlobalKind::ExpMacro
-            {
-                *exp = ExpKind::Call(crate::silver::Call {
-                    kind: Some(ExpCallKind::Macro),
-                    name: name.clone(),
-                    args: Vec::new(),
-                });
+        match exp {
+            // Expression-macro desugaring: bare ident → zero-arg macro call.
+            ExpKind::Ident(name) => {
+                let id = name.id();
+                if let Some(sym) = self.globals.resolve(id)
+                    && sym.kind() == GlobalKind::ExpMacro
+                {
+                    *exp = ExpKind::Call(crate::silver::Call {
+                        kind: Some(ExpCallKind::Macro),
+                        name: name.clone(),
+                        args: Vec::new(),
+                    });
+                }
             }
+
+            // Field-access classification: `e.f` must resolve to a Viper
+            // field global. ADT destructors are not yet tracked in
+            // `Globals`; this pass will need to grow once they are.
+            ExpKind::Field(_base, field_name) => {
+                let id = field_name.id();
+                let field_tgt_name = || self.interner.resolve(&id).to_string();
+                match self.globals.resolve(id) {
+                    Some(sym) => {
+                        let sig = sym.signature();
+                        if sig.as_field().is_none() {
+                            self.errors.push(DisambiguationError::NotAField(
+                                field_tgt_name(),
+                                sig.kind(),
+                            ));
+                        }
+                    }
+                    None => {
+                        self.errors
+                            .push(DisambiguationError::UnknownField(field_tgt_name()));
+                    }
+                }
+            }
+
+            _ => {}
         }
     }
 }
 
-/// Resolve all call kinds in `program`, tagging generic call nodes with their
-/// semantic kind (function/predicate/method/macro) and demoting non-method
-/// assignment-call right-hand sides into expressions.
-pub fn resolve_call_kinds(
+/// Disambiguate the parsed AST against `globals`: tag call nodes, demote
+/// non-statement assignment RHSs, desugar macros, and validate field
+/// accesses.
+pub fn disambiguate(
     program: &mut crate::silver::Program,
     interner: &Interner,
     globals: &Globals,
-) -> Result<(), Vec<CallResolutionError>> {
-    let mut resolver = CallResolver::new(interner, globals);
-    program.walk_mut(&mut resolver);
-    if resolver.errors.is_empty() {
+) -> Result<(), Vec<DisambiguationError>> {
+    let mut disambiguator = Disambiguator::new(interner, globals);
+    program.walk_mut(&mut disambiguator);
+    if disambiguator.errors.is_empty() {
         Ok(())
     } else {
-        Err(resolver.errors)
+        Err(disambiguator.errors)
     }
 }

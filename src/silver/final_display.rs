@@ -407,6 +407,7 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
             write!(f, "unfolding {} in {}", show.with(p), show.with(e))
         }
         PureExpKind::FunctionCall(call) => write!(f, "{}", show.with(call)),
+        PureExpKind::Field(e, field) => write!(f, "{}.{}", show.with(e), show.name(*field)),
         PureExpKind::LetIn { binder, value, exp } => write!(
             f,
             "let {} := {} in {}",

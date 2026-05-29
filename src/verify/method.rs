@@ -443,7 +443,7 @@ pub fn verify_method(
 mod tests {
     use super::*;
     use crate::silver::{
-        GlobalsCollector, IdentCollector, inline_macros, resolve_call_kinds, silver_parser,
+        GlobalsCollector, IdentCollector, inline_macros, disambiguate, silver_parser,
         typecheck_program, walk::AstWalkable,
     };
     use crate::translate;
@@ -461,7 +461,7 @@ mod tests {
         let mut gc = GlobalsCollector::new(&interner);
         program.walk(&mut gc);
         let globals = gc.finalize().expect("globals");
-        resolve_call_kinds(&mut program, &interner, &globals).expect("call kinds");
+        disambiguate(&mut program, &interner, &globals).expect("disambiguation");
         inline_macros(&mut program, &interner).expect("macros");
         let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck");
         translate::translate(&typed, &interner, &globals).expect("translate")

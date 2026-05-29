@@ -269,7 +269,7 @@ pub(crate) fn lower_type(ty: &final_ast::Type) -> vmir::Type {
 mod tests {
     use super::*;
     use crate::silver::{
-        GlobalsCollector, IdentCollector, inline_macros, resolve_call_kinds, silver_parser,
+        GlobalsCollector, IdentCollector, inline_macros, disambiguate, silver_parser,
         typecheck_program, walk::AstWalkable,
     };
 
@@ -281,7 +281,7 @@ mod tests {
         let mut globals_collector = GlobalsCollector::new(&interner);
         program.walk(&mut globals_collector);
         let globals = globals_collector.finalize().expect("globals error");
-        resolve_call_kinds(&mut program, &interner, &globals).expect("call resolution failed");
+        disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
         inline_macros(&mut program, &interner).expect("macro inlining failed");
         let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck failed");
         translate(&typed, &interner, &globals).expect("translation failed")

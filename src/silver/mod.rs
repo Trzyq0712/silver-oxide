@@ -1,5 +1,5 @@
 mod ast;
-mod call_resolver;
+mod disambiguator;
 pub mod final_ast;
 mod final_display;
 mod globals;
@@ -13,7 +13,7 @@ mod util;
 pub mod walk;
 
 pub use ast::*;
-pub use call_resolver::*;
+pub use disambiguator::*;
 pub use final_display::{Show, show};
 pub use globals::{Globals, GlobalsCollector};
 pub use interner::{IdentCollector, Interner};

@@ -102,6 +102,7 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
         P::Ext(ext) => Ext::lower_ext(b, env, sink, ext),
         P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
         P::FunctionCall(_) => Err(TranslationError::Unsupported("function call")),
+        P::Field(_, _) => Err(TranslationError::Unsupported("field read")),
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
         P::AdtDestructor(_, _) => Err(TranslationError::Unsupported("ADT destructor")),
