@@ -7,8 +7,8 @@ use lasso::Spur;
 use crate::silver::final_ast;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, FALSE, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds, PureInst,
-    TRUE, Val,
+    self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds,
+    PureInst, TRUE, Val,
 };
 
 /// A mutable sink for emitted instructions plus the running counters,
@@ -69,6 +69,7 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
+    heap: HeapVal,
     exp: &final_ast::TypedPureExp<Ext>,
 ) -> Result<Val, TranslationError> {
     use final_ast::PureExpKind as P;
@@ -80,7 +81,7 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
             .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&id.0).to_string())),
         P::Const(lit) => Ok(Val::Literal(lower_literal(lit)?)),
         P::Unary(op, x) => {
-            let v = lower(b, env, sink, x)?;
+            let v = lower(b, env, sink, heap, x)?;
             match op {
                 // !v  =  v ? false : true
                 final_ast::UnOp::Not => Ok(sink.emit_pure(ty, PureInst::Ternary(v, FALSE, TRUE))),
@@ -92,21 +93,36 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
                 final_ast::UnOp::Cardinality => Err(TranslationError::Unsupported("cardinality")),
             }
         }
-        P::Binary(op, l, r) => lower_binary(b, env, sink, ty, op, l, r),
+        P::Binary(op, l, r) => lower_binary(b, env, sink, heap, ty, op, l, r),
         P::Ternary { if_, then, else_ } => {
-            let c = lower(b, env, sink, if_)?;
-            let t = lower(b, env, sink, then)?;
-            let e = lower(b, env, sink, else_)?;
+            let c = lower(b, env, sink, heap, if_)?;
+            let t = lower(b, env, sink, heap, then)?;
+            let e = lower(b, env, sink, heap, else_)?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
-        P::Ext(ext) => Ext::lower_ext(b, env, sink, ext),
+        P::Field(base, id) => {
+            let base = lower(b, env, sink, heap, base)?;
+            let field_fn = b.field_addr[&id.0];
+            let addr_ty = vmir::Type::Addr(Box::new(ty.clone()));
+            let field_addr = sink.emit_pure(
+                addr_ty,
+                PureInst::FunctionCall(
+                    heap,
+                    FunctionCall {
+                        function: field_fn,
+                        args: vec![base],
+                    },
+                ),
+            );
+            Ok(sink.emit_pure(ty, PureInst::Deref(heap, field_addr)))
+        }
         P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
         P::FunctionCall(_) => Err(TranslationError::Unsupported("function call")),
-        P::Field(_, _) => Err(TranslationError::Unsupported("field read")),
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
         P::AdtDestructor(_, _) => Err(TranslationError::Unsupported("ADT destructor")),
         P::AdtDiscriminator(_, _) => Err(TranslationError::Unsupported("ADT discriminator")),
+        P::Ext(ext) => Ext::lower_ext(b, env, sink, ext),
     }
 }
 
@@ -114,6 +130,7 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
+    heap: HeapVal,
     ty: vmir::Type,
     op: &final_ast::BinOp,
     l: &final_ast::TypedPureExp<Ext>,
@@ -121,8 +138,8 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
 ) -> Result<Val, TranslationError> {
     use final_ast::BinOp as B;
     use vmir::BinOp as V;
-    let lv = lower(b, env, sink, l)?;
-    let rv = lower(b, env, sink, r)?;
+    let lv = lower(b, env, sink, heap, l)?;
+    let rv = lower(b, env, sink, heap, r)?;
     Ok(match op {
         B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
         B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),

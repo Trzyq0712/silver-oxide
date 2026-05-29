@@ -18,7 +18,7 @@ pub(crate) fn lower_spatial_never(
     val_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::<ResourceCtx>::new(val_base);
-    let (h, bv) = lower_spatial::<!>(b, env, &mut sink, exp)?;
+    let (h, bv) = lower_spatial::<!>(b, env, &mut sink, HeapVal::Empty, exp)?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -32,7 +32,8 @@ pub(crate) fn lower_spatial_ensures(
     val_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::<ResourceCtx>::new(val_base);
-    let (h, bv) = lower_spatial::<final_ast::MethodEnsuresExt>(b, env, &mut sink, exp)?;
+    let (h, bv) =
+        lower_spatial::<final_ast::MethodEnsuresExt>(b, env, &mut sink, HeapVal::Empty, exp)?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -50,17 +51,18 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<ResourceCtx>,
+    heap: HeapVal,
     exp: &final_ast::SpatialExp<Ext>,
 ) -> Result<(HeapVal, Option<Val>), TranslationError> {
     use final_ast::SpatialExpKind as S;
     match &*exp.0 {
         S::Acc(res, perm) => {
-            let h = lower_acc(b, env, sink, res, perm)?;
+            let h = lower_acc(b, env, sink, heap, res, perm)?;
             Ok((h, None))
         }
         S::Conj(l, r) => {
-            let (h_l, b_l) = lower_spatial(b, env, sink, l)?;
-            let (h_r, b_r) = lower_spatial(b, env, sink, r)?;
+            let (h_l, b_l) = lower_spatial(b, env, sink, heap, l)?;
+            let (h_r, b_r) = lower_spatial(b, env, sink, h_l, r)?;
             let h_sum = sink.emit_heap(HeapInst::Add(h_l, h_r));
             let b_sum = match (b_l, b_r) {
                 (None, None) => None,
@@ -73,8 +75,8 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             Ok((h_sum, b_sum))
         }
         S::Implies(cond, body) => {
-            let c = pure_exp::lower(b, env, sink, cond)?;
-            let (h_b, b_b) = lower_spatial(b, env, sink, body)?;
+            let c = pure_exp::lower(b, env, sink, heap, cond)?;
+            let (h_b, b_b) = lower_spatial(b, env, sink, heap, body)?;
             let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_b, HeapVal::Empty));
             // c ==> b_b  =  c ? b_b : true. When body has no boolean, the
             // whole implication is trivially true.
@@ -82,9 +84,9 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             Ok((h, bv))
         }
         S::Ternary { if_, then, else_ } => {
-            let c = pure_exp::lower(b, env, sink, if_)?;
-            let (h_t, b_t) = lower_spatial(b, env, sink, then)?;
-            let (h_e, b_e) = lower_spatial(b, env, sink, else_)?;
+            let c = pure_exp::lower(b, env, sink, heap, if_)?;
+            let (h_t, b_t) = lower_spatial(b, env, sink, heap, then)?;
+            let (h_e, b_e) = lower_spatial(b, env, sink, heap, else_)?;
             let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_t, h_e));
             let bv = match (b_t, b_e) {
                 (None, None) => None,
@@ -101,7 +103,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             Ok((h, bv))
         }
         S::Pure(p) => {
-            let v = pure_exp::lower(b, env, sink, p)?;
+            let v = pure_exp::lower(b, env, sink, heap, p)?;
             Ok((HeapVal::Empty, Some(v)))
         }
     }
@@ -111,14 +113,15 @@ fn lower_acc<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<ResourceCtx>,
+    heap: HeapVal,
     res: &final_ast::ResourceExp<Ext>,
     perm: &final_ast::TypedPureExp<Ext>,
 ) -> Result<HeapVal, TranslationError> {
     use final_ast::ResourceExpKind as R;
-    let perm_val = lower_perm(b, env, sink, perm)?;
+    let perm_val = pure_exp::lower(b, env, sink, heap, perm)?;
     match &*res.0 {
         R::Field(base, fname) => {
-            let base_val = pure_exp::lower(b, env, sink, base)?;
+            let base_val = pure_exp::lower(b, env, sink, heap, base)?;
             let &addr_fn = b.field_addr.get(&fname.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
             })?;
@@ -155,7 +158,7 @@ fn lower_acc<Ext: PureExt>(
                 .expect("predicate snap missing");
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
-                args.push(pure_exp::lower(b, env, sink, a)?);
+                args.push(pure_exp::lower(b, env, sink, heap, a)?);
             }
             let ret_ty = Type::Addr(Box::new(Type::Domain(snap_id)));
             let addr = sink.emit_pure(
@@ -174,15 +177,6 @@ fn lower_acc<Ext: PureExt>(
             })))
         }
     }
-}
-
-fn lower_perm<Ext: PureExt>(
-    b: &Builder<'_>,
-    env: &HashMap<Spur, Val>,
-    sink: &mut Sink<ResourceCtx>,
-    perm: &final_ast::TypedPureExp<Ext>,
-) -> Result<Val, TranslationError> {
-    pure_exp::lower(b, env, sink, perm)
 }
 
 /// Bridge from `silver::Type` (used by `silver::Globals`) to `vmir::Type`.

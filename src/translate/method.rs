@@ -92,7 +92,7 @@ fn lower_stmt(
             if idents.len() != 1 {
                 return Err(TranslationError::Unsupported("multi-LHS var := exp"));
             }
-            let v = pure_exp::lower(b, env, sink, pure)?;
+            let v = pure_exp::lower(b, env, sink, current_heap, pure)?;
             env.insert(idents[0].name.0, v);
             Ok(current_heap)
         }
@@ -140,7 +140,7 @@ fn lower_stmt(
                     return Err(TranslationError::Unsupported("field lvalue"));
                 }
             };
-            let v = pure_exp::lower(b, env, sink, pure)?;
+            let v = pure_exp::lower(b, env, sink, current_heap, pure)?;
             env.insert(name, v);
             Ok(current_heap)
         }
@@ -171,7 +171,7 @@ fn lower_method_call(
     // Lower argument expressions.
     let mut args: Vec<Val> = Vec::with_capacity(call.args.len());
     for a in &call.args {
-        args.push(pure_exp::lower(b, env, sink, a)?);
+        args.push(pure_exp::lower(b, env, sink, current_heap, a)?);
     }
 
     let mut heap = current_heap;
