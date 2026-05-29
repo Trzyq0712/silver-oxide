@@ -1,7 +1,7 @@
-use crate::impl_pure_inst_display;
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::inst::write_inst_block;
+use crate::vmir::pure::PureExtRender;
 use crate::vmir::{HeapVal, Inst, InstContext, MemberId, Type, Val};
+use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
 
 pub struct ResourceCtx;
@@ -50,12 +50,12 @@ pub struct ResourceCall {
 // DISPLAY INFRASTRUCTURE
 // ======================
 
-impl<'a> Display for VmirDisplay<'a, &'a ResourcePureExt> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
+impl PureExtRender for ResourcePureExt {
+    fn render(&self, f: &mut Formatter<'_>, interner: &Rodeo<MemberId>) -> fmt::Result {
+        match self {
             ResourcePureExt::CtxDeref(addr) => write!(f, "*[ctx] {addr}"),
             ResourcePureExt::CtxFunctionCall(call) => {
-                write!(f, "{}[ctx](", self.interner.resolve(&call.function))?;
+                write!(f, "{}[ctx](", interner.resolve(&call.function))?;
                 for (i, arg) in call.args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -67,8 +67,6 @@ impl<'a> Display for VmirDisplay<'a, &'a ResourcePureExt> {
         }
     }
 }
-
-impl_pure_inst_display!(ResourcePureExt);
 
 impl<'a> Display for VmirDisplay<'a, &'a Resource> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -96,7 +94,11 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
             None => Ok(()),
             Some(body) => {
                 writeln!(f, " {{")?;
-                write_inst_block(f, self, &body.insts, self.item.params.len(), 0)?;
+                write!(
+                    f,
+                    "{}",
+                    self.with((self.item.params.len(), 0usize, &body.insts[..]))
+                )?;
                 writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
                 write!(f, "}}")
             }
@@ -107,7 +109,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
 impl<'a> Display for VmirDisplay<'a, &'a ResourceBody> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "{{")?;
-        write_inst_block(f, self, &self.item.insts, 0, 0)?;
+        write!(f, "{}", self.with((0usize, 0usize, &self.item.insts[..])))?;
         writeln!(f, "  result: ({}, {})", self.item.res.0, self.item.res.1)?;
         write!(f, "}}")
     }

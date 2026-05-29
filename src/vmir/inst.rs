@@ -83,47 +83,48 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a !)> {
     }
 }
 
-/// Walk an instruction stream.
-pub(crate) fn write_inst_block<'a, T, C: InstContext>(
-    f: &mut Formatter<'_>,
-    ctx: &VmirDisplay<'a, T>,
-    insts: &'a [Inst<C>],
-    val_base: usize,
-    heap_base: usize,
-) -> fmt::Result
+/// Walk an instruction stream. Wraps `(val_base, heap_base, &[Inst<C>])`
+/// in a `VmirDisplay` so the iteration lives behind a regular `Display`
+/// impl. Callers — `Display for VmirDisplay<&Method>`, `&Resource>`,
+/// `&ResourceBody>` — invoke via `self.with((val_base, heap_base,
+/// &insts[..]))`.
+impl<'a, C: InstContext> Display for VmirDisplay<'a, (usize, usize, &'a [Inst<C>])>
 where
     C::InstExt: Bumps,
-    VmirDisplay<'a, &'a PureInst<C::PureExt>>: Display,
-    HeapInst<C::HeapExt>: Display,
+    C::PureExt: crate::vmir::pure::PureExtRender,
+    C::HeapExt: crate::vmir::heap::HeapExtRender,
     VmirDisplay<'a, (usize, usize, &'a PathConds, &'a C::InstExt)>: Display,
 {
-    let mut e_idx = val_base;
-    let mut h_idx = heap_base;
-    for inst in insts {
-        match &inst.kind {
-            InstKind::Pure(ty, pi) => {
-                writeln!(
-                    f,
-                    "  e{e_idx}: {} := {} {}",
-                    ctx.with(ty),
-                    inst.pc,
-                    ctx.with(pi)
-                )?;
-                e_idx += 1;
-            }
-            InstKind::Heap(hi) => {
-                writeln!(f, "  h{h_idx} := {} {}", inst.pc, hi)?;
-                h_idx += 1;
-            }
-            InstKind::Ext(ext) => {
-                write!(f, "{}", ctx.with((e_idx, h_idx, &inst.pc, ext)))?;
-                let (de, dh) = ext.bumps();
-                e_idx += de;
-                h_idx += dh;
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let (val_base, heap_base, insts) = self.item;
+        let mut e_idx = val_base;
+        let mut h_idx = heap_base;
+        for inst in insts {
+            match &inst.kind {
+                InstKind::Pure(ty, pi) => {
+                    writeln!(
+                        f,
+                        "  e{e_idx}: {} := {} {}",
+                        self.with(ty),
+                        inst.pc,
+                        self.with(pi)
+                    )?;
+                    e_idx += 1;
+                }
+                InstKind::Heap(hi) => {
+                    writeln!(f, "  h{h_idx} := {} {}", inst.pc, hi)?;
+                    h_idx += 1;
+                }
+                InstKind::Ext(ext) => {
+                    write!(f, "{}", self.with((e_idx, h_idx, &inst.pc, ext)))?;
+                    let (de, dh) = ext.bumps();
+                    e_idx += de;
+                    h_idx += dh;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 impl Display for PathConds {

@@ -44,44 +44,27 @@ impl Display for HeapVal {
     }
 }
 
-/// Common rendering for the shared `HeapInst` variants. Used by the
-/// per-`H` Display impls below.
-fn fmt_shared<H>(inst: &HeapInst<H>, f: &mut Formatter<'_>) -> Option<fmt::Result> {
-    match inst {
-        HeapInst::Acc(Acc { loc, perm }) => Some(write!(f, "acc({loc}, {perm})")),
-        HeapInst::Add(lhs, rhs) => Some(write!(f, "{lhs} + {rhs}")),
-        HeapInst::Sub(lhs, rhs) => Some(write!(f, "{lhs} - {rhs}")),
-        HeapInst::Ternary(cond, lhs, rhs) => Some(write!(f, "{cond} ? {lhs} : {rhs}")),
-        HeapInst::Ext(_) => None,
+/// Rendering hook for the `HeapInst::Ext` payload. Symmetric to
+/// `PureExtRender` — sidesteps the `Display for !` orphan-rule problem
+/// and lets `Display for HeapInst<H>` live as a single generic impl.
+pub trait HeapExtRender {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result;
+}
+
+impl HeapExtRender for ! {
+    fn render(&self, _: &mut Formatter<'_>) -> fmt::Result {
+        match *self {}
     }
 }
 
-/// `Display for HeapInst<!>` — the `Ext` arm is uninhabited.
-impl Display for HeapInst<!> {
+impl<H: HeapExtRender> Display for HeapInst<H> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if let Some(r) = fmt_shared(self, f) {
-            return r;
-        }
         match self {
-            _ => unreachable!(),
+            HeapInst::Acc(Acc { loc, perm }) => write!(f, "acc({loc}, {perm})"),
+            HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
+            HeapInst::Sub(lhs, rhs) => write!(f, "{lhs} - {rhs}"),
+            HeapInst::Ternary(cond, lhs, rhs) => write!(f, "{cond} ? {lhs} : {rhs}"),
+            HeapInst::Ext(ext) => ext.render(f),
         }
-    }
-}
-
-/// Body for `Display for HeapInst<H>` when `H: Display` (i.e. an
-/// inhabited extension type). The `!` case gets its own impl above to
-/// sidestep the missing `Display for !`. Note: this helper exists
-/// because a blanket `impl<H: Display>` would collide with the
-/// `HeapInst<!>` impl.
-pub(crate) fn write_heap_inst_with<H: Display>(
-    inst: &HeapInst<H>,
-    f: &mut Formatter<'_>,
-) -> fmt::Result {
-    if let Some(r) = fmt_shared(inst, f) {
-        return r;
-    }
-    match inst {
-        HeapInst::Ext(ext) => write!(f, "{ext}"),
-        _ => unreachable!(),
     }
 }

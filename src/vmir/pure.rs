@@ -1,4 +1,6 @@
-use crate::vmir::{FunctionCall, HeapVal};
+use crate::vmir::display::VmirDisplay;
+use crate::vmir::{FunctionCall, HeapVal, MemberId};
+use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
 
 /// A value can be either a literal or a temporary variable defined earlier.
@@ -89,41 +91,42 @@ impl Display for Literal {
     }
 }
 
-/// Generate a `Display for VmirDisplay<'_, &'_ PureInst<$p>>` impl for a
-/// concrete extension payload type `$p`. We instantiate per-`p` rather
-/// than as a fully generic impl to avoid the HRTB recursion the Rust
-/// trait solver hits when proving
-/// `VmirDisplay<&PureInst<X>>: Display` for unbounded `X`.
-#[macro_export]
-macro_rules! impl_pure_inst_display {
-    ($p:ty) => {
-        impl<'a> ::std::fmt::Display
-            for $crate::vmir::display::VmirDisplay<'a, &'a $crate::vmir::PureInst<$p>>
-        where
-            $crate::vmir::display::VmirDisplay<'a, &'a $p>: ::std::fmt::Display,
-        {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                use $crate::vmir::PureInst;
-                match self.item {
-                    PureInst::Fresh => write!(f, "fresh"),
-                    PureInst::Binary(op, lhs, rhs) => write!(f, "{lhs} {op} {rhs}"),
-                    PureInst::Ternary(cond, then_val, else_val) => {
-                        write!(f, "{cond} ? {then_val} : {else_val}")
-                    }
-                    PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
-                    PureInst::FunctionCall(heap, call) => {
-                        write!(f, "{}[{heap}](", self.interner.resolve(&call.function))?;
-                        for (i, arg) in call.args.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{arg}")?;
-                        }
-                        write!(f, ")")
-                    }
-                    PureInst::Ext(ext) => write!(f, "{}", self.with(ext)),
-                }
+/// Rendering hook for the `PureInst::Ext` payload. Implementors emit
+/// the textual form of the extension (interner is provided for
+/// `MemberId` lookups). The bound `P: PureExtRender` on the generic
+/// `Display for VmirDisplay<&PureInst<P>>` impl below sidesteps HRTB
+/// recursion in the trait solver — `PureInst<_>` doesn't impl this
+/// trait, so the solver can't speculatively unify `P = PureInst<_>`.
+pub trait PureExtRender {
+    fn render(&self, f: &mut Formatter<'_>, interner: &Rodeo<MemberId>) -> fmt::Result;
+}
+
+impl PureExtRender for ! {
+    fn render(&self, _: &mut Formatter<'_>, _: &Rodeo<MemberId>) -> fmt::Result {
+        match *self {}
+    }
+}
+
+impl<'a, P: PureExtRender> Display for VmirDisplay<'a, &'a PureInst<P>> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.item {
+            PureInst::Fresh => write!(f, "fresh"),
+            PureInst::Binary(op, lhs, rhs) => write!(f, "{lhs} {op} {rhs}"),
+            PureInst::Ternary(cond, then_val, else_val) => {
+                write!(f, "{cond} ? {then_val} : {else_val}")
             }
+            PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
+            PureInst::FunctionCall(heap, call) => {
+                write!(f, "{}[{heap}](", self.interner.resolve(&call.function))?;
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
+            PureInst::Ext(ext) => ext.render(f, self.interner),
         }
-    };
+    }
 }

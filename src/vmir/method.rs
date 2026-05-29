@@ -1,8 +1,9 @@
-use crate::impl_pure_inst_display;
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::heap::write_heap_inst_with;
-use crate::vmir::inst::{Bumps, write_inst_block};
-use crate::vmir::{HeapInst, HeapVal, Inst, InstContext, PathConds, ResourceCall, Val};
+use crate::vmir::heap::HeapExtRender;
+use crate::vmir::inst::Bumps;
+use crate::vmir::pure::PureExtRender;
+use crate::vmir::{HeapVal, Inst, InstContext, MemberId, PathConds, ResourceCall, Val};
+use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter};
 
 pub struct MethodCtx;
@@ -91,8 +92,8 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a InstExt)>
     }
 }
 
-impl Display for HeapExt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+impl HeapExtRender for HeapExt {
+    fn render(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             HeapExt::Assign(heap, Assign { loc, val }) => {
                 write!(f, "assign[{heap}] {loc} := {val}")
@@ -101,28 +102,18 @@ impl Display for HeapExt {
     }
 }
 
-/// `Display for HeapInst<HeapExt>` — delegates the shared variants to the
-/// helper and renders `Ext` via the `Display for HeapExt` impl.
-impl Display for HeapInst<HeapExt> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write_heap_inst_with(self, f)
-    }
-}
-
-impl<'a> Display for VmirDisplay<'a, &'a PureExt> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.item {
+impl PureExtRender for PureExt {
+    fn render(&self, f: &mut Formatter<'_>, _: &Rodeo<MemberId>) -> fmt::Result {
+        match self {
             PureExt::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
         }
     }
 }
 
-impl_pure_inst_display!(PureExt);
-
 impl<'a> Display for VmirDisplay<'a, &'a Method> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "{{")?;
-        write_inst_block(f, self, &self.item.insts, 0, 0)?;
+        write!(f, "{}", self.with((0usize, 0usize, &self.item.insts[..])))?;
         write!(f, "}}")
     }
 }
