@@ -68,6 +68,15 @@ impl PureExtRender for ResourcePureExt {
     }
 }
 
+impl crate::vmir::inst::UsesPc for ResourcePureExt {
+    fn uses_pc(&self) -> bool {
+        match self {
+            // Both have SIDECONDs (ctx-heap perm / function precondition).
+            ResourcePureExt::CtxDeref(_) | ResourcePureExt::CtxFunctionCall(_) => true,
+        }
+    }
+}
+
 impl<'a> Display for VmirDisplay<'a, &'a Resource> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "(")?;

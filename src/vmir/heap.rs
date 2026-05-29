@@ -31,6 +31,18 @@ pub struct Acc {
     pub perm: Val,
 }
 
+impl<H: crate::vmir::inst::UsesPc> HeapInst<H> {
+    pub fn uses_pc(&self) -> bool {
+        match self {
+            // Acc: perm ≥ 0. Add: chunk-merge equalities are conditional
+            // on the chunks' perm being positive. Sub: enough perm.
+            HeapInst::Acc(_) | HeapInst::Add(..) | HeapInst::Sub(..) => true,
+            HeapInst::Ternary(..) => false,
+            HeapInst::Ext(ext) => ext.uses_pc(),
+        }
+    }
+}
+
 // ======================
 // DISPLAY INFRASTRUCTURE
 // ======================

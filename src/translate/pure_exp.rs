@@ -45,29 +45,23 @@ impl<C: InstContext> Sink<C> {
 
     pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst<C::PureExt>) -> Val {
         let v = self.next_val_temp();
-        self.insts.push(Inst {
-            pc: PathConds::default(),
-            kind: InstKind::Pure(ty, inst),
-        });
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
         v
     }
 
     pub fn emit_heap(&mut self, inst: HeapInst<C::HeapExt>) -> HeapVal {
         let h = self.next_heap_temp();
-        self.insts.push(Inst {
-            pc: PathConds::default(),
-            kind: InstKind::Heap(inst),
-        });
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Heap(inst)));
         h
     }
 
     /// Push an instruction-kind extension. For `Sink<ResourceCtx>` the
     /// parameter type is `!`, so this method is uncallable.
     pub fn emit_ext(&mut self, ext: C::InstExt) {
-        self.insts.push(Inst {
-            pc: PathConds::default(),
-            kind: InstKind::Ext(ext),
-        });
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Ext(ext)));
     }
 }
 

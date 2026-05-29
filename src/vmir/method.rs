@@ -1,6 +1,6 @@
 use crate::vmir::display::VmirDisplay;
 use crate::vmir::heap::HeapExtRender;
-use crate::vmir::inst::Bumps;
+use crate::vmir::inst::{Bumps, PcPrefix};
 use crate::vmir::pure::PureExtRender;
 use crate::vmir::{HeapVal, Inst, InstContext, MemberId, PathConds, ResourceCall, Val};
 use lasso::Rodeo;
@@ -67,16 +67,41 @@ impl Bumps for InstExt {
     }
 }
 
+impl crate::vmir::inst::UsesPc for InstExt {
+    fn uses_pc(&self) -> bool {
+        match self {
+            InstExt::Assume(_) | InstExt::Assert(_) | InstExt::ResourceCall(_) => true,
+        }
+    }
+}
+
+impl crate::vmir::inst::UsesPc for HeapExt {
+    fn uses_pc(&self) -> bool {
+        match self {
+            HeapExt::Assign(..) => true,
+        }
+    }
+}
+
+impl crate::vmir::inst::UsesPc for PureExt {
+    fn uses_pc(&self) -> bool {
+        match self {
+            PureExt::Perm(..) => false,
+        }
+    }
+}
+
 impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a InstExt)> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let (e_idx, h_idx, pc, ext) = self.item;
         match ext {
-            InstExt::Assume(v) => writeln!(f, "  {pc} assume {v}"),
-            InstExt::Assert(v) => writeln!(f, "  {pc} assert {v}"),
+            InstExt::Assume(v) => writeln!(f, "  {}assume {v}", PcPrefix(pc)),
+            InstExt::Assert(v) => writeln!(f, "  {}assert {v}", PcPrefix(pc)),
             InstExt::ResourceCall(call) => {
                 write!(
                     f,
-                    "  (h{h_idx}, e{e_idx}) := {pc} call {}[{}](",
+                    "  (h{h_idx}, e{e_idx}) := {}call {}[{}](",
+                    PcPrefix(pc),
                     self.interner.resolve(&call.resource),
                     call.ctx_heap,
                 )?;

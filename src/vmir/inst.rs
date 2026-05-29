@@ -8,7 +8,20 @@ use std::hash::Hash;
 
 use derive_where::derive_where;
 
-pub trait Ext = Debug + Clone + PartialEq + Eq + Hash;
+/// Whether the variant has a SIDECOND that the path condition guards.
+/// Used by [`Inst::new`] to refuse non-trivial `PathConds` on
+/// instructions that don't make use of it.
+pub trait UsesPc {
+    fn uses_pc(&self) -> bool;
+}
+
+impl UsesPc for ! {
+    fn uses_pc(&self) -> bool {
+        match *self {}
+    }
+}
+
+pub trait Ext = Debug + Clone + PartialEq + Eq + Hash + UsesPc;
 
 /// A context for instructions, through which additional instruction extensions can be added.
 pub trait InstContext {
@@ -40,7 +53,7 @@ pub enum InstKind<InstCtx: InstContext> {
 /// Conjunction of literals over previously-emitted `Val`s.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PathConds {
-    pub lits: Vec<(Val, Polarity)>,
+    pub conds: Vec<(Val, Polarity)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,6 +88,28 @@ impl Bumps for ! {
     }
 }
 
+impl<C: InstContext> InstKind<C> {
+    pub fn uses_pc(&self) -> bool {
+        match self {
+            InstKind::Pure(_, pi) => pi.uses_pc(),
+            InstKind::Heap(hi) => hi.uses_pc(),
+            InstKind::Ext(ext) => ext.uses_pc(),
+        }
+    }
+}
+
+impl<C: InstContext> Inst<C> {
+    /// Construct an instruction. The path condition must be empty
+    /// unless `kind` has a SIDECOND (see `UsesPc`).
+    pub fn new(pc: PathConds, kind: InstKind<C>) -> Self {
+        debug_assert!(
+            pc.conds.is_empty() || kind.uses_pc(),
+            "non-empty PathConds on a non-SIDECOND instruction"
+        );
+        Self { pc, kind }
+    }
+}
+
 /// Refutable Display impl for an `InstExt = !`
 impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a !)> {
     fn fmt(&self, _: &mut Formatter<'_>) -> fmt::Result {
@@ -104,15 +139,15 @@ where
                 InstKind::Pure(ty, pi) => {
                     writeln!(
                         f,
-                        "  e{e_idx}: {} := {} {}",
+                        "  e{e_idx}: {} := {}{}",
                         self.with(ty),
-                        inst.pc,
+                        PcPrefix(&inst.pc),
                         self.with(pi)
                     )?;
                     e_idx += 1;
                 }
                 InstKind::Heap(hi) => {
-                    writeln!(f, "  h{h_idx} := {} {}", inst.pc, hi)?;
+                    writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), hi)?;
                     h_idx += 1;
                 }
                 InstKind::Ext(ext) => {
@@ -129,8 +164,11 @@ where
 
 impl Display for PathConds {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.conds.is_empty() {
+            return Ok(());
+        }
         write!(f, "<")?;
-        for (i, (val, pol)) in self.lits.iter().enumerate() {
+        for (i, (val, pol)) in self.conds.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
@@ -140,5 +178,21 @@ impl Display for PathConds {
             write!(f, "{val}")?;
         }
         write!(f, ">")
+    }
+}
+
+/// Helper that renders a `PathConds` followed by a trailing space when
+/// the guard is non-empty, and emits nothing at all when the guard is
+/// the trivial `<>`. Use it at instruction-rendering sites so empty
+/// guards don't waste a token.
+pub(crate) struct PcPrefix<'a>(pub &'a PathConds);
+
+impl Display for PcPrefix<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.0.conds.is_empty() {
+            Ok(())
+        } else {
+            write!(f, "{} ", self.0)
+        }
     }
 }

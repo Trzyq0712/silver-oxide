@@ -217,13 +217,13 @@ fn emit_resource_call(
 ) -> (HeapVal, Val) {
     let h = sink.next_heap_temp();
     let v = sink.next_val_temp();
-    sink.insts.push(Inst {
-        pc: PathConds::default(),
-        kind: InstKind::Ext(InstExt::ResourceCall(ResourceCall {
+    sink.insts.push(Inst::new(
+        PathConds::default(),
+        InstKind::Ext(InstExt::ResourceCall(ResourceCall {
             resource,
             ctx_heap,
             args,
         })),
-    });
+    ));
     (h, v)
 }

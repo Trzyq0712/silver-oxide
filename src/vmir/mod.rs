@@ -18,7 +18,7 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 pub use adt::Adt;
 pub use domain::Domain;
 pub use function::{Function, FunctionCall};
-pub use inst::{Inst, InstContext, InstKind, PathConds, Polarity};
+pub use inst::{Bumps, Inst, InstContext, InstKind, PathConds, Polarity, UsesPc};
 pub use method::{Assign, HeapExt, InstExt, Method, MethodCtx, MethodInst, PureExt};
 pub use resource::{
     Resource, ResourceBody, ResourceCall, ResourceCtx, ResourceInst, ResourcePureExt,

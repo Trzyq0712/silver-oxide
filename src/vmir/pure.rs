@@ -52,6 +52,17 @@ pub enum PureInst<P> {
     Ext(P),
 }
 
+impl<P: crate::vmir::inst::UsesPc> PureInst<P> {
+    pub fn uses_pc(&self) -> bool {
+        match self {
+            PureInst::Fresh | PureInst::Ternary(..) => false,
+            PureInst::Binary(op, _, _) => matches!(op, BinOp::Div | BinOp::Mod),
+            PureInst::Deref(..) | PureInst::FunctionCall(..) => true,
+            PureInst::Ext(ext) => ext.uses_pc(),
+        }
+    }
+}
+
 // ======================
 // DISPLAY INFRASTRUCTURE
 // ======================
