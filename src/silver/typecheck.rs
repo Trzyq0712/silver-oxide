@@ -96,7 +96,7 @@ fn type_to_tc(ty: &Type) -> SilverTcType {
         Type::Int => SilverTcType::Int,
         Type::Real => SilverTcType::Real,
         Type::Ref => SilverTcType::Ref,
-        Type::Collection(_) | Type::Domain(..) => SilverTcType::Top,
+        Type::Generic(_) | Type::Collection(_) | Type::Domain(..) => SilverTcType::Top,
     }
 }
 
@@ -441,16 +441,6 @@ impl PureExt for MethodBodyExt {
 // 5. Type translation helpers
 // ==========================================
 
-fn lower_type(ty: &silver::Type) -> Type {
-    match ty {
-        silver::Type::Bool => Type::Bool,
-        silver::Type::Int => Type::Int,
-        silver::Type::Real => Type::Real,
-        silver::Type::Ref => Type::Ref,
-        silver::Type::Generic(_) | silver::Type::Domain(..) => todo!("domain/generic types"),
-    }
-}
-
 fn lower_ident(ident: &silver::Ident) -> Ident {
     Ident(ident.id())
 }
@@ -527,7 +517,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             }
 
             ExpKind::Ascribe(inner, ascribed_ty) => {
-                let target = type_to_tc(&lower_type(ascribed_ty));
+                let target = type_to_tc(&Type::from(&*ascribed_ty));
                 let inner_key = self.constrain_pure(inner)?;
                 self.tc.impose(inner_key.concretizes_explicit(target.clone()))?;
                 self.tc.impose(key.concretizes_explicit(target))?;
@@ -589,7 +579,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 // restore the previous bindings afterwards.
                 let mut prev_bindings = Vec::with_capacity(bound_vars.len());
                 for bv in bound_vars.iter() {
-                    let ty = lower_type(&bv.ty);
+                    let ty = Type::from(&bv.ty);
                     let bk = self.tc.new_term_key();
                     self.tc.impose(bk.concretizes_explicit(type_to_tc(&ty)))?;
                     let prev = self.let_bindings.insert(bv.idn.0.id(), bk);
@@ -722,8 +712,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                         found: call.args.len(),
                     });
                 }
-                let ret_ty = lower_type(&sig.ret);
-                let expected_params: Vec<Type> = sig.params.iter().map(lower_type).collect();
+                let ret_ty = sig.ret.clone();
+                let expected_params: Vec<Type> = sig.params.clone();
                 for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
                     let arg_key = self.constrain_pure(arg)?;
                     self.tc.impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
@@ -756,7 +746,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 self.env.interner.resolve(&field_id)
             ))
         })?;
-        let ret_ty = lower_type(field_ty);
+        let ret_ty = field_ty.clone();
         let base_key = self.constrain_pure(base)?;
         self.tc.impose(base_key.concretizes_explicit(SilverTcType::Ref))?;
         self.tc.impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
@@ -803,7 +793,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 found: call.args.len(),
             });
         }
-        let expected_params: Vec<Type> = sig.params.iter().map(lower_type).collect();
+        let expected_params: Vec<Type> = sig.params.clone();
         for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
             let arg_key = self.constrain_pure(arg)?;
             self.tc.impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
@@ -892,7 +882,7 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
 
             ExpKind::Ascribe(inner, ascribed_ty) => {
                 let inner_exp = self.lower_pure::<Ext>(inner)?;
-                Ok(PureExpKind::Ascribe(inner_exp, lower_type(ascribed_ty)))
+                Ok(PureExpKind::Ascribe(inner_exp, Type::from(ascribed_ty)))
             }
 
             ExpKind::UnOp(op, inner) => self.lower_unop::<Ext>(op, inner),
@@ -1180,7 +1170,7 @@ fn lower_statement(
         S::Var(decls, init) => {
             let mut typed_decls = Vec::with_capacity(decls.len());
             for d in decls.iter() {
-                let ty = lower_type(&d.ty);
+                let ty = Type::from(&d.ty);
                 ctx.add_local(d.idn.0.id(), ty.clone())?;
                 typed_decls.push(TypedIdent {
                     name: Ident(d.idn.0.id()),
@@ -1238,7 +1228,7 @@ fn lower_assign_lhs_typed(
                 .globals
                 .resolve(field_id)
                 .and_then(|s| s.as_field())
-                .map(lower_type)
+                .cloned()
                 .ok_or_else(|| TypeError::Other("undefined field".to_string()))?;
             let base_exp = ctx.typecheck_pure::<MethodBodyExt>(base, SilverTcType::Ref, None)?;
             Ok((final_ast::AssignLhs::Field(base_exp, Ident(field_id)), field_ty))
@@ -1319,7 +1309,7 @@ fn lower_rhs_against_lhs(
             }
             // Each LHS type must match the corresponding return type from the signature.
             for (i, lhs_ty) in lhs_types.iter().enumerate() {
-                let ret_ty = lower_type(&sig.rets[i]);
+                let ret_ty = sig.rets[i].clone();
                 if *lhs_ty != ret_ty {
                     return Err(TypeError::Other(format!(
                         "return {} of `{}`: expected {:?}, found {:?}",
@@ -1333,7 +1323,7 @@ fn lower_rhs_against_lhs(
             // Each arg is constrained by the corresponding parameter type from the signature.
             let mut lowered_args = Vec::with_capacity(call.args.len());
             for (arg, param_ty) in call.args.iter_mut().zip(sig.params.iter()) {
-                let tc = type_to_tc(&lower_type(param_ty));
+                let tc = type_to_tc(param_ty);
                 lowered_args.push(ctx.typecheck_pure::<MethodBodyExt>(arg, tc, None)?);
             }
             Ok(final_ast::AssignRhs::MethodCall(Call {
@@ -1358,7 +1348,7 @@ fn lower_stmt_block(
 fn typecheck_field(field: &silver::Field) -> final_ast::Declaration {
     final_ast::Declaration::Field(final_ast::Field(TypedIdent {
         name: Ident(field.0.idn.0.id()),
-        ty: lower_type(&field.0.ty),
+        ty: Type::from(&field.0.ty),
     }))
 }
 
@@ -1367,7 +1357,7 @@ fn collect_params(args: &[silver::ArgOrType]) -> Vec<TypedIdent> {
         .filter_map(|p| {
             p.idn().map(|idn| TypedIdent {
                 name: Ident(idn.0.id()),
-                ty: lower_type(p.ty()),
+                ty: Type::from(p.ty()),
             })
         })
         .collect()
@@ -1376,7 +1366,7 @@ fn collect_params(args: &[silver::ArgOrType]) -> Vec<TypedIdent> {
 fn add_arg_locals(ctx: &mut LocalEnv, args: &[silver::ArgOrType]) -> Result<(), TypeError> {
     for arg in args {
         if let silver::ArgOrType::Arg(decl) = arg {
-            ctx.add_local(decl.idn.0.id(), lower_type(&decl.ty))?;
+            ctx.add_local(decl.idn.0.id(), Type::from(&decl.ty))?;
         }
     }
     Ok(())
@@ -1417,7 +1407,7 @@ fn typecheck_function(
     let ret_ty = globals
         .resolve(func_spur)
         .and_then(|s| s.as_function())
-        .map(|sig| lower_type(&sig.ret))
+        .map(|sig| sig.ret.clone())
         .ok_or_else(|| {
             TypeError::Other(format!(
                 "internal: function `{}` not in globals",

@@ -283,7 +283,9 @@ pub(crate) fn lower_type(ty: &final_ast::Type) -> vmir::Type {
         final_ast::Type::Int => vmir::Type::Int,
         final_ast::Type::Real => vmir::Type::Real,
         final_ast::Type::Ref => vmir::Type::Ref,
-        final_ast::Type::Collection(_) | final_ast::Type::Domain(_, _) => {
+        final_ast::Type::Generic(_)
+        | final_ast::Type::Collection(_)
+        | final_ast::Type::Domain(_, _) => {
             // Not exercised by the target case. Use Ref as a placeholder; a
             // future round will introduce proper VMIR domain/collection types.
             vmir::Type::Ref

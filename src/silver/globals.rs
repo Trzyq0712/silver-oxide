@@ -4,7 +4,7 @@ use lasso::Spur;
 use nonmax::NonMaxU32;
 use typed_index_collections::TiVec;
 
-use crate::silver::{IdnDecl, Type, interner::Interner, walk::AstWalker};
+use crate::silver::{IdnDecl, final_ast::Type, interner::Interner, walk::AstWalker};
 
 #[derive(Debug, Clone)]
 pub struct FunctionSig {
@@ -310,20 +310,23 @@ impl<'i> GlobalsCollector<'i> {
 
 impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
     fn walk_field(&mut self, field: &'ast super::Field) {
-        self.register(&field.0.idn, GlobalSignature::Field(field.0.ty.clone()));
+        self.register(
+            &field.0.idn,
+            GlobalSignature::Field(Type::from(&field.0.ty)),
+        );
     }
 
     fn walk_predicate(&mut self, pred: &'ast super::Predicate) {
         let sig = PredicateSig {
-            params: pred.signature.args.iter().map(|p| p.ty().clone()).collect(),
+            params: pred.signature.args.iter().map(|p| Type::from(p.ty())).collect(),
         };
         self.register(&pred.signature.name, GlobalSignature::Predicate(sig));
     }
 
     fn walk_function(&mut self, func: &'ast super::Function) {
         let sig = FunctionSig {
-            params: func.signature.args.iter().map(|p| p.ty().clone()).collect(),
-            ret: func.signature.ret[0].ty().clone(),
+            params: func.signature.args.iter().map(|p| Type::from(p.ty())).collect(),
+            ret: Type::from(func.signature.ret[0].ty()),
         };
         self.register(&func.signature.name, GlobalSignature::Function(sig));
     }
@@ -334,13 +337,13 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
                 .signature
                 .args
                 .iter()
-                .map(|p| p.ty().clone())
+                .map(|p| Type::from(p.ty()))
                 .collect(),
             rets: method
                 .signature
                 .ret
                 .iter()
-                .map(|r| r.ty().clone())
+                .map(|r| Type::from(r.ty()))
                 .collect(),
         };
         self.register(&method.signature.name, GlobalSignature::Method(sig));
@@ -366,9 +369,9 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
                 .signature
                 .args
                 .iter()
-                .map(|p| p.ty().clone())
+                .map(|p| Type::from(p.ty()))
                 .collect(),
-            ret: adt_cons.signature.ret[0].ty().clone(),
+            ret: Type::from(adt_cons.signature.ret[0].ty()),
         };
         self.register(
             &adt_cons.signature.name,
@@ -378,8 +381,8 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
 
     fn walk_domain_function(&mut self, func: &'ast super::DomainFunction) {
         let sig = FunctionSig {
-            params: func.signature.args.iter().map(|p| p.ty().clone()).collect(),
-            ret: func.signature.ret[0].ty().clone(),
+            params: func.signature.args.iter().map(|p| Type::from(p.ty())).collect(),
+            ret: Type::from(func.signature.ret[0].ty()),
         };
         self.register(&func.signature.name, GlobalSignature::Function(sig));
     }

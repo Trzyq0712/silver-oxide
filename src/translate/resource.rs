@@ -6,7 +6,7 @@ use lasso::Spur;
 
 use crate::silver::final_ast;
 use crate::translate::pure_exp::{self, PureExt, Sink};
-use crate::translate::{Builder, TranslationError};
+use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
     self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, TRUE, Type, Val,
 };
@@ -142,7 +142,7 @@ fn lower_acc<Ext: PureExt>(
                 .ok_or_else(|| {
                     TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
                 })?;
-            let ret_ty = Type::Addr(Box::new(silver_type_to_vmir(&field_ty)));
+            let ret_ty = Type::Addr(Box::new(lower_type(&field_ty)));
             let addr = sink.emit_pure(
                 ret_ty,
                 PureInst::FunctionCall(
@@ -189,14 +189,3 @@ fn lower_acc<Ext: PureExt>(
     }
 }
 
-/// Bridge from `silver::Type` (used by `silver::Globals`) to `vmir::Type`.
-fn silver_type_to_vmir(ty: &crate::silver::Type) -> vmir::Type {
-    use crate::silver::Type as S;
-    match ty {
-        S::Bool => vmir::Type::Bool,
-        S::Int => vmir::Type::Int,
-        S::Real => vmir::Type::Real,
-        S::Ref => vmir::Type::Ref,
-        S::Generic(_) | S::Domain(_, _) => vmir::Type::Ref,
-    }
-}

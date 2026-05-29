@@ -28,8 +28,25 @@ pub enum Type {
     Int,
     Real,
     Ref,
+    Generic(Ident),
     Collection(BuiltinCollection),
     Domain(Ident, Vec<Type>),
+}
+
+impl From<&super::ast::Type> for Type {
+    fn from(t: &super::ast::Type) -> Self {
+        use super::ast::Type as A;
+        match t {
+            A::Bool => Type::Bool,
+            A::Int => Type::Int,
+            A::Real => Type::Real,
+            A::Ref => Type::Ref,
+            A::Generic(id) => Type::Generic(Ident(id.id())),
+            A::Domain(id, args) => {
+                Type::Domain(Ident(id.id()), args.iter().map(Self::from).collect())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
