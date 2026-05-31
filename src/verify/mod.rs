@@ -18,7 +18,12 @@ pub type MethodResult = (String, Result<(), VerifyError>);
 pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<MethodResult> {
     let program = &analyzed.program;
     let mut results = Vec::new();
-    for &id in &analyzed.order {
+    // Derive a linear order from the dependency graph; acyclicity was already
+    // proven by `analyze`. A future parallel scheduler consumes the graph
+    // directly instead.
+    let order = petgraph::algo::toposort(&analyzed.dep_graph, None)
+        .expect("dep_graph proven acyclic by analyze");
+    for id in order {
         if let vmir::Declaration::Method(m) = &program.decls[id] {
             let name = program.interner.resolve(&id).to_string();
             let outcome = method::verify_method(program, &name, m);

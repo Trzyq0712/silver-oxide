@@ -2,29 +2,30 @@
 //! [`AnalyzedProgram`].
 //!
 //! Currently the only analysis is the verification order: dependencies are
-//! scheduled before dependents, ties break in program order, and methods
-//! (always sinks) fall out last. Programs whose resources depend on each
-//! other circularly are rejected.
+//! scheduled before dependents, and methods (always sinks) fall out last.
+//! Programs whose resources depend on each other circularly are rejected.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
-
-use petgraph::Direction::{Incoming, Outgoing};
-use petgraph::algo::tarjan_scc;
-use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::algo::{tarjan_scc, toposort};
+use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
     Declaration, InstExt, InstKind, Method, MemberId, Program, PureInst, ResourceBody,
 };
+
+/// Dependency graph: node = schedulable `MemberId`, edge dependency ->
+/// dependent. Acyclic once produced by [`analyze`].
+pub type DepGraph = DiGraphMap<MemberId, ()>;
 
 /// A `Program` augmented with the results of static analyses. Extend with
 /// further analysis fields as they are added.
 #[derive(Debug, Clone)]
 pub struct AnalyzedProgram {
     pub program: Program,
-    /// Order in which schedulable members should be verified: every
-    /// dependency precedes its dependents, methods last.
-    pub order: Vec<MemberId>,
+    /// Acyclic dependency graph over schedulable members. The single source
+    /// of truth for verification scheduling: a linear order is obtained by
+    /// toposorting on demand; a parallel scheduler dispatches a node once all
+    /// its dependencies are done.
+    pub dep_graph: DepGraph,
 }
 
 #[derive(Debug)]
@@ -46,87 +47,82 @@ impl std::fmt::Display for AnalysisError {
 
 /// Run all analyses over `program`, producing an [`AnalyzedProgram`].
 pub fn analyze(program: Program) -> Result<AnalyzedProgram, AnalysisError> {
-    let order = verification_order(&program)?;
-    Ok(AnalyzedProgram { program, order })
+    let dep_graph = build_dep_graph(&program);
+    // Toposort purely to validate acyclicity; the order itself is discarded
+    // (consumers derive their own on demand).
+    if toposort(&dep_graph, None).is_err() {
+        return Err(cycle_error(&program, &dep_graph));
+    }
+    dump_callgraph(&dep_graph, &program);
+    Ok(AnalyzedProgram { program, dep_graph })
 }
 
-/// Decide the order in which `program`'s declarations should be verified.
-///
-/// Returns the schedulable members (`Resource | Function | Method`) in an
-/// order where every dependency precedes its dependents, with `MemberId`
-/// (program order) as a deterministic tiebreak. Non-schedulable
-/// declarations (domains, ADTs) are omitted. Returns
-/// [`AnalysisError::CircularDependency`] if the dependency graph has a cycle.
-fn verification_order(program: &Program) -> Result<Vec<MemberId>, AnalysisError> {
-    let mut graph: DiGraph<MemberId, ()> = DiGraph::new();
-    let mut node_of: HashMap<MemberId, NodeIndex> = HashMap::new();
+/// Build the dependency graph over `program`'s schedulable members
+/// (`Resource | Function | Method`). Edges run dependency -> dependent;
+/// references to non-schedulable declarations (domains, ADTs) are dropped.
+fn build_dep_graph(program: &Program) -> DepGraph {
+    let mut graph = DepGraph::new();
 
     // One node per schedulable declaration.
     for (id, decl) in program.decls.iter_enumerated() {
         if is_schedulable(decl) {
-            let n = graph.add_node(id);
-            node_of.insert(id, n);
+            graph.add_node(id);
         }
     }
 
     // Edges: dependency -> dependent. Skip references to non-schedulable
-    // declarations (e.g. `Type::Domain`).
+    // declarations (which are not nodes).
     let mut deps = Vec::new();
     for (id, decl) in program.decls.iter_enumerated() {
-        let Some(&dependent) = node_of.get(&id) else {
+        if !graph.contains_node(id) {
             continue;
-        };
+        }
         deps.clear();
         decl_deps(decl, &mut deps);
-        for dep in &deps {
-            if let Some(&dependency) = node_of.get(dep) {
-                graph.add_edge(dependency, dependent, ());
+        for &dep in &deps {
+            if graph.contains_node(dep) {
+                graph.add_edge(dep, id, ());
             }
         }
     }
 
-    kahn(&graph).ok_or_else(|| cycle_error(program, &graph))
+    graph
 }
 
-/// Kahn's algorithm with a program-order tiebreak. Returns `None` if the
-/// graph contains a cycle (fewer nodes emitted than present).
-fn kahn(graph: &DiGraph<MemberId, ()>) -> Option<Vec<MemberId>> {
-    // Indegree = number of unverified dependencies (incoming edges).
-    let mut indegree: HashMap<NodeIndex, usize> = graph
-        .node_indices()
-        .map(|n| (n, graph.neighbors_directed(n, Incoming).count()))
-        .collect();
+/// Env-gated (`VIPER_DOT`) dump of the dependency graph to
+/// `log_dir()/callgraph.dot` for debugging. Node labels are member names;
+/// edges are unlabeled.
+fn dump_callgraph(graph: &DepGraph, program: &Program) {
+    use petgraph::dot::{Config, Dot};
 
-    // Min-heap on the member id keeps the ready set in program order.
-    let mut ready: BinaryHeap<Reverse<(MemberId, NodeIndex)>> = graph
-        .node_indices()
-        .filter(|n| indegree[n] == 0)
-        .map(|n| Reverse((graph[n], n)))
-        .collect();
-
-    let mut order = Vec::with_capacity(graph.node_count());
-    while let Some(Reverse((id, n))) = ready.pop() {
-        order.push(id);
-        for succ in graph.neighbors_directed(n, Outgoing) {
-            let d = indegree.get_mut(&succ).unwrap();
-            *d -= 1;
-            if *d == 0 {
-                ready.push(Reverse((graph[succ], succ)));
-            }
-        }
+    if std::env::var("VIPER_DOT").is_err() {
+        return;
     }
-
-    (order.len() == graph.node_count()).then_some(order)
+    let edge_attr = |_, _| String::new();
+    let node_attr =
+        |_, (id, _): (MemberId, &MemberId)| format!("label = \"{}\"", program.interner.resolve(&id));
+    let dot = Dot::with_attr_getters(
+        graph,
+        &[Config::EdgeNoLabel, Config::NodeNoLabel],
+        &edge_attr,
+        &node_attr,
+    );
+    let dir = crate::util::log_dir();
+    let path = format!("{dir}/callgraph.dot");
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, format!("{dot:?}")))
+    {
+        eprintln!("failed to write {path}: {e}");
+    }
 }
 
 /// Build a `CircularDependency` error naming the members of a cycle.
-fn cycle_error(program: &Program, graph: &DiGraph<MemberId, ()>) -> AnalysisError {
+fn cycle_error(program: &Program, graph: &DepGraph) -> AnalysisError {
     let mut names = Vec::new();
     for scc in tarjan_scc(graph) {
         let cyclic = scc.len() > 1 || graph.contains_edge(scc[0], scc[0]);
         if cyclic {
-            for n in scc {
-                names.push(program.interner.resolve(&graph[n]).to_string());
+            for id in scc {
+                names.push(program.interner.resolve(&id).to_string());
             }
         }
     }
@@ -190,6 +186,7 @@ mod tests {
         HeapVal, Inst, InstKind, MethodInst, PathConds, Resource, ResourceCall,
     };
     use lasso::Rodeo;
+    use std::collections::HashSet;
     use typed_index_collections::TiVec;
 
     fn resource_requiring(req: Option<MemberId>) -> Declaration {
@@ -258,12 +255,19 @@ mod tests {
             ],
         );
         let analyzed = analyze(prog).expect("acyclic");
-        assert_eq!(analyzed.order, vec![c, b, a, MemberId(3)]);
+        let m = MemberId(3);
+        // Linear chain → unique topo order.
+        let order = toposort(&analyzed.dep_graph, None).expect("acyclic");
+        assert_eq!(order, vec![c, b, a, m]);
+        // Stored graph carries the dependency edges.
+        assert!(analyzed.dep_graph.contains_edge(c, b));
+        assert!(analyzed.dep_graph.contains_edge(b, a));
+        assert!(analyzed.dep_graph.contains_edge(a, m));
     }
 
     #[test]
-    fn independent_nodes_keep_program_order() {
-        // Three independent resources: order is just program order.
+    fn independent_nodes_all_scheduled() {
+        // Three independent resources: all scheduled, order unconstrained.
         let prog = program(
             &["A", "B", "C"],
             vec![
@@ -273,6 +277,10 @@ mod tests {
             ],
         );
         let analyzed = analyze(prog).expect("acyclic");
-        assert_eq!(analyzed.order, vec![MemberId(0), MemberId(1), MemberId(2)]);
+        let scheduled: HashSet<MemberId> = analyzed.dep_graph.nodes().collect();
+        assert_eq!(
+            scheduled,
+            HashSet::from([MemberId(0), MemberId(1), MemberId(2)])
+        );
     }
 }

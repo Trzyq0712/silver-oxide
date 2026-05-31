@@ -17,7 +17,7 @@ pub use heap::{Acc, HeapInst, HeapVal};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::Adt;
-pub use analyze::{AnalysisError, AnalyzedProgram, analyze};
+pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
 pub use function::{Function, FunctionCall};
 pub use inst::{Bumps, Inst, InstContext, InstKind, PathConds, Polarity, UsesPc};
