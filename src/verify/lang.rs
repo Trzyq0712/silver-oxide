@@ -1,32 +1,27 @@
 use egg::*;
-use num::{BigInt, BigRational};
 use std::fmt::{Display, Formatter};
 
 use crate::vmir::BinOp;
+use crate::vmir::Literal;
 use crate::vmir::MemberId;
+use crate::vmir::Type; // Ensure Type is in scope
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
-    Fresh(egg::Symbol),
-    Null,
-    Bool(bool),
-    Int(BigInt),
-    Real(BigRational),
-    Binary(BinOp, [Id; 2]),
-    Ternary([Id; 3]),
-    FuncApp(MemberId, Box<[Id]>),
+    Fresh(u32, Type),
+    Lit(Literal),
+    Binary(BinOp, Type, [Id; 2]),
+    Ite(Type, [Id; 3]),
+    FuncApp(MemberId, Type, Box<[Id]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Discriminant {
-    Fresh(egg::Symbol),
-    Null,
-    Int(BigInt),
-    Real(BigRational),
-    Bool(bool),
-    Binary(BinOp),
-    Ternary,
-    FuncApp(MemberId),
+    Fresh(u32, Type),
+    Lit(Literal),
+    Binary(BinOp, Type),
+    Ite(Type),
+    FuncApp(MemberId, Type),
 }
 
 impl Language for Symbolic {
@@ -36,28 +31,24 @@ impl Language for Symbolic {
         use Discriminant as D;
         use Symbolic as S;
         match self {
-            S::Fresh(s) => D::Fresh(*s),
-            S::Null => D::Null,
-            S::Bool(b) => D::Bool(*b),
-            S::Int(i) => D::Int(i.clone()),
-            S::Real(r) => D::Real(r.clone()),
-            S::Binary(op, _) => D::Binary(*op),
-            S::Ternary(_) => D::Ternary,
-            S::FuncApp(id, _) => D::FuncApp(*id),
+            S::Fresh(s, ty) => D::Fresh(*s, ty.clone()),
+            S::Lit(l) => D::Lit(l.clone()),
+            S::Binary(op, ty, _) => D::Binary(*op, ty.clone()),
+            S::Ite(ty, _) => D::Ite(ty.clone()),
+            S::FuncApp(id, ty, _) => D::FuncApp(id.clone(), ty.clone()),
         }
     }
 
     fn matches(&self, other: &Self) -> bool {
         use Symbolic::*;
         match (self, other) {
-            (Null, Null) => true,
-            (Fresh(s1), Fresh(s2)) => s1 == s2,
-            (Int(i1), Int(i2)) => i1 == i2,
-            (Real(r1), Real(r2)) => r1 == r2,
-            (Bool(b1), Bool(b2)) => b1 == b2,
-            (Binary(op1, _), Binary(op2, _)) => op1 == op2,
-            (Ternary(_), Ternary(_)) => true,
-            (FuncApp(id1, args1), FuncApp(id2, args2)) => id1 == id2 && args1.len() == args2.len(),
+            (Fresh(s1, ty1), Fresh(s2, ty2)) => s1 == s2 && ty1 == ty2,
+            (Lit(l1), Lit(l2)) => l1 == l2,
+            (Binary(op1, ty1, _), Binary(op2, ty2, _)) => op1 == op2 && ty1 == ty2,
+            (Ite(ty1, _), Ite(ty2, _)) => ty1 == ty2,
+            (FuncApp(id1, ty1, args1), FuncApp(id2, ty2, args2)) => {
+                id1 == id2 && ty1 == ty2 && args1.len() == args2.len()
+            }
             _ => false,
         }
     }
@@ -65,20 +56,20 @@ impl Language for Symbolic {
     fn children(&self) -> &[Id] {
         use Symbolic::*;
         match self {
-            Fresh(_) | Null | Bool(_) | Int(_) | Real(_) => &[],
-            Binary(_, ids) => ids,
-            Ternary(ids) => ids,
-            FuncApp(_, ids) => ids,
+            Fresh(..) | Lit(..) => &[],
+            Binary(_, _, ids) => ids,
+            Ite(_, ids) => ids,
+            FuncApp(_, _, ids) => ids,
         }
     }
 
     fn children_mut(&mut self) -> &mut [Id] {
         use Symbolic::*;
         match self {
-            Fresh(_) | Null | Bool(_) | Int(_) | Real(_) => &mut [],
-            Binary(_, ids) => ids,
-            Ternary(ids) => ids,
-            FuncApp(_, ids) => ids,
+            Fresh(..) | Lit(..) => &mut [],
+            Binary(_, _, ids) => ids,
+            Ite(_, ids) => ids,
+            FuncApp(_, _, ids) => ids,
         }
     }
 }
@@ -86,25 +77,11 @@ impl Language for Symbolic {
 impl Display for Symbolic {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Symbolic::Fresh(sym) => write!(f, "{sym}"),
-            Symbolic::Null => write!(f, "null"),
-            Symbolic::Int(i) => write!(f, "{i}"),
-            Symbolic::Real(r) => write!(f, "{r}"),
-            Symbolic::Bool(b) => write!(f, "{b}"),
-            Symbolic::Binary(op, [lhs, rhs]) => write!(f, "({lhs:?} {op} {rhs:?})"),
-            Symbolic::Ternary([cond, then_, else_]) => {
-                write!(f, "({cond:?} ? {then_:?} : {else_:?})")
-            }
-            Symbolic::FuncApp(id, args) => {
-                write!(f, "f{}(", id.0)?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg:?}")?;
-                }
-                write!(f, ")")
-            }
+            Symbolic::Fresh(id, ty) => write!(f, "{id}#{ty}"),
+            Symbolic::Lit(l) => write!(f, "{l}"),
+            Symbolic::Binary(op, _, _) => write!(f, "{op}"),
+            Symbolic::Ite(_, _) => write!(f, "ITE"),
+            Symbolic::FuncApp(id, _, _) => write!(f, "{}(..)", id.0),
         }
     }
 }

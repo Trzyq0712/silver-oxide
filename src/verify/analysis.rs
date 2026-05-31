@@ -1,98 +1,155 @@
-//! Constant-folding analysis for the `Symbolic` e-graph.
-//!
-//! Each e-class carries an `Option<ConstVal>`. When all children of an
-//! arithmetic / boolean / comparison node have known constants, the
-//! analysis computes the result and unions the e-class with the literal
-//! node for that constant (via `modify`). This turns sequences like
-//! `1 - 1` into `0`, `(1 - 1) - 1` into `-1`, etc., automatically — the
-//! heap-permission code can then read the folded value via the usual
-//! e-class scan.
-
 use egg::{Analysis, DidMerge, EGraph, Id};
-use num::{BigInt, BigRational, Zero};
+use num::BigRational;
 
 use crate::verify::lang::Symbolic;
-use crate::vmir::BinOp;
+use crate::vmir::{BinOp, Literal, Type};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ConstVal {
-    Bool(bool),
-    Int(BigInt),
-    Real(BigRational),
-    Null,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Data {
+    pub ty: Type,
+    pub value: Option<Literal>,
 }
 
 #[derive(Default, Debug, Clone)]
 pub struct ConstFold;
 
 impl Analysis<Symbolic> for ConstFold {
-    type Data = Option<ConstVal>;
+    type Data = Data;
 
     fn make(egraph: &mut EGraph<Symbolic, Self>, enode: &Symbolic, _id: Id) -> Self::Data {
         match enode {
-            Symbolic::Bool(b) => Some(ConstVal::Bool(*b)),
-            Symbolic::Int(i) => Some(ConstVal::Int(i.clone())),
-            Symbolic::Real(r) => Some(ConstVal::Real(r.clone())),
-            Symbolic::Null => Some(ConstVal::Null),
-            Symbolic::Binary(op, [l, r]) => {
-                let lc = egraph[*l].data.clone()?;
-                let rc = egraph[*r].data.clone()?;
-                eval_binary(*op, &lc, &rc)
-            }
-            Symbolic::Ternary([c, t, e]) => match egraph[*c].data.as_ref()? {
-                ConstVal::Bool(true) => egraph[*t].data.clone(),
-                ConstVal::Bool(false) => egraph[*e].data.clone(),
-                _ => None,
+            Symbolic::Lit(lit) => Data {
+                ty: match lit {
+                    Literal::Null => Type::Ref,
+                    Literal::Bool(_) => Type::Bool,
+                    Literal::Int(_) => Type::Int,
+                    Literal::Real(_) => Type::Real,
+                },
+                value: Some(lit.clone()),
             },
-            Symbolic::Fresh(_) | Symbolic::FuncApp(_, _) => None,
+
+            Symbolic::Fresh(_, ty) | Symbolic::FuncApp(_, ty, _) => Data {
+                ty: ty.clone(),
+                value: None,
+            },
+
+            Symbolic::Binary(op, ty, [l, r]) => {
+                let lv = &egraph[*l].data.value;
+                let rv = &egraph[*r].data.value;
+
+                let value = match (lv, rv) {
+                    (Some(lv), Some(rv)) => Some(eval_binary(*op, ty, lv, rv)),
+                    _ => None,
+                };
+
+                Data {
+                    ty: ty.clone(),
+                    value,
+                }
+            }
+
+            Symbolic::Ite(ty, [c, t, e]) => {
+                let c_val = &egraph[*c].data.value;
+
+                let value = match c_val {
+                    Some(Literal::Bool(true)) => egraph[*t].data.value.clone(),
+                    Some(Literal::Bool(false)) => egraph[*e].data.value.clone(),
+                    Some(_) => unreachable!("Condition of ITE must be a boolean literal"),
+                    _ => None,
+                };
+
+                Data {
+                    ty: ty.clone(),
+                    value,
+                }
+            }
         }
     }
 
     fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
-        match (a.as_ref(), b.as_ref()) {
-            (Some(va), Some(vb)) if va == vb => DidMerge(false, false),
-            (None, Some(_)) => {
-                *a = b;
-                DidMerge(true, false)
-            }
-            (Some(_), None) => DidMerge(false, true),
-            (None, None) => DidMerge(false, false),
-            // Conflicting constants. Either an inconsistency in the
-            // program or an over-eager union. Keep `a` and report mutation
-            // of `b` to satisfy egg's invariant.
-            _ => DidMerge(false, true),
+        let mut did_merge = DidMerge(false, false);
+
+        if a.ty != b.ty {
+            unreachable!("Type mismatch during merge");
         }
+
+        match (&a.value, &b.value) {
+            (Some(va), Some(vb)) if va == vb => {} // Already equal
+            (None, Some(_)) => {
+                a.value = b.value.clone();
+                did_merge.0 = true;
+            }
+            (Some(_), None) => {
+                did_merge.1 = true;
+            }
+            (None, None) => {}
+            _ => unreachable!(
+                "Conflicting values during merge: {:?} vs {:?}",
+                a.value, b.value
+            ),
+        }
+
+        did_merge
     }
 
     fn modify(egraph: &mut EGraph<Symbolic, Self>, id: Id) {
-        let Some(cv) = egraph[id].data.clone() else { return };
-        let lit = match cv {
-            ConstVal::Bool(b) => Symbolic::Bool(b),
-            ConstVal::Int(i) => Symbolic::Int(i),
-            ConstVal::Real(r) => Symbolic::Real(r),
-            ConstVal::Null => Symbolic::Null,
-        };
-        let lit_id = egraph.add(lit);
-        egraph.union(id, lit_id);
+        let data = egraph[id].data.clone();
+
+        if let Some(lit) = data.value {
+            let lit_node = Symbolic::Lit(lit);
+            let lit_id = egraph.add(lit_node);
+            egraph.union(id, lit_id);
+        }
     }
 }
 
-fn eval_binary(op: BinOp, l: &ConstVal, r: &ConstVal) -> Option<ConstVal> {
-    use ConstVal::*;
-    match (op, l, r) {
-        (BinOp::Plus, Int(a), Int(b)) => Some(Int(a + b)),
-        (BinOp::Plus, Real(a), Real(b)) => Some(Real(a + b)),
-        (BinOp::Minus, Int(a), Int(b)) => Some(Int(a - b)),
-        (BinOp::Minus, Real(a), Real(b)) => Some(Real(a - b)),
-        (BinOp::Mult, Int(a), Int(b)) => Some(Int(a * b)),
-        (BinOp::Mult, Real(a), Real(b)) => Some(Real(a * b)),
-        (BinOp::Div, Int(a), Int(b)) if !b.is_zero() => Some(Int(a / b)),
-        (BinOp::Div, Real(a), Real(b)) if !b.is_zero() => Some(Real(a / b)),
-        (BinOp::Mod, Int(a), Int(b)) if !b.is_zero() => Some(Int(a % b)),
-        (BinOp::Eq, a, b) => Some(Bool(a == b)),
-        (BinOp::Lt, Int(a), Int(b)) => Some(Bool(a < b)),
-        (BinOp::Lt, Real(a), Real(b)) => Some(Bool(a < b)),
-        _ => None,
+pub fn eval_binary(op: BinOp, ty: &Type, l: &Literal, r: &Literal) -> Literal {
+    match op {
+        BinOp::Plus => match (l, r) {
+            (Literal::Int(a), Literal::Int(b)) => Literal::Int(a + b),
+            (Literal::Real(a), Literal::Real(b)) => Literal::Real(a + b),
+            _ => unreachable!("Mixed types or invalid operands for Plus"),
+        },
+
+        BinOp::Minus => match (l, r) {
+            (Literal::Int(a), Literal::Int(b)) => Literal::Int(a - b),
+            (Literal::Real(a), Literal::Real(b)) => Literal::Real(a - b),
+            _ => unreachable!("Mixed types or invalid operands for Minus"),
+        },
+
+        BinOp::Mult => match (l, r) {
+            (Literal::Int(a), Literal::Int(b)) => Literal::Int(a * b),
+            (Literal::Real(a), Literal::Real(b)) => Literal::Real(a * b),
+            // Promotion is allowed for Mult
+            (Literal::Int(b), Literal::Real(a)) => Literal::Real(BigRational::from(a.clone()) * b),
+            (Literal::Real(a), Literal::Int(b)) => Literal::Real(a * BigRational::from(b.clone())),
+            _ => unreachable!("Invalid operands for Mult"),
+        },
+
+        BinOp::Div => match ty {
+            // Target type dictates the division mode
+            Type::Real => {
+                let a = match l {
+                    Literal::Int(i) => BigRational::from(i.clone()),
+                    Literal::Real(r) => r.clone(),
+                    _ => unreachable!("Invalid left operand for Real division"),
+                };
+                let b = match r {
+                    Literal::Int(i) => BigRational::from(i.clone()),
+                    Literal::Real(r) => r.clone(),
+                    _ => unreachable!("Invalid right operand for Real division"),
+                };
+                Literal::Real(a / b)
+            }
+
+            Type::Int => match (l, r) {
+                (Literal::Int(a), Literal::Int(b)) => Literal::Int(a / b),
+                _ => unreachable!("Int division requires Int operands"),
+            },
+
+            _ => unreachable!("Division result must be of type Int or Real"),
+        },
+
+        _ => unimplemented!("Operator {:?} is not implemented yet", op),
     }
 }
-

@@ -6,7 +6,7 @@ use crate::{
     },
     vmir::{
         self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstExt, InstKind,
-        Literal, Method, MethodInst, PureInst, ResourceCall, ResourceInst, Val,
+        Literal, Method, MethodInst, PureInst, ResourceCall, ResourceInst, Type, Val,
     },
 };
 
@@ -55,7 +55,7 @@ impl EvalState {
     fn get_val(&self, ctx: &mut VerifyContext<'_>, val: &Val) -> egg::Id {
         match val {
             Val::Temp(n) => self.vals[*n],
-            Val::Literal(lit) => ctx.add(lit_to_sym(lit)),
+            Val::Literal(lit) => ctx.add(Symbolic::Lit(lit.clone())),
         }
     }
 
@@ -78,26 +78,17 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
     }
 }
 
-fn lit_to_sym(lit: &Literal) -> Symbolic {
-    match lit {
-        Literal::Bool(b) => Symbolic::Bool(*b),
-        Literal::Int(i) => Symbolic::Int(i.clone()),
-        Literal::Real(r) => Symbolic::Real(r.clone()),
-        Literal::Null => Symbolic::Null,
-    }
-}
-
 fn zero_real(ctx: &mut VerifyContext<'_>) -> egg::Id {
-    ctx.add(Symbolic::Real(num::BigInt::from(0).into()))
+    ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())))
 }
 
-/// Best-effort literal extraction: scan the e-class for a `Symbolic::Real`
+/// Best-effort literal extraction: scan the e-class for a real literal
 /// node. Returns the first one found. Used by heap arithmetic to fold
 /// concrete-perm operations and detect zero/negative permission.
 fn extract_real_literal(ctx: &VerifyContext<'_>, id: egg::Id) -> Option<num::BigRational> {
     let canon = ctx.egraph.find(id);
     for node in &ctx.egraph[canon].nodes {
-        if let Symbolic::Real(r) = node {
+        if let Symbolic::Lit(Literal::Real(r)) = node {
             return Some(r.clone());
         }
     }
@@ -110,6 +101,7 @@ fn extract_real_literal(ctx: &VerifyContext<'_>, id: egg::Id) -> Option<num::Big
 fn eval_pure_inst<P, F>(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
+    ty: &Type,
     pi: &PureInst<P>,
     eval_ext: F,
 ) -> egg::Id
@@ -117,27 +109,27 @@ where
     F: FnOnce(&mut VerifyContext<'_>, &EvalState, &P) -> egg::Id,
 {
     match pi {
-        PureInst::Fresh => ctx.fresh_symbolic_value("fresh"),
+        PureInst::Fresh => ctx.fresh_symbolic_value(ty.clone()),
         PureInst::Binary(op, l, r) => {
             let lhs = state.get_val(ctx, l);
             let rhs = state.get_val(ctx, r);
-            ctx.add(Symbolic::Binary(*op, [lhs, rhs]))
+            ctx.add(Symbolic::Binary(*op, ty.clone(), [lhs, rhs]))
         }
         PureInst::Ternary(c, t, e) => {
             let cond = state.get_val(ctx, c);
             let then_ = state.get_val(ctx, t);
             let else_ = state.get_val(ctx, e);
-            ctx.add(Symbolic::Ternary([cond, then_, else_]))
+            ctx.add(Symbolic::Ite(ty.clone(), [cond, then_, else_]))
         }
         PureInst::Deref(hv, loc) => {
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
             heap.value_at(addr)
-                .unwrap_or_else(|| ctx.fresh_symbolic_value("deref"))
+                .unwrap_or_else(|| ctx.fresh_symbolic_value(ty.clone()))
         }
         PureInst::FunctionCall(_heap, fc) => {
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add(Symbolic::FuncApp(fc.function, args.into()))
+            ctx.add(Symbolic::FuncApp(fc.function, ty.clone(), args.into()))
         }
         PureInst::Ext(ext) => eval_ext(ctx, state, ext),
     }
@@ -162,7 +154,8 @@ fn eval_method_pure_ext(
 fn heap_acc(ctx: &mut VerifyContext<'_>, acc: &Acc, state: &EvalState) -> Heap {
     let addr = state.get_val(ctx, &acc.loc);
     let perm = state.get_val(ctx, &acc.perm);
-    let value = ctx.fresh_symbolic_value("snap");
+    // TODO: thread the snapshot's actual value type once `Acc` carries it.
+    let value = ctx.fresh_symbolic_value(Type::Int);
     Heap::empty().with_chunk(addr, Chunk::new(perm, value))
 }
 
@@ -178,7 +171,11 @@ fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
     for (addr, chunk) in entries {
         let canon = ctx.egraph.find(addr);
         if let Some(existing) = out.chunk(canon).cloned() {
-            let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [existing.perm, chunk.perm]));
+            let perm = ctx.add(Symbolic::Binary(
+                BinOp::Plus,
+                Type::Real,
+                [existing.perm, chunk.perm],
+            ));
             ctx.egraph.union(existing.value, chunk.value);
             out = out.with_chunk(canon, Chunk::new(perm, existing.value));
         } else {
@@ -201,7 +198,11 @@ fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
         .collect();
     for (addr, chunk2) in entries {
         if let Some(existing) = out.chunk(addr).cloned() {
-            let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [existing.perm, chunk2.perm]));
+            let perm = ctx.add(Symbolic::Binary(
+                BinOp::Plus,
+                Type::Real,
+                [existing.perm, chunk2.perm],
+            ));
             ctx.egraph.union(existing.value, chunk2.value);
             out = out.with_chunk(addr, Chunk::new(perm, existing.value));
         } else {
@@ -242,12 +243,16 @@ fn heap_subtract(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Result<He
                 if diff == zero {
                     out = out.without_chunk(addr);
                 } else {
-                    let perm = ctx.add(Symbolic::Real(diff));
+                    let perm = ctx.add(Symbolic::Lit(Literal::Real(diff)));
                     out = out.with_chunk(addr, Chunk::new(perm, existing.value));
                 }
             }
             _ => {
-                let perm = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+                let perm = ctx.add(Symbolic::Binary(
+                    BinOp::Minus,
+                    Type::Real,
+                    [existing.perm, chunk2.perm],
+                ));
                 ctx.egraph.union(existing.value, chunk2.value);
                 out = out.with_chunk(addr, Chunk::new(perm, existing.value));
             }
@@ -304,8 +309,8 @@ fn eval_resource_body_inst(
     inst: &ResourceInst,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
-        InstKind::Pure(_ty, pi) => {
-            let id = eval_pure_inst(ctx, state, pi, |_, _, never| match *never {});
+        InstKind::Pure(ty, pi) => {
+            let id = eval_pure_inst(ctx, state, ty, pi, |_, _, never| match *never {});
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
@@ -363,8 +368,8 @@ fn eval_method_inst(
     inst: &MethodInst,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
-        InstKind::Pure(_ty, pi) => {
-            let id = eval_pure_inst(ctx, state, pi, eval_method_pure_ext);
+        InstKind::Pure(ty, pi) => {
+            let id = eval_pure_inst(ctx, state, ty, pi, eval_method_pure_ext);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
@@ -374,13 +379,13 @@ fn eval_method_inst(
         InstKind::Ext(ext) => match ext {
             InstExt::Assume(val) => {
                 let id = state.get_val(ctx, val);
-                let true_ = ctx.add(Symbolic::Bool(true));
+                let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
                 ctx.egraph.union(id, true_);
             }
             InstExt::Assert(val) => {
                 let id = state.get_val(ctx, val);
                 ctx.egraph.rebuild();
-                let true_ = ctx.add(Symbolic::Bool(true));
+                let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
                 if ctx.egraph.find(id) != ctx.egraph.find(true_) {
                     return Err(VerifyError::AssertionFailed);
                 }
@@ -413,12 +418,12 @@ pub fn verify_method(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::viper::{
-        GlobalsCollector, IdentCollector, inline_macros, disambiguate, viper_parser,
-        typecheck_program, walk::AstWalkable,
-    };
     use crate::translate;
     use crate::verify::lang::Symbolic;
+    use crate::viper::{
+        GlobalsCollector, IdentCollector, disambiguate, inline_macros, typecheck_program,
+        viper_parser, walk::AstWalkable,
+    };
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
         VerifyContext::new(interner)
@@ -443,12 +448,12 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
-        let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
-        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
-        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
-        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let b = ctx.add(Symbolic::Fresh(1, Type::Ref));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let p2 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(b, Chunk::new(p2, v2));
@@ -461,7 +466,7 @@ mod tests {
         let canon = ctx.egraph.find(a);
         let chunk = merged.chunk(canon).expect("merged chunk missing");
 
-        let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p1, p2]));
+        let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [p1, p2]));
         ctx.egraph.rebuild();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
@@ -473,12 +478,12 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
-        let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
-        let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
-        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
-        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let b = ctx.add(Symbolic::Fresh(1, Type::Ref));
+        let p2 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p2, v1));
         let h2 = Heap::empty().with_chunk(b, Chunk::new(p1, v2));
@@ -490,7 +495,7 @@ mod tests {
 
         let canon = ctx.egraph.find(a);
         let chunk = result.chunk(canon).expect("result chunk missing");
-        let expected_perm = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
+        let expected_perm = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         ctx.egraph.rebuild();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
@@ -501,10 +506,10 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
-        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
-        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v2));
@@ -523,11 +528,11 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
-        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let p2 = ctx.add(Symbolic::Real(num::BigInt::from(2).into()));
-        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
-        let v2 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v2")));
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let p2 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p2, v2));
@@ -543,10 +548,10 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(egg::Symbol::from("a")));
-        let b = ctx.add(Symbolic::Fresh(egg::Symbol::from("b")));
-        let p1 = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let v1 = ctx.add(Symbolic::Fresh(egg::Symbol::from("v1")));
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let b = ctx.add(Symbolic::Fresh(1, Type::Ref));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
 
         let h1 = Heap::empty();
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
@@ -563,11 +568,11 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let one = ctx.add(Symbolic::Real(num::BigInt::from(1).into()));
-        let diff = ctx.add(Symbolic::Binary(BinOp::Minus, [one, one]));
+        let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let diff = ctx.add(Symbolic::Binary(BinOp::Minus, Type::Real, [one, one]));
         ctx.egraph.rebuild();
 
-        let zero = ctx.add(Symbolic::Real(num::BigInt::from(0).into()));
+        let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         assert_eq!(ctx.egraph.find(diff), ctx.egraph.find(zero));
     }
 

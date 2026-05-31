@@ -1,6 +1,6 @@
 use crate::{
     verify::{analysis::ConstFold, lang::Symbolic},
-    vmir::MemberId,
+    vmir::{MemberId, Type},
 };
 use lasso::Rodeo;
 
@@ -23,9 +23,9 @@ impl<'a> VerifyContext<'a> {
         self.egraph.add(node)
     }
 
-    pub(crate) fn fresh_symbolic_value(&mut self, prefix: &str) -> egg::Id {
-        let symbol = egg::Symbol::from(format!("{prefix}#{}", self.fresh_counter));
+    pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
+        let id = self.fresh_counter as u32;
         self.fresh_counter += 1;
-        self.egraph.add(Symbolic::Fresh(symbol))
+        self.egraph.add(Symbolic::Fresh(id, ty))
     }
 }
