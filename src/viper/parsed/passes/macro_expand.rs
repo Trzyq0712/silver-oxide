@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt};
 
 use lasso::Spur;
 
-use crate::silver::{
+use crate::viper::{
     AssignLhs, AssignRhs, Define, ExpCallKind, ExpKind, ExpOrBlock, Program, Statement,
     StmtCallKind,
     interner::Interner,
@@ -69,7 +69,7 @@ pub fn inline_macros(
 
     // Extract and remove all Define declarations from the AST
     program.0.retain(|decl| {
-        if let crate::silver::Declaration::Define(define) = decl {
+        if let crate::viper::Declaration::Define(define) = decl {
             macro_dict.insert(define.name.0.id(), define.clone());
             false // Remove from AST
         } else {
@@ -141,7 +141,7 @@ impl<'i> MacroInliner<'i> {
     fn expand_stmt_macro(
         &mut self,
         lhs: &[AssignLhs],
-        call: &mut crate::silver::Call<StmtCallKind>,
+        call: &mut crate::viper::Call<StmtCallKind>,
     ) -> Option<Vec<Statement>> {
         let macro_id = call.name.id();
 
@@ -198,7 +198,7 @@ impl<'i> MacroInliner<'i> {
 
 impl<'i> AstWalkerMut<'_> for MacroInliner<'i> {
     // NEW: Intercept blocks to splice expanded macros directly into the statement list
-    fn walk_mut_block(&mut self, block: &mut crate::silver::StmtBlock) {
+    fn walk_mut_block(&mut self, block: &mut crate::viper::StmtBlock) {
         let mut new_stmts = Vec::new();
 
         for mut stmt in std::mem::take(&mut block.0) {
@@ -236,7 +236,7 @@ impl<'i> AstWalkerMut<'_> for MacroInliner<'i> {
             && call.kind == Some(StmtCallKind::Macro)
         {
             if let Some(expanded_stmts) = self.expand_stmt_macro(lhs, call) {
-                *stmt = Statement::Block(crate::silver::Block(expanded_stmts));
+                *stmt = Statement::Block(crate::viper::Block(expanded_stmts));
             }
         }
     }

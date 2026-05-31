@@ -20,7 +20,7 @@
 //! All in-place rewrites happen under `walk_mut_*`; errors are collected
 //! and reported in bulk.
 
-use crate::silver::{
+use crate::viper::{
     AssignRhs, Call, Exp, ExpCallKind, ExpKind, Globals, StmtCallKind,
     globals::GlobalKind,
     interner::Interner,
@@ -83,7 +83,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
             && let ExpKind::Ident(name) = &*exp.kind
             && Some(GlobalKind::StmtMacro) == self.globals.resolve(name.id()).map(|sym| sym.kind())
         {
-            *rhs = AssignRhs::Call(crate::silver::Call {
+            *rhs = AssignRhs::Call(crate::viper::Call {
                 kind: None, // Will be correctly tagged below
                 name: name.clone(),
                 args: Vec::new(),
@@ -116,7 +116,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                     | GlobalKind::Predicate
                     | GlobalKind::ExpMacro
                     | GlobalKind::AdtConstructor => {
-                        let mut new_call = crate::silver::Call {
+                        let mut new_call = crate::viper::Call {
                             kind: None,
                             name: call.name.clone(),
                             args: std::mem::take(&mut call.args),
@@ -199,7 +199,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                 if let Some(sym) = self.globals.resolve(id)
                     && sym.kind() == GlobalKind::ExpMacro
                 {
-                    *exp = ExpKind::Call(crate::silver::Call {
+                    *exp = ExpKind::Call(crate::viper::Call {
                         kind: Some(ExpCallKind::Macro),
                         name: name.clone(),
                         args: Vec::new(),
@@ -239,7 +239,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
 /// non-statement assignment RHSs, desugar macros, and validate field
 /// accesses.
 pub fn disambiguate(
-    program: &mut crate::silver::Program,
+    program: &mut crate::viper::Program,
     interner: &Interner,
     globals: &Globals,
 ) -> Result<(), Vec<DisambiguationError>> {

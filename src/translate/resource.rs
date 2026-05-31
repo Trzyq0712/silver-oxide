@@ -1,10 +1,10 @@
-//! Lower `final_ast::SpatialExp` into a `vmir::ResourceBody`.
+//! Lower `typed::SpatialExp` into a `vmir::ResourceBody`.
 
 use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::silver::final_ast;
+use crate::viper::typed;
 use crate::translate::pure_exp::{self, PureExt, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
@@ -19,7 +19,7 @@ use crate::vmir::{
 pub(crate) fn lower_spatial_never(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    exp: &final_ast::SpatialExp<!>,
+    exp: &typed::SpatialExp<!>,
     val_base: usize,
     initial_heap: HeapVal,
     heap_base: usize,
@@ -35,14 +35,14 @@ pub(crate) fn lower_spatial_never(
 pub(crate) fn lower_spatial_ensures(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    exp: &final_ast::SpatialExp<final_ast::MethodEnsuresExt>,
+    exp: &typed::SpatialExp<typed::MethodEnsuresExt>,
     val_base: usize,
     initial_heap: HeapVal,
     heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
     let (h, bv) =
-        lower_spatial::<final_ast::MethodEnsuresExt>(b, env, &mut sink, initial_heap, exp)?;
+        lower_spatial::<typed::MethodEnsuresExt>(b, env, &mut sink, initial_heap, exp)?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -61,9 +61,9 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<ResourceCtx>,
     heap: HeapVal,
-    exp: &final_ast::SpatialExp<Ext>,
+    exp: &typed::SpatialExp<Ext>,
 ) -> Result<(HeapVal, Option<Val>), TranslationError> {
-    use final_ast::SpatialExpKind as S;
+    use typed::SpatialExpKind as S;
     match &*exp.0 {
         S::Acc(res, perm) => {
             let delta = lower_acc(b, env, sink, heap, res, perm)?;
@@ -124,10 +124,10 @@ fn lower_acc<Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<ResourceCtx>,
     heap: HeapVal,
-    res: &final_ast::ResourceExp<Ext>,
-    perm: &final_ast::TypedPureExp<Ext>,
+    res: &typed::ResourceExp<Ext>,
+    perm: &typed::TypedPureExp<Ext>,
 ) -> Result<HeapVal, TranslationError> {
-    use final_ast::ResourceExpKind as R;
+    use typed::ResourceExpKind as R;
     let perm_val = pure_exp::lower(b, env, sink, heap, perm)?;
     match &*res.0 {
         R::Field(base, fname) => {

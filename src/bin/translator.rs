@@ -3,8 +3,8 @@
 //!
 //! Usage: `cargo run --bin translator -- cases/foo.vpr`
 
-use silver_oxide::silver::{
-    GlobalsCollector, IdentCollector, inline_macros, disambiguate, silver_parser,
+use silver_oxide::viper::{
+    GlobalsCollector, IdentCollector, inline_macros, disambiguate, viper_parser,
     typecheck_program, walk::AstWalkable,
 };
 use silver_oxide::translate;
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("usage: translator <file.vpr>")?;
     let input = fs::read_to_string(&file)?;
 
-    let mut program = silver_parser::sil_program(&input)?;
+    let mut program = viper_parser::vpr_program(&input)?;
 
     let mut ident_collector = IdentCollector::default();
     program.walk_mut(&mut ident_collector);

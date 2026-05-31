@@ -413,8 +413,8 @@ pub fn verify_method(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::silver::{
-        GlobalsCollector, IdentCollector, inline_macros, disambiguate, silver_parser,
+    use crate::viper::{
+        GlobalsCollector, IdentCollector, inline_macros, disambiguate, viper_parser,
         typecheck_program, walk::AstWalkable,
     };
     use crate::translate;
@@ -425,7 +425,7 @@ mod tests {
     }
 
     fn lower(input: &str) -> vmir::Program {
-        let mut program = silver_parser::sil_program(input).expect("parse");
+        let mut program = viper_parser::vpr_program(input).expect("parse");
         let mut ic = IdentCollector::default();
         program.walk_mut(&mut ic);
         let interner = ic.finalize();

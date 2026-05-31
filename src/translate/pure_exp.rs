@@ -1,10 +1,10 @@
-//! Lower `final_ast::TypedPureExp<Ext>` into VMIR `PureInst` chains.
+//! Lower `typed::TypedPureExp<Ext>` into VMIR `PureInst` chains.
 
 use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::silver::final_ast;
+use crate::viper::typed;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
     self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds,
@@ -70,9 +70,9 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
     heap: HeapVal,
-    exp: &final_ast::TypedPureExp<Ext>,
+    exp: &typed::TypedPureExp<Ext>,
 ) -> Result<Val, TranslationError> {
-    use final_ast::PureExpKind as P;
+    use typed::PureExpKind as P;
     let ty = lower_type(&exp.ty);
     match &*exp.exp {
         P::Ident(id) => env
@@ -84,13 +84,13 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
             let v = lower(b, env, sink, heap, x)?;
             match op {
                 // !v  =  v ? false : true
-                final_ast::UnOp::Not => Ok(sink.emit_pure(ty, PureInst::Ternary(v, FALSE, TRUE))),
+                typed::UnOp::Not => Ok(sink.emit_pure(ty, PureInst::Ternary(v, FALSE, TRUE))),
                 // -v  =  0 - v
-                final_ast::UnOp::Neg => Ok(sink.emit_pure(
+                typed::UnOp::Neg => Ok(sink.emit_pure(
                     ty.clone(),
                     PureInst::Binary(vmir::BinOp::Minus, zero_literal(&ty), v),
                 )),
-                final_ast::UnOp::Cardinality => Err(TranslationError::Unsupported("cardinality")),
+                typed::UnOp::Cardinality => Err(TranslationError::Unsupported("cardinality")),
             }
         }
         P::Binary(op, l, r) => lower_binary(b, env, sink, heap, ty, op, l, r),
@@ -134,11 +134,11 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
     sink: &mut Sink<C>,
     heap: HeapVal,
     ty: vmir::Type,
-    op: &final_ast::BinOp,
-    l: &final_ast::TypedPureExp<Ext>,
-    r: &final_ast::TypedPureExp<Ext>,
+    op: &typed::BinOp,
+    l: &typed::TypedPureExp<Ext>,
+    r: &typed::TypedPureExp<Ext>,
 ) -> Result<Val, TranslationError> {
-    use final_ast::BinOp as B;
+    use typed::BinOp as B;
     use vmir::BinOp as V;
     let lv = lower(b, env, sink, heap, l)?;
     let rv = lower(b, env, sink, heap, r)?;
@@ -187,13 +187,13 @@ pub(crate) fn zero_literal(ty: &vmir::Type) -> Val {
     }
 }
 
-pub(crate) fn lower_literal(lit: &final_ast::Literal) -> Result<Literal, TranslationError> {
+pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, TranslationError> {
     match lit {
-        final_ast::Literal::Bool(b) => Ok(Literal::Bool(*b)),
-        final_ast::Literal::Int(n) => Ok(Literal::Int(n.clone())),
-        final_ast::Literal::Real(r) => Ok(Literal::Real(r.clone())),
-        final_ast::Literal::Null => Ok(Literal::Null),
-        final_ast::Literal::Wildcard => Err(TranslationError::Unsupported("wildcard literal")),
+        typed::Literal::Bool(b) => Ok(Literal::Bool(*b)),
+        typed::Literal::Int(n) => Ok(Literal::Int(n.clone())),
+        typed::Literal::Real(r) => Ok(Literal::Real(r.clone())),
+        typed::Literal::Null => Ok(Literal::Null),
+        typed::Literal::Wildcard => Err(TranslationError::Unsupported("wildcard literal")),
     }
 }
 
@@ -219,7 +219,7 @@ impl PureExt for ! {
     }
 }
 
-impl PureExt for final_ast::MethodEnsuresExt {
+impl PureExt for typed::MethodEnsuresExt {
     fn lower_ext<C: InstContext>(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
@@ -230,7 +230,7 @@ impl PureExt for final_ast::MethodEnsuresExt {
     }
 }
 
-impl PureExt for final_ast::MethodBodyExt {
+impl PureExt for typed::MethodBodyExt {
     fn lower_ext<C: InstContext>(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,

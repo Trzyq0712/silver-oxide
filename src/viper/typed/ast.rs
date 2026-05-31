@@ -33,9 +33,9 @@ pub enum Type {
     Domain(Ident, Vec<Type>),
 }
 
-impl From<&super::ast::Type> for Type {
-    fn from(t: &super::ast::Type) -> Self {
-        use super::ast::Type as A;
+impl From<&crate::viper::parsed::ast::Type> for Type {
+    fn from(t: &crate::viper::parsed::ast::Type) -> Self {
+        use crate::viper::parsed::ast::Type as A;
         match t {
             A::Bool => Type::Bool,
             A::Int => Type::Int,

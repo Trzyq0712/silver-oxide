@@ -1,6 +1,6 @@
-//! Interner-aware `Display` for the typed `final_ast`.
+//! Interner-aware `Display` for the typed `typed`.
 //!
-//! `final_ast::Ident` only holds a `Spur`, so rendering readable names requires
+//! `typed::Ident` only holds a `Spur`, so rendering readable names requires
 //! the `Interner`. Mirrors `vmir::display`: a `Show<'a, T>` wrapper carries the
 //! interner and is rethreaded into children via `.with(..)`.
 //!
@@ -9,13 +9,13 @@
 
 use std::fmt::{self, Display, Formatter};
 
-use crate::silver::final_ast::{
+use crate::viper::typed::{
     AssignLhs, AssignRhs, BinOp, Call, Declaration, Field, FuncEnsuresExt, Function, Ident,
     Literal, Method, MethodBodyExt, MethodEnsuresExt, PredicateWithPerm, Predicate, Program,
     PureExpKind, ResourceExp, ResourceExpKind, SpatialExp, SpatialExpKind, StarOrFields, Statement,
     StmtBlock, Type, TypedIdent, TypedPureExp, UnOp,
 };
-use crate::silver::interner::Interner;
+use crate::viper::interner::Interner;
 
 /// Interner-aware formatting wrapper.
 pub struct Show<'a, T> {

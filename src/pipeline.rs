@@ -2,11 +2,11 @@
 
 use std::path::Path;
 
-use crate::silver::{
+use crate::viper::{
     GlobalsCollector, IdentCollector, inline_macros, disambiguate, typecheck_program,
     walk::AstWalkable,
 };
-use crate::{silver_parser, translate, verify, vmir};
+use crate::{viper_parser, translate, verify, vmir};
 
 #[derive(Debug)]
 pub enum PipelineError {
@@ -34,7 +34,7 @@ impl std::fmt::Display for PipelineError {
 pub fn run_file(path: &Path) -> Result<Vec<verify::MethodResult>, PipelineError> {
     let input = std::fs::read_to_string(path).map_err(PipelineError::Io)?;
 
-    let mut program = silver_parser::sil_program(&input)
+    let mut program = viper_parser::vpr_program(&input)
         .map_err(|e| PipelineError::Parse(e.to_string()))?;
 
     let mut ident_collector = IdentCollector::default();

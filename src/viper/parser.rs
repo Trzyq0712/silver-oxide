@@ -1,7 +1,7 @@
-use crate::silver::ast::*;
+use crate::viper::parsed::ast::*;
 
 peg::parser! {
-    pub grammar silver_parser() for str {
+    pub grammar viper_parser() for str {
         rule _ = quiet! { ___ __ ** ___ ___ }
 
         rule white_space() = quiet! { " " / "\t" / "\n" / "\r\n" } / expected!("whitespace")
@@ -308,7 +308,7 @@ peg::parser! {
 
         /// Declarations
 
-        pub rule sil_program() -> Program = _ decls:annotated(<d:single_decl() { vec![d] } / multi_decl()>) ** opt_semi() _
+        pub rule vpr_program() -> Program = _ decls:annotated(<d:single_decl() { vec![d] } / multi_decl()>) ** opt_semi() _
             { Program(decls.into_iter().flatten().collect()) }
 
         rule single_decl() -> Declaration
@@ -431,7 +431,7 @@ peg::parser! {
 
 #[test]
 fn precedence_test() {
-    let exp = silver_parser::exp("!r.b").unwrap();
+    let exp = viper_parser::exp("!r.b").unwrap();
     assert_eq!(
         exp,
         Exp::unknown(ExpKind::UnOp(

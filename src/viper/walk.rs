@@ -1,7 +1,7 @@
 use lasso::Spur;
 use num::{BigInt, BigRational};
 
-use crate::silver::ast::*;
+use crate::viper::parsed::ast::*;
 
 type ExpCall = Call<ExpCallKind>;
 type StmtCall = Call<StmtCallKind>;

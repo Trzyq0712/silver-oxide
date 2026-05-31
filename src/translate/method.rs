@@ -1,11 +1,11 @@
-//! Lower a `final_ast::Method` body into a `vmir::Method` (a flat
+//! Lower a `typed::Method` body into a `vmir::Method` (a flat
 //! `Vec<MethodInst>`). Straight-line only.
 
 use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::silver::final_ast;
+use crate::viper::typed;
 use crate::translate::pure_exp::{self, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
@@ -15,8 +15,8 @@ use crate::vmir::{
 
 pub(crate) fn lower_method(
     b: &Builder<'_>,
-    m: &final_ast::Method,
-    body: &final_ast::StmtBlock,
+    m: &typed::Method,
+    body: &typed::StmtBlock,
 ) -> Result<vmir::Method, TranslationError> {
     let mut sink = Sink::<MethodCtx>::new(0, 0);
     let mut env: HashMap<Spur, Val> = HashMap::new();
@@ -77,9 +77,9 @@ fn lower_stmt(
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
     current_heap: HeapVal,
-    stmt: &final_ast::Statement,
+    stmt: &typed::Statement,
 ) -> Result<HeapVal, TranslationError> {
-    use final_ast::Statement as S;
+    use typed::Statement as S;
     match stmt {
         S::Var(idents, None) => {
             for id in idents {
@@ -89,7 +89,7 @@ fn lower_stmt(
             }
             Ok(current_heap)
         }
-        S::Var(idents, Some(final_ast::AssignRhs::Exp(pure))) => {
+        S::Var(idents, Some(typed::AssignRhs::Exp(pure))) => {
             if idents.len() != 1 {
                 return Err(TranslationError::Unsupported("multi-LHS var := exp"));
             }
@@ -97,17 +97,17 @@ fn lower_stmt(
             env.insert(idents[0].name.0, v);
             Ok(current_heap)
         }
-        S::Var(idents, Some(final_ast::AssignRhs::MethodCall(call))) => {
+        S::Var(idents, Some(typed::AssignRhs::MethodCall(call))) => {
             let ret_names: Vec<Spur> = idents.iter().map(|i| i.name.0).collect();
             let ret_types: Vec<vmir::Type> = idents.iter().map(|i| lower_type(&i.ty)).collect();
             lower_method_call(b, env, sink, current_heap, call, &ret_names, &ret_types)
         }
-        S::Assign(lhss, final_ast::AssignRhs::MethodCall(call)) => {
+        S::Assign(lhss, typed::AssignRhs::MethodCall(call)) => {
             let mut ret_names = Vec::with_capacity(lhss.len());
             for lhs in lhss {
                 match lhs {
-                    final_ast::AssignLhs::Var(name) => ret_names.push(name.0),
-                    final_ast::AssignLhs::Field(_, _) => {
+                    typed::AssignLhs::Var(name) => ret_names.push(name.0),
+                    typed::AssignLhs::Field(_, _) => {
                         return Err(TranslationError::Unsupported("field lvalue"));
                     }
                 }
@@ -131,13 +131,13 @@ fn lower_stmt(
                 .collect::<Result<_, _>>()?;
             lower_method_call(b, env, sink, current_heap, call, &ret_names, &ret_types)
         }
-        S::Assign(lhss, final_ast::AssignRhs::Exp(pure)) => {
+        S::Assign(lhss, typed::AssignRhs::Exp(pure)) => {
             if lhss.len() != 1 {
                 return Err(TranslationError::Unsupported("multi-LHS assign := exp"));
             }
             let name = match &lhss[0] {
-                final_ast::AssignLhs::Var(n) => n.0,
-                final_ast::AssignLhs::Field(_, _) => {
+                typed::AssignLhs::Var(n) => n.0,
+                typed::AssignLhs::Field(_, _) => {
                     return Err(TranslationError::Unsupported("field lvalue"));
                 }
             };
@@ -145,8 +145,8 @@ fn lower_stmt(
             env.insert(name, v);
             Ok(current_heap)
         }
-        S::Assign(_, final_ast::AssignRhs::New(_))
-        | S::Var(_, Some(final_ast::AssignRhs::New(_))) => {
+        S::Assign(_, typed::AssignRhs::New(_))
+        | S::Var(_, Some(typed::AssignRhs::New(_))) => {
             Err(TranslationError::Unsupported("new(...)"))
         }
         S::If(_, _, _) => Err(TranslationError::Unsupported("if statement")),
@@ -165,7 +165,7 @@ fn lower_method_call(
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
     current_heap: HeapVal,
-    call: &final_ast::Call<final_ast::MethodBodyExt>,
+    call: &typed::Call<typed::MethodBodyExt>,
     ret_names: &[Spur],
     ret_types: &[vmir::Type],
 ) -> Result<HeapVal, TranslationError> {

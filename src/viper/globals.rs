@@ -4,7 +4,7 @@ use lasso::Spur;
 use nonmax::NonMaxU32;
 use typed_index_collections::TiVec;
 
-use crate::silver::{IdnDecl, final_ast::Type, interner::Interner, walk::AstWalker};
+use crate::viper::{IdnDecl, typed::Type, interner::Interner, walk::AstWalker};
 
 #[derive(Debug, Clone)]
 pub struct FunctionSig {

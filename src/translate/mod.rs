@@ -1,4 +1,4 @@
-//! Lowers Silver `final_ast::Program` to `vmir::Program`.
+//! Lowers Silver `typed::Program` to `vmir::Program`.
 //!
 //! Minimal scope (Phase 2 first cut): abstract predicates, method contracts
 //! over `acc(P(args), perm)` / `Conj` / `Implies` / `Ternary` / `Pure` lifts
@@ -11,7 +11,7 @@ use lasso::{Rodeo, Spur};
 use std::collections::HashMap;
 use typed_index_collections::TiVec;
 
-use crate::silver::{Globals, Interner, final_ast};
+use crate::viper::{Globals, Interner, typed};
 use crate::vmir;
 
 pub mod errors;
@@ -21,9 +21,9 @@ mod resource;
 
 pub use errors::TranslationError;
 
-/// Build a `vmir::Program` from a typed `final_ast::Program`.
+/// Build a `vmir::Program` from a typed `typed::Program`.
 pub fn translate(
-    program: &final_ast::Program,
+    program: &typed::Program,
     interner: &Interner,
     globals: &Globals,
 ) -> Result<vmir::Program, Vec<TranslationError>> {
@@ -33,21 +33,21 @@ pub fn translate(
     // Phase A: synthesise @snap (predicates) and @addr (predicates + fields).
     for decl in &program.0 {
         match decl {
-            final_ast::Declaration::Predicate(p) => builder.declare_predicate_accessors(p),
-            final_ast::Declaration::Field(f) => builder.declare_field_accessor(f),
-            final_ast::Declaration::Function(_) | final_ast::Declaration::Method(_) => {}
+            typed::Declaration::Predicate(p) => builder.declare_predicate_accessors(p),
+            typed::Declaration::Field(f) => builder.declare_field_accessor(f),
+            typed::Declaration::Function(_) | typed::Declaration::Method(_) => {}
         }
     }
 
     // Phase B1: emit Resource declarations (predicates + method contracts).
     for decl in &program.0 {
         match decl {
-            final_ast::Declaration::Predicate(p) => {
+            typed::Declaration::Predicate(p) => {
                 if let Err(e) = builder.emit_predicate(p) {
                     errors.push(e);
                 }
             }
-            final_ast::Declaration::Method(m) => {
+            typed::Declaration::Method(m) => {
                 if let Err(e) = builder.emit_method_contracts(m) {
                     errors.push(e);
                 }
@@ -58,7 +58,7 @@ pub fn translate(
 
     // Phase B2: emit Method bodies.
     for decl in &program.0 {
-        if let final_ast::Declaration::Method(m) = decl
+        if let typed::Declaration::Method(m) = decl
             && let Err(e) = builder.emit_method_body(m)
         {
             errors.push(e);
@@ -126,7 +126,7 @@ impl<'a> Builder<'a> {
         *slot = Some(decl);
     }
 
-    fn declare_predicate_accessors(&mut self, p: &final_ast::Predicate) {
+    fn declare_predicate_accessors(&mut self, p: &typed::Predicate) {
         let pred_name = self.interner.resolve(&p.name.0);
         let snap_id = self.fresh_decl(&format!("{pred_name}@snap"));
         self.set_decl(snap_id, vmir::Declaration::Domain(vmir::Domain {}));
@@ -141,7 +141,7 @@ impl<'a> Builder<'a> {
         self.pred_addr.insert(p.name.0, addr_id);
     }
 
-    fn declare_field_accessor(&mut self, f: &final_ast::Field) {
+    fn declare_field_accessor(&mut self, f: &typed::Field) {
         let field_name = self.interner.resolve(&f.0.name.0);
         let addr_id = self.fresh_decl(&format!("{field_name}@addr"));
         let addr_fn = vmir::Function {
@@ -153,7 +153,7 @@ impl<'a> Builder<'a> {
         self.field_addr.insert(f.0.name.0, addr_id);
     }
 
-    fn emit_predicate(&mut self, p: &final_ast::Predicate) -> Result<(), TranslationError> {
+    fn emit_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
         let name = self.interner.resolve(&p.name.0).to_owned();
         let pred_id = self.fresh_decl(&name);
         self.name_map.insert(p.name.0, pred_id);
@@ -173,7 +173,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn emit_method_contracts(&mut self, m: &final_ast::Method) -> Result<(), TranslationError> {
+    fn emit_method_contracts(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
         let name = self.interner.resolve(&m.name.0).to_owned();
         // Method itself gets a name slot only if it has a body (Phase B2 fills it).
         // We still intern it now to give it a stable id; Phase B2 sets the decl.
@@ -249,7 +249,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn emit_method_body(&mut self, m: &final_ast::Method) -> Result<(), TranslationError> {
+    fn emit_method_body(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
         let Some(body) = &m.body else { return Ok(()) };
         let method_id = *self
             .name_map
@@ -273,15 +273,15 @@ impl<'a> Builder<'a> {
     }
 }
 
-pub(crate) fn lower_type(ty: &final_ast::Type) -> vmir::Type {
+pub(crate) fn lower_type(ty: &typed::Type) -> vmir::Type {
     match ty {
-        final_ast::Type::Bool => vmir::Type::Bool,
-        final_ast::Type::Int => vmir::Type::Int,
-        final_ast::Type::Real => vmir::Type::Real,
-        final_ast::Type::Ref => vmir::Type::Ref,
-        final_ast::Type::Generic(_)
-        | final_ast::Type::Collection(_)
-        | final_ast::Type::Domain(_, _) => {
+        typed::Type::Bool => vmir::Type::Bool,
+        typed::Type::Int => vmir::Type::Int,
+        typed::Type::Real => vmir::Type::Real,
+        typed::Type::Ref => vmir::Type::Ref,
+        typed::Type::Generic(_)
+        | typed::Type::Collection(_)
+        | typed::Type::Domain(_, _) => {
             // Not exercised by the target case. Use Ref as a placeholder; a
             // future round will introduce proper VMIR domain/collection types.
             vmir::Type::Ref
@@ -292,13 +292,13 @@ pub(crate) fn lower_type(ty: &final_ast::Type) -> vmir::Type {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::silver::{
-        GlobalsCollector, IdentCollector, inline_macros, disambiguate, silver_parser,
+    use crate::viper::{
+        GlobalsCollector, IdentCollector, inline_macros, disambiguate, viper_parser,
         typecheck_program, walk::AstWalkable,
     };
 
     fn run(input: &str) -> vmir::Program {
-        let mut program = silver_parser::sil_program(input).expect("parse failed");
+        let mut program = viper_parser::vpr_program(input).expect("parse failed");
         let mut ident_collector = IdentCollector::default();
         program.walk_mut(&mut ident_collector);
         let interner = ident_collector.finalize();

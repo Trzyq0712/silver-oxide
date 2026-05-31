@@ -1,4 +1,4 @@
-use crate::silver::{Ident, walk::AstWalkerMut};
+use crate::viper::{Ident, walk::AstWalkerMut};
 
 pub type Interner = lasso::RodeoResolver;
 
