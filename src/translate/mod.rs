@@ -447,4 +447,36 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         // Display smoke: must not panic.
         let _ = format!("{p}");
     }
+
+    #[test]
+    fn div_inside_ternary_branch_carries_guard() {
+        // The division only executes on the path where the guard holds, so the
+        // emitted `Div` instruction must carry a non-empty path condition.
+        let input = r#"
+method m(x: Int, y: Int)
+    requires y != 0 ? x / y == x : true
+"#;
+        let p = run(input);
+
+        let req_id = p.interner.get("m@requires").expect("missing m@requires");
+        let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
+            panic!("m@requires must be a Resource");
+        };
+        let body = req.body.as_ref().unwrap();
+
+        let div = body
+            .insts
+            .iter()
+            .find(|i| {
+                matches!(
+                    &i.kind,
+                    vmir::InstKind::Pure(_, vmir::PureInst::Binary(vmir::BinOp::Div, _, _))
+                )
+            })
+            .expect("requires body must contain a Div");
+        assert!(
+            !div.pc.conds.is_empty(),
+            "Div inside the ternary then-branch must be guarded by a path condition"
+        );
+    }
 }

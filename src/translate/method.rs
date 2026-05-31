@@ -9,8 +9,7 @@ use crate::viper::typed;
 use crate::translate::pure_exp::{self, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PathConds, PureInst, ResourceCall,
-    Val,
+    self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PureInst, ResourceCall, Val,
 };
 
 pub(crate) fn lower_method(
@@ -224,8 +223,9 @@ fn emit_resource_call(
 ) -> (HeapVal, Val) {
     let h = sink.next_heap_temp();
     let v = sink.next_val_temp();
+    let pc = sink.pc.clone();
     sink.insts.push(Inst::new(
-        PathConds::default(),
+        pc,
         InstKind::Ext(InstExt::ResourceCall(ResourceCall {
             resource,
             ctx_heap,

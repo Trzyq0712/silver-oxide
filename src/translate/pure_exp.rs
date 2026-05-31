@@ -8,7 +8,7 @@ use crate::viper::typed;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
     self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds,
-    PureInst, TRUE, Val,
+    Polarity, PureInst, TRUE, Val,
 };
 
 /// A mutable sink for emitted instructions plus the running counters,
@@ -19,6 +19,9 @@ pub(crate) struct Sink<C: InstContext> {
     pub val_base: usize,
     pub val_count: usize,
     pub heap_count: usize,
+    /// Running path condition of the lowering point. Sidecond instructions
+    /// are emitted gated by this; branch arms push/pop guards via `with_cond`.
+    pub pc: PathConds,
 }
 
 impl<C: InstContext> Sink<C> {
@@ -28,7 +31,23 @@ impl<C: InstContext> Sink<C> {
             val_base,
             val_count: 0,
             heap_count: heap_base,
+            pc: PathConds::default(),
         }
+    }
+
+    /// Run `f` with `(cond, pol)` pushed onto the path condition, popping it
+    /// afterwards. The pop runs even when `f` returns `Err`, keeping the
+    /// guard stack balanced.
+    pub(crate) fn with_cond<R>(
+        &mut self,
+        cond: Val,
+        pol: Polarity,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.pc.conds.push((cond, pol));
+        let r = f(self);
+        self.pc.conds.pop();
+        r
     }
 
     pub fn next_val_temp(&mut self) -> Val {
@@ -43,25 +62,39 @@ impl<C: InstContext> Sink<C> {
         HeapVal::Temp(id)
     }
 
+    /// Path condition to attach to `kind`: the running guard for sidecond
+    /// instructions, empty for total ones (so `Inst::new`'s debug-assert
+    /// never trips and the IR stays flat where no guard is needed).
+    fn pc_for(&self, kind: &InstKind<C>) -> PathConds {
+        if kind.uses_pc() {
+            self.pc.clone()
+        } else {
+            PathConds::default()
+        }
+    }
+
     pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst<C::PureExt>) -> Val {
         let v = self.next_val_temp();
-        self.insts
-            .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
+        let kind = InstKind::Pure(ty, inst);
+        let pc = self.pc_for(&kind);
+        self.insts.push(Inst::new(pc, kind));
         v
     }
 
     pub fn emit_heap(&mut self, inst: HeapInst<C::HeapExt>) -> HeapVal {
         let h = self.next_heap_temp();
-        self.insts
-            .push(Inst::new(PathConds::default(), InstKind::Heap(inst)));
+        let kind = InstKind::Heap(inst);
+        let pc = self.pc_for(&kind);
+        self.insts.push(Inst::new(pc, kind));
         h
     }
 
     /// Push an instruction-kind extension. For `Sink<ResourceCtx>` the
     /// parameter type is `!`, so this method is uncallable.
     pub fn emit_ext(&mut self, ext: C::InstExt) {
-        self.insts
-            .push(Inst::new(PathConds::default(), InstKind::Ext(ext)));
+        let kind = InstKind::Ext(ext);
+        let pc = self.pc_for(&kind);
+        self.insts.push(Inst::new(pc, kind));
     }
 }
 
@@ -96,8 +129,10 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
         P::Binary(op, l, r) => lower_binary(b, env, sink, heap, ty, op, l, r),
         P::Ternary { if_, then, else_ } => {
             let c = lower(b, env, sink, heap, if_)?;
-            let t = lower(b, env, sink, heap, then)?;
-            let e = lower(b, env, sink, heap, else_)?;
+            let t = sink
+                .with_cond(c.clone(), Polarity::Positive, |sink| lower(b, env, sink, heap, then))?;
+            let e = sink
+                .with_cond(c.clone(), Polarity::Negative, |sink| lower(b, env, sink, heap, else_))?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
         P::Field(base, id) => {
@@ -141,6 +176,31 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
     use typed::BinOp as B;
     use vmir::BinOp as V;
     let lv = lower(b, env, sink, heap, l)?;
+    // Short-circuiting boolean ops only evaluate `r` on the path where `l`
+    // takes the guarding value, so `r` is lowered under that guard.
+    match op {
+        B::And => {
+            // l && r  =  l ? r : false
+            let rv = sink
+                .with_cond(lv.clone(), Polarity::Positive, |sink| lower(b, env, sink, heap, r))?;
+            return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, rv, FALSE)));
+        }
+        B::Or => {
+            // l || r  =  l ? true : r
+            let rv = sink
+                .with_cond(lv.clone(), Polarity::Negative, |sink| lower(b, env, sink, heap, r))?;
+            return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, TRUE, rv)));
+        }
+        B::Implies => {
+            // l ==> r  =  l ? r : true
+            let rv = sink
+                .with_cond(lv.clone(), Polarity::Positive, |sink| lower(b, env, sink, heap, r))?;
+            return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, rv, TRUE)));
+        }
+        _ => {}
+    }
+    // Strict ops: both operands always evaluate, so `r` is lowered under the
+    // outer path condition unchanged.
     let rv = lower(b, env, sink, heap, r)?;
     Ok(match op {
         B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
@@ -166,9 +226,7 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
             let lt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, lv, rv));
             sink.emit_pure(ty, PureInst::Ternary(lt, FALSE, TRUE))
         }
-        B::And => sink.emit_pure(ty, PureInst::Ternary(lv, rv, FALSE)),
-        B::Or => sink.emit_pure(ty, PureInst::Ternary(lv, TRUE, rv)),
-        B::Implies => sink.emit_pure(ty, PureInst::Ternary(lv, rv, TRUE)),
+        B::And | B::Or | B::Implies => unreachable!("handled above"),
         B::Iff => sink.emit_pure(ty, PureInst::Binary(V::Eq, lv, rv)),
         B::In | B::Union | B::SetMinus | B::Intersection | B::Subset | B::Concat | B::Range => {
             return Err(TranslationError::Unsupported("collection operator"));

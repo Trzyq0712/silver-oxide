@@ -8,7 +8,8 @@ use crate::viper::typed;
 use crate::translate::pure_exp::{self, PureExt, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, PureInst, ResourceCtx, TRUE, Type, Val,
+    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, ResourceCtx, TRUE, Type,
+    Val,
 };
 
 /// Lower a resource body. `initial_heap` is the body's starting heap
@@ -86,7 +87,9 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
         }
         S::Implies(cond, body) => {
             let c = pure_exp::lower(b, env, sink, heap, cond)?;
-            let (h_b, b_b) = lower_spatial(b, env, sink, heap, body)?;
+            let (h_b, b_b) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+                lower_spatial(b, env, sink, heap, body)
+            })?;
             let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_b, heap));
             // c ==> b_b  =  c ? b_b : true. When body has no boolean, the
             // whole implication is trivially true.
@@ -95,8 +98,12 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
         }
         S::Ternary { if_, then, else_ } => {
             let c = pure_exp::lower(b, env, sink, heap, if_)?;
-            let (h_t, b_t) = lower_spatial(b, env, sink, heap, then)?;
-            let (h_e, b_e) = lower_spatial(b, env, sink, heap, else_)?;
+            let (h_t, b_t) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+                lower_spatial(b, env, sink, heap, then)
+            })?;
+            let (h_e, b_e) = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
+                lower_spatial(b, env, sink, heap, else_)
+            })?;
             let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_t, h_e));
             let bv = match (b_t, b_e) {
                 (None, None) => None,
