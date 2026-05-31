@@ -150,6 +150,14 @@ pub fn eval_binary(op: BinOp, ty: &Type, l: &Literal, r: &Literal) -> Literal {
             _ => unreachable!("Division result must be of type Int or Real"),
         },
 
+        BinOp::Eq => Literal::Bool(l == r),
+
+        BinOp::Lt => match (l, r) {
+            (Literal::Int(a), Literal::Int(b)) => Literal::Bool(a < b),
+            (Literal::Real(a), Literal::Real(b)) => Literal::Bool(a < b),
+            _ => unreachable!("Lt requires two Int or two Real operands"),
+        },
+
         _ => unimplemented!("Operator {:?} is not implemented yet", op),
     }
 }

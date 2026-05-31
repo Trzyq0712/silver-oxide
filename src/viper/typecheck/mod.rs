@@ -1389,7 +1389,7 @@ pub fn typecheck_program(
 mod tests {
     use super::*;
     use crate::viper::{
-        self, GlobalsCollector, IdentCollector, disambiguate, inline_macros, viper_parser,
+        GlobalsCollector, IdentCollector, disambiguate, inline_macros, viper_parser,
         walk::AstWalkable,
     };
 
