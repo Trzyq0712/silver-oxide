@@ -635,6 +635,55 @@ mod tests {
     }
 
     #[test]
+    fn eq_true_unions_args() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let b = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [a, b]));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        // `assume a == b` is modelled as unioning the equality with `true`.
+        ctx.egraph.union(eq, true_);
+        ctx.saturate();
+
+        assert_eq!(ctx.egraph.find(a), ctx.egraph.find(b));
+    }
+
+    #[test]
+    fn eq_unknown_does_not_union() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let b = ctx.add(Symbolic::Fresh(1, Type::Int));
+        // Build the equality but never prove it true.
+        let _eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [a, b]));
+        ctx.saturate();
+
+        assert_ne!(ctx.egraph.find(a), ctx.egraph.find(b));
+    }
+
+    #[test]
+    fn eq_true_propagates_through_congruence() {
+        let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let f = interner.get_or_intern("f");
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let b = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let fa = ctx.add(Symbolic::FuncApp(f, Type::Int, Box::from([a])));
+        let fb = ctx.add(Symbolic::FuncApp(f, Type::Int, Box::from([b])));
+        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [a, b]));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        ctx.egraph.union(eq, true_);
+        ctx.saturate();
+
+        // Unioning the args lets congruence close `f(a) == f(b)`.
+        assert_eq!(ctx.egraph.find(fa), ctx.egraph.find(fb));
+    }
+
+    #[test]
     fn double_consume_predicate_should_fail() {
         let input = r#"
 predicate number(this: Ref)
