@@ -159,9 +159,50 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, acc: &Acc, state: &EvalState) -> Heap {
     Heap::empty().with_chunk(addr, Chunk::new(perm, value))
 }
 
+/// Merge two fractional chunks at the same address. Decouples the operational
+/// value pick from the declarative agreement axiom: `perm = p0 + p1`,
+/// `value = (p0 > 0) ? v0 : v1` (intentionally asymmetric), and an assumed
+/// `(p0 > 0 && p1 > 0) ==> (v0 == v1)`.
+///
+/// The assume is emitted by unioning the (desugared) implication with `true`;
+/// it is not an eager `union(v0, v1)`. When both fractions are positive,
+/// saturation folds the antecedent, collapses the implication to `v0 == v1`,
+/// and `eq-true-union` fuses the values — erasing the ternary's asymmetry by
+/// congruence. When a fraction is zero, the antecedent is `false` and the
+/// asymmetric pick selects the genuinely-held value. `BinOp` has no `>`/`&&`/
+/// `==>`, so these desugar to `Lt(0, p)` and `Ite` forms.
+fn merge_chunks(
+    ctx: &mut VerifyContext<'_>,
+    p0: egg::Id,
+    v0: egg::Id,
+    p1: egg::Id,
+    v1: egg::Id,
+) -> Chunk {
+    let perm = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [p0, p1]));
+
+    let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
+        num::BigInt::from(0),
+    ))));
+    let p0_pos = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [zero, p0]));
+    let p1_pos = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [zero, p1]));
+
+    let vty = ctx.egraph[v0].data.ty.clone();
+    let value = ctx.add(Symbolic::Ite(vty, [p0_pos, v0, v1]));
+
+    // `(p0 > 0 && p1 > 0) ==> (v0 == v1)` desugared via `Ite`.
+    let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+    let ante = ctx.add(Symbolic::Ite(Type::Bool, [p0_pos, p1_pos, false_]));
+    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [v0, v1]));
+    let imp = ctx.add(Symbolic::Ite(Type::Bool, [ante, eq, true_]));
+    ctx.egraph.union(imp, true_);
+
+    Chunk::new(perm, value)
+}
+
 /// Re-key a heap's chunks under the egraph's current canonical ids. When
 /// two source addresses collapse to the same canonical id, merge their
-/// chunks: sum perms via a `Plus` e-node and union their values.
+/// chunks via [`merge_chunks`].
 fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
     let mut out = Heap::empty();
     let entries: Vec<(egg::Id, Chunk)> = h
@@ -171,13 +212,8 @@ fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
     for (addr, chunk) in entries {
         let canon = ctx.egraph.find(addr);
         if let Some(existing) = out.chunk(canon).cloned() {
-            let perm = ctx.add(Symbolic::Binary(
-                BinOp::Plus,
-                Type::Real,
-                [existing.perm, chunk.perm],
-            ));
-            ctx.egraph.union(existing.value, chunk.value);
-            out = out.with_chunk(canon, Chunk::new(perm, existing.value));
+            let merged = merge_chunks(ctx, existing.perm, existing.value, chunk.perm, chunk.value);
+            out = out.with_chunk(canon, merged);
         } else {
             out = out.with_chunk(canon, chunk);
         }
@@ -186,8 +222,7 @@ fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
 }
 
 /// Heap addition. Canonicalises both inputs first so chunks at e-class
-/// equivalent addresses merge. On collision, perms are summed and values
-/// are unioned in the egraph.
+/// equivalent addresses merge. On collision, chunks merge via [`merge_chunks`].
 fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
     let c1 = canonicalize_heap(ctx, h1);
     let c2 = canonicalize_heap(ctx, h2);
@@ -198,13 +233,8 @@ fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
         .collect();
     for (addr, chunk2) in entries {
         if let Some(existing) = out.chunk(addr).cloned() {
-            let perm = ctx.add(Symbolic::Binary(
-                BinOp::Plus,
-                Type::Real,
-                [existing.perm, chunk2.perm],
-            ));
-            ctx.egraph.union(existing.value, chunk2.value);
-            out = out.with_chunk(addr, Chunk::new(perm, existing.value));
+            let merged = merge_chunks(ctx, existing.perm, existing.value, chunk2.perm, chunk2.value);
+            out = out.with_chunk(addr, merged);
         } else {
             out = out.with_chunk(addr, chunk2);
         }
@@ -467,10 +497,58 @@ mod tests {
         let chunk = merged.chunk(canon).expect("merged chunk missing");
 
         let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [p1, p2]));
-        ctx.egraph.rebuild();
+        ctx.saturate();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
+        // Both fractions positive (1, 2) → agreement axiom fuses the values.
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
+        assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v1));
         assert_eq!(merged.entries().count(), 1);
+    }
+
+    #[test]
+    fn merge_zero_fraction_picks_active_value() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+
+        let merged = heap_union(&mut ctx, &h1, &h2);
+        let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        ctx.saturate();
+
+        // p0 = 0 → asymmetric ternary picks the active half v1; no fusion.
+        assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v1));
+        assert_ne!(ctx.egraph.find(v0), ctx.egraph.find(v1));
+    }
+
+    #[test]
+    fn merge_both_active_fuses_values() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+
+        let merged = heap_union(&mut ctx, &h1, &h2);
+        let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        ctx.saturate();
+
+        // Both fractions positive → agreement axiom fuses the symbolic values.
+        assert_eq!(ctx.egraph.find(v0), ctx.egraph.find(v1));
+        assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v0));
     }
 
     #[test]
