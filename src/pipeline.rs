@@ -6,7 +6,7 @@ use crate::silver::{
     GlobalsCollector, IdentCollector, inline_macros, disambiguate, typecheck_program,
     walk::AstWalkable,
 };
-use crate::{silver_parser, translate, verify};
+use crate::{silver_parser, translate, verify, vmir};
 
 #[derive(Debug)]
 pub enum PipelineError {
@@ -14,6 +14,7 @@ pub enum PipelineError {
     Parse(String),
     Typecheck(String),
     Translate(String),
+    Analyze(String),
 }
 
 impl std::fmt::Display for PipelineError {
@@ -23,6 +24,7 @@ impl std::fmt::Display for PipelineError {
             Self::Parse(e) => write!(f, "parse: {e}"),
             Self::Typecheck(e) => write!(f, "typecheck: {e}"),
             Self::Translate(e) => write!(f, "translate: {e}"),
+            Self::Analyze(e) => write!(f, "analyze: {e}"),
         }
     }
 }
@@ -56,5 +58,8 @@ pub fn run_file(path: &Path) -> Result<Vec<verify::MethodResult>, PipelineError>
     let vmir = translate::translate(&typed, &interner, &globals)
         .map_err(|e| PipelineError::Translate(format!("{e:?}")))?;
 
-    Ok(verify::verify(&vmir))
+    let analyzed =
+        vmir::analyze(vmir).map_err(|e| PipelineError::Analyze(e.to_string()))?;
+
+    Ok(verify::verify(&analyzed))
 }

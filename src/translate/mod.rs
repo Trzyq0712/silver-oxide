@@ -195,8 +195,8 @@ impl<'a> Builder<'a> {
                 &env,
                 requires,
                 params.len(),
-                vmir::HeapVal::Empty,
-                0,
+                vmir::HeapVal::Temp(0),
+                1,
             )?;
             self.set_decl(
                 req_id,
@@ -221,24 +221,20 @@ impl<'a> Builder<'a> {
                 env.insert(r.name.0, vmir::Val::Temp(m.params.len() + i));
             }
             // m@ensures's precondition resource is m@requires (when present).
-            // When set, the ensures body sees the requires delta at
-            // `HeapVal::Temp(0)` and its own emitted heap counters start at 1.
-            let (resource_requires, initial_heap, heap_base) =
-                match self.method_requires.get(&m.name.0).copied() {
-                    Some(req_id) => {
-                        let req_args: Vec<vmir::Val> =
-                            (0..m.params.len()).map(vmir::Val::Temp).collect();
-                        (Some((req_id, req_args)), vmir::HeapVal::Temp(0), 1)
-                    }
-                    None => (None, vmir::HeapVal::Empty, 0),
-                };
+            // `HeapVal::Temp(0)` is reserved for the precondition's heap
+            // delta even when no explicit precondition exists — the slot
+            // is then the caller-supplied (empty) ctx_heap.
+            let resource_requires = self.method_requires.get(&m.name.0).copied().map(|req_id| {
+                let req_args: Vec<vmir::Val> = (0..m.params.len()).map(vmir::Val::Temp).collect();
+                (req_id, req_args)
+            });
             let body = resource::lower_spatial_ensures(
                 self,
                 &env,
                 ensures,
                 params.len(),
-                initial_heap,
-                heap_base,
+                vmir::HeapVal::Temp(0),
+                1,
             )?;
             self.set_decl(
                 ens_id,

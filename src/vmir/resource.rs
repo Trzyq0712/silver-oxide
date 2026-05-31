@@ -64,11 +64,10 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
                     }
                 }
                 writeln!(f, "] {{")?;
-                let heap_base = if self.item.requires.is_some() { 1 } else { 0 };
                 write!(
                     f,
                     "{}",
-                    self.with((self.item.params.len(), heap_base, &body.insts[..]))
+                    self.with((self.item.params.len(), 1usize, &body.insts[..]))
                 )?;
                 writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
                 write!(f, "}}")
