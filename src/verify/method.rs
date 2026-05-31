@@ -384,7 +384,7 @@ fn eval_method_inst(
             }
             InstExt::Assert(val) => {
                 let id = state.get_val(ctx, val);
-                ctx.egraph.rebuild();
+                ctx.saturate();
                 let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
                 if ctx.egraph.find(id) != ctx.egraph.find(true_) {
                     return Err(VerifyError::AssertionFailed);
@@ -574,6 +574,64 @@ mod tests {
 
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         assert_eq!(ctx.egraph.find(diff), ctx.egraph.find(zero));
+    }
+
+    #[test]
+    fn const_fold_folds_ternary() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let cond = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        let t = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let e = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let ite = ctx.add(Symbolic::Ite(Type::Int, [cond, t, e]));
+        ctx.saturate();
+
+        // `true ? t : e` collapses to the symbolic `t`.
+        assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(t));
+        assert_ne!(ctx.egraph.find(ite), ctx.egraph.find(e));
+    }
+
+    #[test]
+    fn rewrite_ite_false_picks_else() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let cond = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+        let t = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let e = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let ite = ctx.add(Symbolic::Ite(Type::Int, [cond, t, e]));
+        ctx.saturate();
+
+        assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(e));
+        assert_ne!(ctx.egraph.find(ite), ctx.egraph.find(t));
+    }
+
+    #[test]
+    fn rewrite_add_zero_int() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let x = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let zero = ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0))));
+        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Int, [x, zero]));
+        ctx.saturate();
+
+        assert_eq!(ctx.egraph.find(sum), ctx.egraph.find(x));
+    }
+
+    #[test]
+    fn rewrite_add_zero_real_commuted() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let x = ctx.add(Symbolic::Fresh(0, Type::Real));
+        let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+        // `0 + x` (commuted) must also fold to `x`.
+        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [zero, x]));
+        ctx.saturate();
+
+        assert_eq!(ctx.egraph.find(sum), ctx.egraph.find(x));
     }
 
     #[test]

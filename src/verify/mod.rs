@@ -5,6 +5,7 @@ mod context;
 mod heap;
 pub mod lang;
 mod method;
+mod rewrite;
 
 pub use method::VerifyError;
 
