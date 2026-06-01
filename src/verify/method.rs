@@ -6,7 +6,8 @@ use crate::{
     },
     vmir::{
         self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstExt, InstKind,
-        Literal, Method, MethodInst, PureInst, ResourceCall, ResourceInst, Type, Val,
+        Literal, Method, MethodInst, PathConds, Polarity, PureInst, ResourceCall, ResourceInst,
+        Type, Val,
     },
 };
 
@@ -177,6 +178,7 @@ fn merge_chunks(
     v0: egg::Id,
     p1: egg::Id,
     v1: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
 ) -> Chunk {
     let perm = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [p0, p1]));
 
@@ -189,12 +191,14 @@ fn merge_chunks(
     let vty = ctx.egraph[v0].data.ty.clone();
     let value = ctx.add(Symbolic::Ite(vty, [p0_pos, v0, v1]));
 
-    // `(p0 > 0 && p1 > 0) ==> (v0 == v1)` desugared via `Ite`.
-    let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+    // `(PC ∧ p0 > 0 ∧ p1 > 0) ==> (v0 == v1)` as the golden-rule ITE chain.
+    // Fold innermost-first: p1_pos, p0_pos, then PC literals in reverse.
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-    let ante = ctx.add(Symbolic::Ite(Type::Bool, [p0_pos, p1_pos, false_]));
     let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [v0, v1]));
-    let imp = ctx.add(Symbolic::Ite(Type::Bool, [ante, eq, true_]));
+    let antecedents = [(p1_pos, Polarity::Positive), (p0_pos, Polarity::Positive)]
+        .into_iter()
+        .chain(pc_lits.iter().rev().copied());
+    let imp = ctx.implication(eq, antecedents);
     ctx.egraph.union(imp, true_);
 
     Chunk::new(perm, value)
@@ -203,7 +207,11 @@ fn merge_chunks(
 /// Re-key a heap's chunks under the egraph's current canonical ids. When
 /// two source addresses collapse to the same canonical id, merge their
 /// chunks via [`merge_chunks`].
-fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
+fn canonicalize_heap(
+    ctx: &mut VerifyContext<'_>,
+    h: &Heap,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Heap {
     let mut out = Heap::empty();
     let entries: Vec<(egg::Id, Chunk)> = h
         .entries()
@@ -212,7 +220,9 @@ fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
     for (addr, chunk) in entries {
         let canon = ctx.egraph.find(addr);
         if let Some(existing) = out.chunk(canon).cloned() {
-            let merged = merge_chunks(ctx, existing.perm, existing.value, chunk.perm, chunk.value);
+            let merged = merge_chunks(
+                ctx, existing.perm, existing.value, chunk.perm, chunk.value, pc_lits,
+            );
             out = out.with_chunk(canon, merged);
         } else {
             out = out.with_chunk(canon, chunk);
@@ -223,9 +233,14 @@ fn canonicalize_heap(ctx: &mut VerifyContext<'_>, h: &Heap) -> Heap {
 
 /// Heap addition. Canonicalises both inputs first so chunks at e-class
 /// equivalent addresses merge. On collision, chunks merge via [`merge_chunks`].
-fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
-    let c1 = canonicalize_heap(ctx, h1);
-    let c2 = canonicalize_heap(ctx, h2);
+fn heap_union(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    h2: &Heap,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Heap {
+    let c1 = canonicalize_heap(ctx, h1, pc_lits);
+    let c2 = canonicalize_heap(ctx, h2, pc_lits);
     let mut out = c1;
     let entries: Vec<(egg::Id, Chunk)> = c2
         .entries()
@@ -233,7 +248,9 @@ fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
         .collect();
     for (addr, chunk2) in entries {
         if let Some(existing) = out.chunk(addr).cloned() {
-            let merged = merge_chunks(ctx, existing.perm, existing.value, chunk2.perm, chunk2.value);
+            let merged = merge_chunks(
+                ctx, existing.perm, existing.value, chunk2.perm, chunk2.value, pc_lits,
+            );
             out = out.with_chunk(addr, merged);
         } else {
             out = out.with_chunk(addr, chunk2);
@@ -247,45 +264,50 @@ fn heap_union(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Heap {
 /// existing and subtracted perms are concrete `Real` literals, the
 /// arithmetic is folded: negative result → `InsufficientPermission`, zero
 /// → chunk dropped, positive → chunk kept with the literal remainder.
-fn heap_subtract(ctx: &mut VerifyContext<'_>, h1: &Heap, h2: &Heap) -> Result<Heap, VerifyError> {
-    let c1 = canonicalize_heap(ctx, h1);
-    let c2 = canonicalize_heap(ctx, h2);
+fn heap_subtract(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    h2: &Heap,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Result<Heap, VerifyError> {
+    let c1 = canonicalize_heap(ctx, h1, &[]);
+    let c2 = canonicalize_heap(ctx, h2, &[]);
     let mut out = c1;
     let entries: Vec<(egg::Id, Chunk)> = c2
         .entries()
         .map(|(addr, chunk)| (addr, chunk.clone()))
         .collect();
-    let zero = num::BigRational::from(num::BigInt::from(0));
+    let zero_rat = num::BigRational::from(num::BigInt::from(0));
     for (addr, chunk2) in entries {
         let Some(existing) = out.chunk(addr).cloned() else {
             return Err(VerifyError::InsufficientPermission);
         };
-        match (
-            extract_real_literal(ctx, existing.perm),
-            extract_real_literal(ctx, chunk2.perm),
-        ) {
-            (Some(r1), Some(r2)) => {
-                let diff = r1 - r2;
-                if diff < zero {
-                    return Err(VerifyError::InsufficientPermission);
-                }
-                ctx.egraph.union(existing.value, chunk2.value);
-                if diff == zero {
-                    out = out.without_chunk(addr);
-                } else {
-                    let perm = ctx.add(Symbolic::Lit(Literal::Real(diff)));
-                    out = out.with_chunk(addr, Chunk::new(perm, existing.value));
-                }
-            }
-            _ => {
-                let perm = ctx.add(Symbolic::Binary(
-                    BinOp::Minus,
-                    Type::Real,
-                    [existing.perm, chunk2.perm],
-                ));
-                ctx.egraph.union(existing.value, chunk2.value);
-                out = out.with_chunk(addr, Chunk::new(perm, existing.value));
-            }
+
+        // Sufficiency goal: `existing.perm >= chunk2.perm`, i.e.
+        // `not(existing.perm < chunk2.perm)`, desugared to an `Ite`.
+        let lt = ctx.add(Symbolic::Binary(
+            BinOp::Lt,
+            Type::Bool,
+            [existing.perm, chunk2.perm],
+        ));
+        let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        let goal = ctx.add(Symbolic::Ite(Type::Bool, [lt, false_, true_]));
+        if !ctx.prove_under_pc(goal, pc_lits) {
+            return Err(VerifyError::InsufficientPermission);
+        }
+
+        ctx.egraph.union(existing.value, chunk2.value);
+
+        let remainder = ctx.add(Symbolic::Binary(
+            BinOp::Minus,
+            Type::Real,
+            [existing.perm, chunk2.perm],
+        ));
+        if extract_real_literal(ctx, remainder).as_ref() == Some(&zero_rat) {
+            out = out.without_chunk(addr);
+        } else {
+            out = out.with_chunk(addr, Chunk::new(remainder, existing.value));
         }
     }
     Ok(out)
@@ -298,6 +320,7 @@ fn eval_heap_inst<H, F>(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     inst: &HeapInst<H>,
+    pc: &PathConds,
     eval_heap_ext: F,
 ) -> Result<Heap, VerifyError>
 where
@@ -308,12 +331,22 @@ where
         HeapInst::Add(h1, h2) => {
             let l = get_heap(state, h1);
             let r = get_heap(state, h2);
-            Ok(heap_union(ctx, &l, &r))
+            let pc_lits: Vec<(egg::Id, Polarity)> = pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            Ok(heap_union(ctx, &l, &r, &pc_lits))
         }
         HeapInst::Sub(h1, h2) => {
             let l = get_heap(state, h1);
             let r = get_heap(state, h2);
-            heap_subtract(ctx, &l, &r)
+            let pc_lits: Vec<(egg::Id, Polarity)> = pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            heap_subtract(ctx, &l, &r, &pc_lits)
         }
         // TODO: condition-aware merge. Currently picks the then branch.
         HeapInst::Ternary(_cond, h1, _h2) => Ok(get_heap(state, h1)),
@@ -344,7 +377,7 @@ fn eval_resource_body_inst(
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
-            let heap = eval_heap_inst(ctx, state, hi, |_, _, never| match *never {})?;
+            let heap = eval_heap_inst(ctx, state, hi, &inst.pc, |_, _, never| match *never {})?;
             state.push_heap(heap);
         }
         InstKind::Ext(never) => match *never {},
@@ -403,7 +436,7 @@ fn eval_method_inst(
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
-            let heap = eval_heap_inst(ctx, state, hi, eval_method_heap_ext)?;
+            let heap = eval_heap_inst(ctx, state, hi, &inst.pc, eval_method_heap_ext)?;
             state.push_heap(heap);
         }
         InstKind::Ext(ext) => match ext {
@@ -411,12 +444,17 @@ fn eval_method_inst(
                 let id = state.get_val(ctx, val);
                 let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
                 ctx.egraph.union(id, true_);
+                ctx.egraph.rebuild();
             }
             InstExt::Assert(val) => {
                 let id = state.get_val(ctx, val);
-                ctx.saturate();
-                let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-                if ctx.egraph.find(id) != ctx.egraph.find(true_) {
+                let pc_lits: Vec<(egg::Id, Polarity)> = inst
+                    .pc
+                    .conds
+                    .iter()
+                    .map(|(v, p)| (state.get_val(ctx, v), *p))
+                    .collect();
+                if !ctx.prove_under_pc(id, &pc_lits) {
                     return Err(VerifyError::AssertionFailed);
                 }
             }
@@ -491,7 +529,7 @@ mod tests {
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let merged = heap_union(&mut ctx, &h1, &h2);
+        let merged = heap_union(&mut ctx, &h1, &h2, &[]);
 
         let canon = ctx.egraph.find(a);
         let chunk = merged.chunk(canon).expect("merged chunk missing");
@@ -519,7 +557,7 @@ mod tests {
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
 
-        let merged = heap_union(&mut ctx, &h1, &h2);
+        let merged = heap_union(&mut ctx, &h1, &h2, &[]);
         let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
         ctx.saturate();
 
@@ -542,13 +580,147 @@ mod tests {
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
 
-        let merged = heap_union(&mut ctx, &h1, &h2);
+        let merged = heap_union(&mut ctx, &h1, &h2, &[]);
         let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
         ctx.saturate();
 
         // Both fractions positive → agreement axiom fuses the symbolic values.
         assert_eq!(ctx.egraph.find(v0), ctx.egraph.find(v1));
         assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v0));
+    }
+
+    #[test]
+    fn merge_under_false_pc_blocks_fusion() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+
+        let merged = heap_union(&mut ctx, &h1, &h2, &[(false_lit, Polarity::Positive)]);
+        let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        ctx.saturate();
+
+        // PC literal is `false` → implication collapses to its `true` fallback;
+        // values must NOT fuse even though both fractions are positive.
+        assert_ne!(ctx.egraph.find(v0), ctx.egraph.find(v1));
+        // Value pick is independent of the PC gate.
+        assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v0));
+    }
+
+    #[test]
+    fn merge_under_true_pc_allows_fusion() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let true_lit = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+
+        let merged = heap_union(&mut ctx, &h1, &h2, &[(true_lit, Polarity::Positive)]);
+        let _chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        ctx.saturate();
+
+        // PC literal is `true` + both fractions positive → agreement fires.
+        assert_eq!(ctx.egraph.find(v0), ctx.egraph.find(v1));
+    }
+
+    #[test]
+    fn prove_under_empty_pc_proves_known_goal() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let g = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        ctx.egraph.union(g, true_);
+        ctx.egraph.rebuild();
+
+        // Goal already in the `true` eclass → proven under the empty PC.
+        assert!(ctx.prove_under_pc(g, &[]));
+    }
+
+    #[test]
+    fn prove_unknown_goal_fails() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        // A free boolean never driven to `true` is not provable.
+        let g = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        assert!(!ctx.prove_under_pc(g, &[]));
+    }
+
+    #[test]
+    fn prove_under_false_pc_is_vacuous() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        // Unprovable goal, but the path is unsatisfiable (`false`).
+        let g = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+
+        assert!(ctx.prove_under_pc(g, &[(false_lit, Polarity::Positive)]));
+        // The vacuous proof must NOT fuse the goal into `true` unconditionally.
+        ctx.saturate();
+        assert_ne!(ctx.egraph.find(g), ctx.egraph.find(true_));
+    }
+
+    #[test]
+    fn prove_commits_conditional_implication() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let c = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let x = ctx.add(Symbolic::Fresh(1, Type::Bool));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        // goal = `c ? true : x` — true under hypothesis `c`, unknown otherwise.
+        let goal = ctx.add(Symbolic::Ite(Type::Bool, [c, true_, x]));
+
+        // Provable under PC `<c>`; commits `c ==> goal` into the live graph.
+        assert!(ctx.prove_under_pc(goal, &[(c, Polarity::Positive)]));
+
+        // Not leaked unconditionally: `c` still unknown ⇒ goal not yet true.
+        ctx.saturate();
+        assert_ne!(ctx.egraph.find(goal), ctx.egraph.find(true_));
+
+        // Once `c` is established, the goal collapses to `true`.
+        ctx.egraph.union(c, true_);
+        ctx.saturate();
+        assert_eq!(ctx.egraph.find(goal), ctx.egraph.find(true_));
+    }
+
+    #[test]
+    fn subtract_symbolic_perm_fails_without_proof() {
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let p_have = ctx.add(Symbolic::Fresh(1, Type::Real));
+        let p_take = ctx.add(Symbolic::Fresh(2, Type::Real));
+        let v1 = ctx.add(Symbolic::Fresh(3, Type::Int));
+        let v2 = ctx.add(Symbolic::Fresh(4, Type::Int));
+
+        let h1 = Heap::empty().with_chunk(a, Chunk::new(p_have, v1));
+        let h2 = Heap::empty().with_chunk(a, Chunk::new(p_take, v2));
+
+        // Symbolic perms → `have >= take` not provable by equality saturation.
+        let err = heap_subtract(&mut ctx, &h1, &h2, &[])
+            .err()
+            .expect("symbolic-perm exhale must fail without a proof");
+        assert!(matches!(err, VerifyError::InsufficientPermission));
     }
 
     #[test]
@@ -569,7 +741,7 @@ mod tests {
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let result = heap_subtract(&mut ctx, &h1, &h2).expect("subtract should succeed");
+        let result = heap_subtract(&mut ctx, &h1, &h2, &[]).expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         let chunk = result.chunk(canon).expect("result chunk missing");
@@ -592,7 +764,7 @@ mod tests {
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v2));
 
-        let result = heap_subtract(&mut ctx, &h1, &h2).expect("subtract should succeed");
+        let result = heap_subtract(&mut ctx, &h1, &h2, &[]).expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         assert!(
@@ -615,7 +787,7 @@ mod tests {
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p2, v2));
 
-        let err = heap_subtract(&mut ctx, &h1, &h2)
+        let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("over-consumption must fail");
         assert!(matches!(err, VerifyError::InsufficientPermission));
@@ -635,7 +807,7 @@ mod tests {
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let _ = b;
 
-        let err = heap_subtract(&mut ctx, &h1, &h2)
+        let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("subtract from empty must fail");
         assert!(matches!(err, VerifyError::InsufficientPermission));
