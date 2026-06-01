@@ -6,6 +6,7 @@ mod heap;
 pub mod lang;
 mod method;
 mod rewrite;
+mod viz;
 
 pub use method::VerifyError;
 

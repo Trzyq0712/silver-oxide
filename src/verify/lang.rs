@@ -1,10 +1,39 @@
 use egg::*;
+use std::cell::Cell;
 use std::fmt::{Display, Formatter};
 
 use crate::vmir::BinOp;
 use crate::vmir::Literal;
 use crate::vmir::MemberId;
 use crate::vmir::Type; // Ensure Type is in scope
+use lasso::Rodeo;
+
+thread_local! {
+    /// Raw pointer to an interner, set only for the duration of a [`with_interner`]
+    /// guard so `Display` can resolve `FuncApp` member ids to their source names.
+    /// Null when no guard is active.
+    static DISPLAY_INTERNER: Cell<*const Rodeo<MemberId>> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Install `interner` as the active display interner until the returned guard
+/// drops. While alive, `Symbolic`'s `Display` prints resolved function names.
+/// The guard borrows `interner`, so the pointer cannot dangle during its scope.
+pub(crate) fn with_interner(interner: &Rodeo<MemberId>) -> InternerGuard<'_> {
+    DISPLAY_INTERNER.with(|c| c.set(interner as *const _));
+    InternerGuard {
+        _marker: std::marker::PhantomData,
+    }
+}
+
+pub(crate) struct InternerGuard<'a> {
+    _marker: std::marker::PhantomData<&'a Rodeo<MemberId>>,
+}
+
+impl Drop for InternerGuard<'_> {
+    fn drop(&mut self) {
+        DISPLAY_INTERNER.with(|c| c.set(std::ptr::null()));
+    }
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
@@ -81,7 +110,17 @@ impl Display for Symbolic {
             Symbolic::Lit(l) => write!(f, "{l}"),
             Symbolic::Binary(op, _, _) => write!(f, "{op}"),
             Symbolic::Ite(_, _) => write!(f, "ITE"),
-            Symbolic::FuncApp(id, _, _) => write!(f, "{}(..)", id.0),
+            Symbolic::FuncApp(id, _, _) => DISPLAY_INTERNER.with(|c| {
+                let ptr = c.get();
+                if ptr.is_null() {
+                    write!(f, "fn{}(..)", id.0)
+                } else {
+                    // SAFETY: a live `InternerGuard` borrows the interner for
+                    // the duration the pointer is non-null (see `with_interner`).
+                    let interner = unsafe { &*ptr };
+                    write!(f, "{}(..)", interner.resolve(id))
+                }
+            }),
         }
     }
 }

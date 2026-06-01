@@ -3,6 +3,7 @@ use crate::{
         context::VerifyContext,
         heap::{Chunk, Heap},
         lang::Symbolic,
+        viz::{self, Snapshotter},
     },
     vmir::{
         self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstExt, InstKind,
@@ -397,11 +398,13 @@ fn eval_resource_call(
     program: &vmir::Program,
     caller_state: &EvalState,
     call: &ResourceCall,
+    snap: &mut Snapshotter,
 ) -> Result<(Heap, egg::Id), VerifyError> {
     let Declaration::Resource(r) = &program.decls[call.resource] else {
         panic!("ResourceCall targets non-Resource declaration");
     };
     let body = r.body.as_ref().ok_or(VerifyError::AbstractResourceCall)?;
+    let res_name = ctx.interner.resolve(&call.resource).to_string();
 
     let args: Vec<egg::Id> = call
         .args
@@ -416,7 +419,11 @@ fn eval_resource_call(
     res_state.push_heap(get_heap(caller_state, &call.ctx_heap));
 
     for inst in &body.insts {
+        let vals_before = res_state.vals.len();
         eval_resource_body_inst(ctx, &mut res_state, inst)?;
+        let highlight = (res_state.vals.len() > vals_before).then(|| res_state.vals[res_state.vals.len() - 1]);
+        let label = format!("{res_name}: {}", viz::resource_inst_label(&inst.kind));
+        snap.snapshot(ctx, res_state.heaps.last(), &label, highlight);
     }
 
     let result_heap = get_heap(&res_state, &body.res.0);
@@ -429,6 +436,7 @@ fn eval_method_inst(
     program: &vmir::Program,
     state: &mut EvalState,
     inst: &MethodInst,
+    snap: &mut Snapshotter,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
@@ -459,7 +467,7 @@ fn eval_method_inst(
                 }
             }
             InstExt::ResourceCall(call) => {
-                let (delta, bool_id) = eval_resource_call(ctx, program, state, call)?;
+                let (delta, bool_id) = eval_resource_call(ctx, program, state, call, snap)?;
                 state.push_heap(delta);
                 state.push_val(bool_id);
             }
@@ -470,14 +478,20 @@ fn eval_method_inst(
 
 pub fn verify_method(
     program: &vmir::Program,
-    _method_name: &str,
+    method_name: &str,
     method: &Method,
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner);
     let mut state = EvalState::new();
+    let mut snap = Snapshotter::from_env(method_name);
 
+    snap.snapshot(&ctx, None, "init", None);
     for inst in &method.insts {
-        eval_method_inst(&mut ctx, program, &mut state, inst)?;
+        let vals_before = state.vals.len();
+        eval_method_inst(&mut ctx, program, &mut state, inst, &mut snap)?;
+        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
+        let label = viz::method_inst_label(&inst.kind, ctx.interner);
+        snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
     }
 
     Ok(())
