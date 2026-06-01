@@ -221,9 +221,13 @@ impl<'a> Builder<'a> {
                 env.insert(r.name.0, vmir::Val::Temp(m.params.len() + i));
             }
             // m@ensures's precondition resource is m@requires (when present).
-            // `HeapVal::Temp(0)` is reserved for the precondition's heap
-            // delta even when no explicit precondition exists — the slot
-            // is then the caller-supplied (empty) ctx_heap.
+            // `HeapVal::Temp(0)` stays the reserved ctx slot (the precondition's
+            // heap delta, supplied by the caller) for future pre-state / `old`
+            // reads — but it must NOT be the permission-accumulation base. The
+            // ensures delta is produced-only: accumulate from `HeapVal::Empty`
+            // so a resource named in both requires and ensures isn't counted
+            // twice. `heap_base` stays 1 because the verifier still occupies
+            // `heaps[0]` with the ctx heap.
             let resource_requires = self.method_requires.get(&m.name.0).copied().map(|req_id| {
                 let req_args: Vec<vmir::Val> = (0..m.params.len()).map(vmir::Val::Temp).collect();
                 (req_id, req_args)
@@ -233,7 +237,7 @@ impl<'a> Builder<'a> {
                 &env,
                 ensures,
                 params.len(),
-                vmir::HeapVal::Temp(0),
+                vmir::HeapVal::Empty,
                 1,
             )?;
             self.set_decl(

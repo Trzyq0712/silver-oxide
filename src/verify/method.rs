@@ -973,4 +973,69 @@ method caller(this: Ref)
             "expected InsufficientPermission, got {result:?}"
         );
     }
+
+    #[test]
+    fn ensures_does_not_double_count_carried_permission() {
+        // `read` requires AND ensures `number(this)`. The ensures delta must be
+        // produced-only (perm 1), not accumulated onto the requires delta
+        // (which would yield perm 2). Likewise `add` carries number(this)/
+        // number(other) through and adds number(res); every chunk stays at 1.
+        let input = r#"
+predicate number(this: Ref)
+
+method assign(this: Ref, value: Int)
+    ensures number(this)
+
+method read(this: Ref) returns (val: Int)
+    requires number(this)
+    ensures number(this)
+
+method add(this: Ref, other: Ref) returns (res: Ref)
+    requires number(this) && number(other)
+    ensures number(this) && number(other) && number(res)
+{
+    var a: Int := read(this)
+    var b: Int := read(other)
+    var sum: Int := a + b
+    assign(res, sum)
+}
+"#;
+        let program = lower(input);
+        let add_id = program.interner.get("add").expect("add method");
+        let vmir::Declaration::Method(add) = &program.decls[add_id] else {
+            panic!("add must be a Method");
+        };
+        let result = verify_method(&program, "add", add);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn exhale_exceeding_held_permission_fails() {
+        // `client` holds only `1/2` of `acc(x.f)` but calls `needs_full`, whose
+        // precondition exhales the full `1/1`. The exhale would drive the
+        // permission to `-1/2`, so verification must fail rather than allow a
+        // negative permission.
+        let input = r#"
+field f: Int
+
+method needs_full(x: Ref)
+    requires acc(x.f, 1/1)
+
+method client(x: Ref)
+    requires acc(x.f, 1/2)
+{
+    needs_full(x)
+}
+"#;
+        let program = lower(input);
+        let client_id = program.interner.get("client").expect("client method");
+        let vmir::Declaration::Method(client) = &program.decls[client_id] else {
+            panic!("client must be a Method");
+        };
+        let result = verify_method(&program, "client", client);
+        assert!(
+            matches!(result, Err(VerifyError::InsufficientPermission)),
+            "expected InsufficientPermission, got {result:?}"
+        );
+    }
 }
