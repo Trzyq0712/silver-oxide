@@ -1186,4 +1186,213 @@ method m(x: Int)
             "expected SideCondition, got {result:?}"
         );
     }
+
+    /// Verify the method `name`, panicking if missing or not a `Method`.
+    fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
+        let id = program
+            .interner
+            .get(name)
+            .unwrap_or_else(|| panic!("missing method {name}"));
+        let vmir::Declaration::Method(m) = &program.decls[id] else {
+            panic!("{name} must be a Method");
+        };
+        verify_method(program, name, m)
+    }
+
+    #[test]
+    fn inline_inhale_then_exhale_roundtrips() {
+        // Inhale a field + a fact about it (read against the growing heap), then
+        // exhale the fact (read against the pre-exhale heap) and the permission.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    inhale acc(x.f, 1/1) && x.f == 5
+    exhale x.f == 5
+    exhale acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "inhale/exhale roundtrip should verify"
+        );
+    }
+
+    #[test]
+    fn inline_exhale_without_permission_fails() {
+        // Exhaling `1/1` while only `1/2` was inhaled drives permission negative.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    inhale acc(x.f, 1/2)
+    exhale acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        let result = verify_named_method(&program, "m");
+        assert!(
+            matches!(result, Err(VerifyError::InsufficientPermission)),
+            "expected InsufficientPermission, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn inline_exhale_unproven_fact_fails() {
+        // The exhaled boolean `x.f == 5` is not known (nothing assumed it).
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    inhale acc(x.f, 1/1)
+    exhale x.f == 5
+}
+"#;
+        let program = lower(input);
+        let result = verify_named_method(&program, "m");
+        assert!(
+            matches!(result, Err(VerifyError::AssertionFailed)),
+            "expected AssertionFailed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn new_single_field_grants_full_permission() {
+        let input = r#"
+field f: Int
+
+method m()
+{
+    var x: Ref := new(f)
+    exhale acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "new(f) should grant full permission to x.f"
+        );
+    }
+
+    #[test]
+    fn new_permission_is_exactly_full() {
+        // `new(f)` grants exactly `1/1`; exhaling it twice over-consumes.
+        let input = r#"
+field f: Int
+
+method m()
+{
+    var x: Ref := new(f)
+    exhale acc(x.f, 1/1)
+    exhale acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        let result = verify_named_method(&program, "m");
+        assert!(
+            matches!(result, Err(VerifyError::InsufficientPermission)),
+            "expected InsufficientPermission, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn perm_in_exhale_sees_removed_permission() {
+        // `acc(x.f)` is exhaled first, so `perm(x.f)` then reads `none` (0).
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+{
+    exhale acc(x.f, 1/1) && perm(x.f) == none
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "perm() in exhale must see the post-removal heap"
+        );
+    }
+
+    #[test]
+    fn perm_before_acc_in_exhale_is_full() {
+        // `perm(x.f)` is read before its `acc` is subtracted, so it is `write` (1).
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+{
+    exhale perm(x.f) == write && acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "perm() read before its acc must be full"
+        );
+    }
+
+    #[test]
+    fn perm_in_inhale_sees_added_permission() {
+        // Inhale tracks the growing heap: after `acc(x.f)`, `perm(x.f) == write`.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    inhale acc(x.f, 1/1) && perm(x.f) == write
+    exhale acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "perm() in inhale must see the added permission"
+        );
+    }
+
+    #[test]
+    fn exhale_value_read_uses_pre_exhale_heap() {
+        // The value `x.f` is read in the same exhale that gives up `acc(x.f)`;
+        // value reads resolve against the fixed pre-exhale heap, so it works.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+{
+    inhale x.f == 5
+    exhale acc(x.f, 1/1) && x.f == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "value read in exhale must use the pre-exhale heap"
+        );
+    }
+
+    #[test]
+    fn new_multiple_fields() {
+        let input = r#"
+field f: Int
+field g: Int
+
+method m()
+{
+    var x: Ref := new(f, g)
+    exhale acc(x.f, 1/1) && acc(x.g, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "new(f, g) should grant full permission to both fields"
+        );
+    }
 }

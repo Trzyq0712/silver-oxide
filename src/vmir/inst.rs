@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapInst, PureInst, Type, Val};
+use crate::vmir::{HeapInst, HeapVal, PureInst, Type, Val};
 
 use std::clone::Clone;
 use std::cmp::{Eq, PartialEq};
@@ -31,6 +31,13 @@ pub trait InstContext {
     type PureExt: Ext = !;
     /// Heap-instruction extensions legal in this context.
     type HeapExt: Ext = !;
+
+    /// Build this context's `perm(loc)` pure extension reading `heap`, when the
+    /// context permits one. Default `None` (no perm extension is constructible,
+    /// e.g. resource bodies whose `PureExt` is the never type).
+    fn perm_pure_ext(_heap: HeapVal, _loc: Val) -> Option<Self::PureExt> {
+        None
+    }
 }
 
 /// An instruction gated by a path condition.

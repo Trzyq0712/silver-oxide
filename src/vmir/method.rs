@@ -12,6 +12,10 @@ impl InstContext for MethodCtx {
     type InstExt = InstExt;
     type HeapExt = HeapExt;
     type PureExt = PureExt;
+
+    fn perm_pure_ext(heap: HeapVal, loc: Val) -> Option<Self::PureExt> {
+        Some(PureExt::Perm(heap, loc))
+    }
 }
 
 /// Method-specific instruction extensions.

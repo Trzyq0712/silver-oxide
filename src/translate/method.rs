@@ -7,9 +7,10 @@ use lasso::Spur;
 
 use crate::viper::typed;
 use crate::translate::pure_exp::{self, Sink};
+use crate::translate::resource::{self, SpatialMode};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PureInst, ResourceCall, Val,
+    self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PureInst, ResourceCall, Type, Val,
 };
 
 pub(crate) fn lower_method(
@@ -92,7 +93,7 @@ fn lower_stmt(
             if idents.len() != 1 {
                 return Err(TranslationError::Unsupported("multi-LHS var := exp"));
             }
-            let v = pure_exp::lower(b, env, sink, current_heap, pure)?;
+            let v = pure_exp::lower(b, env, sink, pure_exp::HeapCtx::same(current_heap), pure)?;
             env.insert(idents[0].name.0, v);
             Ok(current_heap)
         }
@@ -140,13 +141,27 @@ fn lower_stmt(
                     return Err(TranslationError::Unsupported("field lvalue"));
                 }
             };
-            let v = pure_exp::lower(b, env, sink, current_heap, pure)?;
+            let v = pure_exp::lower(b, env, sink, pure_exp::HeapCtx::same(current_heap), pure)?;
             env.insert(name, v);
             Ok(current_heap)
         }
-        S::Assign(_, typed::AssignRhs::New(_))
-        | S::Var(_, Some(typed::AssignRhs::New(_))) => {
-            Err(TranslationError::Unsupported("new(...)"))
+        S::Var(idents, Some(typed::AssignRhs::New(sof))) => {
+            if idents.len() != 1 {
+                return Err(TranslationError::Unsupported("multi-LHS var := new"));
+            }
+            lower_new(b, env, sink, current_heap, idents[0].name.0, sof)
+        }
+        S::Assign(lhss, typed::AssignRhs::New(sof)) => {
+            if lhss.len() != 1 {
+                return Err(TranslationError::Unsupported("multi-LHS assign := new"));
+            }
+            let name = match &lhss[0] {
+                typed::AssignLhs::Var(n) => n.0,
+                typed::AssignLhs::Field(_, _) => {
+                    return Err(TranslationError::Unsupported("field lvalue"));
+                }
+            };
+            lower_new(b, env, sink, current_heap, name, sof)
         }
         S::If(_, _, _) => Err(TranslationError::Unsupported("if statement")),
         S::Block(_) => Err(TranslationError::Unsupported("nested block")),
@@ -154,8 +169,69 @@ fn lower_stmt(
         S::Unfold(_) => Err(TranslationError::Unsupported("unfold")),
         S::Assume(_) => Err(TranslationError::Unsupported("source-level assume")),
         S::Assert(_) => Err(TranslationError::Unsupported("source-level assert")),
-        S::Inhale(_) => Err(TranslationError::Unsupported("inhale")),
-        S::Exhale(_) => Err(TranslationError::Unsupported("exhale")),
+        // Inhale: add the assertion's heap delta to the current heap and assume
+        // its boolean. Heap-dependent sub-expressions are evaluated against the
+        // growing heap (`ReadHeap::Track`), so later conjuncts can observe the
+        // permissions just inhaled.
+        S::Inhale(e) => {
+            let (h_out, bv) =
+                resource::lower_spatial(b, env, sink, current_heap, SpatialMode::Inhale, e)?;
+            if let Some(v) = bv {
+                sink.emit_ext(InstExt::Assume(v));
+            }
+            Ok(h_out)
+        }
+        // Exhale: subtract the assertion's heap delta (accumulated from
+        // `Empty`) from the current heap and assert its boolean. All
+        // heap-dependent sub-expressions are evaluated against the heap from
+        // *before* the exhale (`ReadHeap::Fixed(current_heap)`), since the
+        // permissions are still held at that point.
+        S::Exhale(e) => {
+            // Subtraction happens inside `lower_spatial` (left-to-right), so a
+            // `perm` in the assertion observes the running reduced heap, while
+            // value reads use the fixed pre-exhale `current_heap`.
+            let (h_out, bv) = resource::lower_spatial(
+                b,
+                env,
+                sink,
+                current_heap,
+                SpatialMode::Exhale {
+                    value_heap: current_heap,
+                },
+                e,
+            )?;
+            if let Some(v) = bv {
+                sink.emit_ext(InstExt::Assert(v));
+            }
+            Ok(h_out)
+        }
+    }
+}
+
+/// Lower `lhs := new(fields)`: allocate a fresh `Ref`, bind it to `lhs`, and
+/// inhale full permission to each listed field (`acc(lhs.f, write)`), adding the
+/// chunks to the current heap. `new(*)` is not yet supported.
+fn lower_new(
+    b: &Builder<'_>,
+    env: &mut HashMap<Spur, Val>,
+    sink: &mut Sink<MethodCtx>,
+    current_heap: HeapVal,
+    lhs: Spur,
+    sof: &typed::StarOrFields,
+) -> Result<HeapVal, TranslationError> {
+    let v = sink.emit_pure(Type::Ref, PureInst::Fresh);
+    env.insert(lhs, v.clone());
+
+    match sof {
+        typed::StarOrFields::Fields(fields) => {
+            let mut heap = current_heap;
+            for f in fields {
+                let delta = resource::field_acc_delta(b, sink, v.clone(), f.0, vmir::write())?;
+                heap = sink.emit_heap(HeapInst::Add(heap, delta));
+            }
+            Ok(heap)
+        }
+        typed::StarOrFields::Star => Err(TranslationError::Unsupported("new(*)")),
     }
 }
 
@@ -171,7 +247,7 @@ fn lower_method_call(
     // Lower argument expressions.
     let mut args: Vec<Val> = Vec::with_capacity(call.args.len());
     for a in &call.args {
-        args.push(pure_exp::lower(b, env, sink, current_heap, a)?);
+        args.push(pure_exp::lower(b, env, sink, pure_exp::HeapCtx::same(current_heap), a)?);
     }
 
     let mut heap = current_heap;
