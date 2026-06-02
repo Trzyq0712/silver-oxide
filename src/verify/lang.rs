@@ -106,7 +106,7 @@ impl Language for Symbolic {
 impl Display for Symbolic {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Symbolic::Fresh(id, ty) => write!(f, "{id}#{ty}"),
+            Symbolic::Fresh(id, ty) => write!(f, "{ty}#{id}"),
             Symbolic::Lit(l) => write!(f, "{l}"),
             Symbolic::Binary(op, _, _) => write!(f, "{op}"),
             Symbolic::Ite(_, _) => write!(f, "ITE"),

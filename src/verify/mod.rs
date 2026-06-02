@@ -8,15 +8,16 @@ mod method;
 mod rewrite;
 mod viz;
 
-pub use method::VerifyError;
+pub use method::{VerifyError, verify_resource};
 
-/// Result for one method: its name and whether verification succeeded.
+/// Result for one verification unit (method or resource): its name and whether
+/// verification succeeded.
 pub type MethodResult = (String, Result<(), VerifyError>);
 
-/// Verify an already-analyzed program in dependency order. Returns one
-/// entry per method body. Resources and functions are scheduled ahead of
-/// methods but are not verified yet (future work); only method bodies are
-/// verified.
+/// Verify an already-analyzed program in dependency order. Returns one entry
+/// per verification unit. Resources are verified self-contained (well-formed
+/// side conditions) ahead of the methods that use them; methods are then
+/// verified, reusing the resources' established proofs.
 pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<MethodResult> {
     let program = &analyzed.program;
     let mut results = Vec::new();
@@ -26,9 +27,13 @@ pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<MethodResult> {
     let order = petgraph::algo::toposort(&analyzed.dep_graph, None)
         .expect("dep_graph proven acyclic by analyze");
     for id in order {
-        if let vmir::Declaration::Method(m) = &program.decls[id] {
-            let name = program.interner.resolve(&id).to_string();
-            let outcome = method::verify_method(program, &name, m);
+        let name = program.interner.resolve(&id).to_string();
+        let outcome = match &program.decls[id] {
+            vmir::Declaration::Resource(r) => Some(method::verify_resource(program, &name, r)),
+            vmir::Declaration::Method(m) => Some(method::verify_method(program, &name, m)),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
             results.push((name, outcome));
         }
     }

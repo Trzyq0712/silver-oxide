@@ -6,9 +6,9 @@ use crate::{
         viz::{self, Snapshotter},
     },
     vmir::{
-        self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstExt, InstKind,
-        Literal, Method, MethodInst, PathConds, Polarity, PureInst, ResourceCall, ResourceInst,
-        Type, Val,
+        self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstContext, InstExt,
+        InstKind, Literal, Method, MethodInst, PathConds, Polarity, PureInst, Resource,
+        ResourceCall, ResourceInst, Type, Val,
     },
 };
 
@@ -17,6 +17,9 @@ pub enum VerifyError {
     AssertionFailed,
     InsufficientPermission,
     AbstractResourceCall,
+    /// A resource's side condition (e.g. `acc` permission ≥ 0, division divisor
+    /// ≠ 0) could not be discharged. Carries a human-readable description.
+    SideCondition(&'static str),
     /// Encountered a method-only heap extension (e.g. `Assign`) in a body
     /// the verifier doesn't yet handle structurally. Reserved for
     /// not-yet-implemented variants.
@@ -29,6 +32,7 @@ impl std::fmt::Display for VerifyError {
             Self::AssertionFailed => write!(f, "assertion failed"),
             Self::InsufficientPermission => write!(f, "insufficient permission"),
             Self::AbstractResourceCall => write!(f, "call to abstract resource"),
+            Self::SideCondition(what) => write!(f, "side condition may not hold: {what}"),
             Self::Unimplemented(what) => write!(f, "unimplemented: {what}"),
         }
     }
@@ -388,23 +392,22 @@ fn eval_resource_body_inst(
 
 /// Evaluate a resource invocation as a **reusable proof**.
 ///
-/// Contract: all of the body's structural facts (fresh values, chunk
-/// presences, value identities, the precondition's boolean) are added
-/// unconditionally to the caller's egraph. Returns
-/// `(heap_delta, bool_handle)`. The *outer* boolean is **not** assumed or
-/// asserted here — the caller decides.
+/// The resource was already verified self-contained (see [`verify_resource`]),
+/// so this does **not** step the body for the user (no per-instruction
+/// snapshots) nor re-discharge its side conditions. It re-evaluates the body
+/// atomically into the caller's egraph to produce `(heap_delta, bool_handle)`
+/// and to inject the knowledge it yields (chunk-merge equalities). The *outer*
+/// boolean is **not** assumed or asserted here — the caller decides.
 fn eval_resource_call(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,
     caller_state: &EvalState,
     call: &ResourceCall,
-    snap: &mut Snapshotter,
 ) -> Result<(Heap, egg::Id), VerifyError> {
     let Declaration::Resource(r) = &program.decls[call.resource] else {
         panic!("ResourceCall targets non-Resource declaration");
     };
     let body = r.body.as_ref().ok_or(VerifyError::AbstractResourceCall)?;
-    let res_name = ctx.interner.resolve(&call.resource).to_string();
 
     let args: Vec<egg::Id> = call
         .args
@@ -419,11 +422,7 @@ fn eval_resource_call(
     res_state.push_heap(get_heap(caller_state, &call.ctx_heap));
 
     for inst in &body.insts {
-        let vals_before = res_state.vals.len();
         eval_resource_body_inst(ctx, &mut res_state, inst)?;
-        let highlight = (res_state.vals.len() > vals_before).then(|| res_state.vals[res_state.vals.len() - 1]);
-        let label = format!("{res_name}: {}", viz::resource_inst_label(&inst.kind));
-        snap.snapshot(ctx, res_state.heaps.last(), &label, highlight);
     }
 
     let result_heap = get_heap(&res_state, &body.res.0);
@@ -436,7 +435,6 @@ fn eval_method_inst(
     program: &vmir::Program,
     state: &mut EvalState,
     inst: &MethodInst,
-    snap: &mut Snapshotter,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
@@ -467,7 +465,7 @@ fn eval_method_inst(
                 }
             }
             InstExt::ResourceCall(call) => {
-                let (delta, bool_id) = eval_resource_call(ctx, program, state, call, snap)?;
+                let (delta, bool_id) = eval_resource_call(ctx, program, state, call)?;
                 state.push_heap(delta);
                 state.push_val(bool_id);
             }
@@ -488,7 +486,7 @@ pub fn verify_method(
     snap.snapshot(&ctx, None, "init", None);
     for inst in &method.insts {
         let vals_before = state.vals.len();
-        eval_method_inst(&mut ctx, program, &mut state, inst, &mut snap)?;
+        eval_method_inst(&mut ctx, program, &mut state, inst)?;
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
         let label = viz::method_inst_label(&inst.kind, ctx.interner);
         snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
@@ -496,6 +494,98 @@ pub fn verify_method(
 
     Ok(())
 }
+
+/// Verify a resource self-contained: run its body in a fresh egraph with fresh
+/// symbolic params and a parametric (empty) ctx heap, discharging each
+/// instruction's side-condition obligations under its path condition. Abstract
+/// resources have nothing to check. This establishes well-formedness **once**;
+/// method call sites reuse it without re-checking (see [`eval_resource_call`]).
+pub fn verify_resource(
+    program: &vmir::Program,
+    resource_name: &str,
+    resource: &Resource,
+) -> Result<(), VerifyError> {
+    let Some(body) = resource.body.as_ref() else {
+        return Ok(());
+    };
+
+    let mut ctx = VerifyContext::new(&program.interner);
+    let params: Vec<egg::Id> = resource
+        .params
+        .iter()
+        .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
+        .collect();
+    let mut state = EvalState::with_args(params);
+    // Parametric ctx heap: an empty heap whose reads yield fresh symbolics.
+    state.push_heap(Heap::empty());
+
+    let mut snap = Snapshotter::from_env(resource_name);
+    snap.snapshot(&ctx, None, "init", None);
+
+    for inst in &body.insts {
+        let pc_lits: Vec<(egg::Id, Polarity)> = inst
+            .pc
+            .conds
+            .iter()
+            .map(|(v, p)| (state.get_val(&mut ctx, v), *p))
+            .collect();
+        for (goal, msg) in inst_obligations(&mut ctx, &state, &inst.kind) {
+            if !ctx.prove_under_pc(goal, &pc_lits) {
+                return Err(VerifyError::SideCondition(msg));
+            }
+        }
+
+        let vals_before = state.vals.len();
+        eval_resource_body_inst(&mut ctx, &mut state, inst)?;
+        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
+        let label = viz::resource_inst_label(&inst.kind);
+        snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
+    }
+
+    Ok(())
+}
+
+/// Side-condition obligations implied by an instruction's kind, as
+/// `(goal, description)` pairs that must each be proven `true` under the
+/// instruction's path condition. `acc` requires a non-negative permission;
+/// division requires a non-zero divisor.
+fn inst_obligations<C: InstContext>(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    kind: &InstKind<C>,
+) -> Vec<(egg::Id, &'static str)> {
+    let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+    match kind {
+        // `not(perm < 0)` desugared to an `Ite`.
+        InstKind::Heap(HeapInst::Acc(acc)) => {
+            let perm = state.get_val(ctx, &acc.perm);
+            let zero = zero_real(ctx);
+            let lt = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [perm, zero]));
+            let goal = ctx.add(Symbolic::Ite(Type::Bool, [lt, false_, true_]));
+            vec![(goal, "permission may be negative")]
+        }
+        // `not(divisor == 0)` desugared to an `Ite`.
+        InstKind::Pure(_, PureInst::Binary(BinOp::Div, _, r)) => {
+            let rv = state.get_val(ctx, r);
+            let rty = ctx.egraph[rv].data.ty.clone();
+            let zero = zero_of(ctx, &rty);
+            let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [rv, zero]));
+            let goal = ctx.add(Symbolic::Ite(Type::Bool, [eq, false_, true_]));
+            vec![(goal, "divisor may be zero")]
+        }
+        _ => vec![],
+    }
+}
+
+/// Zero literal of the given numeric type (`Real` fallback for non-numeric).
+fn zero_of(ctx: &mut VerifyContext<'_>, ty: &Type) -> egg::Id {
+    match ty {
+        Type::Int => ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0)))),
+        _ => zero_real(ctx),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1036,6 +1126,64 @@ method client(x: Ref)
         assert!(
             matches!(result, Err(VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
+        );
+    }
+
+    /// Verify the resource interned under `name`, panicking if it is missing or
+    /// is not a `Resource`.
+    fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
+        let id = program
+            .interner
+            .get(name)
+            .unwrap_or_else(|| panic!("missing resource {name}"));
+        let vmir::Declaration::Resource(r) = &program.decls[id] else {
+            panic!("{name} must be a Resource");
+        };
+        verify_resource(program, name, r)
+    }
+
+    #[test]
+    fn resource_negative_permission_rejected() {
+        // `acc(x.f, 1/1 - 2/1)` folds to permission -1 → side condition fails.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1 - 2/1)
+"#;
+        let program = lower(input);
+        let result = verify_named_resource(&program, "m@requires");
+        assert!(
+            matches!(result, Err(VerifyError::SideCondition(_))),
+            "expected SideCondition, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resource_positive_permission_ok() {
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+"#;
+        let program = lower(input);
+        let result = verify_named_resource(&program, "m@requires");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn resource_div_by_zero_rejected() {
+        // `x / 0` in the precondition → divisor side condition fails.
+        let input = r#"
+method m(x: Int)
+    requires x / 0 == x
+"#;
+        let program = lower(input);
+        let result = verify_named_resource(&program, "m@requires");
+        assert!(
+            matches!(result, Err(VerifyError::SideCondition(_))),
+            "expected SideCondition, got {result:?}"
         );
     }
 }

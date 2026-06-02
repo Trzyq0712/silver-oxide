@@ -118,7 +118,13 @@ impl Snapshotter {
 
         // Highlight the e-class the produced value landed in: a bold red border
         // (no fill, so the type color stays visible). Injected last so it wins.
-        if let Some(id) = highlight {
+        //
+        // Skip constants: a produced value that folded to a literal (e.g. a
+        // resource call whose contract boolean is the vacuous `true`) lives in
+        // the shared global literal e-class, so a border + arg arrows out of it
+        // are noise — every such step would mark the same node.
+        if let Some(id) = highlight.filter(|id| ctx.egraph[ctx.egraph.find(*id)].data.value.is_none())
+        {
             let canon = ctx.egraph.find(id);
             let needle = format!("subgraph cluster_{} {{\n", usize::from(canon));
             if let Some(pos) = dot.find(&needle) {
