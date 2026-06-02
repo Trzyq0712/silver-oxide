@@ -1598,4 +1598,50 @@ method m()
             "new(f, g) should grant full permission to both fields"
         );
     }
+
+    #[test]
+    fn rewrite_and_true_collapses() {
+        // b && true  =  ite(b, true, false)  =>  b
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+        let b = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let t = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        let f = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+        let ite = ctx.add(Symbolic::Ite(Type::Bool, [b, t, f]));
+        ctx.saturate();
+        assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(b));
+    }
+
+    #[test]
+    fn rewrite_and_self_collapses() {
+        // b && b  =  ite(b, b, false)  =>  b
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+        let b = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let f = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+        let ite = ctx.add(Symbolic::Ite(Type::Bool, [b, b, f]));
+        ctx.saturate();
+        assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(b));
+    }
+
+    #[test]
+    fn under_pc_verifies() {
+        // `assume (b && true) ==> x.f == 10` then `assert (b && b) ==> x.f == 10`:
+        // both antecedents collapse to `b`, so the implications are congruent.
+        let input = r#"
+field f: Int
+
+method under_pc(x: Ref, b: Bool)
+{
+    inhale acc(x.f, 1/1)
+    assume (b && true) ==> x.f == 10
+    assert (b && b) ==> x.f == 10
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "under_pc").is_ok(),
+            "under_pc should verify with the and-true / and-self rewrites"
+        );
+    }
 }

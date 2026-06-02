@@ -5,9 +5,11 @@
 //! term and the e-graph cannot grow exponentially. No
 //! commutativity/associativity rules.
 //!
-//! `Symbolic` is a hand-written `Language` without `FromOp`, so the string
-//! `rewrite!` macro is unavailable; patterns are built programmatically via
-//! `PatternAst`/`ENodeOrVar` instead.
+//! `Symbolic` is a hand-written, *typed* `Language` (nodes carry `Type` /
+//! `MemberId`), so egg's string `rewrite!` macro — which needs `FromOp` — is
+//! not used. Instead, rules are written declaratively via the small [`Pat`]
+//! builder below: e.g. `rule("ite-true", pite(pbool(true), pvar("?x"),
+//! pvar("?y")), pvar("?x"))`.
 
 use egg::{Applier, EGraph, ENodeOrVar, Id, Pattern, PatternAst, Rewrite, Subst, Symbol, Var};
 
@@ -21,45 +23,101 @@ fn var(name: &str) -> Var {
     name.parse().expect("valid pattern var")
 }
 
+// ======================
+// PATTERN BUILDER DSL
+// ======================
+
+/// A pattern term over [`Symbolic`], built declaratively and lowered to a
+/// `PatternAst`. Mirrors the `Symbolic` variants that appear in rules; the
+/// `Ite` result type is omitted because `Symbolic::matches` ignores it.
+enum Pat {
+    Var(&'static str),
+    Lit(Literal),
+    Binary(BinOp, Type, Box<Pat>, Box<Pat>),
+    Ite(Box<Pat>, Box<Pat>, Box<Pat>),
+}
+
+impl Pat {
+    fn build(&self, ast: &mut PatternAst<Symbolic>) -> Id {
+        match self {
+            Pat::Var(name) => ast.add(ENodeOrVar::Var(var(name))),
+            Pat::Lit(lit) => ast.add(ENodeOrVar::ENode(Symbolic::Lit(lit.clone()))),
+            Pat::Binary(op, ty, l, r) => {
+                let l = l.build(ast);
+                let r = r.build(ast);
+                ast.add(ENodeOrVar::ENode(Symbolic::Binary(*op, ty.clone(), [l, r])))
+            }
+            Pat::Ite(c, t, e) => {
+                let c = c.build(ast);
+                let t = t.build(ast);
+                let e = e.build(ast);
+                // Result type is irrelevant to matching; `Bool` is a placeholder.
+                ast.add(ENodeOrVar::ENode(Symbolic::Ite(Type::Bool, [c, t, e])))
+            }
+        }
+    }
+
+    fn pattern(&self) -> Pattern<Symbolic> {
+        let mut ast = PatternAst::default();
+        self.build(&mut ast);
+        Pattern::new(ast)
+    }
+}
+
+fn pvar(name: &'static str) -> Pat {
+    Pat::Var(name)
+}
+fn pbool(b: bool) -> Pat {
+    Pat::Lit(Literal::Bool(b))
+}
+fn pite(c: Pat, t: Pat, e: Pat) -> Pat {
+    Pat::Ite(Box::new(c), Box::new(t), Box::new(e))
+}
+fn pbin(op: BinOp, ty: Type, l: Pat, r: Pat) -> Pat {
+    Pat::Binary(op, ty, Box::new(l), Box::new(r))
+}
+
+/// A rewrite from one pattern to another (RHS is a sub-term of the LHS).
+fn rule(name: &str, lhs: Pat, rhs: Pat) -> Rule {
+    Rewrite::new(name.to_string(), lhs.pattern(), rhs.pattern()).unwrap()
+}
+
+/// A rewrite with a custom applier (e.g. a conditional e-class union).
+fn rule_with(
+    name: &str,
+    lhs: Pat,
+    applier: impl Applier<Symbolic, ConstFold> + Send + Sync + 'static,
+) -> Rule {
+    Rewrite::new(name.to_string(), lhs.pattern(), applier).unwrap()
+}
+
+// ======================
+// RULE SET
+// ======================
+
 /// The full rule set run during saturation.
 pub fn rules() -> Vec<Rule> {
-    let mut rules = vec![ite_true(), ite_false(), eq_true_union()];
+    let mut rules = vec![
+        // ite(true, x, y) => x   /   ite(false, x, y) => y
+        rule("ite-true", pite(pbool(true), pvar("?x"), pvar("?y")), pvar("?x")),
+        rule("ite-false", pite(pbool(false), pvar("?x"), pvar("?y")), pvar("?y")),
+        // b && true  =  ite(b, true, false) => b
+        rule(
+            "ite-true-false",
+            pite(pvar("?c"), pbool(true), pbool(false)),
+            pvar("?c"),
+        ),
+        // b && b  =  ite(b, b, false) => b
+        rule(
+            "and-self",
+            pite(pvar("?c"), pvar("?c"), pbool(false)),
+            pvar("?c"),
+        ),
+        eq_true_union(),
+    ];
     rules.extend(add_zero(Type::Int, Literal::Int(0.into())));
     rules.extend(add_zero(Type::Real, Literal::Real(num::BigInt::from(0).into())));
     rules
-}
-
-/// `ite(true, x, y) => x`. The `Ite` result type is irrelevant (ignored by
-/// `Symbolic::matches`), so one rule covers every type.
-fn ite_true() -> Rule {
-    let x = var("?x");
-    let y = var("?y");
-    let mut lhs = PatternAst::default();
-    let cond = lhs.add(ENodeOrVar::ENode(Symbolic::Lit(Literal::Bool(true))));
-    let xn = lhs.add(ENodeOrVar::Var(x));
-    let yn = lhs.add(ENodeOrVar::Var(y));
-    lhs.add(ENodeOrVar::ENode(Symbolic::Ite(Type::Bool, [cond, xn, yn])));
-
-    let mut rhs = PatternAst::default();
-    rhs.add(ENodeOrVar::Var(x));
-
-    Rewrite::new("ite-true", Pattern::new(lhs), Pattern::new(rhs)).unwrap()
-}
-
-/// `ite(false, x, y) => y`.
-fn ite_false() -> Rule {
-    let x = var("?x");
-    let y = var("?y");
-    let mut lhs = PatternAst::default();
-    let cond = lhs.add(ENodeOrVar::ENode(Symbolic::Lit(Literal::Bool(false))));
-    let xn = lhs.add(ENodeOrVar::Var(x));
-    let yn = lhs.add(ENodeOrVar::Var(y));
-    lhs.add(ENodeOrVar::ENode(Symbolic::Ite(Type::Bool, [cond, xn, yn])));
-
-    let mut rhs = PatternAst::default();
-    rhs.add(ENodeOrVar::Var(y));
-
-    Rewrite::new("ite-false", Pattern::new(lhs), Pattern::new(rhs)).unwrap()
 }
 
 /// Applier for `eq-true-union`: when a matched `Eq` e-class is proven `true`,
@@ -103,44 +161,36 @@ impl Applier<Symbolic, ConstFold> for UnionEqArgs {
 /// unioning the operands. `Eq`'s result type is always `Bool`, so the concrete
 /// type in the pattern is correct under type-comparing `Binary` matching.
 fn eq_true_union() -> Rule {
-    let a = var("?a");
-    let b = var("?b");
-    let mut lhs = PatternAst::default();
-    let an = lhs.add(ENodeOrVar::Var(a));
-    let bn = lhs.add(ENodeOrVar::Var(b));
-    lhs.add(ENodeOrVar::ENode(Symbolic::Binary(
-        BinOp::Eq,
-        Type::Bool,
-        [an, bn],
-    )));
-
-    Rewrite::new("eq-true-union", Pattern::new(lhs), UnionEqArgs { a, b }).unwrap()
+    rule_with(
+        "eq-true-union",
+        pbin(BinOp::Eq, Type::Bool, pvar("?a"), pvar("?b")),
+        UnionEqArgs {
+            a: var("?a"),
+            b: var("?b"),
+        },
+    )
 }
 
 /// `x + 0 => x` and `0 + x => x` for the given numeric type. Type-correctness
 /// is preserved by the concrete typed zero literal even though `Binary`'s
 /// result type is ignored by matching.
 fn add_zero(ty: Type, zero: Literal) -> Vec<Rule> {
-    let make = |name: &str, swap: bool| {
-        let x = var("?x");
-        let mut lhs = PatternAst::default();
-        let xn = lhs.add(ENodeOrVar::Var(x));
-        let zn = lhs.add(ENodeOrVar::ENode(Symbolic::Lit(zero.clone())));
-        let children = if swap { [zn, xn] } else { [xn, zn] };
-        lhs.add(ENodeOrVar::ENode(Symbolic::Binary(BinOp::Plus, ty.clone(), children)));
-
-        let mut rhs = PatternAst::default();
-        rhs.add(ENodeOrVar::Var(x));
-
-        Rewrite::new(name.to_string(), Pattern::new(lhs), Pattern::new(rhs)).unwrap()
-    };
     let suffix = match ty {
         Type::Int => "int",
         Type::Real => "real",
         _ => "num",
     };
+    let lit = || Pat::Lit(zero.clone());
     vec![
-        make(&format!("add-zero-{suffix}-r"), false),
-        make(&format!("add-zero-{suffix}-l"), true),
+        rule(
+            &format!("add-zero-{suffix}-r"),
+            pbin(BinOp::Plus, ty.clone(), pvar("?x"), lit()),
+            pvar("?x"),
+        ),
+        rule(
+            &format!("add-zero-{suffix}-l"),
+            pbin(BinOp::Plus, ty, lit(), pvar("?x")),
+            pvar("?x"),
+        ),
     ]
 }
