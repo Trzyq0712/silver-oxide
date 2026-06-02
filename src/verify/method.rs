@@ -1378,6 +1378,100 @@ method m(x: Ref)
     }
 
     #[test]
+    fn assert_held_permission_ok() {
+        // `assert acc(x.f)` becomes `perm(x.f) >= write`; held in full → ok, and
+        // it is non-destructive, so the permission is still exhalable after.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+{
+    assert acc(x.f, 1/1)
+    exhale acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "assert acc must hold and not consume the permission"
+        );
+    }
+
+    #[test]
+    fn assert_unheld_permission_fails() {
+        // `perm(x.f) = 0 >= write` is false.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    assert acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        let result = verify_named_method(&program, "m");
+        assert!(
+            matches!(result, Err(VerifyError::AssertionFailed)),
+            "expected AssertionFailed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn assert_pure_unproven_fails() {
+        let input = r#"
+method m(x: Int)
+{
+    assert x == 5
+}
+"#;
+        let program = lower(input);
+        let result = verify_named_method(&program, "m");
+        assert!(
+            matches!(result, Err(VerifyError::AssertionFailed)),
+            "expected AssertionFailed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn assume_then_assert_pure() {
+        let input = r#"
+method m(x: Int)
+{
+    assume x == 5
+    assert x == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "assumed fact must be assertable"
+        );
+    }
+
+    #[test]
+    fn assume_then_assert_acc() {
+        // `assume acc(x.f)` records the fact `perm(x.f) >= write` (it adds no
+        // chunk — unlike `inhale`); asserting the same fact then holds. The
+        // permission is genuinely held here so the assumed fact is consistent.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+{
+    assume acc(x.f, 1/1)
+    assert acc(x.f, 1/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "assumed perm fact must be assertable"
+        );
+    }
+
+    #[test]
     fn new_multiple_fields() {
         let input = r#"
 field f: Int

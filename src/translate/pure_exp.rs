@@ -324,65 +324,14 @@ impl PureExt for typed::MethodBodyExt {
         ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError> {
-        use crate::viper::typed::ResourceExpKind as R;
         match ext {
             typed::MethodBodyExt::Old(..) => {
                 Err(TranslationError::Unsupported("`old` in method body"))
             }
             // perm(loc): query the permission held at `loc` in the perm heap.
             typed::MethodBodyExt::Perm(res) => {
-                let addr = match &*res.0 {
-                    R::Field(base, fname) => {
-                        let base_val = lower(b, env, sink, hctx, base)?;
-                        let &addr_fn = b.field_addr.get(&fname.0).ok_or_else(|| {
-                            TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
-                        })?;
-                        let field_ty = b
-                            .globals
-                            .resolve(fname.0)
-                            .and_then(|s| s.as_field().cloned())
-                            .ok_or_else(|| {
-                                TranslationError::UnknownIdent(
-                                    b.interner.resolve(&fname.0).to_string(),
-                                )
-                            })?;
-                        let ret_ty = vmir::Type::Addr(Box::new(lower_type(&field_ty)));
-                        sink.emit_pure(
-                            ret_ty,
-                            PureInst::FunctionCall(
-                                HeapVal::Empty,
-                                FunctionCall {
-                                    function: addr_fn,
-                                    args: vec![base_val],
-                                },
-                            ),
-                        )
-                    }
-                    R::PredicateCall(call) => {
-                        let &addr_fn = b.pred_addr.get(&call.name.0).ok_or_else(|| {
-                            TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
-                        })?;
-                        let &snap_id = b
-                            .pred_snap
-                            .get(&call.name.0)
-                            .expect("predicate snap missing");
-                        let mut args = Vec::with_capacity(call.args.len());
-                        for a in &call.args {
-                            args.push(lower(b, env, sink, hctx, a)?);
-                        }
-                        let ret_ty = vmir::Type::Addr(Box::new(vmir::Type::Domain(snap_id)));
-                        sink.emit_pure(
-                            ret_ty,
-                            PureInst::FunctionCall(
-                                HeapVal::Empty,
-                                FunctionCall {
-                                    function: addr_fn,
-                                    args,
-                                },
-                            ),
-                        )
-                    }
-                };
+                let addr =
+                    crate::translate::resource::lower_resource_addr(b, env, sink, hctx, res)?;
                 let pe = C::perm_pure_ext(hctx.perm, addr)
                     .ok_or(TranslationError::Unsupported("perm in this context"))?;
                 Ok(sink.emit_pure(ty, PureInst::Ext(pe)))

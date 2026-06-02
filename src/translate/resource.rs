@@ -170,12 +170,49 @@ fn lower_acc<C: InstContext, Ext: PureExt>(
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
 ) -> Result<HeapVal, TranslationError> {
-    use typed::ResourceExpKind as R;
     let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
+    let addr = lower_resource_addr(b, env, sink, hctx, res)?;
+    Ok(sink.emit_heap(HeapInst::Acc(Acc {
+        loc: addr,
+        perm: perm_val,
+    })))
+}
+
+/// Lower a `ResourceExp` to its address: the `@addr` function applied to the
+/// resource's base/arguments (`field@addr(base)` or `pred@addr(args)`). The
+/// `@addr` call is heap-independent. Shared by `acc`, `perm`, and `new`.
+pub(crate) fn lower_resource_addr<C: InstContext, Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink<C>,
+    hctx: HeapCtx,
+    res: &typed::ResourceExp<Ext>,
+) -> Result<Val, TranslationError> {
+    use typed::ResourceExpKind as R;
     match &*res.0 {
         R::Field(base, fname) => {
             let base_val = pure_exp::lower(b, env, sink, hctx, base)?;
-            field_acc_delta(b, sink, base_val, fname.0, perm_val)
+            let &addr_fn = b.field_addr.get(&fname.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
+            })?;
+            let field_ty = b
+                .globals
+                .resolve(fname.0)
+                .and_then(|s| s.as_field().cloned())
+                .ok_or_else(|| {
+                    TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
+                })?;
+            let ret_ty = Type::Addr(Box::new(lower_type(&field_ty)));
+            Ok(sink.emit_pure(
+                ret_ty,
+                PureInst::FunctionCall(
+                    HeapVal::Empty,
+                    FunctionCall {
+                        function: addr_fn,
+                        args: vec![base_val],
+                    },
+                ),
+            ))
         }
         R::PredicateCall(call) => {
             let &addr_fn = b.pred_addr.get(&call.name.0).ok_or_else(|| {
@@ -190,7 +227,7 @@ fn lower_acc<C: InstContext, Ext: PureExt>(
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
             let ret_ty = Type::Addr(Box::new(Type::Domain(snap_id)));
-            let addr = sink.emit_pure(
+            Ok(sink.emit_pure(
                 ret_ty,
                 PureInst::FunctionCall(
                     HeapVal::Empty,
@@ -199,12 +236,72 @@ fn lower_acc<C: InstContext, Ext: PureExt>(
                         args,
                     },
                 ),
-            );
-            Ok(sink.emit_heap(HeapInst::Acc(Acc {
-                loc: addr,
-                perm: perm_val,
-            })))
+            ))
         }
+    }
+}
+
+/// Lower an assertion used by source-level `assert`/`assume` into a single
+/// boolean over `heap` (returns `None` when trivially true). Permission is
+/// **not** moved: each `acc(loc, p)` becomes the boolean `perm(loc) >= p`.
+pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink<C>,
+    heap: HeapVal,
+    exp: &typed::SpatialExp<Ext>,
+) -> Result<Option<Val>, TranslationError> {
+    use typed::SpatialExpKind as S;
+    let hctx = HeapCtx::same(heap);
+    match &*exp.0 {
+        // acc(loc, p)  ==>  perm(loc) >= p  ==  not(perm(loc) < p)
+        S::Acc(res, perm) => {
+            let p = pure_exp::lower(b, env, sink, hctx, perm)?;
+            let addr = lower_resource_addr(b, env, sink, hctx, res)?;
+            let pe = C::perm_pure_ext(heap, addr)
+                .ok_or(TranslationError::Unsupported("perm in this context"))?;
+            let held = sink.emit_pure(Type::Real, PureInst::Ext(pe));
+            let lt = sink.emit_pure(Type::Bool, PureInst::Binary(vmir::BinOp::Lt, held, p));
+            Ok(Some(sink.emit_pure(Type::Bool, PureInst::Ternary(lt, FALSE, TRUE))))
+        }
+        S::Conj(l, r) => {
+            let bl = lower_assertion_bool(b, env, sink, heap, l)?;
+            let br = lower_assertion_bool(b, env, sink, heap, r)?;
+            Ok(match (bl, br) {
+                (None, None) => None,
+                (Some(v), None) | (None, Some(v)) => Some(v),
+                // l && r  =  l ? r : false
+                (Some(vl), Some(vr)) => {
+                    Some(sink.emit_pure(Type::Bool, PureInst::Ternary(vl, vr, FALSE)))
+                }
+            })
+        }
+        S::Implies(cond, body) => {
+            let c = pure_exp::lower(b, env, sink, hctx, cond)?;
+            let bb = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+                lower_assertion_bool(b, env, sink, heap, body)
+            })?;
+            // c ==> bb  =  c ? bb : true
+            Ok(bb.map(|v| sink.emit_pure(Type::Bool, PureInst::Ternary(c, v, TRUE))))
+        }
+        S::Ternary { if_, then, else_ } => {
+            let c = pure_exp::lower(b, env, sink, hctx, if_)?;
+            let bt = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+                lower_assertion_bool(b, env, sink, heap, then)
+            })?;
+            let be = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
+                lower_assertion_bool(b, env, sink, heap, else_)
+            })?;
+            Ok(match (bt, be) {
+                (None, None) => None,
+                (Some(vt), None) => Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, vt, TRUE))),
+                (None, Some(ve)) => Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, TRUE, ve))),
+                (Some(vt), Some(ve)) => {
+                    Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, vt, ve)))
+                }
+            })
+        }
+        S::Pure(p) => Ok(Some(pure_exp::lower(b, env, sink, hctx, p)?)),
     }
 }
 

@@ -167,8 +167,21 @@ fn lower_stmt(
         S::Block(_) => Err(TranslationError::Unsupported("nested block")),
         S::Fold(_) => Err(TranslationError::Unsupported("fold")),
         S::Unfold(_) => Err(TranslationError::Unsupported("unfold")),
-        S::Assume(_) => Err(TranslationError::Unsupported("source-level assume")),
-        S::Assert(_) => Err(TranslationError::Unsupported("source-level assert")),
+        // Source-level assert/assume are non-destructive: the assertion is
+        // reduced to a boolean over the current heap (each `acc(loc, p)` becomes
+        // `perm(loc) >= p`) and asserted/assumed. The heap is unchanged.
+        S::Assert(e) => {
+            if let Some(v) = resource::lower_assertion_bool(b, env, sink, current_heap, e)? {
+                sink.emit_ext(InstExt::Assert(v));
+            }
+            Ok(current_heap)
+        }
+        S::Assume(e) => {
+            if let Some(v) = resource::lower_assertion_bool(b, env, sink, current_heap, e)? {
+                sink.emit_ext(InstExt::Assume(v));
+            }
+            Ok(current_heap)
+        }
         // Inhale: add the assertion's heap delta to the current heap and assume
         // its boolean. Heap-dependent sub-expressions are evaluated against the
         // growing heap (`ReadHeap::Track`), so later conjuncts can observe the
