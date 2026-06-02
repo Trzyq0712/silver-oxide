@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
 use crate::verify::lang;
-use crate::vmir::{self, HeapInst, InstExt, InstKind, PureInst, Type};
+use crate::vmir::Type;
 
 pub(crate) struct Snapshotter {
     /// `None` = disabled (env var unset).
@@ -51,14 +51,15 @@ impl Snapshotter {
         }
     }
 
-    /// Record a snapshot of the current e-graph and (optionally) a heap. The
-    /// `label` becomes the page's top annotation; `highlight`, if set, is the
-    /// value produced by the just-executed instruction — its e-class cluster is
-    /// drawn highlighted.
+    /// Record a snapshot of the current e-graph and the given labeled heaps
+    /// (e.g. the two operands and result of a heap `add`/`sub`). The `label`
+    /// becomes the page's top annotation; `highlight`, if set, is the value
+    /// produced by the just-executed instruction — its e-class cluster is drawn
+    /// highlighted.
     pub(crate) fn snapshot(
         &mut self,
         ctx: &VerifyContext<'_>,
-        heap: Option<&Heap>,
+        heaps: &[(String, Heap)],
         label: &str,
         highlight: Option<egg::Id>,
     ) {
@@ -79,9 +80,14 @@ impl Snapshotter {
                 .to_string()
         };
 
-        // Heap subgraph: injected right after egg's fixed opening line. Rename
-        // the graph so each page is a distinct `digraph`.
-        let header = heap.map(|h| heap_subgraph(ctx, h)).unwrap_or_default();
+        // Heap subgraphs (one per labeled heap), injected right after egg's
+        // fixed opening line. Rename the graph so each page is a distinct
+        // `digraph`.
+        let header: String = heaps
+            .iter()
+            .enumerate()
+            .map(|(i, (lbl, h))| heap_subgraph(ctx, i, lbl, h))
+            .collect();
         dot = dot.replacen(
             "digraph egraph {\n",
             &format!("digraph step_{step:03} {{\n{header}"),
@@ -162,36 +168,34 @@ impl Drop for Snapshotter {
     }
 }
 
-/// Build the `cluster_heap` subgraph plus edges into the e-class clusters.
-/// Every referenced id is canonicalized (`egraph.find`) so edges always land
-/// on a live cluster even though the dump is un-saturated.
-fn heap_subgraph(ctx: &VerifyContext<'_>, heap: &Heap) -> String {
-    let mut s = String::from(
-        "  subgraph cluster_heap {\n    label=\"heap\"\n    style=solid\n    rank=source\n",
+/// Build one heap's `cluster_heap_<idx>` subgraph (titled `label`) plus edges
+/// into the e-class clusters. `idx` namespaces the cluster and its chunk nodes
+/// so several heaps (e.g. `add`'s two operands and result) can coexist on one
+/// page. Every referenced id is canonicalized (`egraph.find`) so edges always
+/// land on a live cluster even though the dump is un-saturated.
+fn heap_subgraph(ctx: &VerifyContext<'_>, idx: usize, label: &str, heap: &Heap) -> String {
+    let mut s = format!(
+        "  subgraph cluster_heap_{idx} {{\n    label=\"{}\"\n    style=solid\n    rank=source\n",
+        escape(label)
     );
     let mut edges = String::new();
     for (addr, chunk) in heap.entries() {
         let c_addr = ctx.egraph.find(addr);
         let c_val = ctx.egraph.find(chunk.value);
         let c_perm = ctx.egraph.find(chunk.perm);
-        s.push_str(&format!(
-            "    chunk_{a}[label=\"chunk\", shape=box]\n",
-            a = usize::from(addr)
-        ));
+        let node = format!("chunk_{idx}_{}", usize::from(addr));
+        s.push_str(&format!("    {node}[label=\"chunk\", shape=box]\n"));
         // Edges target an arbitrary node `.0` in the destination cluster.
         edges.push_str(&format!(
-            "  chunk_{a} -> {ca}.0 [lhead=cluster_{ca}, color=blue, label=\"@\"]\n",
-            a = usize::from(addr),
+            "  {node} -> {ca}.0 [lhead=cluster_{ca}, color=blue, label=\"@\"]\n",
             ca = usize::from(c_addr),
         ));
         edges.push_str(&format!(
-            "  chunk_{a} -> {cv}.0 [lhead=cluster_{cv}, color=black, label=\"v\"]\n",
-            a = usize::from(addr),
+            "  {node} -> {cv}.0 [lhead=cluster_{cv}, color=black, label=\"v\"]\n",
             cv = usize::from(c_val),
         ));
         edges.push_str(&format!(
-            "  chunk_{a} -> {cp}.0 [lhead=cluster_{cp}, color=red, label=\"p\"]\n",
-            a = usize::from(addr),
+            "  {node} -> {cp}.0 [lhead=cluster_{cp}, color=red, label=\"p\"]\n",
             cp = usize::from(c_perm),
         ));
     }
@@ -274,50 +278,4 @@ fn sanitize(s: &str) -> String {
 /// Escape a string for use inside a dot `"..."` label.
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Short label for a method instruction, used as the page annotation.
-pub(crate) fn method_inst_label(
-    kind: &InstKind<vmir::MethodCtx>,
-    interner: &lasso::Rodeo<vmir::MemberId>,
-) -> String {
-    match kind {
-        InstKind::Pure(_, pi) => format!("pure {}", pure_tag(pi)),
-        InstKind::Heap(hi) => format!("heap {}", heap_tag(hi)),
-        InstKind::Ext(InstExt::Assume(_)) => "assume".into(),
-        InstKind::Ext(InstExt::Assert(_)) => "assert".into(),
-        InstKind::Ext(InstExt::ResourceCall(call)) => {
-            format!("rescall {}", interner.resolve(&call.resource))
-        }
-    }
-}
-
-/// Short label for a resource-body instruction (Ext is the never type here).
-pub(crate) fn resource_inst_label(kind: &InstKind<vmir::ResourceCtx>) -> String {
-    match kind {
-        InstKind::Pure(_, pi) => format!("pure {}", pure_tag(pi)),
-        InstKind::Heap(hi) => format!("heap {}", heap_tag(hi)),
-        InstKind::Ext(never) => match *never {},
-    }
-}
-
-fn pure_tag<P>(pi: &PureInst<P>) -> &'static str {
-    match pi {
-        PureInst::Fresh => "fresh",
-        PureInst::Binary(..) => "binary",
-        PureInst::Ternary(..) => "ternary",
-        PureInst::Deref(..) => "deref",
-        PureInst::FunctionCall(..) => "call",
-        PureInst::Ext(_) => "ext",
-    }
-}
-
-fn heap_tag<H>(hi: &HeapInst<H>) -> &'static str {
-    match hi {
-        HeapInst::Acc(_) => "acc",
-        HeapInst::Add(..) => "add",
-        HeapInst::Sub(..) => "sub",
-        HeapInst::Ternary(..) => "ternary",
-        HeapInst::Ext(_) => "ext",
-    }
 }

@@ -3,7 +3,7 @@ use crate::{
         context::VerifyContext,
         heap::{Chunk, Heap},
         lang::Symbolic,
-        viz::{self, Snapshotter},
+        viz::Snapshotter,
     },
     vmir::{
         self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstContext, InstExt,
@@ -127,6 +127,30 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
     match hv {
         HeapVal::Empty => Heap::empty(),
         HeapVal::Temp(n) => state.heaps[*n].clone(),
+    }
+}
+
+/// Heaps to visualize for an instruction, labeled as in VMIR (`h0`, `h1`, …).
+/// For heap `add`/`sub` this is the two operands plus the result; for any other
+/// instruction it is the current working heap (if any). Called after the
+/// instruction has been evaluated, so the result heap sits at `heaps_before`.
+fn display_heaps<C: vmir::InstContext>(
+    state: &EvalState,
+    kind: &InstKind<C>,
+    heaps_before: usize,
+) -> Vec<(String, Heap)> {
+    match kind {
+        InstKind::Heap(HeapInst::Add(h1, h2)) | InstKind::Heap(HeapInst::Sub(h1, h2)) => vec![
+            (h1.to_string(), get_heap(state, h1)),
+            (h2.to_string(), get_heap(state, h2)),
+            (format!("h{heaps_before}"), state.heaps[heaps_before].clone()),
+        ],
+        _ => state
+            .heaps
+            .last()
+            .map(|h| (format!("h{}", state.heaps.len() - 1), h.clone()))
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -560,7 +584,7 @@ pub fn verify_method(
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
-    snap.snapshot(&ctx, None, "init", None);
+    snap.snapshot(&ctx, &[], "init", None);
     for inst in &method.insts {
         let vals_before = state.vals.len();
         let heaps_before = state.heaps.len();
@@ -575,8 +599,8 @@ pub fn verify_method(
             return Err(err.with_inst(inst_text));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
-        let label = viz::method_inst_label(&inst.kind, ctx.interner);
-        snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
+        let heaps = display_heaps(&state, &inst.kind, heaps_before);
+        snap.snapshot(&ctx, &heaps, &inst_text, highlight);
     }
 
     Ok(())
@@ -607,7 +631,7 @@ pub fn verify_resource(
     state.push_heap(Heap::empty());
 
     let mut snap = Snapshotter::from_env(resource_name);
-    snap.snapshot(&ctx, None, "init", None);
+    snap.snapshot(&ctx, &[], "init", None);
 
     for inst in &body.insts {
         let vals_before = state.vals.len();
@@ -629,8 +653,8 @@ pub fn verify_resource(
             return Err(err.with_inst(inst_text));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
-        let label = viz::resource_inst_label(&inst.kind);
-        snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
+        let heaps = display_heaps(&state, &inst.kind, heaps_before);
+        snap.snapshot(&ctx, &heaps, &inst_text, highlight);
     }
 
     Ok(())
