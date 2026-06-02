@@ -97,7 +97,9 @@ impl Display for Literal {
             Literal::Null => write!(f, "null"),
             Literal::Bool(b) => write!(f, "{b}"),
             Literal::Int(v) => write!(f, "{v}"),
-            Literal::Real(v) => write!(f, "{v}"),
+            // Reals are permission amounts: always show as a fraction (no space),
+            // e.g. `1/1`, `1/2`, `0/1` — never the reduced integer form.
+            Literal::Real(v) => write!(f, "{}/{}", v.numer(), v.denom()),
         }
     }
 }
