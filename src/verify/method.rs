@@ -7,10 +7,11 @@ use crate::{
     },
     vmir::{
         self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstContext, InstExt,
-        InstKind, Literal, Method, MethodInst, PathConds, Polarity, PureInst, Resource,
+        Inst, InstKind, Literal, MemberId, Method, MethodInst, PathConds, Polarity, PureInst, Resource,
         ResourceCall, ResourceInst, Type, Val,
     },
 };
+use crate::vmir::display::VmirDisplay;
 
 #[derive(Debug)]
 pub enum VerifyError {
@@ -24,6 +25,11 @@ pub enum VerifyError {
     /// the verifier doesn't yet handle structurally. Reserved for
     /// not-yet-implemented variants.
     Unimplemented(&'static str),
+    /// Verification failed while executing a specific instruction.
+    AtInst {
+        inst: String,
+        source: Box<VerifyError>,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -34,6 +40,27 @@ impl std::fmt::Display for VerifyError {
             Self::AbstractResourceCall => write!(f, "call to abstract resource"),
             Self::SideCondition(what) => write!(f, "side condition may not hold: {what}"),
             Self::Unimplemented(what) => write!(f, "unimplemented: {what}"),
+            Self::AtInst { inst, source } => write!(f, "{source}\n    instruction: {inst}"),
+        }
+    }
+}
+
+impl VerifyError {
+    fn with_inst(self, inst: String) -> Self {
+        match self {
+            Self::AtInst { .. } => self,
+            _ => Self::AtInst {
+                inst,
+                source: Box::new(self),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn root_cause(&self) -> &VerifyError {
+        match self {
+            Self::AtInst { source, .. } => source.root_cause(),
+            _ => self,
         }
     }
 }
@@ -73,6 +100,25 @@ impl EvalState {
     }
 }
 
+/// Render a single instruction (method or resource body) for error context.
+fn format_inst<C: InstContext>(
+    inst: &Inst<C>,
+    interner: &lasso::Rodeo<MemberId>,
+    val_base: usize,
+    heap_base: usize,
+) -> String
+where
+    C::InstExt: vmir::Bumps,
+    C::PureExt: vmir::PureExtRender,
+    C::HeapExt: vmir::HeapExtRender,
+    for<'a> VmirDisplay<'a, (usize, usize, &'a PathConds, &'a C::InstExt)>: std::fmt::Display,
+{
+    VmirDisplay::new((val_base, heap_base, std::slice::from_ref(inst)), interner)
+        .to_string()
+        .trim()
+        .to_string()
+}
+
 /// Heap-fetch is monomorphic — `HeapVal` carries no ctx-heap variant. The
 /// caller-supplied ctx heap of a resource body lives at
 /// `state.heaps[0]` by convention (mirroring how params occupy the
@@ -86,6 +132,37 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
 
 fn zero_real(ctx: &mut VerifyContext<'_>) -> egg::Id {
     ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())))
+}
+
+fn collect_pc_lits(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    pc: &PathConds,
+) -> Vec<(egg::Id, Polarity)> {
+    pc.conds
+        .iter()
+        .map(|(v, p)| (state.get_val(ctx, v), *p))
+        .collect()
+}
+
+fn check_deref_permission(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    pc_lits: &[(egg::Id, Polarity)],
+    heap: &HeapVal,
+    loc: &Val,
+) -> Result<(), VerifyError> {
+    let addr = state.get_val(ctx, loc);
+    let perm = get_heap(state, heap)
+        .perm_at(addr)
+        .unwrap_or_else(|| zero_real(ctx));
+    let zero = zero_real(ctx);
+    let positive = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [zero, perm]));
+    if ctx.prove_under_pc(positive, pc_lits) {
+        Ok(())
+    } else {
+        Err(VerifyError::InsufficientPermission)
+    }
 }
 
 /// Best-effort literal extraction: scan the e-class for a real literal
@@ -486,7 +563,17 @@ pub fn verify_method(
     snap.snapshot(&ctx, None, "init", None);
     for inst in &method.insts {
         let vals_before = state.vals.len();
-        eval_method_inst(&mut ctx, program, &mut state, inst)?;
+        let heaps_before = state.heaps.len();
+        let inst_text = format_inst(inst, &program.interner, vals_before, heaps_before);
+        if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
+            let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
+            if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
+                return Err(err.with_inst(inst_text.clone()));
+            }
+        }
+        if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst) {
+            return Err(err.with_inst(inst_text));
+        }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
         let label = viz::method_inst_label(&inst.kind, ctx.interner);
         snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
@@ -523,20 +610,24 @@ pub fn verify_resource(
     snap.snapshot(&ctx, None, "init", None);
 
     for inst in &body.insts {
-        let pc_lits: Vec<(egg::Id, Polarity)> = inst
-            .pc
-            .conds
-            .iter()
-            .map(|(v, p)| (state.get_val(&mut ctx, v), *p))
-            .collect();
+        let vals_before = state.vals.len();
+        let heaps_before = state.heaps.len();
+        let inst_text = format_inst(inst, &program.interner, vals_before, heaps_before);
+        let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
+        if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
+            if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
+                return Err(err.with_inst(inst_text.clone()));
+            }
+        }
         for (goal, msg) in inst_obligations(&mut ctx, &state, &inst.kind) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
-                return Err(VerifyError::SideCondition(msg));
+                return Err(VerifyError::SideCondition(msg).with_inst(inst_text.clone()));
             }
         }
 
-        let vals_before = state.vals.len();
-        eval_resource_body_inst(&mut ctx, &mut state, inst)?;
+        if let Err(err) = eval_resource_body_inst(&mut ctx, &mut state, inst) {
+            return Err(err.with_inst(inst_text));
+        }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
         let label = viz::resource_inst_label(&inst.kind);
         snap.snapshot(&ctx, state.heaps.last(), &label, highlight);
@@ -824,7 +915,7 @@ mod tests {
         let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("symbolic-perm exhale must fail without a proof");
-        assert!(matches!(err, VerifyError::InsufficientPermission));
+        assert!(matches!(err.root_cause(), VerifyError::InsufficientPermission));
     }
 
     #[test]
@@ -894,7 +985,7 @@ mod tests {
         let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("over-consumption must fail");
-        assert!(matches!(err, VerifyError::InsufficientPermission));
+        assert!(matches!(err.root_cause(), VerifyError::InsufficientPermission));
     }
 
     #[test]
@@ -914,7 +1005,7 @@ mod tests {
         let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("subtract from empty must fail");
-        assert!(matches!(err, VerifyError::InsufficientPermission));
+        assert!(matches!(err.root_cause(), VerifyError::InsufficientPermission));
     }
 
     #[test]
@@ -1059,7 +1150,7 @@ method caller(this: Ref)
         };
         let result = verify_method(&program, "caller", caller);
         assert!(
-            matches!(result, Err(VerifyError::InsufficientPermission)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
         );
     }
@@ -1124,7 +1215,7 @@ method client(x: Ref)
         };
         let result = verify_method(&program, "client", client);
         assert!(
-            matches!(result, Err(VerifyError::InsufficientPermission)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
         );
     }
@@ -1154,7 +1245,7 @@ method m(x: Ref)
         let program = lower(input);
         let result = verify_named_resource(&program, "m@requires");
         assert!(
-            matches!(result, Err(VerifyError::SideCondition(_))),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))),
             "expected SideCondition, got {result:?}"
         );
     }
@@ -1182,7 +1273,7 @@ method m(x: Int)
         let program = lower(input);
         let result = verify_named_resource(&program, "m@requires");
         assert!(
-            matches!(result, Err(VerifyError::SideCondition(_))),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))),
             "expected SideCondition, got {result:?}"
         );
     }
@@ -1235,7 +1326,7 @@ method m(x: Ref)
         let program = lower(input);
         let result = verify_named_method(&program, "m");
         assert!(
-            matches!(result, Err(VerifyError::InsufficientPermission)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
         );
     }
@@ -1255,7 +1346,7 @@ method m(x: Ref)
         let program = lower(input);
         let result = verify_named_method(&program, "m");
         assert!(
-            matches!(result, Err(VerifyError::AssertionFailed)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::AssertionFailed)),
             "expected AssertionFailed, got {result:?}"
         );
     }
@@ -1294,7 +1385,7 @@ method m()
         let program = lower(input);
         let result = verify_named_method(&program, "m");
         assert!(
-            matches!(result, Err(VerifyError::InsufficientPermission)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
         );
     }
@@ -1412,8 +1503,26 @@ method m(x: Ref)
         let program = lower(input);
         let result = verify_named_method(&program, "m");
         assert!(
-            matches!(result, Err(VerifyError::AssertionFailed)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::AssertionFailed)),
             "expected AssertionFailed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deref_without_permission_fails() {
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    assert x.f == 5
+}
+"#;
+        let program = lower(input);
+        let result = verify_named_method(&program, "m");
+        assert!(
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
+            "expected InsufficientPermission, got {result:?}"
         );
     }
 
@@ -1428,7 +1537,7 @@ method m(x: Int)
         let program = lower(input);
         let result = verify_named_method(&program, "m");
         assert!(
-            matches!(result, Err(VerifyError::AssertionFailed)),
+            matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::AssertionFailed)),
             "expected AssertionFailed, got {result:?}"
         );
     }

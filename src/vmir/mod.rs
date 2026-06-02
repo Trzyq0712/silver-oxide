@@ -13,8 +13,8 @@ pub mod display;
 
 pub use ty::Type;
 
-pub use heap::{Acc, HeapInst, HeapVal};
-pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
+pub use heap::{Acc, HeapExtRender, HeapInst, HeapVal};
+pub use pure::{BinOp, FALSE, Literal, NULL, PureExtRender, PureInst, TRUE, Val, none, write};
 
 pub use adt::Adt;
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
