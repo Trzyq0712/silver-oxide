@@ -10,16 +10,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .ok_or("usage: verifier <file.vpr>")?;
 
-    match pipeline::run_file(Path::new(&file)) {
+    match pipeline::run_file_timed(Path::new(&file)) {
         Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
-        Ok(results) if results.is_empty() => println!("[INFO] no method bodies to verify"),
-        Ok(results) => {
-            for (name, outcome) in &results {
-                match outcome {
-                    Ok(()) => println!("  [OK] {name}"),
-                    Err(e) => println!("  [FAIL] {name}: {e}"),
+        Ok((results, timings)) => {
+            if results.is_empty() {
+                println!("[INFO] no method bodies to verify");
+            } else {
+                for (name, outcome) in &results {
+                    match outcome {
+                        Ok(()) => println!("  [OK] {name}"),
+                        Err(e) => println!("  [FAIL] {name}: {e}"),
+                    }
                 }
             }
+            eprintln!("[TIMING]\n{timings}");
         }
     }
 
