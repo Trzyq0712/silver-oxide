@@ -1,19 +1,19 @@
 //! Parse a Silver file, typecheck it, lower to VMIR, and print the resulting
 //! `vmir::Program`.
 //!
-//! Usage: `cargo run --bin translator -- cases/foo.vpr`
+//! Usage: `cargo run --bin translate -- cases/foo.vpr`
 
-use silver_oxide::viper::{
-    GlobalsCollector, IdentCollector, inline_macros, disambiguate, viper_parser,
-    typecheck_program, walk::AstWalkable,
-};
 use silver_oxide::translate;
+use silver_oxide::viper::{
+    GlobalsCollector, IdentCollector, disambiguate, inline_macros, typecheck_program, viper_parser,
+    walk::AstWalkable,
+};
 use std::{error::Error, fs};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let file = std::env::args()
         .nth(1)
-        .ok_or("usage: translator <file.vpr>")?;
+        .ok_or("usage: translate <file.vpr>")?;
     let input = fs::read_to_string(&file)?;
 
     let mut program = viper_parser::vpr_program(&input)?;

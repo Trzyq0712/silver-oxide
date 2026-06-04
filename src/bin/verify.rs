@@ -1,14 +1,12 @@
 //! Parse + typecheck + translate + verify.
 //!
-//! Usage: `cargo run --bin verifier -- cases/foo.vpr`
+//! Usage: `cargo run --bin verify -- cases/foo.vpr`
 
 use silver_oxide::pipeline;
 use std::{error::Error, path::Path};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let file = std::env::args()
-        .nth(1)
-        .ok_or("usage: verifier <file.vpr>")?;
+    let file = std::env::args().nth(1).ok_or("usage: verify <file.vpr>")?;
 
     match pipeline::run_file_timed(Path::new(&file)) {
         Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
