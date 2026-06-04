@@ -158,9 +158,25 @@ impl<'a> Builder<'a> {
         let pred_id = self.fresh_decl(&name);
         self.name_map.insert(p.name.0, pred_id);
         let params: Vec<vmir::Type> = p.params.iter().map(|p| lower_type(&p.ty)).collect();
+        // A concrete predicate body lowers to a resource body exactly like a
+        // method precondition: params occupy `Val::Temp(0..n)` and the spatial
+        // assertion accumulates onto the ctx heap (`HeapVal::Temp(0)`).
         let body = match &p.body {
             None => None,
-            Some(_) => return Err(TranslationError::Unsupported("concrete predicate body")),
+            Some(body_exp) => {
+                let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
+                for (i, param) in p.params.iter().enumerate() {
+                    env.insert(param.name.0, vmir::Val::Temp(i));
+                }
+                Some(resource::lower_spatial_never(
+                    self,
+                    &env,
+                    body_exp,
+                    params.len(),
+                    vmir::HeapVal::Temp(0),
+                    1,
+                )?)
+            }
         };
         self.set_decl(
             pred_id,

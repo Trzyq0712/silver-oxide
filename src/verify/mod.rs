@@ -26,11 +26,24 @@ pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<MethodResult> {
     // directly instead.
     let order = petgraph::algo::toposort(&analyzed.dep_graph, None)
         .expect("dep_graph proven acyclic by analyze");
+    // Resources are verified before the methods that use them (dependency
+    // order), so each resource's proof certificate is cached and grafted at
+    // call sites rather than re-walking the body.
+    let mut certs: std::collections::HashMap<vmir::MemberId, context::ResourceCertificate> =
+        std::collections::HashMap::new();
     for id in order {
         let name = program.interner.resolve(&id).to_string();
         let outcome = match &program.decls[id] {
-            vmir::Declaration::Resource(r) => Some(method::verify_resource(program, &name, r)),
-            vmir::Declaration::Method(m) => Some(method::verify_method(program, &name, m)),
+            vmir::Declaration::Resource(r) => match method::verify_resource(program, &name, r) {
+                Ok(cert) => {
+                    if let Some(cert) = cert {
+                        certs.insert(id, cert);
+                    }
+                    Some(Ok(()))
+                }
+                Err(e) => Some(Err(e)),
+            },
+            vmir::Declaration::Method(m) => Some(method::verify_method(program, &name, m, &certs)),
             _ => None,
         };
         if let Some(outcome) = outcome {

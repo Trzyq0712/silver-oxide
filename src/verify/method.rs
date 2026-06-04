@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
-        context::VerifyContext,
+        context::{ResourceCertificate, VerifyContext},
         heap::{Chunk, Heap},
         lang::Symbolic,
         viz::Snapshotter,
@@ -499,24 +501,28 @@ fn eval_resource_body_inst(
     Ok(())
 }
 
-/// Evaluate a resource invocation as a **reusable proof**.
-///
-/// The resource was already verified self-contained (see [`verify_resource`]),
-/// so this does **not** step the body for the user (no per-instruction
-/// snapshots) nor re-discharge its side conditions. It re-evaluates the body
-/// atomically into the caller's egraph to produce `(heap_delta, bool_handle)`
-/// and to inject the knowledge it yields (chunk-merge equalities). The *outer*
-/// boolean is **not** assumed or asserted here — the caller decides.
+/// Evaluate a resource invocation as a **reusable proof** by grafting the
+/// resource's pre-verified certificate (see [`verify_resource`]) into the
+/// caller's e-graph, substituting the formal params for the call args. This
+/// transfers every proven merge for free — no re-walk, no re-saturation — and
+/// returns `(heap_delta, bool_handle)`. The *outer* boolean is **not** assumed
+/// or asserted here; the caller decides.
 fn eval_resource_call(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,
     caller_state: &EvalState,
     call: &ResourceCall,
+    certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(Heap, egg::Id), VerifyError> {
     let Declaration::Resource(r) = &program.decls[call.resource] else {
         panic!("ResourceCall targets non-Resource declaration");
     };
-    let body = r.body.as_ref().ok_or(VerifyError::AbstractResourceCall)?;
+    if r.body.is_none() {
+        return Err(VerifyError::AbstractResourceCall);
+    }
+    let cert = certs
+        .get(&call.resource)
+        .expect("resource certificate built before any call (dependency order)");
 
     let args: Vec<egg::Id> = call
         .args
@@ -524,19 +530,7 @@ fn eval_resource_call(
         .map(|v| caller_state.get_val(ctx, v))
         .collect();
 
-    let mut res_state = EvalState::with_args(args);
-
-    // Caller-supplied ctx heap occupies the body's `HeapVal::Temp(0)`
-    // slot, mirroring how params occupy `Val::Temp(0..n_params)`.
-    res_state.push_heap(get_heap(caller_state, &call.ctx_heap));
-
-    for inst in &body.insts {
-        eval_resource_body_inst(ctx, &mut res_state, inst)?;
-    }
-
-    let result_heap = get_heap(&res_state, &body.res.0);
-    let result_bool = res_state.get_val(ctx, &body.res.1);
-    Ok((result_heap, result_bool))
+    Ok(ctx.graft_certificate(cert, &args))
 }
 
 fn eval_method_inst(
@@ -544,6 +538,7 @@ fn eval_method_inst(
     program: &vmir::Program,
     state: &mut EvalState,
     inst: &MethodInst,
+    certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
@@ -574,7 +569,7 @@ fn eval_method_inst(
                 }
             }
             InstExt::ResourceCall(call) => {
-                let (delta, bool_id) = eval_resource_call(ctx, program, state, call)?;
+                let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
                 state.push_heap(delta);
                 state.push_val(bool_id);
             }
@@ -587,6 +582,7 @@ pub fn verify_method(
     program: &vmir::Program,
     method_name: &str,
     method: &Method,
+    certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner);
     let mut state = EvalState::new();
@@ -603,7 +599,7 @@ pub fn verify_method(
                 return Err(err.with_inst(inst_text.clone()));
             }
         }
-        if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst) {
+        if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst, certs) {
             return Err(err.with_inst(inst_text));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
@@ -623,9 +619,10 @@ pub fn verify_resource(
     program: &vmir::Program,
     resource_name: &str,
     resource: &Resource,
-) -> Result<(), VerifyError> {
+) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
-        return Ok(());
+        // Abstract resource: nothing to prove, no certificate.
+        return Ok(None);
     };
 
     let mut ctx = VerifyContext::new(&program.interner);
@@ -634,7 +631,7 @@ pub fn verify_resource(
         .iter()
         .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
         .collect();
-    let mut state = EvalState::with_args(params);
+    let mut state = EvalState::with_args(params.clone());
     // Parametric ctx heap: an empty heap whose reads yield fresh symbolics.
     state.push_heap(Heap::empty());
 
@@ -665,7 +662,32 @@ pub fn verify_resource(
         snap.snapshot(&ctx, &heaps, &inst_text, highlight);
     }
 
-    Ok(())
+    // Saturate so the certificate carries every proven merge, then snapshot the
+    // result roots (canonicalized) for grafting at call sites.
+    ctx.saturate();
+    let delta_heap = get_heap(&state, &body.res.0);
+    let delta: Vec<(egg::Id, egg::Id, egg::Id)> = delta_heap
+        .entries()
+        .map(|(addr, chunk)| {
+            (
+                ctx.egraph.find(addr),
+                ctx.egraph.find(chunk.perm),
+                ctx.egraph.find(chunk.value),
+            )
+        })
+        .collect();
+    let bool_val = state.get_val(&mut ctx, &body.res.1);
+    let bool_id = ctx.egraph.find(bool_val);
+    let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
+
+    Ok(Some(ResourceCertificate {
+        egraph: ctx.egraph.clone(),
+        fresh_types: ctx.fresh_types.clone(),
+        func_ret_types: ctx.func_ret_types.clone(),
+        params,
+        delta,
+        bool_id,
+    }))
 }
 
 /// Side-condition obligations implied by an instruction's kind, as
@@ -1192,11 +1214,7 @@ method caller(this: Ref)
 }
 "#;
         let program = lower(input);
-        let caller_id = program.interner.get("caller").expect("caller method");
-        let vmir::Declaration::Method(caller) = &program.decls[caller_id] else {
-            panic!("caller must be a Method");
-        };
-        let result = verify_method(&program, "caller", caller);
+        let result = verify_named_method(&program, "caller");
         assert!(
             matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
@@ -1230,11 +1248,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
 }
 "#;
         let program = lower(input);
-        let add_id = program.interner.get("add").expect("add method");
-        let vmir::Declaration::Method(add) = &program.decls[add_id] else {
-            panic!("add must be a Method");
-        };
-        let result = verify_method(&program, "add", add);
+        let result = verify_named_method(&program, "add");
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
@@ -1257,11 +1271,7 @@ method client(x: Ref)
 }
 "#;
         let program = lower(input);
-        let client_id = program.interner.get("client").expect("client method");
-        let vmir::Declaration::Method(client) = &program.decls[client_id] else {
-            panic!("client must be a Method");
-        };
-        let result = verify_method(&program, "client", client);
+        let result = verify_named_method(&program, "client");
         assert!(
             matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
             "expected InsufficientPermission, got {result:?}"
@@ -1278,7 +1288,21 @@ method client(x: Ref)
         let vmir::Declaration::Resource(r) = &program.decls[id] else {
             panic!("{name} must be a Resource");
         };
-        verify_resource(program, name, r)
+        verify_resource(program, name, r).map(|_| ())
+    }
+
+    /// Build certificates for every resource in `program` (test helper).
+    fn build_certs(program: &vmir::Program) -> HashMap<MemberId, ResourceCertificate> {
+        let mut certs = HashMap::new();
+        for (id, decl) in program.decls.iter_enumerated() {
+            if let vmir::Declaration::Resource(r) = decl {
+                let name = program.interner.resolve(&id).to_string();
+                if let Some(cert) = verify_resource(program, &name, r).expect("resource verifies") {
+                    certs.insert(id, cert);
+                }
+            }
+        }
+        certs
     }
 
     #[test]
@@ -1335,7 +1359,8 @@ method m(x: Int)
         let vmir::Declaration::Method(m) = &program.decls[id] else {
             panic!("{name} must be a Method");
         };
-        verify_method(program, name, m)
+        let certs = build_certs(program);
+        verify_method(program, name, m, &certs)
     }
 
     #[test]
@@ -1644,6 +1669,50 @@ method m()
         assert!(
             verify_named_method(&program, "m").is_ok(),
             "new(f, g) should grant full permission to both fields"
+        );
+    }
+
+    #[test]
+    fn concrete_predicate_body_verifies() {
+        // A predicate with a concrete body lowers to a resource and is verified
+        // well-formed (reading `this.f` needs the `acc(this.f)` it just granted).
+        let input = r#"
+field f: Int
+
+predicate number(this: Ref) {
+    acc(this.f, 1/1) && this.f == 0
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_resource(&program, "number").is_ok(),
+            "concrete predicate should verify well-formed"
+        );
+    }
+
+    #[test]
+    fn graft_reuses_ensures_equality() {
+        // `seteq`'s postcondition establishes `x.f == y.f`. The caller grafts the
+        // certificate, assumes that boolean, and can then discharge the same
+        // equality without re-deriving it.
+        let input = r#"
+field f: Int
+
+method seteq(x: Ref, y: Ref)
+    requires acc(x.f, 1/1) && acc(y.f, 1/1)
+    ensures acc(x.f, 1/1) && acc(y.f, 1/1) && x.f == y.f
+
+method m(x: Ref, y: Ref)
+    requires acc(x.f, 1/1) && acc(y.f, 1/1)
+{
+    seteq(x, y)
+    assert x.f == y.f
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "the grafted ensures equality should be reusable"
         );
     }
 
