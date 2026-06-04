@@ -9,7 +9,7 @@ use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
-    Declaration, InstExt, InstKind, Method, MemberId, Program, PureInst, ResourceBody,
+    Declaration, InstExt, InstKind, MemberId, Method, Program, PureInst, ResourceBody,
 };
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
@@ -99,8 +99,9 @@ fn dump_callgraph(graph: &DepGraph, program: &Program) {
         return;
     }
     let edge_attr = |_, _| String::new();
-    let node_attr =
-        |_, (id, _): (MemberId, &MemberId)| format!("label = \"{}\"", program.interner.resolve(&id));
+    let node_attr = |_, (id, _): (MemberId, &MemberId)| {
+        format!("label = \"{}\"", program.interner.resolve(&id))
+    };
     let dot = Dot::with_attr_getters(
         graph,
         &[Config::EdgeNoLabel, Config::NodeNoLabel],
@@ -109,7 +110,8 @@ fn dump_callgraph(graph: &DepGraph, program: &Program) {
     );
     let dir = crate::util::log_dir();
     let path = format!("{dir}/callgraph.dot");
-    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, format!("{dot:?}")))
+    if let Err(e) =
+        std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, format!("{dot:?}")))
     {
         eprintln!("failed to write {path}: {e}");
     }
@@ -182,9 +184,7 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmir::{
-        HeapVal, Inst, InstKind, MethodInst, PathConds, Resource, ResourceCall,
-    };
+    use crate::vmir::{HeapVal, Inst, InstKind, MethodInst, PathConds, Resource, ResourceCall};
     use lasso::Rodeo;
     use std::collections::HashSet;
     use typed_index_collections::TiVec;

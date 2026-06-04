@@ -6,8 +6,8 @@
 //! Usage: `cargo run --bin typecheck -- cases/foo.vpr`
 
 use silver_oxide::viper::{
-    GlobalsCollector, IdentCollector, inline_macros, disambiguate, show, viper_parser,
-    typecheck_program, walk::AstWalkable,
+    GlobalsCollector, IdentCollector, disambiguate, inline_macros, show, typecheck_program,
+    viper_parser, walk::AstWalkable,
 };
 use std::{error::Error, fs};
 

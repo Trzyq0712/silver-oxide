@@ -4,7 +4,7 @@ use lasso::Spur;
 use nonmax::NonMaxU32;
 use typed_index_collections::TiVec;
 
-use crate::viper::{IdnDecl, typed::Type, interner::Interner, walk::AstWalker};
+use crate::viper::{IdnDecl, interner::Interner, typed::Type, walk::AstWalker};
 
 #[derive(Debug, Clone)]
 pub struct FunctionSig {
@@ -318,14 +318,24 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
 
     fn walk_predicate(&mut self, pred: &'ast super::Predicate) {
         let sig = PredicateSig {
-            params: pred.signature.args.iter().map(|p| Type::from(p.ty())).collect(),
+            params: pred
+                .signature
+                .args
+                .iter()
+                .map(|p| Type::from(p.ty()))
+                .collect(),
         };
         self.register(&pred.signature.name, GlobalSignature::Predicate(sig));
     }
 
     fn walk_function(&mut self, func: &'ast super::Function) {
         let sig = FunctionSig {
-            params: func.signature.args.iter().map(|p| Type::from(p.ty())).collect(),
+            params: func
+                .signature
+                .args
+                .iter()
+                .map(|p| Type::from(p.ty()))
+                .collect(),
             ret: Type::from(func.signature.ret[0].ty()),
         };
         self.register(&func.signature.name, GlobalSignature::Function(sig));
@@ -381,7 +391,12 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
 
     fn walk_domain_function(&mut self, func: &'ast super::DomainFunction) {
         let sig = FunctionSig {
-            params: func.signature.args.iter().map(|p| Type::from(p.ty())).collect(),
+            params: func
+                .signature
+                .args
+                .iter()
+                .map(|p| Type::from(p.ty()))
+                .collect(),
             ret: Type::from(func.signature.ret[0].ty()),
         };
         self.register(&func.signature.name, GlobalSignature::Function(sig));

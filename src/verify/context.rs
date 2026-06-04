@@ -68,7 +68,12 @@ impl<'a> VerifyContext<'a> {
 
     /// Add a `FuncApp`, recording its return type in the side-oracle so the
     /// viz can color the result (the node itself is type-free).
-    pub(crate) fn add_func_app(&mut self, fc: &FunctionCall, ret_ty: Type, args: Box<[egg::Id]>) -> egg::Id {
+    pub(crate) fn add_func_app(
+        &mut self,
+        fc: &FunctionCall,
+        ret_ty: Type,
+        args: Box<[egg::Id]>,
+    ) -> egg::Id {
         self.add_func_app_id(fc.function, ret_ty, args)
     }
 
@@ -88,7 +93,11 @@ impl<'a> VerifyContext<'a> {
     /// delta and boolean e-class. Every merge proven in the certificate
     /// transfers for free (reconstruction is keyed by certificate e-class), so
     /// the caller never re-derives or re-saturates the resource's facts.
-    pub(crate) fn graft_certificate(&mut self, cert: &ResourceCertificate, args: &[egg::Id]) -> (Heap, egg::Id) {
+    pub(crate) fn graft_certificate(
+        &mut self,
+        cert: &ResourceCertificate,
+        args: &[egg::Id],
+    ) -> (Heap, egg::Id) {
         let mut subst: HashMap<Id, Id> = HashMap::new();
         for (p, a) in cert.params.iter().zip(args) {
             subst.insert(cert.egraph.find(*p), *a);
@@ -172,9 +181,7 @@ impl<'a> VerifyContext<'a> {
         if unsat_pc {
             proven = true;
         } else {
-            let runner = egg::Runner::default()
-                .with_egraph(probe)
-                .run(&self.rules);
+            let runner = egg::Runner::default().with_egraph(probe).run(&self.rules);
             let probe = runner.egraph;
             if probe.find(goal) == probe.find(true_) {
                 proven = true;

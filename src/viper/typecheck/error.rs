@@ -23,7 +23,10 @@ pub enum TypeError {
     IllegalResultUsage,
     UndefinedLabel(String),
     ShadowedName(String),
-    WrongReturnCount { expected: usize, found: usize },
+    WrongReturnCount {
+        expected: usize,
+        found: usize,
+    },
     Tc(TcErr<ViperTcType>),
     Other(String),
 }
@@ -72,7 +75,10 @@ impl std::fmt::Display for TypeError {
                 write!(f, "name `{name}` already declared in this scope")
             }
             TypeError::WrongReturnCount { expected, found } => {
-                write!(f, "assignment expects {expected} target(s) on LHS, found {found}")
+                write!(
+                    f,
+                    "assignment expects {expected} target(s) on LHS, found {found}"
+                )
             }
             TypeError::Tc(e) => write!(f, "Constraint error: {e:?}"),
             TypeError::Other(msg) => write!(f, "{msg}"),

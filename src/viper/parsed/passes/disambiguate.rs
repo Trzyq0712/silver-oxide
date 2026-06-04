@@ -217,10 +217,8 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                     Some(sym) => {
                         let sig = sym.signature();
                         if sig.as_field().is_none() {
-                            self.errors.push(DisambiguationError::NotAField(
-                                field_tgt_name(),
-                                sig.kind(),
-                            ));
+                            self.errors
+                                .push(DisambiguationError::NotAField(field_tgt_name(), sig.kind()));
                         }
                     }
                     None => {

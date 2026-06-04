@@ -299,9 +299,7 @@ pub(crate) fn lower_type(ty: &typed::Type) -> vmir::Type {
         typed::Type::Int => vmir::Type::Int,
         typed::Type::Real => vmir::Type::Real,
         typed::Type::Ref => vmir::Type::Ref,
-        typed::Type::Generic(_)
-        | typed::Type::Collection(_)
-        | typed::Type::Domain(_, _) => {
+        typed::Type::Generic(_) | typed::Type::Collection(_) | typed::Type::Domain(_, _) => {
             // Not exercised by the target case. Use Ref as a placeholder; a
             // future round will introduce proper VMIR domain/collection types.
             vmir::Type::Ref
@@ -313,8 +311,8 @@ pub(crate) fn lower_type(ty: &typed::Type) -> vmir::Type {
 mod tests {
     use super::*;
     use crate::viper::{
-        GlobalsCollector, IdentCollector, inline_macros, disambiguate, viper_parser,
-        typecheck_program, walk::AstWalkable,
+        GlobalsCollector, IdentCollector, disambiguate, inline_macros, typecheck_program,
+        viper_parser, walk::AstWalkable,
     };
 
     fn run(input: &str) -> vmir::Program {

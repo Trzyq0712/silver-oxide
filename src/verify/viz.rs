@@ -153,7 +153,8 @@ impl Snapshotter {
         // resource call whose contract boolean is the vacuous `true`) lives in
         // the shared global literal e-class, so a border + arg arrows out of it
         // are noise — every such step would mark the same node.
-        if let Some(id) = highlight.filter(|id| ctx.egraph[ctx.egraph.find(*id)].data.value.is_none())
+        if let Some(id) =
+            highlight.filter(|id| ctx.egraph[ctx.egraph.find(*id)].data.value.is_none())
         {
             let canon = ctx.egraph.find(id);
             let needle = format!("subgraph cluster_{} {{\n", usize::from(canon));
@@ -244,7 +245,15 @@ fn render_pdf(dir: &std::path::Path, method: &str, pages: &[String]) {
             continue;
         }
         tmp_dots.push(dp.clone());
-        if run("dot", &["-Tpdf".as_ref(), dp.as_os_str(), "-o".as_ref(), pp.as_os_str()]) {
+        if run(
+            "dot",
+            &[
+                "-Tpdf".as_ref(),
+                dp.as_os_str(),
+                "-o".as_ref(),
+                pp.as_os_str(),
+            ],
+        ) {
             page_pdfs.push(pp);
         }
     }
@@ -292,7 +301,6 @@ fn cluster_color(ty: Option<&Type>) -> &'static str {
         _ => "#e0e0e0",                // gray: Domain/Addr or unknown
     }
 }
-
 
 /// Filename-safe slug.
 fn sanitize(s: &str) -> String {

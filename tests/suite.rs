@@ -89,7 +89,11 @@ fn passing_cases_all_verify() {
         }
     }
 
-    assert!(failures.is_empty(), "{} passing case(s) not verified", failures.len());
+    assert!(
+        failures.is_empty(),
+        "{} passing case(s) not verified",
+        failures.len()
+    );
 }
 
 /// Failing cases: the pipeline must either error or at least one method must
@@ -117,7 +121,9 @@ fn failing_cases_are_rejected() {
         if rejected {
             ok += 1;
         } else {
-            surprises.push(format!("  [UNEXPECTED-OK] {name}: verified but expected rejection"));
+            surprises.push(format!(
+                "  [UNEXPECTED-OK] {name}: verified but expected rejection"
+            ));
         }
     }
 

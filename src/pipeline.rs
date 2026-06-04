@@ -4,10 +4,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::viper::{
-    GlobalsCollector, IdentCollector, inline_macros, disambiguate, typecheck_program,
+    GlobalsCollector, IdentCollector, disambiguate, inline_macros, typecheck_program,
     walk::AstWalkable,
 };
-use crate::{viper_parser, translate, verify, vmir};
+use crate::{translate, verify, viper_parser, vmir};
 
 #[derive(Debug)]
 pub enum PipelineError {
