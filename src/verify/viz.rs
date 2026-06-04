@@ -18,12 +18,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
-use crate::verify::lang::{self, Symbolic};
-use crate::vmir::{BinOp, Literal, Type};
+use crate::verify::lang::Symbolic;
+use crate::vmir::{MemberId, Type};
 
 pub(crate) struct Snapshotter {
     /// `None` = disabled (env var unset).
@@ -70,17 +70,32 @@ impl Snapshotter {
         }
 
         let step = self.pages.len();
-        // Resolve `FuncApp` member ids to source names while rendering.
-        let mut dot = {
-            let _g = lang::with_interner(ctx.interner);
-            ctx.egraph
-                .dot()
-                .with_config_line("ranksep=1.2")
-                // Global ranking so the heap cluster's `rank=source` reliably
-                // pins it to the topmost rank on every page (stable position).
-                .with_config_line("newrank=true")
-                .to_string()
-        };
+        let mut dot = ctx
+            .egraph
+            .dot()
+            .with_config_line("ranksep=1.2")
+            // Global ranking so the heap cluster's `rank=source` reliably pins it
+            // to the topmost rank on every page (stable position).
+            .with_config_line("newrank=true")
+            .to_string();
+
+        // Resolve `FuncApp` member ids (rendered `fn<id>(..)` by `Symbolic`'s
+        // type-free `Display`) to their source names — the viz holds the
+        // interner, so the e-graph itself need not.
+        let mut funcs: HashSet<MemberId> = HashSet::new();
+        for class in ctx.egraph.classes() {
+            for node in &class.nodes {
+                if let Symbolic::FuncApp(m, _) = node {
+                    funcs.insert(*m);
+                }
+            }
+        }
+        for m in funcs {
+            dot = dot.replace(
+                &format!("fn{}(..)", m.0),
+                &format!("{}(..)", escape(ctx.interner.resolve(&m))),
+            );
+        }
 
         // Heap subgraphs (one per labeled heap), injected right after egg's
         // fixed opening line. Rename the graph so each page is a distinct
@@ -114,7 +129,13 @@ impl Snapshotter {
         // (cluster-scope `label` is the cluster's own, so no leakage).
         let mut type_memo: HashMap<egg::Id, Option<Type>> = HashMap::new();
         for class in ctx.egraph.classes() {
-            let ty = infer_type(ctx, class.id, &mut type_memo);
+            let ty = crate::verify::context::infer_type(
+                &ctx.egraph,
+                &ctx.fresh_types,
+                &ctx.func_ret_types,
+                class.id,
+                &mut type_memo,
+            );
             let mut attrs = format!("    bgcolor=\"{}\"\n", cluster_color(ty.as_ref()));
             if let Some(lit) = &class.data.value {
                 attrs.push_str(&format!("    label=\"= {}\"\n", escape(&lit.to_string())));
@@ -272,53 +293,6 @@ fn cluster_color(ty: Option<&Type>) -> &'static str {
     }
 }
 
-/// Reconstruct an e-class's type from the type-free e-graph (memoized,
-/// cycle-safe, best-effort): `Lit`→literal type, `RealCast`→Real,
-/// `Binary`→`Bool` for comparisons else operand type, `Ite`→branch type, and
-/// the irreducible `Fresh`/`FuncApp` sources from the context's side oracle.
-fn infer_type(
-    ctx: &VerifyContext<'_>,
-    id: egg::Id,
-    memo: &mut HashMap<egg::Id, Option<Type>>,
-) -> Option<Type> {
-    let canon = ctx.egraph.find(id);
-    if let Some(t) = memo.get(&canon) {
-        return t.clone();
-    }
-    // Seed `None` first so cycles terminate (best-effort).
-    memo.insert(canon, None);
-    let nodes = ctx.egraph[canon].nodes.clone();
-    let mut result = None;
-    for node in &nodes {
-        let t = match node {
-            Symbolic::Lit(l) => Some(lit_type(l)),
-            Symbolic::RealCast(_) => Some(Type::Real),
-            Symbolic::Fresh(u) => ctx.fresh_types.get(u).cloned(),
-            Symbolic::FuncApp(m, _) => ctx.func_ret_types.get(m).cloned(),
-            Symbolic::Binary(op, [l, _]) => match op {
-                BinOp::Eq | BinOp::Lt => Some(Type::Bool),
-                _ => infer_type(ctx, *l, memo),
-            },
-            Symbolic::Ite([_, then, _]) => infer_type(ctx, *then, memo),
-        };
-        if t.is_some() {
-            result = t;
-            break;
-        }
-    }
-    memo.insert(canon, result.clone());
-    result
-}
-
-/// Type of a literal value.
-fn lit_type(lit: &Literal) -> Type {
-    match lit {
-        Literal::Null => Type::Ref,
-        Literal::Bool(_) => Type::Bool,
-        Literal::Int(_) => Type::Int,
-        Literal::Real(_) => Type::Real,
-    }
-}
 
 /// Filename-safe slug.
 fn sanitize(s: &str) -> String {
