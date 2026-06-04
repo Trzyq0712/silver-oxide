@@ -1690,6 +1690,59 @@ predicate number(this: Ref) {
         );
     }
 
+    /// Build `d != 0` as `not(d == 0)` = `ite(d == 0, false, true)`, returning
+    /// the e-class id (test helper, pure VMIR / e-graph level).
+    fn ne_zero(ctx: &mut VerifyContext<'_>, d: egg::Id) -> egg::Id {
+        let zero = ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0))));
+        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [d, zero]));
+        let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        ctx.add(Symbolic::Ite([eq, false_, true_]))
+    }
+
+    #[test]
+    fn graft_transfers_nonzero_knowledge() {
+        // Pure VMIR / e-graph level — no Viper. A resource has *proven* its
+        // formal param `d` non-zero (its certificate e-graph merges `d != 0`
+        // with `true`). Grafting the certificate into a caller (param `d` → arg
+        // `a`) transfers that fact: the caller then knows `a != 0` *without
+        // assuming any boolean* — the knowledge comes from the merge alone.
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+
+        // --- resource side: learn `d != 0` ---
+        let mut rctx = fresh_ctx(&interner);
+        let d = rctx.fresh_symbolic_value(Type::Int);
+        let d_ne0 = ne_zero(&mut rctx, d);
+        let r_true = rctx.add(Symbolic::Lit(Literal::Bool(true)));
+        rctx.egraph.union(d_ne0, r_true); // the resource proved it
+        rctx.egraph.rebuild();
+        rctx.saturate();
+        let cert = ResourceCertificate {
+            egraph: rctx.egraph.clone(),
+            fresh_types: rctx.fresh_types.clone(),
+            func_ret_types: rctx.func_ret_types.clone(),
+            params: vec![rctx.egraph.find(d)],
+            delta: vec![],
+            bool_id: rctx.egraph.find(d_ne0),
+        };
+
+        // --- caller side: graft, then check `a != 0` is known true ---
+        let mut cctx = fresh_ctx(&interner);
+        let a = cctx.fresh_symbolic_value(Type::Int);
+        // No `Assume` anywhere — the only knowledge injected is the graft.
+        let _ = cctx.graft_certificate(&cert, &[a]);
+        cctx.egraph.rebuild();
+
+        let a_ne0 = ne_zero(&mut cctx, a);
+        let c_true = cctx.add(Symbolic::Lit(Literal::Bool(true)));
+        cctx.saturate();
+        assert_eq!(
+            cctx.egraph.find(a_ne0),
+            cctx.egraph.find(c_true),
+            "grafted proof should make `a != 0` trivially true"
+        );
+    }
+
     #[test]
     fn graft_reuses_ensures_equality() {
         // `seteq`'s postcondition establishes `x.f == y.f`. The caller grafts the
@@ -1791,6 +1844,86 @@ method under_pc(x: Ref, b: Bool)
         assert!(
             verify_named_method(&program, "under_pc").is_ok(),
             "under_pc should verify with the and-true / and-self rewrites"
+        );
+    }
+
+    #[test]
+    fn unlabeled_old_reads_post_requires_heap() {
+        // Unlabeled `old(...)` reads the post-requires-inhale heap. The
+        // precondition holds `acc(x.f, 1/2)`; after inhaling another `1/2` the
+        // current permission is `1/1`, but `old(perm(x.f))` must still see the
+        // `1/2` held right after the precondition was inhaled.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/2)
+{
+    inhale acc(x.f, 1/2)
+    assert perm(x.f) == 1/1
+    assert old(perm(x.f)) == 1/2
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "old(perm(x.f)) should see the 1/2 permission held after the precondition"
+        );
+    }
+
+    #[test]
+    fn labeled_old_reads_label_heap_permission() {
+        // `label L` captures the heap holding `acc(x.f, 1/2)`. After inhaling
+        // another `1/2`, the current permission is `1/1`, but `old[L](perm(x.f))`
+        // must still see the `1/2` held at `L` — proving `old[L]` reaches the
+        // captured heap, not the current one.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/2)
+{
+    label L
+    inhale acc(x.f, 1/2)
+    assert perm(x.f) == 1/1
+    assert old[L](perm(x.f)) == 1/2
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "old[L](perm(x.f)) should see the 1/2 permission held at L"
+        );
+    }
+
+    #[test]
+    fn old_before_its_label_is_a_translation_error() {
+        // Straight-line lowering only knows labels it has already passed. An
+        // `old[L]` used before `label L` cannot find the captured heap and is a
+        // clean translation error (not a panic).
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+{
+    assert old[L](x.f) == x.f
+    label L
+}
+"#;
+        let mut program = viper_parser::vpr_program(input).expect("parse");
+        let mut ic = IdentCollector::default();
+        program.walk_mut(&mut ic);
+        let interner = ic.finalize();
+        let mut gc = GlobalsCollector::new(&interner);
+        program.walk(&mut gc);
+        let globals = gc.finalize().expect("globals");
+        disambiguate(&mut program, &interner, &globals).expect("disambiguation");
+        inline_macros(&mut program, &interner).expect("macros");
+        let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck");
+        assert!(
+            translate::translate(&typed, &interner, &globals).is_err(),
+            "old[L] before label L must fail translation"
         );
     }
 }

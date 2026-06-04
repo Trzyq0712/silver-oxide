@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::viper::typed;
 use crate::translate::{Builder, TranslationError, lower_type};
+use crate::viper::typed;
 use crate::vmir::{
     self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds,
     Polarity, PureInst, TRUE, Val,
@@ -98,22 +98,34 @@ impl<C: InstContext> Sink<C> {
     }
 }
 
+/// Earlier heap states an `old(...)` expression can read from, in a method
+/// body. `baseline` is the post-requires-inhale heap (target of unlabeled
+/// `old`); `labeled` maps each `label L` to the heap captured at that point.
+pub(crate) struct OldHeaps<'a> {
+    pub baseline: HeapVal,
+    pub labeled: &'a HashMap<Spur, HeapVal>,
+}
+
 /// Heaps a pure expression reads from. `value` is used by field derefs and
 /// heap-dependent functions; `perm` is used by `perm(loc)`. They differ only on
 /// `exhale`, where value reads use the pre-exhale heap but `perm` tracks the
-/// running (subtracted) heap; elsewhere both are the same heap.
+/// running (subtracted) heap; elsewhere both are the same heap. `old`, when
+/// present, lets `old(...)` reach back to earlier heap states (method bodies
+/// only); `None` outside a method body.
 #[derive(Clone, Copy)]
-pub(crate) struct HeapCtx {
+pub(crate) struct HeapCtx<'a> {
     pub value: HeapVal,
     pub perm: HeapVal,
+    pub old: Option<&'a OldHeaps<'a>>,
 }
 
-impl HeapCtx {
-    /// Both reads from the same heap (the common case).
-    pub(crate) fn same(heap: HeapVal) -> Self {
+impl<'a> HeapCtx<'a> {
+    /// Both reads from `heap`, with `old` reachable (method-body lowering).
+    pub(crate) fn same_with_old(heap: HeapVal, old: &'a OldHeaps<'a>) -> Self {
         Self {
             value: heap,
             perm: heap,
+            old: Some(old),
         }
     }
 }
@@ -122,7 +134,7 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
-    hctx: HeapCtx,
+    hctx: HeapCtx<'_>,
     exp: &typed::TypedPureExp<Ext>,
 ) -> Result<Val, TranslationError> {
     use typed::PureExpKind as P;
@@ -159,10 +171,12 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
         P::Binary(op, l, r) => lower_binary(b, env, sink, hctx, ty, op, l, r),
         P::Ternary { if_, then, else_ } => {
             let c = lower(b, env, sink, hctx, if_)?;
-            let t = sink
-                .with_cond(c.clone(), Polarity::Positive, |sink| lower(b, env, sink, hctx, then))?;
-            let e = sink
-                .with_cond(c.clone(), Polarity::Negative, |sink| lower(b, env, sink, hctx, else_))?;
+            let t = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+                lower(b, env, sink, hctx, then)
+            })?;
+            let e = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
+                lower(b, env, sink, hctx, else_)
+            })?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
         P::Field(base, id) => {
@@ -197,7 +211,12 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
 /// literal, at translation time. The result type drives Real-vs-Int math (so a
 /// `Real`-typed `4/2` over Int literals folds to `Real(2)`). Returns `None` for
 /// non-arithmetic ops (comparisons are left to the e-graph) or type mismatches.
-fn fold_arith_literals(op: &typed::BinOp, l: &Literal, r: &Literal, ty: &vmir::Type) -> Option<Literal> {
+fn fold_arith_literals(
+    op: &typed::BinOp,
+    l: &Literal,
+    r: &Literal,
+    ty: &vmir::Type,
+) -> Option<Literal> {
     use num::BigRational;
     use typed::BinOp as B;
     let rat = |lit: &Literal| -> Option<BigRational> {
@@ -256,7 +275,7 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
-    hctx: HeapCtx,
+    hctx: HeapCtx<'_>,
     ty: vmir::Type,
     op: &typed::BinOp,
     l: &typed::TypedPureExp<Ext>,
@@ -270,20 +289,23 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
     match op {
         B::And => {
             // l && r  =  l ? r : false
-            let rv = sink
-                .with_cond(lv.clone(), Polarity::Positive, |sink| lower(b, env, sink, hctx, r))?;
+            let rv = sink.with_cond(lv.clone(), Polarity::Positive, |sink| {
+                lower(b, env, sink, hctx, r)
+            })?;
             return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, rv, FALSE)));
         }
         B::Or => {
             // l || r  =  l ? true : r
-            let rv = sink
-                .with_cond(lv.clone(), Polarity::Negative, |sink| lower(b, env, sink, hctx, r))?;
+            let rv = sink.with_cond(lv.clone(), Polarity::Negative, |sink| {
+                lower(b, env, sink, hctx, r)
+            })?;
             return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, TRUE, rv)));
         }
         B::Implies => {
             // l ==> r  =  l ? r : true
-            let rv = sink
-                .with_cond(lv.clone(), Polarity::Positive, |sink| lower(b, env, sink, hctx, r))?;
+            let rv = sink.with_cond(lv.clone(), Polarity::Positive, |sink| {
+                lower(b, env, sink, hctx, r)
+            })?;
             return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, rv, TRUE)));
         }
         _ => {}
@@ -363,7 +385,7 @@ pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
         b: &Builder<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink<C>,
-        hctx: HeapCtx,
+        hctx: HeapCtx<'_>,
         ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError>;
@@ -374,7 +396,7 @@ impl PureExt for ! {
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
         _sink: &mut Sink<C>,
-        _hctx: HeapCtx,
+        _hctx: HeapCtx<'_>,
         _ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError> {
@@ -387,7 +409,7 @@ impl PureExt for typed::MethodEnsuresExt {
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
         _sink: &mut Sink<C>,
-        _hctx: HeapCtx,
+        _hctx: HeapCtx<'_>,
         _ty: vmir::Type,
         _ext: &Self,
     ) -> Result<Val, TranslationError> {
@@ -400,13 +422,36 @@ impl PureExt for typed::MethodBodyExt {
         b: &Builder<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink<C>,
-        hctx: HeapCtx,
+        hctx: HeapCtx<'_>,
         ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError> {
         match ext {
-            typed::MethodBodyExt::Old(..) => {
-                Err(TranslationError::Unsupported("`old` in method body"))
+            // old(e) / old[L](e): re-read `e` against an earlier heap. Unlabeled
+            // → the post-requires-inhale baseline; labeled → the heap captured
+            // at `label L`. The `old` context is carried along so nested `old`s
+            // still resolve.
+            typed::MethodBodyExt::Old(label, inner) => {
+                let old = hctx
+                    .old
+                    .ok_or(TranslationError::Unsupported("`old` outside method body"))?;
+                let heap = match label {
+                    None => old.baseline,
+                    Some(l) => *old.labeled.get(l).ok_or_else(|| {
+                        TranslationError::UnknownIdent(b.interner.resolve(l).to_string())
+                    })?,
+                };
+                lower(
+                    b,
+                    env,
+                    sink,
+                    HeapCtx {
+                        value: heap,
+                        perm: heap,
+                        old: hctx.old,
+                    },
+                    inner,
+                )
             }
             // perm(loc): query the permission held at `loc` in the perm heap.
             typed::MethodBodyExt::Perm(res) => {

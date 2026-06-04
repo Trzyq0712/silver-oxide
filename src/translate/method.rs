@@ -5,10 +5,10 @@ use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::viper::typed;
 use crate::translate::pure_exp::{self, Sink};
 use crate::translate::resource::{self, SpatialMode};
 use crate::translate::{Builder, TranslationError, lower_type};
+use crate::viper::typed;
 use crate::vmir::{
     self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PureInst, ResourceCall, Type, Val,
 };
@@ -55,8 +55,21 @@ pub(crate) fn lower_method(
         pre_heap = h_pre;
     }
 
+    // Baseline for unlabeled `old`: the heap right after the precondition is
+    // inhaled (`HeapVal::Empty` when there is no precondition). `labeled`
+    // accumulates the heap captured at each `label L` as lowering proceeds.
+    let baseline = current_heap;
+    let mut labeled: HashMap<Spur, HeapVal> = HashMap::new();
     for stmt in &body.0 {
-        current_heap = lower_stmt(b, &mut env, &mut sink, current_heap, stmt)?;
+        current_heap = lower_stmt(
+            b,
+            &mut env,
+            &mut sink,
+            current_heap,
+            baseline,
+            &mut labeled,
+            stmt,
+        )?;
     }
 
     // Exhale this method's own postcondition: call self@ensures, sub delta,
@@ -77,6 +90,8 @@ fn lower_stmt(
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
     current_heap: HeapVal,
+    baseline: HeapVal,
+    labeled: &mut HashMap<Spur, HeapVal>,
     stmt: &typed::Statement,
 ) -> Result<HeapVal, TranslationError> {
     use typed::Statement as S;
@@ -93,14 +108,34 @@ fn lower_stmt(
             if idents.len() != 1 {
                 return Err(TranslationError::Unsupported("multi-LHS var := exp"));
             }
-            let v = pure_exp::lower(b, env, sink, pure_exp::HeapCtx::same(current_heap), pure)?;
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
+            let v = pure_exp::lower(
+                b,
+                env,
+                sink,
+                pure_exp::HeapCtx::same_with_old(current_heap, &old),
+                pure,
+            )?;
             env.insert(idents[0].name.0, v);
             Ok(current_heap)
         }
         S::Var(idents, Some(typed::AssignRhs::MethodCall(call))) => {
             let ret_names: Vec<Spur> = idents.iter().map(|i| i.name.0).collect();
             let ret_types: Vec<vmir::Type> = idents.iter().map(|i| lower_type(&i.ty)).collect();
-            lower_method_call(b, env, sink, current_heap, call, &ret_names, &ret_types)
+            lower_method_call(
+                b,
+                env,
+                sink,
+                current_heap,
+                baseline,
+                labeled,
+                call,
+                &ret_names,
+                &ret_types,
+            )
         }
         S::Assign(lhss, typed::AssignRhs::MethodCall(call)) => {
             let mut ret_names = Vec::with_capacity(lhss.len());
@@ -129,7 +164,17 @@ fn lower_stmt(
                         .map(|_| vmir::Type::Int)
                 })
                 .collect::<Result<_, _>>()?;
-            lower_method_call(b, env, sink, current_heap, call, &ret_names, &ret_types)
+            lower_method_call(
+                b,
+                env,
+                sink,
+                current_heap,
+                baseline,
+                labeled,
+                call,
+                &ret_names,
+                &ret_types,
+            )
         }
         S::Assign(lhss, typed::AssignRhs::Exp(pure)) => {
             if lhss.len() != 1 {
@@ -141,7 +186,17 @@ fn lower_stmt(
                     return Err(TranslationError::Unsupported("field lvalue"));
                 }
             };
-            let v = pure_exp::lower(b, env, sink, pure_exp::HeapCtx::same(current_heap), pure)?;
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
+            let v = pure_exp::lower(
+                b,
+                env,
+                sink,
+                pure_exp::HeapCtx::same_with_old(current_heap, &old),
+                pure,
+            )?;
             env.insert(name, v);
             Ok(current_heap)
         }
@@ -171,15 +226,32 @@ fn lower_stmt(
         // reduced to a boolean over the current heap (each `acc(loc, p)` becomes
         // `perm(loc) >= p`) and asserted/assumed. The heap is unchanged.
         S::Assert(e) => {
-            if let Some(v) = resource::lower_assertion_bool(b, env, sink, current_heap, e)? {
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
+            if let Some(v) =
+                resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
+            {
                 sink.emit_ext(InstExt::Assert(v));
             }
             Ok(current_heap)
         }
         S::Assume(e) => {
-            if let Some(v) = resource::lower_assertion_bool(b, env, sink, current_heap, e)? {
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
+            if let Some(v) =
+                resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
+            {
                 sink.emit_ext(InstExt::Assume(v));
             }
+            Ok(current_heap)
+        }
+        // A `label L` marks the current heap state for later `old[L](...)`.
+        S::Label(l) => {
+            labeled.insert(*l, current_heap);
             Ok(current_heap)
         }
         // Inhale: add the assertion's heap delta to the current heap and assume
@@ -187,8 +259,19 @@ fn lower_stmt(
         // growing heap (`ReadHeap::Track`), so later conjuncts can observe the
         // permissions just inhaled.
         S::Inhale(e) => {
-            let (h_out, bv) =
-                resource::lower_spatial(b, env, sink, current_heap, SpatialMode::Inhale, e)?;
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
+            let (h_out, bv) = resource::lower_spatial(
+                b,
+                env,
+                sink,
+                current_heap,
+                SpatialMode::Inhale,
+                Some(&old),
+                e,
+            )?;
             if let Some(v) = bv {
                 sink.emit_ext(InstExt::Assume(v));
             }
@@ -203,6 +286,10 @@ fn lower_stmt(
             // Subtraction happens inside `lower_spatial` (left-to-right), so a
             // `perm` in the assertion observes the running reduced heap, while
             // value reads use the fixed pre-exhale `current_heap`.
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
             let (h_out, bv) = resource::lower_spatial(
                 b,
                 env,
@@ -211,6 +298,7 @@ fn lower_stmt(
                 SpatialMode::Exhale {
                     value_heap: current_heap,
                 },
+                Some(&old),
                 e,
             )?;
             if let Some(v) = bv {
@@ -253,14 +341,23 @@ fn lower_method_call(
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink<MethodCtx>,
     current_heap: HeapVal,
+    baseline: HeapVal,
+    labeled: &HashMap<Spur, HeapVal>,
     call: &typed::Call<typed::MethodBodyExt>,
     ret_names: &[Spur],
     ret_types: &[vmir::Type],
 ) -> Result<HeapVal, TranslationError> {
-    // Lower argument expressions.
+    // Lower argument expressions (may contain `old(...)`).
+    let old = pure_exp::OldHeaps { baseline, labeled };
     let mut args: Vec<Val> = Vec::with_capacity(call.args.len());
     for a in &call.args {
-        args.push(pure_exp::lower(b, env, sink, pure_exp::HeapCtx::same(current_heap), a)?);
+        args.push(pure_exp::lower(
+            b,
+            env,
+            sink,
+            pure_exp::HeapCtx::same_with_old(current_heap, &old),
+            a,
+        )?);
     }
 
     let mut heap = current_heap;

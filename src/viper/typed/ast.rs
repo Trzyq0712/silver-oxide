@@ -217,6 +217,8 @@ pub enum Statement {
     Block(StmtBlock),
     Fold(PredicateWithPerm<MethodBodyExt>),
     Unfold(PredicateWithPerm<MethodBodyExt>),
+    /// Label marking a heap state for `old[L](...)` to refer back to.
+    Label(Spur),
 }
 
 #[derive(Debug, Clone, PartialEq)]

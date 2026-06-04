@@ -4,13 +4,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::viper::{
     self,
+    globals::Globals,
+    interner::Interner,
     typed::{
         self, BinOp, Call, FuncEnsuresExt, Ident, Literal, MethodBodyExt, MethodEnsuresExt,
         PredicateWithPerm, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp, SpatialExpKind,
         Type, TypedIdent, TypedPureExp, UnOp,
     },
-    globals::Globals,
-    interner::Interner,
 };
 
 mod error;
@@ -18,7 +18,6 @@ mod lattice;
 
 pub use error::TypeError;
 use lattice::{ViperTcType, type_to_tc};
-
 
 // ==========================================
 // 3. Context types
@@ -110,8 +109,7 @@ impl<'g> LocalEnv<'g> {
         let mut c = ConstraintCtx::new(self, None);
         c.constrain_resource(&mut acc.loc)?;
         let pk = c.constrain_pure(&mut acc.perm)?;
-        c.tc
-            .impose(pk.concretizes_explicit(ViperTcType::Numeric))?;
+        c.tc.impose(pk.concretizes_explicit(ViperTcType::Numeric))?;
         let table = c.tc.type_check().map_err(TypeError::from)?;
 
         let lowerer = LoweringCtx::new(self, &table);
@@ -345,7 +343,10 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             }
 
             ExpKind::Result => {
-                let ty = self.result_ty.clone().ok_or(TypeError::IllegalResultUsage)?;
+                let ty = self
+                    .result_ty
+                    .clone()
+                    .ok_or(TypeError::IllegalResultUsage)?;
                 self.tc.impose(key.concretizes_explicit(type_to_tc(&ty)))?;
             }
 
@@ -357,7 +358,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             ExpKind::Ascribe(inner, ascribed_ty) => {
                 let target = type_to_tc(&Type::from(&*ascribed_ty));
                 let inner_key = self.constrain_pure(inner)?;
-                self.tc.impose(inner_key.concretizes_explicit(target.clone()))?;
+                self.tc
+                    .impose(inner_key.concretizes_explicit(target.clone()))?;
                 self.tc.impose(key.concretizes_explicit(target))?;
             }
 
@@ -367,7 +369,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
 
             ExpKind::Ternary(cond, then, else_) => {
                 let cond_key = self.constrain_pure(cond)?;
-                self.tc.impose(cond_key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(cond_key.concretizes_explicit(ViperTcType::Bool))?;
                 let then_key = self.constrain_pure(then)?;
                 let else_key = self.constrain_pure(else_)?;
                 self.tc.impose(key.is_sym_meet_of(then_key, else_key))?;
@@ -404,12 +407,14 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
 
             ExpKind::AdtDestructor(base, _field) => {
                 self.constrain_pure(base)?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
 
             ExpKind::AdtDiscriminator(base, _variant) => {
                 self.constrain_pure(base)?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
 
             ExpKind::Quantifier(_, bound_vars, _triggers, body) => {
@@ -434,8 +439,10 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                         }
                     }
                 }
-                self.tc.impose(body_key.concretizes_explicit(ViperTcType::Bool))?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(body_key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
 
             _ => {
@@ -458,17 +465,21 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         match op {
             viper::UnOp::Not => {
                 let inner_key = self.constrain_pure(inner)?;
-                self.tc.impose(inner_key.concretizes_explicit(ViperTcType::Bool))?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(inner_key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
             viper::UnOp::Neg => {
                 let inner_key = self.constrain_pure(inner)?;
-                self.tc.impose(inner_key.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(inner_key.concretizes_explicit(ViperTcType::Numeric))?;
                 self.tc.impose(key.equate_with(inner_key))?;
             }
             viper::UnOp::Perm => {
                 self.constrain_resource(inner)?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Real))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Real))?;
             }
         }
         Ok(())
@@ -490,27 +501,37 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             SBinOp::And | SBinOp::Or | SBinOp::Implies | SBinOp::Iff => {
                 self.tc.impose(lk.concretizes_explicit(ViperTcType::Bool))?;
                 self.tc.impose(rk.concretizes_explicit(ViperTcType::Bool))?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
             SBinOp::Eq | SBinOp::Neq => {
                 self.tc.impose(lk.equate_with(rk))?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
             SBinOp::Lt | SBinOp::Le | SBinOp::Gt | SBinOp::Ge => {
-                self.tc.impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
-                self.tc.impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
                 self.tc.impose(lk.equate_with(rk))?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
             SBinOp::Plus | SBinOp::Minus | SBinOp::Mult | SBinOp::Mod => {
-                self.tc.impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
-                self.tc.impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
                 self.tc.impose(key.is_sym_meet_of(lk, rk))?;
             }
             SBinOp::Div => {
-                self.tc.impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
-                self.tc.impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
-                self.tc.impose(key.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Numeric))?;
             }
             _ => {
                 return Err(TypeError::Other(format!(
@@ -554,9 +575,11 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 let expected_params: Vec<Type> = sig.params.clone();
                 for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
                     let arg_key = self.constrain_pure(arg)?;
-                    self.tc.impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
+                    self.tc
+                        .impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
                 }
-                self.tc.impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
+                self.tc
+                    .impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
                 Ok(())
             }
             ExpCallKind::Macro => Err(TypeError::Other(
@@ -586,8 +609,10 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         })?;
         let ret_ty = field_ty.clone();
         let base_key = self.constrain_pure(base)?;
-        self.tc.impose(base_key.concretizes_explicit(ViperTcType::Ref))?;
-        self.tc.impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
+        self.tc
+            .impose(base_key.concretizes_explicit(ViperTcType::Ref))?;
+        self.tc
+            .impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
         Ok(())
     }
 
@@ -595,7 +620,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         match exp.kind.as_mut() {
             viper::ExpKind::Field(base, _field_name) => {
                 let base_key = self.constrain_pure(base)?;
-                self.tc.impose(base_key.concretizes_explicit(ViperTcType::Ref))?;
+                self.tc
+                    .impose(base_key.concretizes_explicit(ViperTcType::Ref))?;
                 Ok(())
             }
             viper::ExpKind::Call(call) => match call.kind.as_ref().expect("call kind resolved") {
@@ -634,7 +660,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         let expected_params: Vec<Type> = sig.params.clone();
         for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
             let arg_key = self.constrain_pure(arg)?;
-            self.tc.impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
+            self.tc
+                .impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
         }
         Ok(())
     }
@@ -653,7 +680,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             ExpKind::Acc(acc_exp) => {
                 self.constrain_resource(&mut acc_exp.loc)?;
                 let perm_key = self.constrain_pure(&mut acc_exp.perm)?;
-                self.tc.impose(perm_key.concretizes_explicit(ViperTcType::Numeric))?;
+                self.tc
+                    .impose(perm_key.concretizes_explicit(ViperTcType::Numeric))?;
                 Ok(())
             }
             ExpKind::BinOp(viper::BinOp::And | viper::BinOp::InhaleExhale, l, r) => {
@@ -662,18 +690,21 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             }
             ExpKind::BinOp(viper::BinOp::Implies, l, r) => {
                 let cond_key = self.constrain_pure(l)?;
-                self.tc.impose(cond_key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(cond_key.concretizes_explicit(ViperTcType::Bool))?;
                 self.constrain_spatial(r)
             }
             ExpKind::Ternary(cond, then, else_) => {
                 let cond_key = self.constrain_pure(cond)?;
-                self.tc.impose(cond_key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(cond_key.concretizes_explicit(ViperTcType::Bool))?;
                 self.constrain_spatial(then)?;
                 self.constrain_spatial(else_)
             }
             _ => {
                 let pure_key = self.constrain_pure(exp)?;
-                self.tc.impose(pure_key.concretizes_explicit(ViperTcType::Bool))?;
+                self.tc
+                    .impose(pure_key.concretizes_explicit(ViperTcType::Bool))?;
                 Ok(())
             }
         }
@@ -685,10 +716,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
 // ==========================================
 
 impl<'a, 'g> LoweringCtx<'a, 'g> {
-    fn lower_pure<Ext: PureExt>(
-        &self,
-        exp: &viper::Exp,
-    ) -> Result<TypedPureExp<Ext>, TypeError> {
+    fn lower_pure<Ext: PureExt>(&self, exp: &viper::Exp) -> Result<TypedPureExp<Ext>, TypeError> {
         let ty = self.resolved_ty(exp)?;
         let kind = self.lower_pure_kind::<Ext>(exp)?;
         Ok(TypedPureExp {
@@ -792,8 +820,14 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
         inner: &viper::Exp,
     ) -> Result<PureExpKind<Ext>, TypeError> {
         match op {
-            viper::UnOp::Not => Ok(PureExpKind::Unary(UnOp::Not, self.lower_pure::<Ext>(inner)?)),
-            viper::UnOp::Neg => Ok(PureExpKind::Unary(UnOp::Neg, self.lower_pure::<Ext>(inner)?)),
+            viper::UnOp::Not => Ok(PureExpKind::Unary(
+                UnOp::Not,
+                self.lower_pure::<Ext>(inner)?,
+            )),
+            viper::UnOp::Neg => Ok(PureExpKind::Unary(
+                UnOp::Neg,
+                self.lower_pure::<Ext>(inner)?,
+            )),
             viper::UnOp::Perm => {
                 let resource = self.lower_resource::<Ext>(inner)?;
                 Ok(PureExpKind::Ext(Ext::lower_perm(resource)?))
@@ -859,16 +893,15 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
         for arg in call.args.iter() {
             args.push(self.lower_pure::<Ext>(arg)?);
         }
-        Ok(ResourceExp(Box::new(ResourceExpKind::PredicateCall(Call {
-            name: Ident(call.name.id()),
-            args,
-        }))))
+        Ok(ResourceExp(Box::new(ResourceExpKind::PredicateCall(
+            Call {
+                name: Ident(call.name.id()),
+                args,
+            },
+        ))))
     }
 
-    fn lower_spatial<Ext: PureExt>(
-        &self,
-        exp: &viper::Exp,
-    ) -> Result<SpatialExp<Ext>, TypeError> {
+    fn lower_spatial<Ext: PureExt>(&self, exp: &viper::Exp) -> Result<SpatialExp<Ext>, TypeError> {
         use viper::ExpKind;
 
         if let ExpKind::Call(call) = &*exp.kind {
@@ -885,7 +918,9 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
             ExpKind::Acc(acc_exp) => {
                 let resource = self.lower_resource::<Ext>(&acc_exp.loc)?;
                 let perm_exp = self.lower_pure::<Ext>(&acc_exp.perm)?;
-                Ok(SpatialExp(Box::new(SpatialExpKind::Acc(resource, perm_exp))))
+                Ok(SpatialExp(Box::new(SpatialExpKind::Acc(
+                    resource, perm_exp,
+                ))))
             }
 
             ExpKind::BinOp(viper::BinOp::And | viper::BinOp::InhaleExhale, l, r) => {
@@ -1001,9 +1036,7 @@ fn lower_statement(
         S::Exhale(e) => Ok(typed::Statement::Exhale(ctx.typecheck_spatial(e)?)),
 
         S::Fold(acc) => Ok(typed::Statement::Fold(ctx.typecheck_pred_with_perm(acc)?)),
-        S::Unfold(acc) => Ok(typed::Statement::Unfold(
-            ctx.typecheck_pred_with_perm(acc)?,
-        )),
+        S::Unfold(acc) => Ok(typed::Statement::Unfold(ctx.typecheck_pred_with_perm(acc)?)),
 
         S::Var(decls, init) => {
             let mut typed_decls = Vec::with_capacity(decls.len());
@@ -1040,9 +1073,14 @@ fn lower_statement(
             Ok(typed::Statement::Block(typed::StmtBlock(stmts)))
         }
 
-        S::If(..) | S::While(..) | S::Goto(..) | S::Label(..) | S::Refute(..) => Err(
-            TypeError::Other("statement not yet supported in initial scope".to_string()),
-        ),
+        // A `label L` marks the current heap state; its name was already
+        // collected by `collect_labels` for `old[L]` validation. Invariants on
+        // the label are loop-related and out of scope (ignored).
+        S::Label(decl, _invs) => Ok(typed::Statement::Label(decl.0.id())),
+
+        S::If(..) | S::While(..) | S::Goto(..) | S::Refute(..) => Err(TypeError::Other(
+            "statement not yet supported in initial scope".to_string(),
+        )),
     }
 }
 
@@ -1053,11 +1091,9 @@ fn lower_assign_lhs_typed(
     match lhs {
         viper::AssignLhs::Ident(ident) => {
             let spur = ident.id();
-            let ty = ctx
-                .locals
-                .get(&spur)
-                .cloned()
-                .ok_or_else(|| TypeError::UndefinedVariable(ctx.interner.resolve(&spur).to_string()))?;
+            let ty = ctx.locals.get(&spur).cloned().ok_or_else(|| {
+                TypeError::UndefinedVariable(ctx.interner.resolve(&spur).to_string())
+            })?;
             Ok((typed::AssignLhs::Var(Ident(spur)), ty))
         }
         viper::AssignLhs::Field(base, field) => {
@@ -1271,8 +1307,11 @@ fn typecheck_function(
         match iter.next() {
             None => None,
             Some(e) => {
-                let first =
-                    ctx.typecheck_pure::<FuncEnsuresExt>(e, ViperTcType::Bool, Some(ret_ty.clone()))?;
+                let first = ctx.typecheck_pure::<FuncEnsuresExt>(
+                    e,
+                    ViperTcType::Bool,
+                    Some(ret_ty.clone()),
+                )?;
                 let combined = iter.try_fold(first, |acc, e| {
                     let next = ctx.typecheck_pure::<FuncEnsuresExt>(
                         e,
@@ -1616,9 +1655,13 @@ method test()
         assert!(
             result
                 .as_ref()
-                .is_err_and(|errs| errs
-                    .iter()
-                    .any(|e| matches!(e, TypeError::WrongReturnCount { expected: 1, found: 2 }))),
+                .is_err_and(|errs| errs.iter().any(|e| matches!(
+                    e,
+                    TypeError::WrongReturnCount {
+                        expected: 1,
+                        found: 2
+                    }
+                ))),
             "expected WrongReturnCount, got: {result:?}"
         );
     }
@@ -1638,9 +1681,13 @@ method test()
         assert!(
             result
                 .as_ref()
-                .is_err_and(|errs| errs
-                    .iter()
-                    .any(|e| matches!(e, TypeError::WrongReturnCount { expected: 1, found: 2 }))),
+                .is_err_and(|errs| errs.iter().any(|e| matches!(
+                    e,
+                    TypeError::WrongReturnCount {
+                        expected: 1,
+                        found: 2
+                    }
+                ))),
             "expected WrongReturnCount, got: {result:?}"
         );
     }
@@ -1662,9 +1709,13 @@ method test(a: Int)
         assert!(
             result
                 .as_ref()
-                .is_err_and(|errs| errs
-                    .iter()
-                    .any(|e| matches!(e, TypeError::WrongReturnCount { expected: 1, found: 2 }))),
+                .is_err_and(|errs| errs.iter().any(|e| matches!(
+                    e,
+                    TypeError::WrongReturnCount {
+                        expected: 1,
+                        found: 2
+                    }
+                ))),
             "expected WrongReturnCount, got: {result:?}"
         );
     }

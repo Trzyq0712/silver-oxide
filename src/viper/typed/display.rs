@@ -9,13 +9,13 @@
 
 use std::fmt::{self, Display, Formatter};
 
+use crate::viper::interner::Interner;
 use crate::viper::typed::{
     AssignLhs, AssignRhs, BinOp, Call, Declaration, Field, FuncEnsuresExt, Function, Ident,
-    Literal, Method, MethodBodyExt, MethodEnsuresExt, PredicateWithPerm, Predicate, Program,
+    Literal, Method, MethodBodyExt, MethodEnsuresExt, Predicate, PredicateWithPerm, Program,
     PureExpKind, ResourceExp, ResourceExpKind, SpatialExp, SpatialExpKind, StarOrFields, Statement,
     StmtBlock, Type, TypedIdent, TypedPureExp, UnOp,
 };
-use crate::viper::interner::Interner;
 
 /// Interner-aware formatting wrapper.
 pub struct Show<'a, T> {
@@ -80,7 +80,12 @@ impl ShowExt for MethodBodyExt {
         match self {
             MethodBodyExt::Old(None, e) => write!(f, "old({})", Show::new(e, interner)),
             MethodBodyExt::Old(Some(label), e) => {
-                write!(f, "old[{}]({})", interner.resolve(label), Show::new(e, interner))
+                write!(
+                    f,
+                    "old[{}]({})",
+                    interner.resolve(label),
+                    Show::new(e, interner)
+                )
             }
             MethodBodyExt::Perm(res) => write!(f, "perm({})", Show::new(res, interner)),
         }
@@ -120,7 +125,12 @@ impl<'a> Display for Show<'a, &'a Field> {
 
 impl<'a> Display for Show<'a, &'a TypedIdent> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name(self.item.name), self.with(&self.item.ty))
+        write!(
+            f,
+            "{}: {}",
+            self.name(self.item.name),
+            self.with(&self.item.ty)
+        )
     }
 }
 
@@ -138,7 +148,11 @@ impl<'a> Display for Show<'a, &'a Type> {
     }
 }
 
-fn fmt_params(f: &mut Formatter<'_>, show: &Show<'_, impl Sized>, params: &[TypedIdent]) -> fmt::Result {
+fn fmt_params(
+    f: &mut Formatter<'_>,
+    show: &Show<'_, impl Sized>,
+    params: &[TypedIdent],
+) -> fmt::Result {
     write!(f, "(")?;
     for (i, p) in params.iter().enumerate() {
         if i > 0 {
@@ -252,6 +266,7 @@ impl<'a> Display for Show<'a, &'a Statement> {
             Statement::Block(b) => write!(f, "{}", self.with(b)),
             Statement::Fold(p) => write!(f, "fold {}", self.with(p)),
             Statement::Unfold(p) => write!(f, "unfold {}", self.with(p)),
+            Statement::Label(l) => write!(f, "label {}", self.interner.resolve(l)),
         }
     }
 }
@@ -402,7 +417,13 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
             write!(f, "{} {} {}", show.with(l), show.with(op), show.with(r))
         }
         PureExpKind::Ternary { if_, then, else_ } => {
-            write!(f, "{} ? {} : {}", show.with(if_), show.with(then), show.with(else_))
+            write!(
+                f,
+                "{} ? {} : {}",
+                show.with(if_),
+                show.with(then),
+                show.with(else_)
+            )
         }
         PureExpKind::Unfolding(p, e) => {
             write!(f, "unfolding {} in {}", show.with(p), show.with(e))

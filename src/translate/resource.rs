@@ -4,12 +4,12 @@ use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::viper::typed;
-use crate::translate::pure_exp::{self, HeapCtx, PureExt, Sink};
+use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PureExt, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
+use crate::viper::typed;
 use crate::vmir::{
-    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, InstContext, Polarity, PureInst, ResourceCtx,
-    TRUE, Type, Val,
+    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, InstContext, Polarity, PureInst,
+    ResourceCtx, TRUE, Type, Val,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -29,13 +29,19 @@ pub(crate) enum SpatialMode {
 impl SpatialMode {
     /// Heaps to read sub-expressions from, given the current accumulation heap.
     /// `perm` always tracks `acc_heap`; values track it on inhale but use the
-    /// fixed pre-exhale heap on exhale.
-    fn heap_ctx(self, acc_heap: HeapVal) -> HeapCtx {
+    /// fixed pre-exhale heap on exhale. `old` (method bodies only) is carried
+    /// through so `old(...)` sub-expressions can reach earlier heaps.
+    fn heap_ctx<'a>(self, acc_heap: HeapVal, old: Option<&'a OldHeaps<'a>>) -> HeapCtx<'a> {
         match self {
-            SpatialMode::Inhale => HeapCtx::same(acc_heap),
+            SpatialMode::Inhale => HeapCtx {
+                value: acc_heap,
+                perm: acc_heap,
+                old,
+            },
             SpatialMode::Exhale { value_heap } => HeapCtx {
                 value: value_heap,
                 perm: acc_heap,
+                old,
             },
         }
     }
@@ -55,7 +61,15 @@ pub(crate) fn lower_spatial_never(
     heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
-    let (h, bv) = lower_spatial(b, env, &mut sink, initial_heap, SpatialMode::Inhale, exp)?;
+    let (h, bv) = lower_spatial(
+        b,
+        env,
+        &mut sink,
+        initial_heap,
+        SpatialMode::Inhale,
+        None,
+        exp,
+    )?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -71,7 +85,15 @@ pub(crate) fn lower_spatial_ensures(
     heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
-    let (h, bv) = lower_spatial(b, env, &mut sink, initial_heap, SpatialMode::Inhale, exp)?;
+    let (h, bv) = lower_spatial(
+        b,
+        env,
+        &mut sink,
+        initial_heap,
+        SpatialMode::Inhale,
+        None,
+        exp,
+    )?;
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -91,11 +113,12 @@ pub(crate) fn lower_spatial<C: InstContext, Ext: PureExt>(
     sink: &mut Sink<C>,
     acc_heap: HeapVal,
     mode: SpatialMode,
+    old: Option<&OldHeaps>,
     exp: &typed::SpatialExp<Ext>,
 ) -> Result<(HeapVal, Option<Val>), TranslationError> {
     use typed::SpatialExpKind as S;
     // Heaps to read heap-dependent sub-expressions from at this point.
-    let hctx = mode.heap_ctx(acc_heap);
+    let hctx = mode.heap_ctx(acc_heap, old);
     match &*exp.0 {
         S::Acc(res, perm) => {
             let delta = lower_acc(b, env, sink, hctx, res, perm)?;
@@ -108,8 +131,8 @@ pub(crate) fn lower_spatial<C: InstContext, Ext: PureExt>(
             Ok((h_out, None))
         }
         S::Conj(l, r) => {
-            let (h_mid, b_l) = lower_spatial(b, env, sink, acc_heap, mode, l)?;
-            let (h_out, b_r) = lower_spatial(b, env, sink, h_mid, mode, r)?;
+            let (h_mid, b_l) = lower_spatial(b, env, sink, acc_heap, mode, old, l)?;
+            let (h_out, b_r) = lower_spatial(b, env, sink, h_mid, mode, old, r)?;
 
             let b_sum = match (b_l, b_r) {
                 (None, None) => None,
@@ -124,7 +147,7 @@ pub(crate) fn lower_spatial<C: InstContext, Ext: PureExt>(
         S::Implies(cond, body) => {
             let c = pure_exp::lower(b, env, sink, hctx, cond)?;
             let (h_b, b_b) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, body)
+                lower_spatial(b, env, sink, acc_heap, mode, old, body)
             })?;
             let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_b, acc_heap));
             // c ==> b_b  =  c ? b_b : true. When body has no boolean, the
@@ -135,10 +158,10 @@ pub(crate) fn lower_spatial<C: InstContext, Ext: PureExt>(
         S::Ternary { if_, then, else_ } => {
             let c = pure_exp::lower(b, env, sink, hctx, if_)?;
             let (h_t, b_t) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, then)
+                lower_spatial(b, env, sink, acc_heap, mode, old, then)
             })?;
             let (h_e, b_e) = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, else_)
+                lower_spatial(b, env, sink, acc_heap, mode, old, else_)
             })?;
             let h = sink.emit_heap(HeapInst::Ternary(c.clone(), h_t, h_e));
             let bv = match (b_t, b_e) {
@@ -166,7 +189,7 @@ fn lower_acc<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
-    hctx: HeapCtx,
+    hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
 ) -> Result<HeapVal, TranslationError> {
@@ -185,7 +208,7 @@ pub(crate) fn lower_resource_addr<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
-    hctx: HeapCtx,
+    hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
 ) -> Result<Val, TranslationError> {
     use typed::ResourceExpKind as R;
@@ -249,10 +272,15 @@ pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink<C>,
     heap: HeapVal,
+    old: Option<&OldHeaps>,
     exp: &typed::SpatialExp<Ext>,
 ) -> Result<Option<Val>, TranslationError> {
     use typed::SpatialExpKind as S;
-    let hctx = HeapCtx::same(heap);
+    let hctx = HeapCtx {
+        value: heap,
+        perm: heap,
+        old,
+    };
     match &*exp.0 {
         // acc(loc, p)  ==>  perm(loc) >= p  ==  not(perm(loc) < p)
         S::Acc(res, perm) => {
@@ -262,11 +290,13 @@ pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
                 .ok_or(TranslationError::Unsupported("perm in this context"))?;
             let held = sink.emit_pure(Type::Real, PureInst::Ext(pe));
             let lt = sink.emit_pure(Type::Bool, PureInst::Binary(vmir::BinOp::Lt, held, p));
-            Ok(Some(sink.emit_pure(Type::Bool, PureInst::Ternary(lt, FALSE, TRUE))))
+            Ok(Some(
+                sink.emit_pure(Type::Bool, PureInst::Ternary(lt, FALSE, TRUE)),
+            ))
         }
         S::Conj(l, r) => {
-            let bl = lower_assertion_bool(b, env, sink, heap, l)?;
-            let br = lower_assertion_bool(b, env, sink, heap, r)?;
+            let bl = lower_assertion_bool(b, env, sink, heap, old, l)?;
+            let br = lower_assertion_bool(b, env, sink, heap, old, r)?;
             Ok(match (bl, br) {
                 (None, None) => None,
                 (Some(v), None) | (None, Some(v)) => Some(v),
@@ -279,7 +309,7 @@ pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
         S::Implies(cond, body) => {
             let c = pure_exp::lower(b, env, sink, hctx, cond)?;
             let bb = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_assertion_bool(b, env, sink, heap, body)
+                lower_assertion_bool(b, env, sink, heap, old, body)
             })?;
             // c ==> bb  =  c ? bb : true
             Ok(bb.map(|v| sink.emit_pure(Type::Bool, PureInst::Ternary(c, v, TRUE))))
@@ -287,15 +317,19 @@ pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
         S::Ternary { if_, then, else_ } => {
             let c = pure_exp::lower(b, env, sink, hctx, if_)?;
             let bt = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_assertion_bool(b, env, sink, heap, then)
+                lower_assertion_bool(b, env, sink, heap, old, then)
             })?;
             let be = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
-                lower_assertion_bool(b, env, sink, heap, else_)
+                lower_assertion_bool(b, env, sink, heap, old, else_)
             })?;
             Ok(match (bt, be) {
                 (None, None) => None,
-                (Some(vt), None) => Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, vt, TRUE))),
-                (None, Some(ve)) => Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, TRUE, ve))),
+                (Some(vt), None) => {
+                    Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, vt, TRUE)))
+                }
+                (None, Some(ve)) => {
+                    Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, TRUE, ve)))
+                }
                 (Some(vt), Some(ve)) => {
                     Some(sink.emit_pure(Type::Bool, PureInst::Ternary(c, vt, ve)))
                 }
@@ -315,9 +349,10 @@ pub(crate) fn field_acc_delta<C: InstContext>(
     fname: Spur,
     perm: Val,
 ) -> Result<HeapVal, TranslationError> {
-    let &addr_fn = b.field_addr.get(&fname).ok_or_else(|| {
-        TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string())
-    })?;
+    let &addr_fn = b
+        .field_addr
+        .get(&fname)
+        .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
     let field_ty = b
         .globals
         .resolve(fname)
@@ -336,4 +371,3 @@ pub(crate) fn field_acc_delta<C: InstContext>(
     );
     Ok(sink.emit_heap(HeapInst::Acc(Acc { loc: addr, perm })))
 }
-
