@@ -1,3 +1,4 @@
+use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
         context::VerifyContext,
@@ -6,12 +7,11 @@ use crate::{
         viz::Snapshotter,
     },
     vmir::{
-        self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, InstContext, InstExt,
-        Inst, InstKind, Literal, MemberId, Method, MethodInst, PathConds, Polarity, PureInst, Resource,
-        ResourceCall, ResourceInst, Type, Val,
+        self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, Inst, InstContext,
+        InstExt, InstKind, Literal, MemberId, Method, MethodInst, PathConds, Polarity, PureInst,
+        Resource, ResourceCall, ResourceInst, Type, Val,
     },
 };
-use crate::vmir::display::VmirDisplay;
 
 #[derive(Debug)]
 pub enum VerifyError {
@@ -143,7 +143,10 @@ fn display_heaps<C: vmir::InstContext>(
         InstKind::Heap(HeapInst::Add(h1, h2)) | InstKind::Heap(HeapInst::Sub(h1, h2)) => vec![
             (h1.to_string(), get_heap(state, h1)),
             (h2.to_string(), get_heap(state, h2)),
-            (format!("h{heaps_before}"), state.heaps[heaps_before].clone()),
+            (
+                format!("h{heaps_before}"),
+                state.heaps[heaps_before].clone(),
+            ),
         ],
         _ => state
             .heaps
@@ -181,7 +184,7 @@ fn check_deref_permission(
         .perm_at(addr)
         .unwrap_or_else(|| zero_real(ctx));
     let zero = zero_real(ctx);
-    let positive = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [zero, perm]));
+    let positive = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, perm]));
     if ctx.prove_under_pc(positive, pc_lits) {
         Ok(())
     } else {
@@ -220,13 +223,17 @@ where
         PureInst::Binary(op, l, r) => {
             let lhs = state.get_val(ctx, l);
             let rhs = state.get_val(ctx, r);
-            ctx.add(Symbolic::Binary(*op, ty.clone(), [lhs, rhs]))
+            ctx.add(Symbolic::Binary(*op, [lhs, rhs]))
         }
         PureInst::Ternary(c, t, e) => {
             let cond = state.get_val(ctx, c);
             let then_ = state.get_val(ctx, t);
             let else_ = state.get_val(ctx, e);
-            ctx.add(Symbolic::Ite(ty.clone(), [cond, then_, else_]))
+            ctx.add(Symbolic::Ite([cond, then_, else_]))
+        }
+        PureInst::RealCast(v) => {
+            let inner = state.get_val(ctx, v);
+            ctx.add(Symbolic::RealCast(inner))
         }
         PureInst::Deref(hv, loc) => {
             let heap = get_heap(state, hv);
@@ -236,7 +243,7 @@ where
         }
         PureInst::FunctionCall(_heap, fc) => {
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add(Symbolic::FuncApp(fc.function, ty.clone(), args.into()))
+            ctx.add_func_app(fc, ty.clone(), args.into())
         }
         PureInst::Ext(ext) => eval_ext(ctx, state, ext),
     }
@@ -286,21 +293,20 @@ fn merge_chunks(
     v1: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Chunk {
-    let perm = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [p0, p1]));
+    let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p0, p1]));
 
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
         num::BigInt::from(0),
     ))));
-    let p0_pos = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [zero, p0]));
-    let p1_pos = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [zero, p1]));
+    let p0_pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, p0]));
+    let p1_pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, p1]));
 
-    let vty = ctx.egraph[v0].data.ty.clone();
-    let value = ctx.add(Symbolic::Ite(vty, [p0_pos, v0, v1]));
+    let value = ctx.add(Symbolic::Ite([p0_pos, v0, v1]));
 
     // `(PC ∧ p0 > 0 ∧ p1 > 0) ==> (v0 == v1)` as the golden-rule ITE chain.
     // Fold innermost-first: p1_pos, p0_pos, then PC literals in reverse.
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [v0, v1]));
+    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [v0, v1]));
     let antecedents = [(p1_pos, Polarity::Positive), (p0_pos, Polarity::Positive)]
         .into_iter()
         .chain(pc_lits.iter().rev().copied());
@@ -327,7 +333,12 @@ fn canonicalize_heap(
         let canon = ctx.egraph.find(addr);
         if let Some(existing) = out.chunk(canon).cloned() {
             let merged = merge_chunks(
-                ctx, existing.perm, existing.value, chunk.perm, chunk.value, pc_lits,
+                ctx,
+                existing.perm,
+                existing.value,
+                chunk.perm,
+                chunk.value,
+                pc_lits,
             );
             out = out.with_chunk(canon, merged);
         } else {
@@ -355,7 +366,12 @@ fn heap_union(
     for (addr, chunk2) in entries {
         if let Some(existing) = out.chunk(addr).cloned() {
             let merged = merge_chunks(
-                ctx, existing.perm, existing.value, chunk2.perm, chunk2.value, pc_lits,
+                ctx,
+                existing.perm,
+                existing.value,
+                chunk2.perm,
+                chunk2.value,
+                pc_lits,
             );
             out = out.with_chunk(addr, merged);
         } else {
@@ -391,25 +407,17 @@ fn heap_subtract(
 
         // Sufficiency goal: `existing.perm >= chunk2.perm`, i.e.
         // `not(existing.perm < chunk2.perm)`, desugared to an `Ite`.
-        let lt = ctx.add(Symbolic::Binary(
-            BinOp::Lt,
-            Type::Bool,
-            [existing.perm, chunk2.perm],
-        ));
+        let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
         let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-        let goal = ctx.add(Symbolic::Ite(Type::Bool, [lt, false_, true_]));
+        let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
         if !ctx.prove_under_pc(goal, pc_lits) {
             return Err(VerifyError::InsufficientPermission);
         }
 
         ctx.egraph.union(existing.value, chunk2.value);
 
-        let remainder = ctx.add(Symbolic::Binary(
-            BinOp::Minus,
-            Type::Real,
-            [existing.perm, chunk2.perm],
-        ));
+        let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
         if extract_real_literal(ctx, remainder).as_ref() == Some(&zero_rat) {
             out = out.without_chunk(addr);
         } else {
@@ -676,17 +684,17 @@ fn inst_obligations<C: InstContext>(
         InstKind::Heap(HeapInst::Acc(acc)) => {
             let perm = state.get_val(ctx, &acc.perm);
             let zero = zero_real(ctx);
-            let lt = ctx.add(Symbolic::Binary(BinOp::Lt, Type::Bool, [perm, zero]));
-            let goal = ctx.add(Symbolic::Ite(Type::Bool, [lt, false_, true_]));
+            let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));
+            let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
             vec![(goal, "permission may be negative")]
         }
-        // `not(divisor == 0)` desugared to an `Ite`.
-        InstKind::Pure(_, PureInst::Binary(BinOp::Div, _, r)) => {
+        // `not(divisor == 0)` desugared to an `Ite`. The divisor is homogeneous
+        // with the result (casts), so the VMIR result type gives the zero's type.
+        InstKind::Pure(ty, PureInst::Binary(BinOp::Div, _, r)) => {
             let rv = state.get_val(ctx, r);
-            let rty = ctx.egraph[rv].data.ty.clone();
-            let zero = zero_of(ctx, &rty);
-            let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [rv, zero]));
-            let goal = ctx.add(Symbolic::Ite(Type::Bool, [eq, false_, true_]));
+            let zero = zero_of(ctx, ty);
+            let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [rv, zero]));
+            let goal = ctx.add(Symbolic::Ite([eq, false_, true_]));
             vec![(goal, "divisor may be zero")]
         }
         _ => vec![],
@@ -700,7 +708,6 @@ fn zero_of(ctx: &mut VerifyContext<'_>, ty: &Type) -> egg::Id {
         _ => zero_real(ctx),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -735,12 +742,12 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
-        let b = ctx.add(Symbolic::Fresh(1, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         let p2 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
-        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2));
+        let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(b, Chunk::new(p2, v2));
@@ -753,7 +760,7 @@ mod tests {
         let canon = ctx.egraph.find(a);
         let chunk = merged.chunk(canon).expect("merged chunk missing");
 
-        let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [p1, p2]));
+        let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p1, p2]));
         ctx.saturate();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
         // Both fractions positive (1, 2) → agreement axiom fuses the values.
@@ -767,17 +774,19 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
         let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v0 = ctx.add(Symbolic::Fresh(1));
+        let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
 
         let merged = heap_union(&mut ctx, &h1, &h2, &[]);
-        let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        let chunk = merged
+            .chunk(ctx.egraph.find(a))
+            .expect("merged chunk missing");
         ctx.saturate();
 
         // p0 = 0 → asymmetric ternary picks the active half v1; no fusion.
@@ -790,17 +799,19 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
         let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v0 = ctx.add(Symbolic::Fresh(1));
+        let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
 
         let merged = heap_union(&mut ctx, &h1, &h2, &[]);
-        let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        let chunk = merged
+            .chunk(ctx.egraph.find(a))
+            .expect("merged chunk missing");
         ctx.saturate();
 
         // Both fractions positive → agreement axiom fuses the symbolic values.
@@ -813,18 +824,20 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
         let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v0 = ctx.add(Symbolic::Fresh(1));
+        let v1 = ctx.add(Symbolic::Fresh(2));
         let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
 
         let merged = heap_union(&mut ctx, &h1, &h2, &[(false_lit, Polarity::Positive)]);
-        let chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        let chunk = merged
+            .chunk(ctx.egraph.find(a))
+            .expect("merged chunk missing");
         ctx.saturate();
 
         // PC literal is `false` → implication collapses to its `true` fallback;
@@ -839,18 +852,20 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
         let p0 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v0 = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v0 = ctx.add(Symbolic::Fresh(1));
+        let v1 = ctx.add(Symbolic::Fresh(2));
         let true_lit = ctx.add(Symbolic::Lit(Literal::Bool(true)));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
 
         let merged = heap_union(&mut ctx, &h1, &h2, &[(true_lit, Polarity::Positive)]);
-        let _chunk = merged.chunk(ctx.egraph.find(a)).expect("merged chunk missing");
+        let _chunk = merged
+            .chunk(ctx.egraph.find(a))
+            .expect("merged chunk missing");
         ctx.saturate();
 
         // PC literal is `true` + both fractions positive → agreement fires.
@@ -862,7 +877,7 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let g = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let g = ctx.add(Symbolic::Fresh(0));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         ctx.egraph.union(g, true_);
         ctx.egraph.rebuild();
@@ -877,7 +892,7 @@ mod tests {
         let mut ctx = fresh_ctx(&interner);
 
         // A free boolean never driven to `true` is not provable.
-        let g = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let g = ctx.add(Symbolic::Fresh(0));
         assert!(!ctx.prove_under_pc(g, &[]));
     }
 
@@ -887,7 +902,7 @@ mod tests {
         let mut ctx = fresh_ctx(&interner);
 
         // Unprovable goal, but the path is unsatisfiable (`false`).
-        let g = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let g = ctx.add(Symbolic::Fresh(0));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
 
@@ -902,11 +917,11 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let c = ctx.add(Symbolic::Fresh(0, Type::Bool));
-        let x = ctx.add(Symbolic::Fresh(1, Type::Bool));
+        let c = ctx.add(Symbolic::Fresh(0));
+        let x = ctx.add(Symbolic::Fresh(1));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         // goal = `c ? true : x` — true under hypothesis `c`, unknown otherwise.
-        let goal = ctx.add(Symbolic::Ite(Type::Bool, [c, true_, x]));
+        let goal = ctx.add(Symbolic::Ite([c, true_, x]));
 
         // Provable under PC `<c>`; commits `c ==> goal` into the live graph.
         assert!(ctx.prove_under_pc(goal, &[(c, Polarity::Positive)]));
@@ -926,11 +941,11 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
-        let p_have = ctx.add(Symbolic::Fresh(1, Type::Real));
-        let p_take = ctx.add(Symbolic::Fresh(2, Type::Real));
-        let v1 = ctx.add(Symbolic::Fresh(3, Type::Int));
-        let v2 = ctx.add(Symbolic::Fresh(4, Type::Int));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let p_have = ctx.add(Symbolic::Fresh(1));
+        let p_take = ctx.add(Symbolic::Fresh(2));
+        let v1 = ctx.add(Symbolic::Fresh(3));
+        let v2 = ctx.add(Symbolic::Fresh(4));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p_have, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p_take, v2));
@@ -939,7 +954,10 @@ mod tests {
         let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("symbolic-perm exhale must fail without a proof");
-        assert!(matches!(err.root_cause(), VerifyError::InsufficientPermission));
+        assert!(matches!(
+            err.root_cause(),
+            VerifyError::InsufficientPermission
+        ));
     }
 
     #[test]
@@ -947,12 +965,12 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
-        let b = ctx.add(Symbolic::Fresh(1, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
         let p2 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
-        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2));
+        let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p2, v1));
         let h2 = Heap::empty().with_chunk(b, Chunk::new(p1, v2));
@@ -975,10 +993,10 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
-        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2));
+        let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v2));
@@ -997,11 +1015,11 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         let p2 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
-        let v2 = ctx.add(Symbolic::Fresh(3, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2));
+        let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p2, v2));
@@ -1009,7 +1027,10 @@ mod tests {
         let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("over-consumption must fail");
-        assert!(matches!(err.root_cause(), VerifyError::InsufficientPermission));
+        assert!(matches!(
+            err.root_cause(),
+            VerifyError::InsufficientPermission
+        ));
     }
 
     #[test]
@@ -1017,10 +1038,10 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Ref));
-        let b = ctx.add(Symbolic::Fresh(1, Type::Ref));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
         let p1 = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let v1 = ctx.add(Symbolic::Fresh(2, Type::Int));
+        let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty();
         let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
@@ -1029,7 +1050,10 @@ mod tests {
         let err = heap_subtract(&mut ctx, &h1, &h2, &[])
             .err()
             .expect("subtract from empty must fail");
-        assert!(matches!(err.root_cause(), VerifyError::InsufficientPermission));
+        assert!(matches!(
+            err.root_cause(),
+            VerifyError::InsufficientPermission
+        ));
     }
 
     #[test]
@@ -1038,7 +1062,7 @@ mod tests {
         let mut ctx = fresh_ctx(&interner);
 
         let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let diff = ctx.add(Symbolic::Binary(BinOp::Minus, Type::Real, [one, one]));
+        let diff = ctx.add(Symbolic::Binary(BinOp::Minus, [one, one]));
         ctx.egraph.rebuild();
 
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
@@ -1051,9 +1075,9 @@ mod tests {
         let mut ctx = fresh_ctx(&interner);
 
         let cond = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-        let t = ctx.add(Symbolic::Fresh(0, Type::Int));
-        let e = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let ite = ctx.add(Symbolic::Ite(Type::Int, [cond, t, e]));
+        let t = ctx.add(Symbolic::Fresh(0));
+        let e = ctx.add(Symbolic::Fresh(1));
+        let ite = ctx.add(Symbolic::Ite([cond, t, e]));
         ctx.saturate();
 
         // `true ? t : e` collapses to the symbolic `t`.
@@ -1067,9 +1091,9 @@ mod tests {
         let mut ctx = fresh_ctx(&interner);
 
         let cond = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-        let t = ctx.add(Symbolic::Fresh(0, Type::Int));
-        let e = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let ite = ctx.add(Symbolic::Ite(Type::Int, [cond, t, e]));
+        let t = ctx.add(Symbolic::Fresh(0));
+        let e = ctx.add(Symbolic::Fresh(1));
+        let ite = ctx.add(Symbolic::Ite([cond, t, e]));
         ctx.saturate();
 
         assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(e));
@@ -1081,9 +1105,9 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let x = ctx.add(Symbolic::Fresh(0, Type::Int));
+        let x = ctx.add(Symbolic::Fresh(0));
         let zero = ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0))));
-        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Int, [x, zero]));
+        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, [x, zero]));
         ctx.saturate();
 
         assert_eq!(ctx.egraph.find(sum), ctx.egraph.find(x));
@@ -1094,10 +1118,10 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let x = ctx.add(Symbolic::Fresh(0, Type::Real));
+        let x = ctx.add(Symbolic::Fresh(0));
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         // `0 + x` (commuted) must also fold to `x`.
-        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, Type::Real, [zero, x]));
+        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, [zero, x]));
         ctx.saturate();
 
         assert_eq!(ctx.egraph.find(sum), ctx.egraph.find(x));
@@ -1108,9 +1132,9 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Int));
-        let b = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [a, b]));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
+        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         // `assume a == b` is modelled as unioning the equality with `true`.
         ctx.egraph.union(eq, true_);
@@ -1124,10 +1148,10 @@ mod tests {
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Int));
-        let b = ctx.add(Symbolic::Fresh(1, Type::Int));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
         // Build the equality but never prove it true.
-        let _eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [a, b]));
+        let _eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
         ctx.saturate();
 
         assert_ne!(ctx.egraph.find(a), ctx.egraph.find(b));
@@ -1139,11 +1163,11 @@ mod tests {
         let f = interner.get_or_intern("f");
         let mut ctx = fresh_ctx(&interner);
 
-        let a = ctx.add(Symbolic::Fresh(0, Type::Int));
-        let b = ctx.add(Symbolic::Fresh(1, Type::Int));
-        let fa = ctx.add(Symbolic::FuncApp(f, Type::Int, Box::from([a])));
-        let fb = ctx.add(Symbolic::FuncApp(f, Type::Int, Box::from([b])));
-        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, Type::Bool, [a, b]));
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
+        let fa = ctx.add(Symbolic::FuncApp(f, Box::from([a])));
+        let fb = ctx.add(Symbolic::FuncApp(f, Box::from([b])));
+        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         ctx.egraph.union(eq, true_);
         ctx.saturate();
@@ -1624,14 +1648,46 @@ method m()
     }
 
     #[test]
+    fn literal_division_folds_to_real() {
+        // `4/2` is const-folded at translation to the Real literal `2/1`, so it
+        // matches an explicit `2/1` on exhale.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 4/2)
+{
+    exhale acc(x.f, 2/1)
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "4/2 should fold to 2/1 and match"
+        );
+    }
+
+    #[test]
+    fn realcast_folds_int_to_real() {
+        // real(2) const-folds to the Real literal 2.
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut ctx = fresh_ctx(&interner);
+        let two = ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(2))));
+        let cast = ctx.add(Symbolic::RealCast(two));
+        let real_two = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(2).into())));
+        ctx.saturate();
+        assert_eq!(ctx.egraph.find(cast), ctx.egraph.find(real_two));
+    }
+
+    #[test]
     fn rewrite_and_true_collapses() {
         // b && true  =  ite(b, true, false)  =>  b
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
-        let b = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let b = ctx.add(Symbolic::Fresh(0));
         let t = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         let f = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-        let ite = ctx.add(Symbolic::Ite(Type::Bool, [b, t, f]));
+        let ite = ctx.add(Symbolic::Ite([b, t, f]));
         ctx.saturate();
         assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(b));
     }
@@ -1641,9 +1697,9 @@ method m()
         // b && b  =  ite(b, b, false)  =>  b
         let interner = lasso::Rodeo::<vmir::MemberId>::new();
         let mut ctx = fresh_ctx(&interner);
-        let b = ctx.add(Symbolic::Fresh(0, Type::Bool));
+        let b = ctx.add(Symbolic::Fresh(0));
         let f = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-        let ite = ctx.add(Symbolic::Ite(Type::Bool, [b, b, f]));
+        let ite = ctx.add(Symbolic::Ite([b, b, f]));
         ctx.saturate();
         assert_eq!(ctx.egraph.find(ite), ctx.egraph.find(b));
     }

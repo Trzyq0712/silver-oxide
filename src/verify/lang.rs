@@ -5,7 +5,6 @@ use std::fmt::{Display, Formatter};
 use crate::vmir::BinOp;
 use crate::vmir::Literal;
 use crate::vmir::MemberId;
-use crate::vmir::Type; // Ensure Type is in scope
 use lasso::Rodeo;
 
 thread_local! {
@@ -37,20 +36,22 @@ impl Drop for InternerGuard<'_> {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
-    Fresh(u32, Type),
+    Fresh(u32),
     Lit(Literal),
-    Binary(BinOp, Type, [Id; 2]),
-    Ite(Type, [Id; 3]),
-    FuncApp(MemberId, Type, Box<[Id]>),
+    Binary(BinOp, [Id; 2]),
+    Ite([Id; 3]),
+    FuncApp(MemberId, Box<[Id]>),
+    RealCast(Id),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Discriminant {
-    Fresh(u32, Type),
+    Fresh(u32),
     Lit(Literal),
-    Binary(BinOp, Type),
+    Binary(BinOp),
     Ite,
-    FuncApp(MemberId, Type),
+    FuncApp(MemberId),
+    RealCast,
 }
 
 impl Language for Symbolic {
@@ -60,24 +61,24 @@ impl Language for Symbolic {
         use Discriminant as D;
         use Symbolic as S;
         match self {
-            S::Fresh(s, ty) => D::Fresh(*s, ty.clone()),
+            S::Fresh(s) => D::Fresh(*s),
             S::Lit(l) => D::Lit(l.clone()),
-            S::Binary(op, ty, _) => D::Binary(*op, ty.clone()),
-            S::Ite(_, _) => D::Ite,
-            S::FuncApp(id, ty, _) => D::FuncApp(id.clone(), ty.clone()),
+            S::Binary(op, _) => D::Binary(*op),
+            S::Ite(_) => D::Ite,
+            S::FuncApp(id, _) => D::FuncApp(*id),
+            S::RealCast(_) => D::RealCast,
         }
     }
 
     fn matches(&self, other: &Self) -> bool {
         use Symbolic::*;
         match (self, other) {
-            (Fresh(s1, ty1), Fresh(s2, ty2)) => s1 == s2 && ty1 == ty2,
+            (Fresh(s1), Fresh(s2)) => s1 == s2,
             (Lit(l1), Lit(l2)) => l1 == l2,
-            (Binary(op1, ty1, _), Binary(op2, ty2, _)) => op1 == op2 && ty1 == ty2,
-            (Ite(_, _), Ite(_, _)) => true,
-            (FuncApp(id1, ty1, args1), FuncApp(id2, ty2, args2)) => {
-                id1 == id2 && ty1 == ty2 && args1.len() == args2.len()
-            }
+            (Binary(op1, _), Binary(op2, _)) => op1 == op2,
+            (Ite(_), Ite(_)) => true,
+            (RealCast(_), RealCast(_)) => true,
+            (FuncApp(id1, args1), FuncApp(id2, args2)) => id1 == id2 && args1.len() == args2.len(),
             _ => false,
         }
     }
@@ -86,9 +87,10 @@ impl Language for Symbolic {
         use Symbolic::*;
         match self {
             Fresh(..) | Lit(..) => &[],
-            Binary(_, _, ids) => ids,
-            Ite(_, ids) => ids,
-            FuncApp(_, _, ids) => ids,
+            Binary(_, ids) => ids,
+            Ite(ids) => ids,
+            RealCast(id) => std::slice::from_ref(id),
+            FuncApp(_, ids) => ids,
         }
     }
 
@@ -96,9 +98,10 @@ impl Language for Symbolic {
         use Symbolic::*;
         match self {
             Fresh(..) | Lit(..) => &mut [],
-            Binary(_, _, ids) => ids,
-            Ite(_, ids) => ids,
-            FuncApp(_, _, ids) => ids,
+            Binary(_, ids) => ids,
+            Ite(ids) => ids,
+            RealCast(id) => std::slice::from_mut(id),
+            FuncApp(_, ids) => ids,
         }
     }
 }
@@ -106,11 +109,12 @@ impl Language for Symbolic {
 impl Display for Symbolic {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Symbolic::Fresh(id, ty) => write!(f, "{ty}#{id}"),
+            Symbolic::Fresh(id) => write!(f, "fresh{id}"),
             Symbolic::Lit(l) => write!(f, "{l}"),
-            Symbolic::Binary(op, _, _) => write!(f, "{op}"),
-            Symbolic::Ite(_, _) => write!(f, "ITE"),
-            Symbolic::FuncApp(id, _, _) => DISPLAY_INTERNER.with(|c| {
+            Symbolic::Binary(op, _) => write!(f, "{op}"),
+            Symbolic::Ite(_) => write!(f, "ITE"),
+            Symbolic::RealCast(_) => write!(f, "real"),
+            Symbolic::FuncApp(id, _) => DISPLAY_INTERNER.with(|c| {
                 let ptr = c.get();
                 if ptr.is_null() {
                     write!(f, "fn{}(..)", id.0)
@@ -121,6 +125,61 @@ impl Display for Symbolic {
                     write!(f, "{}(..)", interner.resolve(id))
                 }
             }),
+        }
+    }
+}
+
+/// Error from [`Symbolic::from_op`] when a rewrite-pattern token is unknown.
+#[derive(Debug)]
+pub struct FromOpError(String);
+
+impl Display for FromOpError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for FromOpError {}
+
+impl FromOp for Symbolic {
+    type Error = FromOpError;
+
+    /// Parse a node from an s-expression operator + already-parsed children.
+    /// Enables egg's string `rewrite!` macro (no type tags to encode now).
+    /// Pattern variables (`?x`) are handled by egg before this is called.
+    fn from_op(op: &str, children: Vec<Id>) -> Result<Self, Self::Error> {
+        use Symbolic::*;
+        let bin = |o: BinOp| {
+            if children.len() == 2 {
+                Ok(Binary(o, [children[0], children[1]]))
+            } else {
+                Err(FromOpError(format!("`{op}` expects 2 children")))
+            }
+        };
+        match (op, children.len()) {
+            ("true", 0) => Ok(Lit(Literal::Bool(true))),
+            ("false", 0) => Ok(Lit(Literal::Bool(false))),
+            ("null", 0) => Ok(Lit(Literal::Null)),
+            ("ite", 3) => Ok(Ite([children[0], children[1], children[2]])),
+            ("real", 1) => Ok(RealCast(children[0])),
+            ("+", _) => bin(BinOp::Plus),
+            ("-", _) => bin(BinOp::Minus),
+            ("*", _) => bin(BinOp::Mult),
+            ("/", _) => bin(BinOp::Div),
+            ("mod", _) => bin(BinOp::Mod),
+            ("==", _) => bin(BinOp::Eq),
+            ("<", _) => bin(BinOp::Lt),
+            // A bare integer is `Lit(Int)`; a fraction (`0/1`, `1/2`) is `Lit(Real)`.
+            (lit, 0) => {
+                if let Ok(n) = lit.parse::<num::BigInt>() {
+                    Ok(Lit(Literal::Int(n)))
+                } else if let Ok(r) = lit.parse::<num::BigRational>() {
+                    Ok(Lit(Literal::Real(r)))
+                } else {
+                    Err(FromOpError(format!("unknown leaf `{lit}`")))
+                }
+            }
+            _ => Err(FromOpError(format!("unknown op `{op}`/{}", children.len()))),
         }
     }
 }

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::{
     verify::{analysis::ConstFold, lang::Symbolic, rewrite},
-    vmir::{Literal, MemberId, Polarity, Type},
+    vmir::{FunctionCall, Literal, MemberId, Polarity, Type},
 };
 use lasso::Rodeo;
 
@@ -9,6 +11,12 @@ pub(crate) struct VerifyContext<'a> {
     rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
     pub(crate) interner: &'a Rodeo<MemberId>,
+    /// Type side-oracle: the irreducible type sources that the type-free
+    /// e-graph nodes no longer carry. Keyed by stable node payloads (the
+    /// `Fresh` counter and the `FuncApp` member id), so no union upkeep is
+    /// needed — the visualization reads them directly to reconstruct types.
+    pub(crate) fresh_types: HashMap<u32, Type>,
+    pub(crate) func_ret_types: HashMap<MemberId, Type>,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -18,6 +26,8 @@ impl<'a> VerifyContext<'a> {
             rules: rewrite::rules(),
             fresh_counter: 0,
             interner,
+            fresh_types: HashMap::new(),
+            func_ret_types: HashMap::new(),
         }
     }
 
@@ -32,10 +42,18 @@ impl<'a> VerifyContext<'a> {
         self.egraph.add(node)
     }
 
+    /// Add a `FuncApp`, recording its return type in the side-oracle so the
+    /// viz can color the result (the node itself is type-free).
+    pub(crate) fn add_func_app(&mut self, fc: &FunctionCall, ret_ty: Type, args: Box<[egg::Id]>) -> egg::Id {
+        self.func_ret_types.entry(fc.function).or_insert(ret_ty);
+        self.egraph.add(Symbolic::FuncApp(fc.function, args))
+    }
+
     pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
         let id = self.fresh_counter as u32;
         self.fresh_counter += 1;
-        self.egraph.add(Symbolic::Fresh(id, ty))
+        self.fresh_types.insert(id, ty);
+        self.egraph.add(Symbolic::Fresh(id))
     }
 
     /// Build `antecedents ==> consequent` as a right-associative chain of `Ite`
@@ -52,8 +70,8 @@ impl<'a> VerifyContext<'a> {
         let mut imp = consequent;
         for (id, pol) in antecedents {
             imp = match pol {
-                Polarity::Positive => self.add(Symbolic::Ite(Type::Bool, [id, imp, true_])),
-                Polarity::Negative => self.add(Symbolic::Ite(Type::Bool, [id, true_, imp])),
+                Polarity::Positive => self.add(Symbolic::Ite([id, imp, true_])),
+                Polarity::Negative => self.add(Symbolic::Ite([id, true_, imp])),
             };
         }
         imp

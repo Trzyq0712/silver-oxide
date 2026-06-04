@@ -132,7 +132,17 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
             .get(&id.0)
             .cloned()
             .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&id.0).to_string())),
-        P::Const(lit) => Ok(Val::Literal(lower_literal(lit)?)),
+        P::Const(lit) => {
+            let lit = lower_literal(lit)?;
+            // An Int literal used in a Real (permission) context becomes the
+            // equivalent Real literal directly — no `real(..)` cast needed.
+            match lit {
+                Literal::Int(n) if ty == vmir::Type::Real => {
+                    Ok(Val::Literal(Literal::Real(num::BigRational::from(n))))
+                }
+                _ => Ok(Val::Literal(lit)),
+            }
+        }
         P::Unary(op, x) => {
             let v = lower(b, env, sink, hctx, x)?;
             match op {
@@ -183,6 +193,65 @@ pub(crate) fn lower<C: InstContext, Ext: PureExt>(
     }
 }
 
+/// Fold a binary **arithmetic** op over two constant literals into a single
+/// literal, at translation time. The result type drives Real-vs-Int math (so a
+/// `Real`-typed `4/2` over Int literals folds to `Real(2)`). Returns `None` for
+/// non-arithmetic ops (comparisons are left to the e-graph) or type mismatches.
+fn fold_arith_literals(op: &typed::BinOp, l: &Literal, r: &Literal, ty: &vmir::Type) -> Option<Literal> {
+    use num::BigRational;
+    use typed::BinOp as B;
+    let rat = |lit: &Literal| -> Option<BigRational> {
+        match lit {
+            Literal::Int(n) => Some(BigRational::from(n.clone())),
+            Literal::Real(x) => Some(x.clone()),
+            _ => None,
+        }
+    };
+    match ty {
+        vmir::Type::Real => {
+            let (a, b) = (rat(l)?, rat(r)?);
+            let v = match op {
+                B::Plus => a + b,
+                B::Minus => a - b,
+                B::Mult => a * b,
+                B::Div => a / b,
+                _ => return None,
+            };
+            Some(Literal::Real(v))
+        }
+        vmir::Type::Int => {
+            let (Literal::Int(a), Literal::Int(b)) = (l, r) else {
+                return None;
+            };
+            let v = match op {
+                B::Plus => a + b,
+                B::Minus => a - b,
+                B::Mult => a * b,
+                B::Div => a / b,
+                B::Mod => a % b,
+                _ => return None,
+            };
+            Some(Literal::Int(v))
+        }
+        _ => None,
+    }
+}
+
+/// Wrap `v` in `real(..)` when an `Int` operand is used where a `Real` is
+/// expected, keeping every operation's e-graph operands homogeneous.
+fn real_cast_if<C: InstContext>(
+    sink: &mut Sink<C>,
+    v: Val,
+    operand_ty: &vmir::Type,
+    target_ty: &vmir::Type,
+) -> Val {
+    if *target_ty == vmir::Type::Real && *operand_ty == vmir::Type::Int {
+        sink.emit_pure(vmir::Type::Real, PureInst::RealCast(v))
+    } else {
+        v
+    }
+}
+
 fn lower_binary<C: InstContext, Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -222,6 +291,17 @@ fn lower_binary<C: InstContext, Ext: PureExt>(
     // Strict ops: both operands always evaluate, so `r` is lowered under the
     // outer path condition unchanged.
     let rv = lower(b, env, sink, hctx, r)?;
+    // Const-fold literal arithmetic at translation time, e.g. `4/2 => 2/1`
+    // (one Real literal instead of `real(4) / real(2)`).
+    if let (Val::Literal(la), Val::Literal(lb)) = (&lv, &rv) {
+        if let Some(folded) = fold_arith_literals(op, la, lb, &ty) {
+            return Ok(Val::Literal(folded));
+        }
+    }
+    // Homogenize: a `Real`-result arithmetic op with an `Int` operand gets that
+    // operand wrapped in `real(..)` so the e-graph operands share a type.
+    let lv = real_cast_if(sink, lv, &lower_type(&l.ty), &ty);
+    let rv = real_cast_if(sink, rv, &lower_type(&r.ty), &ty);
     Ok(match op {
         B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
         B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),

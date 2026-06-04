@@ -47,6 +47,8 @@ pub enum PureInst<P> {
     Fresh,
     Binary(BinOp, Val, Val),
     Ternary(Val, Val, Val),
+    /// Cast an Int value to Real (`real(v)`).
+    RealCast(Val),
     Deref(HeapVal, Val),
     FunctionCall(HeapVal, FunctionCall),
     Ext(P),
@@ -55,7 +57,7 @@ pub enum PureInst<P> {
 impl<P: crate::vmir::inst::UsesPc> PureInst<P> {
     pub fn uses_pc(&self) -> bool {
         match self {
-            PureInst::Fresh | PureInst::Ternary(..) => false,
+            PureInst::Fresh | PureInst::Ternary(..) | PureInst::RealCast(..) => false,
             PureInst::Binary(op, _, _) => matches!(op, BinOp::Div | BinOp::Mod),
             PureInst::Deref(..) | PureInst::FunctionCall(..) => true,
             PureInst::Ext(ext) => ext.uses_pc(),
@@ -125,6 +127,7 @@ impl<'a, P: PureExtRender> Display for VmirDisplay<'a, &'a PureInst<P>> {
         match self.item {
             PureInst::Fresh => write!(f, "fresh"),
             PureInst::Binary(op, lhs, rhs) => write!(f, "{lhs} {op} {rhs}"),
+            PureInst::RealCast(v) => write!(f, "real({v})"),
             PureInst::Ternary(cond, then_val, else_val) => {
                 write!(f, "{cond} ? {then_val} : {else_val}")
             }

@@ -18,10 +18,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use std::collections::HashMap;
+
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
-use crate::verify::lang;
-use crate::vmir::Type;
+use crate::verify::lang::{self, Symbolic};
+use crate::vmir::{BinOp, Literal, Type};
 
 pub(crate) struct Snapshotter {
     /// `None` = disabled (env var unset).
@@ -105,15 +107,16 @@ impl Snapshotter {
             dot.insert_str(pos, &title);
         }
 
-        // Per-eclass styling: background colored by type (primitives get a hue,
-        // adt/domain stays gray) plus the const-fold value as the cluster label
-        // when known. egg opens each cluster with `subgraph cluster_<id> {\n`;
-        // inject right after it (cluster-scope `label` is the cluster's own, so
-        // no leakage into nested content).
+        // Per-eclass styling: background colored by type — reconstructed by
+        // inference over the type-free e-graph plus the context's type oracle —
+        // plus the const-fold value as the cluster label when known. egg opens
+        // each cluster with `subgraph cluster_<id> {\n`; inject right after it
+        // (cluster-scope `label` is the cluster's own, so no leakage).
+        let mut type_memo: HashMap<egg::Id, Option<Type>> = HashMap::new();
         for class in ctx.egraph.classes() {
-            let data = &class.data;
-            let mut attrs = format!("    bgcolor=\"{}\"\n", cluster_color(&data.ty));
-            if let Some(lit) = &data.value {
+            let ty = infer_type(ctx, class.id, &mut type_memo);
+            let mut attrs = format!("    bgcolor=\"{}\"\n", cluster_color(ty.as_ref()));
+            if let Some(lit) = &class.data.value {
                 attrs.push_str(&format!("    label=\"= {}\"\n", escape(&lit.to_string())));
             }
             let needle = format!("subgraph cluster_{} {{\n", usize::from(class.id));
@@ -256,15 +259,64 @@ fn run(program: &str, args: &[&std::ffi::OsStr]) -> bool {
         .unwrap_or(false)
 }
 
-/// Background color for an e-class cluster, keyed by its type. Primitives get
-/// distinct pastel hues; aggregate (`Domain`/`Addr`) types stay gray.
-fn cluster_color(ty: &Type) -> &'static str {
+/// Background color for an e-class cluster, keyed by its (inferred) type.
+/// Primitives get distinct pastel hues; aggregate (`Domain`/`Addr`) and unknown
+/// types stay gray.
+fn cluster_color(ty: Option<&Type>) -> &'static str {
     match ty {
-        Type::Int => "#cce5ff",  // blue
-        Type::Bool => "#d4edda", // green
-        Type::Real => "#fff3cd", // yellow
-        Type::Ref => "#e2d4f0",  // purple
-        Type::Domain(_) | Type::Addr(_) => "#e0e0e0", // gray
+        Some(Type::Int) => "#cce5ff",  // blue
+        Some(Type::Bool) => "#d4edda", // green
+        Some(Type::Real) => "#fff3cd", // yellow
+        Some(Type::Ref) => "#e2d4f0",  // purple
+        _ => "#e0e0e0",                // gray: Domain/Addr or unknown
+    }
+}
+
+/// Reconstruct an e-class's type from the type-free e-graph (memoized,
+/// cycle-safe, best-effort): `Lit`→literal type, `RealCast`→Real,
+/// `Binary`→`Bool` for comparisons else operand type, `Ite`→branch type, and
+/// the irreducible `Fresh`/`FuncApp` sources from the context's side oracle.
+fn infer_type(
+    ctx: &VerifyContext<'_>,
+    id: egg::Id,
+    memo: &mut HashMap<egg::Id, Option<Type>>,
+) -> Option<Type> {
+    let canon = ctx.egraph.find(id);
+    if let Some(t) = memo.get(&canon) {
+        return t.clone();
+    }
+    // Seed `None` first so cycles terminate (best-effort).
+    memo.insert(canon, None);
+    let nodes = ctx.egraph[canon].nodes.clone();
+    let mut result = None;
+    for node in &nodes {
+        let t = match node {
+            Symbolic::Lit(l) => Some(lit_type(l)),
+            Symbolic::RealCast(_) => Some(Type::Real),
+            Symbolic::Fresh(u) => ctx.fresh_types.get(u).cloned(),
+            Symbolic::FuncApp(m, _) => ctx.func_ret_types.get(m).cloned(),
+            Symbolic::Binary(op, [l, _]) => match op {
+                BinOp::Eq | BinOp::Lt => Some(Type::Bool),
+                _ => infer_type(ctx, *l, memo),
+            },
+            Symbolic::Ite([_, then, _]) => infer_type(ctx, *then, memo),
+        };
+        if t.is_some() {
+            result = t;
+            break;
+        }
+    }
+    memo.insert(canon, result.clone());
+    result
+}
+
+/// Type of a literal value.
+fn lit_type(lit: &Literal) -> Type {
+    match lit {
+        Literal::Null => Type::Ref,
+        Literal::Bool(_) => Type::Bool,
+        Literal::Int(_) => Type::Int,
+        Literal::Real(_) => Type::Real,
     }
 }
 
