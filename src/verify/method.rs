@@ -430,8 +430,6 @@ fn eval_heap_inst(
                 .collect();
             heap_subtract(ctx, &l, &r, &pc_lits)
         }
-        // TODO: condition-aware merge. Currently picks the then branch.
-        HeapInst::Ternary(_cond, h1, _h2) => Ok(get_heap(state, h1)),
         // SIDECOND-bearing structural assignment, not yet modeled.
         HeapInst::Assign(_heap, Assign { .. }) => {
             Err(VerifyError::Unimplemented("HeapInst::Assign"))
@@ -1886,6 +1884,81 @@ method m(x: Ref)
         assert!(
             translate::translate(&typed, &interner, &globals).is_err(),
             "old[L] before label L must fail translation"
+        );
+    }
+
+    // A conditional spatial assertion `b ? A : A'` lowers to one additive heap
+    // timeline with the branch folded into the permission fractions (no heap
+    // ternary). The verifier recovers each branch by assuming the condition.
+    const COND_INHALE: &str = r#"
+field f: Int
+
+method m(x: Ref, b: Bool)
+{
+    inhale b ? (acc(x.f, 1/2) && x.f == 0) : (acc(x.f, 1/1) && x.f == 1)
+"#;
+
+    #[test]
+    fn conditional_inhale_true_branch_verifies() {
+        let input = format!(
+            "{COND_INHALE}    assume b\n    assert perm(x.f) == 1/2\n    assert x.f == 0\n}}"
+        );
+        let program = lower(&input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "under `b`, the held permission is 1/2 and x.f == 0"
+        );
+    }
+
+    #[test]
+    fn conditional_inhale_false_branch_verifies() {
+        // `b == false` (not `!b`): the e-graph propagates equality with a literal
+        // via `eq-true-union`, whereas a `!b` ternary's negation isn't pushed
+        // back onto `b` — a separate backend gap, not the branch lowering.
+        let input = format!(
+            "{COND_INHALE}    assume b == false\n    assert perm(x.f) == 1/1\n    assert x.f == 1\n}}"
+        );
+        let program = lower(&input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "under `!b`, the held permission is 1/1 and x.f == 1"
+        );
+    }
+
+    #[test]
+    fn conditional_inhale_does_not_leak_other_branch() {
+        // Under the true branch, the false branch's value (`x.f == 1`) must NOT
+        // be derivable — the agreement axiom keeps the branch values isolated.
+        let input = format!("{COND_INHALE}    assume b\n    assert x.f == 1\n}}");
+        let program = lower(&input);
+        assert!(
+            matches!(
+                verify_named_method(&program, "m"),
+                Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
+            ),
+            "true branch must not leak the false branch's value"
+        );
+    }
+
+    #[test]
+    fn implies_spatial_verifies() {
+        // `b ==> (acc(x.f) && x.f == 7)` gives full permission and the value
+        // only under `b`; assuming `b`, both are recoverable.
+        let input = r#"
+field f: Int
+
+method m(x: Ref, b: Bool)
+{
+    inhale b ==> (acc(x.f, 1/1) && x.f == 7)
+    assume b
+    assert perm(x.f) == 1/1
+    assert x.f == 7
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "under `b`, the implication grants full permission and x.f == 7"
         );
     }
 }

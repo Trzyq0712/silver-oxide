@@ -268,6 +268,7 @@ fn lower_stmt(
                 current_heap,
                 SpatialMode::Inhale,
                 Some(&old),
+                None,
                 e,
             )?;
             if let Some(v) = bv {
@@ -297,6 +298,7 @@ fn lower_stmt(
                     value_heap: current_heap,
                 },
                 Some(&old),
+                None,
                 e,
             )?;
             if let Some(v) = bv {

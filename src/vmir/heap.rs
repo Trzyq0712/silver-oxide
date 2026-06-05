@@ -17,8 +17,6 @@ pub enum HeapInst {
     Add(HeapVal, HeapVal),
     /// Heap subtraction (difference).
     Sub(HeapVal, HeapVal),
-    /// Conditional heap: `cond ? then : else`.
-    Ternary(Val, HeapVal, HeapVal),
     /// Assign a value to a heap location in a given heap.
     /// SIDECOND: the location must have at least `write` permission.
     Assign(HeapVal, Assign),
@@ -41,11 +39,12 @@ pub struct Assign {
 impl HeapInst {
     pub fn uses_pc(&self) -> bool {
         match self {
-            // Acc: perm ≥ 0. Add: chunk-merge equalities are conditional
-            // on the chunks' perm being positive. Sub: enough perm.
-            // Assign: location must have write permission.
-            HeapInst::Acc(_) | HeapInst::Add(..) | HeapInst::Sub(..) | HeapInst::Assign(..) => true,
-            HeapInst::Ternary(..) => false,
+            // Acc: perm ≥ 0. Sub: enough perm. Assign: location must have write
+            // permission. Add is **unconditional**: the branch is encoded in the
+            // (gated) permission fractions, so chunk-merge equalities need no
+            // path condition — the agreement axiom's `p > 0` guards suffice.
+            HeapInst::Acc(_) | HeapInst::Sub(..) | HeapInst::Assign(..) => true,
+            HeapInst::Add(..) => false,
         }
     }
 }
@@ -69,7 +68,6 @@ impl Display for HeapInst {
             HeapInst::Acc(Acc { loc, perm }) => write!(f, "acc({loc}, {perm})"),
             HeapInst::Add(lhs, rhs) => write!(f, "{lhs} + {rhs}"),
             HeapInst::Sub(lhs, rhs) => write!(f, "{lhs} - {rhs}"),
-            HeapInst::Ternary(cond, lhs, rhs) => write!(f, "{cond} ? {lhs} : {rhs}"),
             HeapInst::Assign(heap, Assign { loc, val }) => {
                 write!(f, "assign[{heap}] {loc} := {val}")
             }
