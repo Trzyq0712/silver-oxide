@@ -7,15 +7,15 @@ use lasso::Spur;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstContext, InstKind, Literal, PathConds,
-    Polarity, PureInst, TRUE, Val,
+    self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Polarity,
+    PureInst, ResourceCall, TRUE, Val,
 };
 
-/// A mutable sink for emitted instructions plus the running counters,
-/// parameterised by the body's `InstContext`. The choice of `C` controls
-/// which extension variants the caller is allowed to construct.
-pub(crate) struct Sink<C: InstContext> {
-    pub insts: Vec<Inst<C>>,
+/// A mutable sink for emitted instructions plus the running counters. The
+/// instruction set is uniform; how the resulting stream is interpreted is the
+/// caller's concern (resource delta+bool, method effects, function result).
+pub(crate) struct Sink {
+    pub insts: Vec<Inst>,
     pub val_base: usize,
     pub val_count: usize,
     pub heap_count: usize,
@@ -24,7 +24,7 @@ pub(crate) struct Sink<C: InstContext> {
     pub pc: PathConds,
 }
 
-impl<C: InstContext> Sink<C> {
+impl Sink {
     pub fn new(val_base: usize, heap_base: usize) -> Self {
         Self {
             insts: Vec::new(),
@@ -65,7 +65,7 @@ impl<C: InstContext> Sink<C> {
     /// Path condition to attach to `kind`: the running guard for sidecond
     /// instructions, empty for total ones (so `Inst::new`'s debug-assert
     /// never trips and the IR stays flat where no guard is needed).
-    fn pc_for(&self, kind: &InstKind<C>) -> PathConds {
+    fn pc_for(&self, kind: &InstKind) -> PathConds {
         if kind.uses_pc() {
             self.pc.clone()
         } else {
@@ -73,7 +73,7 @@ impl<C: InstContext> Sink<C> {
         }
     }
 
-    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst<C::PureExt>) -> Val {
+    pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
         let v = self.next_val_temp();
         let kind = InstKind::Pure(ty, inst);
         let pc = self.pc_for(&kind);
@@ -81,7 +81,7 @@ impl<C: InstContext> Sink<C> {
         v
     }
 
-    pub fn emit_heap(&mut self, inst: HeapInst<C::HeapExt>) -> HeapVal {
+    pub fn emit_heap(&mut self, inst: HeapInst) -> HeapVal {
         let h = self.next_heap_temp();
         let kind = InstKind::Heap(inst);
         let pc = self.pc_for(&kind);
@@ -89,12 +89,24 @@ impl<C: InstContext> Sink<C> {
         h
     }
 
-    /// Push an instruction-kind extension. For `Sink<ResourceCtx>` the
-    /// parameter type is `!`, so this method is uncallable.
-    pub fn emit_ext(&mut self, ext: C::InstExt) {
-        let kind = InstKind::Ext(ext);
+    pub fn emit_assume(&mut self, v: Val) {
+        let kind = InstKind::Assume(v);
         let pc = self.pc_for(&kind);
         self.insts.push(Inst::new(pc, kind));
+    }
+
+    pub fn emit_assert(&mut self, v: Val) {
+        let kind = InstKind::Assert(v);
+        let pc = self.pc_for(&kind);
+        self.insts.push(Inst::new(pc, kind));
+    }
+
+    /// Emit a `ResourceCall`, producing its `(heap_delta, bool)` pair.
+    pub fn emit_resource_call(&mut self, call: ResourceCall) -> (HeapVal, Val) {
+        let kind = InstKind::ResourceCall(call);
+        let pc = self.pc_for(&kind);
+        self.insts.push(Inst::new(pc, kind));
+        (self.next_heap_temp(), self.next_val_temp())
     }
 }
 
@@ -130,10 +142,10 @@ impl<'a> HeapCtx<'a> {
     }
 }
 
-pub(crate) fn lower<C: InstContext, Ext: PureExt>(
+pub(crate) fn lower<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     hctx: HeapCtx<'_>,
     exp: &typed::TypedPureExp<Ext>,
 ) -> Result<Val, TranslationError> {
@@ -258,12 +270,7 @@ fn fold_arith_literals(
 
 /// Wrap `v` in `real(..)` when an `Int` operand is used where a `Real` is
 /// expected, keeping every operation's e-graph operands homogeneous.
-fn real_cast_if<C: InstContext>(
-    sink: &mut Sink<C>,
-    v: Val,
-    operand_ty: &vmir::Type,
-    target_ty: &vmir::Type,
-) -> Val {
+fn real_cast_if(sink: &mut Sink, v: Val, operand_ty: &vmir::Type, target_ty: &vmir::Type) -> Val {
     if *target_ty == vmir::Type::Real && *operand_ty == vmir::Type::Int {
         sink.emit_pure(vmir::Type::Real, PureInst::RealCast(v))
     } else {
@@ -271,10 +278,10 @@ fn real_cast_if<C: InstContext>(
     }
 }
 
-fn lower_binary<C: InstContext, Ext: PureExt>(
+fn lower_binary<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     hctx: HeapCtx<'_>,
     ty: vmir::Type,
     op: &typed::BinOp,
@@ -381,10 +388,10 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
 /// `perm`, etc.). `hctx` carries the value/perm heaps; `ty` is the expression's
 /// result type.
 pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
-    fn lower_ext<C: InstContext>(
+    fn lower_ext(
         b: &Builder<'_>,
         env: &HashMap<Spur, Val>,
-        sink: &mut Sink<C>,
+        sink: &mut Sink,
         hctx: HeapCtx<'_>,
         ty: vmir::Type,
         ext: &Self,
@@ -392,10 +399,10 @@ pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
 }
 
 impl PureExt for ! {
-    fn lower_ext<C: InstContext>(
+    fn lower_ext(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
-        _sink: &mut Sink<C>,
+        _sink: &mut Sink,
         _hctx: HeapCtx<'_>,
         _ty: vmir::Type,
         ext: &Self,
@@ -405,10 +412,10 @@ impl PureExt for ! {
 }
 
 impl PureExt for typed::MethodEnsuresExt {
-    fn lower_ext<C: InstContext>(
+    fn lower_ext(
         _b: &Builder<'_>,
         _env: &HashMap<Spur, Val>,
-        _sink: &mut Sink<C>,
+        _sink: &mut Sink,
         _hctx: HeapCtx<'_>,
         _ty: vmir::Type,
         _ext: &Self,
@@ -418,10 +425,10 @@ impl PureExt for typed::MethodEnsuresExt {
 }
 
 impl PureExt for typed::MethodBodyExt {
-    fn lower_ext<C: InstContext>(
+    fn lower_ext(
         b: &Builder<'_>,
         env: &HashMap<Spur, Val>,
-        sink: &mut Sink<C>,
+        sink: &mut Sink,
         hctx: HeapCtx<'_>,
         ty: vmir::Type,
         ext: &Self,
@@ -457,9 +464,7 @@ impl PureExt for typed::MethodBodyExt {
             typed::MethodBodyExt::Perm(res) => {
                 let addr =
                     crate::translate::resource::lower_resource_addr(b, env, sink, hctx, res)?;
-                let pe = C::perm_pure_ext(hctx.perm, addr)
-                    .ok_or(TranslationError::Unsupported("perm in this context"))?;
-                Ok(sink.emit_pure(ty, PureInst::Ext(pe)))
+                Ok(sink.emit_pure(ty, PureInst::Perm(hctx.perm, addr)))
             }
         }
     }

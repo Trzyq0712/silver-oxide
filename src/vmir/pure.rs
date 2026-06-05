@@ -1,6 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{FunctionCall, HeapVal, MemberId};
-use lasso::Rodeo;
+use crate::vmir::{FunctionCall, HeapVal};
 use std::fmt::{self, Display, Formatter};
 
 /// A value can be either a literal or a temporary variable defined earlier.
@@ -43,7 +42,7 @@ pub fn write() -> Val {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PureInst<P> {
+pub enum PureInst {
     Fresh,
     Binary(BinOp, Val, Val),
     Ternary(Val, Val, Val),
@@ -51,16 +50,18 @@ pub enum PureInst<P> {
     RealCast(Val),
     Deref(HeapVal, Val),
     FunctionCall(HeapVal, FunctionCall),
-    Ext(P),
+    /// Query the permission amount of an address in a heap.
+    Perm(HeapVal, Val),
 }
 
-impl<P: crate::vmir::inst::UsesPc> PureInst<P> {
+impl PureInst {
     pub fn uses_pc(&self) -> bool {
         match self {
             PureInst::Fresh | PureInst::Ternary(..) | PureInst::RealCast(..) => false,
             PureInst::Binary(op, _, _) => matches!(op, BinOp::Div | BinOp::Mod),
             PureInst::Deref(..) | PureInst::FunctionCall(..) => true,
-            PureInst::Ext(ext) => ext.uses_pc(),
+            // Permission queries are pure reads with no side condition.
+            PureInst::Perm(..) => false,
         }
     }
 }
@@ -106,23 +107,7 @@ impl Display for Literal {
     }
 }
 
-/// Rendering hook for the `PureInst::Ext` payload. Implementors emit
-/// the textual form of the extension (interner is provided for
-/// `MemberId` lookups). The bound `P: PureExtRender` on the generic
-/// `Display for VmirDisplay<&PureInst<P>>` impl below sidesteps HRTB
-/// recursion in the trait solver — `PureInst<_>` doesn't impl this
-/// trait, so the solver can't speculatively unify `P = PureInst<_>`.
-pub trait PureExtRender {
-    fn render(&self, f: &mut Formatter<'_>, interner: &Rodeo<MemberId>) -> fmt::Result;
-}
-
-impl PureExtRender for ! {
-    fn render(&self, _: &mut Formatter<'_>, _: &Rodeo<MemberId>) -> fmt::Result {
-        match *self {}
-    }
-}
-
-impl<'a, P: PureExtRender> Display for VmirDisplay<'a, &'a PureInst<P>> {
+impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             PureInst::Fresh => write!(f, "fresh"),
@@ -142,7 +127,7 @@ impl<'a, P: PureExtRender> Display for VmirDisplay<'a, &'a PureInst<P>> {
                 }
                 write!(f, ")[{heap}]")
             }
-            PureInst::Ext(ext) => ext.render(f, self.interner),
+            PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
         }
     }
 }

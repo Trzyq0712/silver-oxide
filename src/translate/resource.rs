@@ -8,8 +8,7 @@ use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PureExt, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
-    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, InstContext, Polarity, PureInst,
-    ResourceCtx, TRUE, Type, Val,
+    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, TRUE, Type, Val,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -60,7 +59,7 @@ pub(crate) fn lower_spatial_never(
     initial_heap: HeapVal,
     heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
-    let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
+    let mut sink = Sink::new(val_base, heap_base);
     let (h, bv) = lower_spatial(
         b,
         env,
@@ -84,7 +83,7 @@ pub(crate) fn lower_spatial_ensures(
     initial_heap: HeapVal,
     heap_base: usize,
 ) -> Result<vmir::ResourceBody, TranslationError> {
-    let mut sink = Sink::<ResourceCtx>::new(val_base, heap_base);
+    let mut sink = Sink::new(val_base, heap_base);
     let (h, bv) = lower_spatial(
         b,
         env,
@@ -107,10 +106,10 @@ pub(crate) fn lower_spatial_ensures(
 /// instead of always emitting a `Pure` ternary lets us collapse
 /// `acc(...) && acc(...)` and similar all-permission expressions to just the
 /// heap delta with no boolean witness.
-pub(crate) fn lower_spatial<C: InstContext, Ext: PureExt>(
+pub(crate) fn lower_spatial<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     acc_heap: HeapVal,
     mode: SpatialMode,
     old: Option<&OldHeaps>,
@@ -185,10 +184,10 @@ pub(crate) fn lower_spatial<C: InstContext, Ext: PureExt>(
     }
 }
 
-fn lower_acc<C: InstContext, Ext: PureExt>(
+fn lower_acc<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
@@ -204,10 +203,10 @@ fn lower_acc<C: InstContext, Ext: PureExt>(
 /// Lower a `ResourceExp` to its address: the `@addr` function applied to the
 /// resource's base/arguments (`field@addr(base)` or `pred@addr(args)`). The
 /// `@addr` call is heap-independent. Shared by `acc`, `perm`, and `new`.
-pub(crate) fn lower_resource_addr<C: InstContext, Ext: PureExt>(
+pub(crate) fn lower_resource_addr<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
 ) -> Result<Val, TranslationError> {
@@ -267,10 +266,10 @@ pub(crate) fn lower_resource_addr<C: InstContext, Ext: PureExt>(
 /// Lower an assertion used by source-level `assert`/`assume` into a single
 /// boolean over `heap` (returns `None` when trivially true). Permission is
 /// **not** moved: each `acc(loc, p)` becomes the boolean `perm(loc) >= p`.
-pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
+pub(crate) fn lower_assertion_bool<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     heap: HeapVal,
     old: Option<&OldHeaps>,
     exp: &typed::SpatialExp<Ext>,
@@ -286,9 +285,7 @@ pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
         S::Acc(res, perm) => {
             let p = pure_exp::lower(b, env, sink, hctx, perm)?;
             let addr = lower_resource_addr(b, env, sink, hctx, res)?;
-            let pe = C::perm_pure_ext(heap, addr)
-                .ok_or(TranslationError::Unsupported("perm in this context"))?;
-            let held = sink.emit_pure(Type::Real, PureInst::Ext(pe));
+            let held = sink.emit_pure(Type::Real, PureInst::Perm(heap, addr));
             let lt = sink.emit_pure(Type::Bool, PureInst::Binary(vmir::BinOp::Lt, held, p));
             Ok(Some(
                 sink.emit_pure(Type::Bool, PureInst::Ternary(lt, FALSE, TRUE)),
@@ -342,9 +339,9 @@ pub(crate) fn lower_assertion_bool<C: InstContext, Ext: PureExt>(
 /// Emit the single-chunk heap delta for `acc(base.fname, perm)`: the field's
 /// `@addr` function applied to `base`, followed by a `HeapInst::Acc`. Returns
 /// the produced delta heap. Shared by `lower_acc` and `new(...)` lowering.
-pub(crate) fn field_acc_delta<C: InstContext>(
+pub(crate) fn field_acc_delta(
     b: &Builder<'_>,
-    sink: &mut Sink<C>,
+    sink: &mut Sink,
     base: Val,
     fname: Spur,
     perm: Val,

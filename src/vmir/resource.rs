@@ -1,12 +1,6 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapVal, Inst, InstContext, MemberId, Type, Val};
+use crate::vmir::{HeapVal, Inst, MemberId, Type, Val};
 use std::fmt::{self, Display, Formatter};
-
-pub struct ResourceCtx;
-
-impl InstContext for ResourceCtx {}
-
-pub type ResourceInst = Inst<ResourceCtx>;
 
 /// A reusable unit of proof.
 ///
@@ -20,7 +14,7 @@ pub struct Resource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceBody {
-    pub insts: Vec<ResourceInst>,
+    pub insts: Vec<Inst>,
     pub res: (crate::vmir::HeapVal, Val),
 }
 

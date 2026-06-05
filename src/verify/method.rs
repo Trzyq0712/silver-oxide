@@ -9,9 +9,8 @@ use crate::{
         viz::Snapshotter,
     },
     vmir::{
-        self, Acc, Assign, BinOp, Declaration, HeapExt, HeapInst, HeapVal, Inst, InstContext,
-        InstExt, InstKind, Literal, MemberId, Method, MethodInst, PathConds, Polarity, PureInst,
-        Resource, ResourceCall, ResourceInst, Type, Val,
+        self, Acc, Assign, BinOp, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal,
+        MemberId, Method, PathConds, Polarity, PureInst, Resource, ResourceCall, Type, Val,
     },
 };
 
@@ -103,18 +102,12 @@ impl EvalState {
 }
 
 /// Render a single instruction (method or resource body) for error context.
-fn format_inst<C: InstContext>(
-    inst: &Inst<C>,
+fn format_inst(
+    inst: &Inst,
     interner: &lasso::Rodeo<MemberId>,
     val_base: usize,
     heap_base: usize,
-) -> String
-where
-    C::InstExt: vmir::Bumps,
-    C::PureExt: vmir::PureExtRender,
-    C::HeapExt: vmir::HeapExtRender,
-    for<'a> VmirDisplay<'a, (usize, usize, &'a PathConds, &'a C::InstExt)>: std::fmt::Display,
-{
+) -> String {
     VmirDisplay::new((val_base, heap_base, std::slice::from_ref(inst)), interner)
         .to_string()
         .trim()
@@ -136,11 +129,7 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
 /// For heap `add`/`sub` this is the two operands plus the result; for any other
 /// instruction it is the current working heap (if any). Called after the
 /// instruction has been evaluated, so the result heap sits at `heaps_before`.
-fn display_heaps<C: vmir::InstContext>(
-    state: &EvalState,
-    kind: &InstKind<C>,
-    heaps_before: usize,
-) -> Vec<(String, Heap)> {
+fn display_heaps(state: &EvalState, kind: &InstKind, heaps_before: usize) -> Vec<(String, Heap)> {
     match kind {
         InstKind::Heap(HeapInst::Add(h1, h2)) | InstKind::Heap(HeapInst::Sub(h1, h2)) => vec![
             (h1.to_string(), get_heap(state, h1)),
@@ -207,19 +196,13 @@ fn extract_real_literal(ctx: &VerifyContext<'_>, id: egg::Id) -> Option<num::Big
     None
 }
 
-/// Evaluate a `PureInst<P>`. The `Ext(P)` arm is delegated to a
-/// context-specific evaluator (`eval_ext`); for `P = !` the closure is
-/// uncallable, so the caller can pass `|_, _, never| match *never {}`.
-fn eval_pure_inst<P, F>(
+/// Evaluate a `PureInst` into its symbolic e-class id.
+fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     ty: &Type,
-    pi: &PureInst<P>,
-    eval_ext: F,
-) -> egg::Id
-where
-    F: FnOnce(&mut VerifyContext<'_>, &EvalState, &P) -> egg::Id,
-{
+    pi: &PureInst,
+) -> egg::Id {
     match pi {
         PureInst::Fresh => ctx.fresh_symbolic_value(ty.clone()),
         PureInst::Binary(op, l, r) => {
@@ -247,19 +230,8 @@ where
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add_func_app(fc, ty.clone(), args.into())
         }
-        PureInst::Ext(ext) => eval_ext(ctx, state, ext),
-    }
-}
-
-/// Pure-ext evaluator for method bodies. Handles `PureExt::Perm`:
-/// permission-amount query in the given heap.
-fn eval_method_pure_ext(
-    ctx: &mut VerifyContext<'_>,
-    state: &EvalState,
-    ext: &vmir::PureExt,
-) -> egg::Id {
-    match ext {
-        vmir::PureExt::Perm(hv, loc) => {
+        // perm(loc): permission amount held at `loc` in the given heap.
+        PureInst::Perm(hv, loc) => {
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
@@ -429,19 +401,13 @@ fn heap_subtract(
     Ok(out)
 }
 
-/// Evaluate a heap inst. `H` is the heap-ext slot; the `Ext(H)` arm is
-/// delegated to `eval_heap_ext`. `Sub` may fail with
-/// `InsufficientPermission`.
-fn eval_heap_inst<H, F>(
+/// Evaluate a heap inst. `Sub` may fail with `InsufficientPermission`.
+fn eval_heap_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
-    inst: &HeapInst<H>,
+    inst: &HeapInst,
     pc: &PathConds,
-    eval_heap_ext: F,
-) -> Result<Heap, VerifyError>
-where
-    F: FnOnce(&mut VerifyContext<'_>, &EvalState, &H) -> Result<Heap, VerifyError>,
-{
+) -> Result<Heap, VerifyError> {
     match inst {
         HeapInst::Acc(acc) => Ok(heap_acc(ctx, acc, state)),
         HeapInst::Add(h1, h2) => {
@@ -466,37 +432,35 @@ where
         }
         // TODO: condition-aware merge. Currently picks the then branch.
         HeapInst::Ternary(_cond, h1, _h2) => Ok(get_heap(state, h1)),
-        HeapInst::Ext(ext) => eval_heap_ext(ctx, state, ext),
+        // SIDECOND-bearing structural assignment, not yet modeled.
+        HeapInst::Assign(_heap, Assign { .. }) => {
+            Err(VerifyError::Unimplemented("HeapInst::Assign"))
+        }
     }
 }
 
-/// Heap-ext evaluator for method bodies. Currently `HeapExt::Assign` is
-/// recognised but not implemented structurally — it returns an error.
-fn eval_method_heap_ext(
-    _ctx: &mut VerifyContext<'_>,
-    _state: &EvalState,
-    ext: &HeapExt,
-) -> Result<Heap, VerifyError> {
-    match ext {
-        HeapExt::Assign(_heap, Assign { .. }) => Err(VerifyError::Unimplemented("HeapExt::Assign")),
-    }
-}
-
+/// Evaluate one instruction of a resource body (well-formedness pass). Resource
+/// bodies currently emit only `Pure`/`Heap`; the effectful variants are not yet
+/// produced there (a follow-up enables inline `assume`).
 fn eval_resource_body_inst(
     ctx: &mut VerifyContext<'_>,
     state: &mut EvalState,
-    inst: &ResourceInst,
+    inst: &Inst,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
-            let id = eval_pure_inst(ctx, state, ty, pi, |_, _, never| match *never {});
+            let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
-            let heap = eval_heap_inst(ctx, state, hi, &inst.pc, |_, _, never| match *never {})?;
+            let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
         }
-        InstKind::Ext(never) => match *never {},
+        InstKind::Assume(_) | InstKind::Assert(_) | InstKind::ResourceCall(_) => {
+            return Err(VerifyError::Unimplemented(
+                "effectful inst in resource body",
+            ));
+        }
     }
     Ok(())
 }
@@ -537,43 +501,41 @@ fn eval_method_inst(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,
     state: &mut EvalState,
-    inst: &MethodInst,
+    inst: &Inst,
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
-            let id = eval_pure_inst(ctx, state, ty, pi, eval_method_pure_ext);
+            let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
-            let heap = eval_heap_inst(ctx, state, hi, &inst.pc, eval_method_heap_ext)?;
+            let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
         }
-        InstKind::Ext(ext) => match ext {
-            InstExt::Assume(val) => {
-                let id = state.get_val(ctx, val);
-                let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-                ctx.egraph.union(id, true_);
-                ctx.egraph.rebuild();
+        InstKind::Assume(val) => {
+            let id = state.get_val(ctx, val);
+            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+            ctx.egraph.union(id, true_);
+            ctx.egraph.rebuild();
+        }
+        InstKind::Assert(val) => {
+            let id = state.get_val(ctx, val);
+            let pc_lits: Vec<(egg::Id, Polarity)> = inst
+                .pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            if !ctx.prove_under_pc(id, &pc_lits) {
+                return Err(VerifyError::AssertionFailed);
             }
-            InstExt::Assert(val) => {
-                let id = state.get_val(ctx, val);
-                let pc_lits: Vec<(egg::Id, Polarity)> = inst
-                    .pc
-                    .conds
-                    .iter()
-                    .map(|(v, p)| (state.get_val(ctx, v), *p))
-                    .collect();
-                if !ctx.prove_under_pc(id, &pc_lits) {
-                    return Err(VerifyError::AssertionFailed);
-                }
-            }
-            InstExt::ResourceCall(call) => {
-                let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
-                state.push_heap(delta);
-                state.push_val(bool_id);
-            }
-        },
+        }
+        InstKind::ResourceCall(call) => {
+            let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
+            state.push_heap(delta);
+            state.push_val(bool_id);
+        }
     }
     Ok(())
 }
@@ -694,10 +656,10 @@ pub fn verify_resource(
 /// `(goal, description)` pairs that must each be proven `true` under the
 /// instruction's path condition. `acc` requires a non-negative permission;
 /// division requires a non-zero divisor.
-fn inst_obligations<C: InstContext>(
+fn inst_obligations(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
-    kind: &InstKind<C>,
+    kind: &InstKind,
 ) -> Vec<(egg::Id, &'static str)> {
     let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));

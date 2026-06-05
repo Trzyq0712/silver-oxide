@@ -9,16 +9,14 @@ use crate::translate::pure_exp::{self, Sink};
 use crate::translate::resource::{self, SpatialMode};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
-use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstExt, InstKind, MethodCtx, PureInst, ResourceCall, Type, Val,
-};
+use crate::vmir::{self, HeapInst, HeapVal, PureInst, ResourceCall, Type, Val};
 
 pub(crate) fn lower_method(
     b: &Builder<'_>,
     m: &typed::Method,
     body: &typed::StmtBlock,
 ) -> Result<vmir::Method, TranslationError> {
-    let mut sink = Sink::<MethodCtx>::new(0, 0);
+    let mut sink = Sink::new(0, 0);
     let mut env: HashMap<Spur, Val> = HashMap::new();
 
     // Emit fresh values for params and rets inline. The method has no
@@ -50,7 +48,7 @@ pub(crate) fn lower_method(
         let (h_pre, b_pre) =
             emit_resource_call(&mut sink, req_id, HeapVal::Empty, param_vals.clone());
         let h_new = sink.emit_heap(HeapInst::Add(current_heap, h_pre));
-        sink.emit_ext(InstExt::Assume(b_pre));
+        sink.emit_assume(b_pre);
         current_heap = h_new;
         pre_heap = h_pre;
     }
@@ -79,7 +77,7 @@ pub(crate) fn lower_method(
         ens_args.extend(ret_vals);
         let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, pre_heap, ens_args);
         let _h_new = sink.emit_heap(HeapInst::Sub(current_heap, h_post));
-        sink.emit_ext(InstExt::Assert(b_post));
+        sink.emit_assert(b_post);
     }
 
     Ok(vmir::Method { insts: sink.insts })
@@ -88,7 +86,7 @@ pub(crate) fn lower_method(
 fn lower_stmt(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
-    sink: &mut Sink<MethodCtx>,
+    sink: &mut Sink,
     current_heap: HeapVal,
     baseline: HeapVal,
     labeled: &mut HashMap<Spur, HeapVal>,
@@ -233,7 +231,7 @@ fn lower_stmt(
             if let Some(v) =
                 resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
-                sink.emit_ext(InstExt::Assert(v));
+                sink.emit_assert(v);
             }
             Ok(current_heap)
         }
@@ -245,7 +243,7 @@ fn lower_stmt(
             if let Some(v) =
                 resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
-                sink.emit_ext(InstExt::Assume(v));
+                sink.emit_assume(v);
             }
             Ok(current_heap)
         }
@@ -273,7 +271,7 @@ fn lower_stmt(
                 e,
             )?;
             if let Some(v) = bv {
-                sink.emit_ext(InstExt::Assume(v));
+                sink.emit_assume(v);
             }
             Ok(h_out)
         }
@@ -302,7 +300,7 @@ fn lower_stmt(
                 e,
             )?;
             if let Some(v) = bv {
-                sink.emit_ext(InstExt::Assert(v));
+                sink.emit_assert(v);
             }
             Ok(h_out)
         }
@@ -315,7 +313,7 @@ fn lower_stmt(
 fn lower_new(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
-    sink: &mut Sink<MethodCtx>,
+    sink: &mut Sink,
     current_heap: HeapVal,
     lhs: Spur,
     sof: &typed::StarOrFields,
@@ -339,7 +337,7 @@ fn lower_new(
 fn lower_method_call(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
-    sink: &mut Sink<MethodCtx>,
+    sink: &mut Sink,
     current_heap: HeapVal,
     baseline: HeapVal,
     labeled: &HashMap<Spur, HeapVal>,
@@ -370,7 +368,7 @@ fn lower_method_call(
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
         let (h_pre, b_pre) = emit_resource_call(sink, req_id, HeapVal::Empty, args.clone());
         let h_new = sink.emit_heap(HeapInst::Sub(heap, h_pre));
-        sink.emit_ext(InstExt::Assert(b_pre));
+        sink.emit_assert(b_pre);
         heap = h_new;
         callee_pre_heap = h_pre;
     }
@@ -390,7 +388,7 @@ fn lower_method_call(
         ens_args.extend(ret_vals.iter().cloned());
         let (h_post, b_post) = emit_resource_call(sink, ens_id, callee_pre_heap, ens_args);
         let h_new = sink.emit_heap(HeapInst::Add(heap, h_post));
-        sink.emit_ext(InstExt::Assume(b_post));
+        sink.emit_assume(b_post);
         heap = h_new;
     }
 
@@ -398,25 +396,16 @@ fn lower_method_call(
 }
 
 /// Emit a `ResourceCall` instruction that produces both a `HeapVal::Temp` and
-/// a `Val::Temp`. Returns the produced pair. Method-body only — resource
-/// bodies cannot reach this code path because `Sink<ResourceCtx>` has no
-/// `MethodInstExt` to construct.
+/// a `Val::Temp`. Returns the produced pair.
 fn emit_resource_call(
-    sink: &mut Sink<MethodCtx>,
+    sink: &mut Sink,
     resource: vmir::MemberId,
     ctx_heap: HeapVal,
     args: Vec<Val>,
 ) -> (HeapVal, Val) {
-    let h = sink.next_heap_temp();
-    let v = sink.next_val_temp();
-    let pc = sink.pc.clone();
-    sink.insts.push(Inst::new(
-        pc,
-        InstKind::Ext(InstExt::ResourceCall(ResourceCall {
-            resource,
-            ctx_heap,
-            args,
-        })),
-    ));
-    (h, v)
+    sink.emit_resource_call(ResourceCall {
+        resource,
+        ctx_heap,
+        args,
+    })
 }

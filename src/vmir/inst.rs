@@ -1,60 +1,27 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapInst, HeapVal, PureInst, Type, Val};
+use crate::vmir::{HeapInst, PureInst, ResourceCall, Type, Val};
 
-use std::clone::Clone;
-use std::cmp::{Eq, PartialEq};
-use std::fmt::{self, Debug, Display, Formatter};
-use std::hash::Hash;
-
-use derive_where::derive_where;
-
-/// Whether the variant has a SIDECOND that the path condition guards.
-/// Used by [`Inst::new`] to refuse non-trivial `PathConds` on
-/// instructions that don't make use of it.
-pub trait UsesPc {
-    fn uses_pc(&self) -> bool;
-}
-
-impl UsesPc for ! {
-    fn uses_pc(&self) -> bool {
-        match *self {}
-    }
-}
-
-pub trait Ext = Debug + Clone + PartialEq + Eq + Hash + UsesPc;
-
-/// A context for instructions, through which additional instruction extensions can be added.
-pub trait InstContext {
-    /// Top-level instruction-kind extensions legal in this context.
-    type InstExt: Ext = !;
-    /// Pure-instruction extensions legal in this context.
-    type PureExt: Ext = !;
-    /// Heap-instruction extensions legal in this context.
-    type HeapExt: Ext = !;
-
-    /// Build this context's `perm(loc)` pure extension reading `heap`, when the
-    /// context permits one. Default `None` (no perm extension is constructible,
-    /// e.g. resource bodies whose `PureExt` is the never type).
-    fn perm_pure_ext(_heap: HeapVal, _loc: Val) -> Option<Self::PureExt> {
-        None
-    }
-}
+use std::fmt::{self, Display, Formatter};
 
 /// An instruction gated by a path condition.
-#[derive_where(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Inst<InstCtx: InstContext> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Inst {
     pub pc: PathConds,
-    pub kind: InstKind<InstCtx>,
+    pub kind: InstKind,
 }
 
-#[derive_where(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum InstKind<InstCtx: InstContext> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InstKind {
     /// Produces a temporary of a given type.
-    Pure(Type, PureInst<InstCtx::PureExt>),
+    Pure(Type, PureInst),
     /// Produces a heap value.
-    Heap(HeapInst<InstCtx::HeapExt>),
-    /// Context-specific top-level extensions.
-    Ext(InstCtx::InstExt),
+    Heap(HeapInst),
+    /// Assume a boolean fact. Produces nothing.
+    Assume(Val),
+    /// Assert a boolean obligation. Produces nothing.
+    Assert(Val),
+    /// Call a resource, producing a `(heap_delta, bool)` pair.
+    ResourceCall(ResourceCall),
 }
 
 /// Conjunction of literals over previously-emitted `Val`s.
@@ -79,36 +46,23 @@ impl From<bool> for Polarity {
     }
 }
 
-// ======================
-// DISPLAY INFRASTRUCTURE
-// ======================
-
-/// Counter contribution of an `InstKind::Ext` variant. Returns
-/// `(val_bump, heap_bump)`.
-pub trait Bumps {
-    fn bumps(&self) -> (usize, usize);
-}
-
-impl Bumps for ! {
-    fn bumps(&self) -> (usize, usize) {
-        match *self {}
-    }
-}
-
-impl<C: InstContext> InstKind<C> {
+impl InstKind {
+    /// Whether the variant has a SIDECOND that the path condition guards.
+    /// Used by [`Inst::new`] to refuse non-trivial `PathConds` on
+    /// instructions that don't make use of it.
     pub fn uses_pc(&self) -> bool {
         match self {
             InstKind::Pure(_, pi) => pi.uses_pc(),
             InstKind::Heap(hi) => hi.uses_pc(),
-            InstKind::Ext(ext) => ext.uses_pc(),
+            InstKind::Assume(_) | InstKind::Assert(_) | InstKind::ResourceCall(_) => true,
         }
     }
 }
 
-impl<C: InstContext> Inst<C> {
+impl Inst {
     /// Construct an instruction. The path condition must be empty
-    /// unless `kind` has a SIDECOND (see `UsesPc`).
-    pub fn new(pc: PathConds, kind: InstKind<C>) -> Self {
+    /// unless `kind` has a SIDECOND (see [`InstKind::uses_pc`]).
+    pub fn new(pc: PathConds, kind: InstKind) -> Self {
         debug_assert!(
             pc.conds.is_empty() || kind.uses_pc(),
             "non-empty PathConds on a non-SIDECOND instruction"
@@ -117,26 +71,15 @@ impl<C: InstContext> Inst<C> {
     }
 }
 
-/// Refutable Display impl for an `InstExt = !`
-impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a PathConds, &'a !)> {
-    fn fmt(&self, _: &mut Formatter<'_>) -> fmt::Result {
-        let (_, _, _, never) = self.item;
-        match *never {}
-    }
-}
+// ======================
+// DISPLAY INFRASTRUCTURE
+// ======================
 
-/// Walk an instruction stream. Wraps `(val_base, heap_base, &[Inst<C>])`
-/// in a `VmirDisplay` so the iteration lives behind a regular `Display`
-/// impl. Callers — `Display for VmirDisplay<&Method>`, `&Resource>`,
-/// `&ResourceBody>` — invoke via `self.with((val_base, heap_base,
-/// &insts[..]))`.
-impl<'a, C: InstContext> Display for VmirDisplay<'a, (usize, usize, &'a [Inst<C>])>
-where
-    C::InstExt: Bumps,
-    C::PureExt: crate::vmir::pure::PureExtRender,
-    C::HeapExt: crate::vmir::heap::HeapExtRender,
-    VmirDisplay<'a, (usize, usize, &'a PathConds, &'a C::InstExt)>: Display,
-{
+/// Walk an instruction stream. Wraps `(val_base, heap_base, &[Inst])` in a
+/// `VmirDisplay` so the iteration lives behind a regular `Display` impl.
+/// Callers — `Display for VmirDisplay<&Method>`, `&Resource>`, `&ResourceBody>`
+/// — invoke via `self.with((val_base, heap_base, &insts[..]))`.
+impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let (val_base, heap_base, insts) = self.item;
         let mut e_idx = val_base;
@@ -157,11 +100,24 @@ where
                     writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), hi)?;
                     h_idx += 1;
                 }
-                InstKind::Ext(ext) => {
-                    write!(f, "{}", self.with((e_idx, h_idx, &inst.pc, ext)))?;
-                    let (de, dh) = ext.bumps();
-                    e_idx += de;
-                    h_idx += dh;
+                InstKind::Assume(v) => writeln!(f, "  {}assume {v}", PcPrefix(&inst.pc))?,
+                InstKind::Assert(v) => writeln!(f, "  {}assert {v}", PcPrefix(&inst.pc))?,
+                InstKind::ResourceCall(call) => {
+                    write!(
+                        f,
+                        "  (h{h_idx}, e{e_idx}) := {}call {}(",
+                        PcPrefix(&inst.pc),
+                        self.interner.resolve(&call.resource),
+                    )?;
+                    for (i, arg) in call.args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    writeln!(f, ")[{}]", call.ctx_heap)?;
+                    e_idx += 1;
+                    h_idx += 1;
                 }
             }
         }

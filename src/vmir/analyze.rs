@@ -8,9 +8,7 @@
 use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::prelude::DiGraphMap;
 
-use crate::vmir::{
-    Declaration, InstExt, InstKind, MemberId, Method, Program, PureInst, ResourceBody,
-};
+use crate::vmir::{Declaration, InstKind, MemberId, Method, Program, PureInst, ResourceBody};
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
 /// dependent. Acyclic once produced by [`analyze`].
@@ -162,11 +160,13 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
 }
 
 fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
-    // Resource bodies use `ResourceCtx` (`InstExt = !`): the only member
-    // references are `FunctionCall`s (e.g. `@addr` functions).
+    // Resource bodies reference members through `FunctionCall`s (e.g. `@addr`
+    // functions) and `ResourceCall`s.
     for inst in &body.insts {
-        if let InstKind::Pure(_, PureInst::FunctionCall(_, fc)) = &inst.kind {
-            out.push(fc.function);
+        match &inst.kind {
+            InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
+            InstKind::ResourceCall(c) => out.push(c.resource),
+            _ => {}
         }
     }
 }
@@ -175,7 +175,7 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
     for inst in &m.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::Ext(InstExt::ResourceCall(c)) => out.push(c.resource),
+            InstKind::ResourceCall(c) => out.push(c.resource),
             _ => {}
         }
     }
@@ -184,7 +184,7 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmir::{HeapVal, Inst, InstKind, MethodInst, PathConds, Resource, ResourceCall};
+    use crate::vmir::{HeapVal, Inst, InstKind, PathConds, Resource, ResourceCall};
     use lasso::Rodeo;
     use std::collections::HashSet;
     use typed_index_collections::TiVec;
@@ -203,9 +203,9 @@ mod tests {
             ctx_heap: HeapVal::Empty,
             args: vec![],
         };
-        let inst: MethodInst = Inst {
+        let inst: Inst = Inst {
             pc: PathConds::default(),
-            kind: InstKind::Ext(InstExt::ResourceCall(call)),
+            kind: InstKind::ResourceCall(call),
         };
         Declaration::Method(Method { insts: vec![inst] })
     }

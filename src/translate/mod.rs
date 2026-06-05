@@ -416,7 +416,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
                     saw_addr_call = true;
                 }
                 vmir::InstKind::Heap(vmir::HeapInst::Acc(_)) => saw_acc = true,
-                // ResourceCall is now in MethodInstExt — by construction
+                // ResourceCall is a top-level InstKind — by construction
                 // unreachable here (ResourceInst's Ext slot is `!`).
                 _ => {}
             }
@@ -444,21 +444,17 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             "add body must contain HeapInst::Add"
         );
         assert!(
-            kinds
-                .iter()
-                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::InstExt::Assert(_)))),
-            "add body must contain MethodInstExt::Assert"
+            kinds.iter().any(|k| matches!(k, vmir::InstKind::Assert(_))),
+            "add body must contain an Assert"
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, vmir::InstKind::Assume(_))),
+            "add body must contain an Assume"
         );
         assert!(
             kinds
                 .iter()
-                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::InstExt::Assume(_)))),
-            "add body must contain MethodInstExt::Assume"
-        );
-        assert!(
-            kinds
-                .iter()
-                .any(|k| matches!(k, vmir::InstKind::Ext(vmir::InstExt::ResourceCall(_)))),
+                .any(|k| matches!(k, vmir::InstKind::ResourceCall(_))),
             "add body must contain a ResourceCall"
         );
 
