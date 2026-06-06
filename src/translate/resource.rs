@@ -67,7 +67,6 @@ pub(crate) fn lower_spatial_never(
         initial_heap,
         SpatialMode::Inhale,
         None,
-        None,
         exp,
     )?;
     Ok(vmir::ResourceBody {
@@ -92,7 +91,6 @@ pub(crate) fn lower_spatial_ensures(
         initial_heap,
         SpatialMode::Inhale,
         None,
-        None,
         exp,
     )?;
     Ok(vmir::ResourceBody {
@@ -108,14 +106,13 @@ pub(crate) fn lower_spatial_ensures(
 /// instead of always emitting a `Pure` ternary lets us collapse
 /// `acc(...) && acc(...)` and similar all-permission expressions to just the
 /// heap delta with no boolean witness.
-/// `guard` is the active branch condition (a `Bool` `Val`) under which the
-/// spatial expression is reached, or `None` at the top level. The branch is
-/// encoded into permission fractions rather than into a heap multiplexer: every
-/// `acc`'s permission is gated `guard ? perm : none`, and chunks are added to a
-/// single monotonic heap timeline (no `HeapInst::Ternary`). The agreement axiom
-/// in the verifier keeps values from mutually-exclusive branches isolated,
-/// since their fractions are never both positive.
-#[allow(clippy::too_many_arguments)]
+///
+/// A branch is encoded into permission fractions rather than a heap multiplexer:
+/// the enclosing `with_cond` path condition gates every `acc`'s permission (see
+/// `gate_perm_by_pc`) and chunks are added to a single monotonic heap timeline
+/// (no `HeapInst::Ternary`). The verifier's agreement axiom keeps values from
+/// mutually-exclusive branches isolated, since their fractions are never both
+/// positive.
 pub(crate) fn lower_spatial<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -123,7 +120,6 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     acc_heap: HeapVal,
     mode: SpatialMode,
     old: Option<&OldHeaps>,
-    guard: Option<Val>,
     exp: &typed::SpatialExp<Ext>,
 ) -> Result<(HeapVal, Option<Val>), TranslationError> {
     use typed::SpatialExpKind as S;
@@ -131,7 +127,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     let hctx = mode.heap_ctx(acc_heap, old);
     match &*exp.0 {
         S::Acc(res, perm) => {
-            let delta = lower_acc(b, env, sink, hctx, guard, res, perm)?;
+            let delta = lower_acc(b, env, sink, hctx, res, perm)?;
             // Inhale adds the chunk; exhale subtracts it (so a later `perm`
             // observes the reduced heap). The add/sub is unconditional — the
             // branch lives in the (gated) permission fraction.
@@ -142,8 +138,8 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             Ok((h_out, None))
         }
         S::Conj(l, r) => {
-            let (h_mid, b_l) = lower_spatial(b, env, sink, acc_heap, mode, old, guard.clone(), l)?;
-            let (h_out, b_r) = lower_spatial(b, env, sink, h_mid, mode, old, guard, r)?;
+            let (h_mid, b_l) = lower_spatial(b, env, sink, acc_heap, mode, old, l)?;
+            let (h_out, b_r) = lower_spatial(b, env, sink, h_mid, mode, old, r)?;
 
             let b_sum = match (b_l, b_r) {
                 (None, None) => None,
@@ -157,12 +153,11 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
         }
         S::Implies(cond, body) => {
             let c = pure_exp::lower(b, env, sink, hctx, cond)?;
-            let g = conj(sink, guard, c.clone());
-            // Body chunks are gated by `g` and added onto the same running heap;
-            // the result heap is simply the body's. `with_cond` keeps the path
-            // condition so the body's `acc`/deref side conditions discharge.
+            // `with_cond` pushes `c` onto the path condition; that stack is both
+            // the body's side-condition guard and the source of the permission
+            // gating (see `gate_perm_by_pc`), so no separate guard value is built.
             let (h_out, b_b) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, old, Some(g), body)
+                lower_spatial(b, env, sink, acc_heap, mode, old, body)
             })?;
             // c ==> b_b  =  c ? b_b : true. When body has no boolean, the
             // whole implication is trivially true.
@@ -171,16 +166,15 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
         }
         S::Ternary { if_, then, else_ } => {
             let c = pure_exp::lower(b, env, sink, hctx, if_)?;
-            let g_then = conj(sink, guard.clone(), c.clone());
-            let not_c = negate(sink, c.clone());
-            let g_else = conj(sink, guard, not_c);
             // Both arms add their gated chunks to the same timeline, in order:
-            // then onto `acc_heap`, else onto the then-result. No heap ternary.
+            // then onto `acc_heap`, else onto the then-result. No heap ternary;
+            // the else arm's negative polarity is applied by flipping ternary
+            // branches in `gate_perm_by_pc`, not by materializing `!c`.
             let (h_mid, b_t) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, old, Some(g_then), then)
+                lower_spatial(b, env, sink, acc_heap, mode, old, then)
             })?;
             let (h_out, b_e) = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
-                lower_spatial(b, env, sink, h_mid, mode, old, Some(g_else), else_)
+                lower_spatial(b, env, sink, h_mid, mode, old, else_)
             })?;
             let bv = match (b_t, b_e) {
                 (None, None) => None,
@@ -203,27 +197,22 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     }
 }
 
-/// `guard && c` as a pure ternary `guard ? c : false` (or just `c` at the top
-/// level). Used to combine nested branch conditions for permission gating.
-fn conj(sink: &mut Sink, guard: Option<Val>, c: Val) -> Val {
-    match guard {
-        None => c,
-        Some(g) => sink.emit_pure(Type::Bool, PureInst::Ternary(g, c, FALSE)),
+/// Gate a permission amount by the current path condition: each branch literal
+/// wraps `perm` in a ternary, with `none` (0) on the *dead* side. A positive
+/// literal `b` yields `b ? perm : none`; a negative literal (the else arm)
+/// yields `b ? none : perm` — flipped branches instead of a materialized `!b`.
+/// The empty path condition (top level) returns `perm` unchanged.
+fn gate_perm_by_pc(sink: &mut Sink, perm: Val) -> Val {
+    let mut v = perm;
+    // Innermost literal first, so the outermost guard ends up outermost.
+    for (lit, pol) in sink.pc.conds.clone().into_iter().rev() {
+        let (then_, else_) = match pol {
+            Polarity::Positive => (v, none()),
+            Polarity::Negative => (none(), v),
+        };
+        v = sink.emit_pure(Type::Real, PureInst::Ternary(lit, then_, else_));
     }
-}
-
-/// `!c` as a pure ternary `c ? false : true`.
-fn negate(sink: &mut Sink, c: Val) -> Val {
-    sink.emit_pure(Type::Bool, PureInst::Ternary(c, FALSE, TRUE))
-}
-
-/// Gate a permission amount by the active branch guard: `guard ? perm : none`
-/// (or `perm` unguarded). A dead branch contributes `none` (0) permission.
-fn gate_perm(sink: &mut Sink, guard: Option<Val>, perm: Val) -> Val {
-    match guard {
-        None => perm,
-        Some(g) => sink.emit_pure(Type::Real, PureInst::Ternary(g, perm, none())),
-    }
+    v
 }
 
 fn lower_acc<Ext: PureExt>(
@@ -231,12 +220,11 @@ fn lower_acc<Ext: PureExt>(
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
-    guard: Option<Val>,
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
 ) -> Result<HeapVal, TranslationError> {
     let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
-    let perm_val = gate_perm(sink, guard, perm_val);
+    let perm_val = gate_perm_by_pc(sink, perm_val);
     let addr = lower_resource_addr(b, env, sink, hctx, res)?;
     Ok(sink.emit_heap(HeapInst::Acc(Acc {
         loc: addr,
