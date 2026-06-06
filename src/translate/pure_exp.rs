@@ -216,18 +216,15 @@ pub(crate) fn lower<Ext: PureExt>(
     }
 }
 
-/// Fold a binary **arithmetic** op over two constant literals into a single
-/// literal, at translation time. The result type drives Real-vs-Int math (so a
-/// `Real`-typed `4/2` over Int literals folds to `Real(2)`). Returns `None` for
-/// non-arithmetic ops (comparisons are left to the e-graph) or type mismatches.
-fn fold_arith_literals(
-    op: &typed::BinOp,
-    l: &Literal,
-    r: &Literal,
-    ty: &vmir::Type,
-) -> Option<Literal> {
+/// The single fold kept during lowering: a division of literals in a `Real`
+/// (permission) context becomes one `Real` fraction literal, so `1/2` is a
+/// literal rather than a `real(1) / real(2)` division. No other arithmetic is
+/// folded — e.g. `1/2 + 1/3` stays a real addition for the e-graph to handle.
+fn fold_real_div(op: &typed::BinOp, l: &Literal, r: &Literal, ty: &vmir::Type) -> Option<Literal> {
     use num::BigRational;
-    use typed::BinOp as B;
+    if !matches!(op, typed::BinOp::Div) || *ty != vmir::Type::Real {
+        return None;
+    }
     let rat = |lit: &Literal| -> Option<BigRational> {
         match lit {
             Literal::Int(n) => Some(BigRational::from(n.clone())),
@@ -235,34 +232,7 @@ fn fold_arith_literals(
             _ => None,
         }
     };
-    match ty {
-        vmir::Type::Real => {
-            let (a, b) = (rat(l)?, rat(r)?);
-            let v = match op {
-                B::Plus => a + b,
-                B::Minus => a - b,
-                B::Mult => a * b,
-                B::Div => a / b,
-                _ => return None,
-            };
-            Some(Literal::Real(v))
-        }
-        vmir::Type::Int => {
-            let (Literal::Int(a), Literal::Int(b)) = (l, r) else {
-                return None;
-            };
-            let v = match op {
-                B::Plus => a + b,
-                B::Minus => a - b,
-                B::Mult => a * b,
-                B::Div => a / b,
-                B::Mod => a % b,
-                _ => return None,
-            };
-            Some(Literal::Int(v))
-        }
-        _ => None,
-    }
+    Some(Literal::Real(rat(l)? / rat(r)?))
 }
 
 /// Wrap `v` in `real(..)` when an `Int` operand is used where a `Real` is
@@ -317,10 +287,10 @@ fn lower_binary<Ext: PureExt>(
     // Strict ops: both operands always evaluate, so `r` is lowered under the
     // outer path condition unchanged.
     let rv = lower(b, env, sink, hctx, r)?;
-    // Const-fold literal arithmetic at translation time, e.g. `4/2 => 2/1`
-    // (one Real literal instead of `real(4) / real(2)`).
+    // Only fold a literal division in a `Real` context to its fraction (`1/2`);
+    // all other literal arithmetic stays symbolic for the e-graph.
     if let (Val::Literal(la), Val::Literal(lb)) = (&lv, &rv) {
-        if let Some(folded) = fold_arith_literals(op, la, lb, &ty) {
+        if let Some(folded) = fold_real_div(op, la, lb, &ty) {
             return Ok(Val::Literal(folded));
         }
     }
