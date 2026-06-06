@@ -178,25 +178,28 @@ fn lower_stmt(
             if lhss.len() != 1 {
                 return Err(TranslationError::Unsupported("multi-LHS assign := exp"));
             }
-            let name = match &lhss[0] {
-                typed::AssignLhs::Var(n) => n.0,
-                typed::AssignLhs::Field(_, _) => {
-                    return Err(TranslationError::Unsupported("field lvalue"));
-                }
-            };
             let old = pure_exp::OldHeaps {
                 baseline,
                 labeled: &*labeled,
             };
-            let v = pure_exp::lower(
-                b,
-                env,
-                sink,
-                pure_exp::HeapCtx::same_with_old(current_heap, &old),
-                pure,
-            )?;
-            env.insert(name, v);
-            Ok(current_heap)
+            let hctx = pure_exp::HeapCtx::same_with_old(current_heap, &old);
+            let v = pure_exp::lower(b, env, sink, hctx, pure)?;
+            match &lhss[0] {
+                typed::AssignLhs::Var(n) => {
+                    env.insert(n.0, v);
+                    Ok(current_heap)
+                }
+                // `e.f := v`: mutate the heap at `field@addr(e)` to `v`. The
+                // `Assign` is guarded — it requires write permission at the loc.
+                typed::AssignLhs::Field(base, fname) => {
+                    let base_val = pure_exp::lower(b, env, sink, hctx, base)?;
+                    let addr = resource::field_addr(b, sink, base_val, fname.0)?;
+                    Ok(sink.emit_heap_guarded(HeapInst::Assign(
+                        current_heap,
+                        vmir::Assign { loc: addr, val: v },
+                    )))
+                }
+            }
         }
         S::Var(idents, Some(typed::AssignRhs::New(sof))) => {
             if idents.len() != 1 {

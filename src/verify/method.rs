@@ -430,9 +430,28 @@ fn eval_heap_inst(
                 .collect();
             heap_subtract(ctx, &l, &r, &pc_lits)
         }
-        // SIDECOND-bearing structural assignment, not yet modeled.
-        HeapInst::Assign(_heap, Assign { .. }) => {
-            Err(VerifyError::Unimplemented("HeapInst::Assign"))
+        // Field assignment `loc := val`: requires write permission at `loc`,
+        // then updates the chunk's value (permission unchanged).
+        HeapInst::Assign(heap, Assign { loc, val }) => {
+            let h = get_heap(state, heap);
+            let addr = state.get_val(ctx, loc);
+            let new_val = state.get_val(ctx, val);
+            let perm = h.perm_at(addr).unwrap_or_else(|| zero_real(ctx));
+            // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc.
+            let pc_lits: Vec<(egg::Id, Polarity)> = pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+            let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, write]));
+            let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+            let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+            if !ctx.prove_under_pc(goal, &pc_lits) {
+                return Err(VerifyError::InsufficientPermission);
+            }
+            Ok(h.with_chunk(addr, Chunk::new(perm, new_val)))
         }
     }
 }
@@ -1959,6 +1978,70 @@ method m(x: Ref, b: Bool)
         assert!(
             verify_named_method(&program, "m").is_ok(),
             "under `b`, the implication grants full permission and x.f == 7"
+        );
+    }
+
+    #[test]
+    fn field_assign_updates_value() {
+        // With write permission, `x.f := 10` mutates the heap value so a later
+        // `assert x.f == 10` discharges.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    inhale acc(x.f, 1/1)
+    x.f := 10
+    assert x.f == 10
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "field assignment under write permission should verify"
+        );
+    }
+
+    #[test]
+    fn field_assign_without_write_permission_fails() {
+        // Only 1/2 held after the exhale: a field write needs full permission.
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    inhale acc(x.f, 1/1)
+    exhale acc(x.f, 1/2)
+    x.f := 20
+}
+"#;
+        let program = lower(input);
+        assert!(
+            matches!(
+                verify_named_method(&program, "m"),
+                Err(ref e) if matches!(e.root_cause(), VerifyError::InsufficientPermission)
+            ),
+            "field write without full permission must fail"
+        );
+    }
+
+    #[test]
+    fn field_assign_with_no_permission_fails() {
+        let input = r#"
+field f: Int
+
+method m(x: Ref)
+{
+    x.f := 1
+}
+"#;
+        let program = lower(input);
+        assert!(
+            matches!(
+                verify_named_method(&program, "m"),
+                Err(ref e) if matches!(e.root_cause(), VerifyError::InsufficientPermission)
+            ),
+            "field write with no permission held must fail"
         );
     }
 }

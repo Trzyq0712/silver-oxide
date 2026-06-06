@@ -248,27 +248,7 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
     match &*res.0 {
         R::Field(base, fname) => {
             let base_val = pure_exp::lower(b, env, sink, hctx, base)?;
-            let &addr_fn = b.field_addr.get(&fname.0).ok_or_else(|| {
-                TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
-            })?;
-            let field_ty = b
-                .globals
-                .resolve(fname.0)
-                .and_then(|s| s.as_field().cloned())
-                .ok_or_else(|| {
-                    TranslationError::UnknownIdent(b.interner.resolve(&fname.0).to_string())
-                })?;
-            let ret_ty = Type::Addr(Box::new(lower_type(&field_ty)));
-            Ok(sink.emit_pure(
-                ret_ty,
-                PureInst::FunctionCall(
-                    HeapVal::Empty,
-                    FunctionCall {
-                        function: addr_fn,
-                        args: vec![base_val],
-                    },
-                ),
-            ))
+            field_addr(b, sink, base_val, fname.0)
         }
         R::PredicateCall(call) => {
             let &addr_fn = b.pred_addr.get(&call.name.0).ok_or_else(|| {
@@ -370,16 +350,15 @@ pub(crate) fn lower_assertion_bool<Ext: PureExt>(
     }
 }
 
-/// Emit the single-chunk heap delta for `acc(base.fname, perm)`: the field's
-/// `@addr` function applied to `base`, followed by a `HeapInst::Acc`. Returns
-/// the produced delta heap. Shared by `lower_acc` and `new(...)` lowering.
-pub(crate) fn field_acc_delta(
+/// Emit `field@addr(base)`: the field's heap-independent `@addr` function
+/// applied to the receiver, typed `Addr<field_ty>`. Shared by every site that
+/// needs a field location (`acc`, `perm`, `new`, field assignment).
+pub(crate) fn field_addr(
     b: &Builder<'_>,
     sink: &mut Sink,
     base: Val,
     fname: Spur,
-    perm: Val,
-) -> Result<HeapVal, TranslationError> {
+) -> Result<Val, TranslationError> {
     let &addr_fn = b
         .field_addr
         .get(&fname)
@@ -390,7 +369,7 @@ pub(crate) fn field_acc_delta(
         .and_then(|s| s.as_field().cloned())
         .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
     let ret_ty = Type::Addr(Box::new(lower_type(&field_ty)));
-    let addr = sink.emit_pure(
+    Ok(sink.emit_pure(
         ret_ty,
         PureInst::FunctionCall(
             HeapVal::Empty,
@@ -399,6 +378,19 @@ pub(crate) fn field_acc_delta(
                 args: vec![base],
             },
         ),
-    );
+    ))
+}
+
+/// Emit the single-chunk heap delta for `acc(base.fname, perm)`: the field's
+/// `@addr` function applied to `base`, followed by a `HeapInst::Acc`. Returns
+/// the produced delta heap. Shared by `lower_acc` and `new(...)` lowering.
+pub(crate) fn field_acc_delta(
+    b: &Builder<'_>,
+    sink: &mut Sink,
+    base: Val,
+    fname: Spur,
+    perm: Val,
+) -> Result<HeapVal, TranslationError> {
+    let addr = field_addr(b, sink, base, fname)?;
     Ok(sink.emit_heap_guarded(HeapInst::Acc(Acc { loc: addr, perm })))
 }

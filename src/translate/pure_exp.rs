@@ -7,8 +7,8 @@ use lasso::Spur;
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, FunctionCall, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Polarity,
-    PureInst, ResourceCall, TRUE, Val,
+    self, FALSE, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Polarity, PureInst,
+    ResourceCall, TRUE, Val,
 };
 
 /// A mutable sink for emitted instructions plus the running counters. The
@@ -203,21 +203,8 @@ pub(crate) fn lower<Ext: PureExt>(
         }
         P::Field(base, id) => {
             let base = lower(b, env, sink, hctx, base)?;
-            let &field_fn = b.field_addr.get(&id.0).ok_or_else(|| {
-                TranslationError::UnknownIdent(b.interner.resolve(&id.0).to_string())
-            })?;
-            let addr_ty = vmir::Type::Addr(Box::new(ty.clone()));
-            let field_addr = sink.emit_pure(
-                addr_ty,
-                PureInst::FunctionCall(
-                    HeapVal::Empty,
-                    FunctionCall {
-                        function: field_fn,
-                        args: vec![base],
-                    },
-                ),
-            );
-            Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, field_addr)))
+            let addr = crate::translate::resource::field_addr(b, sink, base, id.0)?;
+            Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
         }
         P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
         P::FunctionCall(_) => Err(TranslationError::Unsupported("function call")),
