@@ -23,7 +23,8 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", self.with(param))?;
+            // Label params `e0`, `e1`, … (they occupy `Val::Temp(0..n)`).
+            write!(f, "e{i}: {}", self.with(param))?;
         }
         write!(f, ") -> {}", self.with(&self.item.ret))
     }

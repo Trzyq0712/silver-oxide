@@ -36,7 +36,9 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", self.with(param))?;
+            // Params occupy `Val::Temp(0..n)`, so label them `e0`, `e1`, … to
+            // match the temporaries the body refers to.
+            write!(f, "e{i}: {}", self.with(param))?;
         }
         write!(f, ")")?;
 
