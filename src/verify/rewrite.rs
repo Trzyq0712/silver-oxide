@@ -15,13 +15,30 @@ fn var(name: &str) -> Var {
 /// The full rule set run during saturation.
 pub fn rules() -> Vec<Rule> {
     vec![
-        // ite(true, x, y) => x   /   ite(false, x, y) => y
+        // ite(true, x, y) => x
         rw!("ite-true";  "(ite true ?x ?y)"  => "?x"),
+        // ite(false, x, y) => y
         rw!("ite-false"; "(ite false ?x ?y)" => "?y"),
-        // b && true  =  ite(b, true, false) => b
-        rw!("ite-true-false"; "(ite ?c true false)" => "?c"),
-        // b && b  =  ite(b, b, false) => b
+        // c ? x : x  =>  x
+        rw!("ite-same"; "(ite ?c ?x ?x)" => "?x"),
+        // b && true  == b || false  == c ? true : false => c
+        rw!("ite-ident"; "(ite ?c true false)" => "?c"),
+        // b && b  ==  c ? c : false => c
         rw!("and-self";  "(ite ?c ?c false)" => "?c"),
+        // b || b  ==  c ? true : c => c
+        rw!("or-self";   "(ite ?c true ?c)" => "?c"),
+        // c ? c : true  =>  true   (If c is true, it's true. If c is false, it's true)
+        rw!("ite-c-true"; "(ite ?c ?c true)" => "true"),
+        // c ? false : c =>  false  (If c is true, it's false. If c is false, it's false)
+        rw!("ite-false-c"; "(ite ?c false ?c)" => "false"),
+        // c ? (c ? x : y) : x  =>  x
+        rw!("ite-nested-x-t"; "(ite ?c (ite ?c ?x ?y) ?x)" => "?x"),
+        // c ? x : (c ? y : x)  =>  x
+        rw!("ite-nested-x-f"; "(ite ?c ?x (ite ?c ?y ?x))" => "?x"),
+        // c ? (c ? x : y) : y  =>  c ? x : y  (Merges outer root directly to inner node)
+        rw!("ite-collapse-t"; "(ite ?c (ite ?c ?x ?y) ?y)" => "(ite ?c ?x ?y)"),
+        // c ? x : (c ? x : y)  =>  c ? x : y  (Merges outer root directly to inner node)
+        rw!("ite-collapse-f"; "(ite ?c ?x (ite ?c ?x ?y))" => "(ite ?c ?x ?y)"),
         // x + 0 => x  (Int)
         rw!("add-zero-int-r"; "(+ ?x 0)" => "?x"),
         rw!("add-zero-int-l"; "(+ 0 ?x)" => "?x"),
