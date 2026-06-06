@@ -16,9 +16,9 @@ pub enum InstKind {
     Pure(Type, PureInst),
     /// Produces a heap value.
     Heap(HeapInst),
-    /// Assume a boolean fact. Produces nothing.
+    /// Assume a boolean fact. Produces no value.
     Assume(Val),
-    /// Assert a boolean obligation. Produces nothing.
+    /// Assert a boolean obligation. Produces no value.
     Assert(Val),
     /// Call a resource, producing a `(heap_delta, bool)` pair.
     ResourceCall(ResourceCall),
@@ -46,27 +46,11 @@ impl From<bool> for Polarity {
     }
 }
 
-impl InstKind {
-    /// Whether the variant has a SIDECOND that the path condition guards.
-    /// Used by [`Inst::new`] to refuse non-trivial `PathConds` on
-    /// instructions that don't make use of it.
-    pub fn uses_pc(&self) -> bool {
-        match self {
-            InstKind::Pure(_, pi) => pi.uses_pc(),
-            InstKind::Heap(hi) => hi.uses_pc(),
-            InstKind::Assume(_) | InstKind::Assert(_) | InstKind::ResourceCall(_) => true,
-        }
-    }
-}
-
 impl Inst {
-    /// Construct an instruction. The path condition must be empty
-    /// unless `kind` has a SIDECOND (see [`InstKind::uses_pc`]).
+    /// Construct an instruction. A non-empty `pc` gates the instruction's side
+    /// condition; the translation attaches one only where it is needed (see the
+    /// `*_guarded` emitters in `translate`).
     pub fn new(pc: PathConds, kind: InstKind) -> Self {
-        debug_assert!(
-            pc.conds.is_empty() || kind.uses_pc(),
-            "non-empty PathConds on a non-SIDECOND instruction"
-        );
         Self { pc, kind }
     }
 }

@@ -133,7 +133,9 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             // branch lives in the (gated) permission fraction.
             let h_out = match mode {
                 SpatialMode::Inhale => sink.emit_heap(HeapInst::Add(acc_heap, delta)),
-                SpatialMode::Exhale { .. } => sink.emit_heap(HeapInst::Sub(acc_heap, delta)),
+                SpatialMode::Exhale { .. } => {
+                    sink.emit_heap_guarded(HeapInst::Sub(acc_heap, delta))
+                }
             };
             Ok((h_out, None))
         }
@@ -226,7 +228,7 @@ fn lower_acc<Ext: PureExt>(
     let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
     let perm_val = gate_perm_by_pc(sink, perm_val);
     let addr = lower_resource_addr(b, env, sink, hctx, res)?;
-    Ok(sink.emit_heap(HeapInst::Acc(Acc {
+    Ok(sink.emit_heap_guarded(HeapInst::Acc(Acc {
         loc: addr,
         perm: perm_val,
     })))
@@ -398,5 +400,5 @@ pub(crate) fn field_acc_delta(
             },
         ),
     );
-    Ok(sink.emit_heap(HeapInst::Acc(Acc { loc: addr, perm })))
+    Ok(sink.emit_heap_guarded(HeapInst::Acc(Acc { loc: addr, perm })))
 }

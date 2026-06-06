@@ -62,50 +62,60 @@ impl Sink {
         HeapVal::Temp(id)
     }
 
-    /// Path condition to attach to `kind`: the running guard for sidecond
-    /// instructions, empty for total ones (so `Inst::new`'s debug-assert
-    /// never trips and the IR stays flat where no guard is needed).
-    fn pc_for(&self, kind: &InstKind) -> PathConds {
-        if kind.uses_pc() {
-            self.pc.clone()
-        } else {
-            PathConds::default()
-        }
+    /// A snapshot of the running path condition, to attach to a side-condition
+    /// instruction. Empty outside any branch.
+    fn guard(&self) -> PathConds {
+        self.pc.clone()
     }
 
+    /// Emit a **total** pure instruction (no side condition) — flat, no pc.
     pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
         let v = self.next_val_temp();
-        let kind = InstKind::Pure(ty, inst);
-        let pc = self.pc_for(&kind);
-        self.insts.push(Inst::new(pc, kind));
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
         v
     }
 
+    /// Emit a pure instruction whose side condition (e.g. `Deref` permission,
+    /// `Div`/`Mod` divisor) must hold under the running path condition.
+    pub fn emit_pure_guarded(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
+        let v = self.next_val_temp();
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
+        v
+    }
+
+    /// Emit a **total** heap instruction (no side condition) — e.g. `Add`.
     pub fn emit_heap(&mut self, inst: HeapInst) -> HeapVal {
         let h = self.next_heap_temp();
-        let kind = InstKind::Heap(inst);
-        let pc = self.pc_for(&kind);
-        self.insts.push(Inst::new(pc, kind));
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Heap(inst)));
+        h
+    }
+
+    /// Emit a heap instruction whose side condition (`Acc` perm ≥ 0, `Sub`
+    /// sufficient perm, `Assign` write perm) must hold under the running pc.
+    pub fn emit_heap_guarded(&mut self, inst: HeapInst) -> HeapVal {
+        let h = self.next_heap_temp();
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::Heap(inst)));
         h
     }
 
     pub fn emit_assume(&mut self, v: Val) {
-        let kind = InstKind::Assume(v);
-        let pc = self.pc_for(&kind);
-        self.insts.push(Inst::new(pc, kind));
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::Assume(v)));
     }
 
     pub fn emit_assert(&mut self, v: Val) {
-        let kind = InstKind::Assert(v);
-        let pc = self.pc_for(&kind);
-        self.insts.push(Inst::new(pc, kind));
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::Assert(v)));
     }
 
     /// Emit a `ResourceCall`, producing its `(heap_delta, bool)` pair.
     pub fn emit_resource_call(&mut self, call: ResourceCall) -> (HeapVal, Val) {
-        let kind = InstKind::ResourceCall(call);
-        let pc = self.pc_for(&kind);
-        self.insts.push(Inst::new(pc, kind));
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::ResourceCall(call)));
         (self.next_heap_temp(), self.next_val_temp())
     }
 }
@@ -207,7 +217,7 @@ pub(crate) fn lower<Ext: PureExt>(
                     },
                 ),
             );
-            Ok(sink.emit_pure(ty, PureInst::Deref(hctx.value, field_addr)))
+            Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, field_addr)))
         }
         P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
         P::FunctionCall(_) => Err(TranslationError::Unsupported("function call")),
@@ -335,8 +345,8 @@ fn lower_binary<Ext: PureExt>(
         B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
         B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),
         B::Mult => sink.emit_pure(ty, PureInst::Binary(V::Mult, lv, rv)),
-        B::Div => sink.emit_pure(ty, PureInst::Binary(V::Div, lv, rv)),
-        B::Mod => sink.emit_pure(ty, PureInst::Binary(V::Mod, lv, rv)),
+        B::Div => sink.emit_pure_guarded(ty, PureInst::Binary(V::Div, lv, rv)),
+        B::Mod => sink.emit_pure_guarded(ty, PureInst::Binary(V::Mod, lv, rv)),
         B::Eq => sink.emit_pure(ty, PureInst::Binary(V::Eq, lv, rv)),
         B::Lt => sink.emit_pure(ty, PureInst::Binary(V::Lt, lv, rv)),
         // Desugarings:

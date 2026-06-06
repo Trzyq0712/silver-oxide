@@ -76,7 +76,7 @@ pub(crate) fn lower_method(
         let mut ens_args = param_vals;
         ens_args.extend(ret_vals);
         let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, pre_heap, ens_args);
-        let _h_new = sink.emit_heap(HeapInst::Sub(current_heap, h_post));
+        let _h_new = sink.emit_heap_guarded(HeapInst::Sub(current_heap, h_post));
         sink.emit_assert(b_post);
     }
 
@@ -367,7 +367,7 @@ fn lower_method_call(
     // bool. `@requires` has no precondition itself → ctx_heap is empty.
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
         let (h_pre, b_pre) = emit_resource_call(sink, req_id, HeapVal::Empty, args.clone());
-        let h_new = sink.emit_heap(HeapInst::Sub(heap, h_pre));
+        let h_new = sink.emit_heap_guarded(HeapInst::Sub(heap, h_pre));
         sink.emit_assert(b_pre);
         heap = h_new;
         callee_pre_heap = h_pre;

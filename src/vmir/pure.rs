@@ -46,24 +46,13 @@ pub enum PureInst {
     Fresh,
     Binary(BinOp, Val, Val),
     Ternary(Val, Val, Val),
-    /// Cast an Int value to Real (`real(v)`).
+    /// Cast an Int value to a Real
     RealCast(Val),
+    /// Read a value from a heap at a given location.
     Deref(HeapVal, Val),
-    FunctionCall(HeapVal, FunctionCall),
     /// Query the permission amount of an address in a heap.
     Perm(HeapVal, Val),
-}
-
-impl PureInst {
-    pub fn uses_pc(&self) -> bool {
-        match self {
-            PureInst::Fresh | PureInst::Ternary(..) | PureInst::RealCast(..) => false,
-            PureInst::Binary(op, _, _) => matches!(op, BinOp::Div | BinOp::Mod),
-            PureInst::Deref(..) | PureInst::FunctionCall(..) => true,
-            // Permission queries are pure reads with no side condition.
-            PureInst::Perm(..) => false,
-        }
-    }
+    FunctionCall(HeapVal, FunctionCall),
 }
 
 // ======================

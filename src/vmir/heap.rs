@@ -36,19 +36,6 @@ pub struct Assign {
     pub val: Val,
 }
 
-impl HeapInst {
-    pub fn uses_pc(&self) -> bool {
-        match self {
-            // Acc: perm ≥ 0. Sub: enough perm. Assign: location must have write
-            // permission. Add is **unconditional**: the branch is encoded in the
-            // (gated) permission fractions, so chunk-merge equalities need no
-            // path condition — the agreement axiom's `p > 0` guards suffice.
-            HeapInst::Acc(_) | HeapInst::Sub(..) | HeapInst::Assign(..) => true,
-            HeapInst::Add(..) => false,
-        }
-    }
-}
-
 // ======================
 // DISPLAY INFRASTRUCTURE
 // ======================
