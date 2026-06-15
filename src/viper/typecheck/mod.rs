@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::viper::{
     self,
-    globals::Globals,
+    globals::{GlobalSignature, Globals},
     interner::Interner,
     typed::{
         self, BinOp, Call, FuncEnsuresExt, Ident, Literal, MethodBodyExt, MethodEnsuresExt,
@@ -405,14 +405,48 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 self.tc.impose(key.equate_with(body_key))?;
             }
 
-            ExpKind::AdtDestructor(base, _field) => {
-                self.constrain_pure(base)?;
+            ExpKind::AdtDestructor(base, field) => {
+                // `e.f`: `e` must be the ADT owning destructor `f`; the result is
+                // the field's type.
+                let fid = field.id();
+                let (adt, field_ty) = {
+                    let info = self.env.globals.dtor_by_name.get(&fid).ok_or_else(|| {
+                        TypeError::Other(format!(
+                            "unknown ADT destructor: {}",
+                            self.env.interner.resolve(&fid)
+                        ))
+                    })?;
+                    (info.adt, info.ty.clone())
+                };
+                let base_key = self.constrain_pure(base)?;
                 self.tc
-                    .impose(key.concretizes_explicit(ViperTcType::Bool))?;
+                    .impose(base_key.concretizes_explicit(ViperTcType::Domain(Ident(adt))))?;
+                self.tc
+                    .impose(key.concretizes_explicit(type_to_tc(&field_ty)))?;
             }
 
-            ExpKind::AdtDiscriminator(base, _variant) => {
-                self.constrain_pure(base)?;
+            ExpKind::AdtDiscriminator(base, variant) => {
+                // `e.is<Ctor>`: `e` must be the ADT owning `Ctor`; result is Bool.
+                let vid = variant.id();
+                let adt = {
+                    let sym = self.env.globals.resolve(vid).ok_or_else(|| {
+                        TypeError::Other(format!(
+                            "unknown ADT constructor in discriminator: {}",
+                            self.env.interner.resolve(&vid)
+                        ))
+                    })?;
+                    sym.as_adt_constructor()
+                        .ok_or_else(|| {
+                            TypeError::Other(format!(
+                                "{} is not an ADT constructor",
+                                self.env.interner.resolve(&vid)
+                            ))
+                        })?
+                        .adt
+                };
+                let base_key = self.constrain_pure(base)?;
+                self.tc
+                    .impose(base_key.concretizes_explicit(ViperTcType::Domain(Ident(adt))))?;
                 self.tc
                     .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
@@ -558,21 +592,24 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 self.env.interner.resolve(&call_name).to_string(),
             )),
             ExpCallKind::Function | ExpCallKind::AdtConstructor => {
-                let sig = sym.as_function().ok_or_else(|| {
-                    TypeError::Other(format!(
-                        "{} is not a function",
-                        self.env.interner.resolve(&call_name)
-                    ))
-                })?;
-                if sig.params.len() != call.args.len() {
+                let (params, ret_ty) = match sym.signature() {
+                    GlobalSignature::Function(s) => (s.params.clone(), s.ret.clone()),
+                    GlobalSignature::AdtConstructor(s) => (s.params.clone(), s.ret.clone()),
+                    _ => {
+                        return Err(TypeError::Other(format!(
+                            "{} is not callable",
+                            self.env.interner.resolve(&call_name)
+                        )));
+                    }
+                };
+                if params.len() != call.args.len() {
                     return Err(TypeError::WrongArgCount {
                         name: self.env.interner.resolve(&call_name).to_string(),
-                        expected: sig.params.len(),
+                        expected: params.len(),
                         found: call.args.len(),
                     });
                 }
-                let ret_ty = sig.ret.clone();
-                let expected_params: Vec<Type> = sig.params.clone();
+                let expected_params: Vec<Type> = params;
                 for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
                     let arg_key = self.constrain_pure(arg)?;
                     self.tc
@@ -1443,6 +1480,42 @@ mod tests {
         disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
         inline_macros(&mut program, &interner).expect("macro inline failed");
         typecheck_program(&mut program, &interner, &globals)
+    }
+
+    #[test]
+    fn adt_destructor_classified_and_typed() {
+        // `l.head` is classified as a destructor (disambiguation succeeds) and
+        // typed to the field's type (`Int`), so the function body type-checks.
+        let result = run_pipeline(
+            r#"
+adt List { Cons(head: Int, tail: List) Nil() }
+function f(l: List): Int { l.head }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn adt_discriminator_on_adt_ok() {
+        let result = run_pipeline(
+            r#"
+adt MyAdt { one() two() }
+function h(x: MyAdt): Bool { x.istwo }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn adt_discriminator_on_non_adt_base_fails() {
+        // Soundness: the base must be the variant's ADT, not an arbitrary type.
+        let result = run_pipeline(
+            r#"
+adt MyAdt { one() two() }
+function g(n: Int): Bool { n.istwo }
+"#,
+        );
+        assert!(result.is_err(), "expected type error for Int base, got Ok");
     }
 
     #[test]

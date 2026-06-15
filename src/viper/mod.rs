@@ -10,7 +10,7 @@ mod typecheck;
 pub use parsed::*;
 pub use typed::{Show, show};
 
-pub use globals::{Globals, GlobalsCollector};
+pub use globals::{GlobalSignature, Globals, GlobalsCollector};
 pub use interner::{IdentCollector, Interner};
 pub use parser::viper_parser;
 pub use typecheck::{TypeError, typecheck_program};

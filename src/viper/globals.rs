@@ -37,6 +37,23 @@ pub struct AdtSig {
 pub struct AdtConstructorSig {
     pub params: Vec<Type>,
     pub ret: Type,
+    /// Name `Spur` of the owning ADT.
+    pub adt: Spur,
+    /// Position of this constructor among its ADT's variants (its tag index).
+    pub tag: usize,
+}
+
+/// A destructor (constructor field accessor), e.g. `head` of `Cons`.
+#[derive(Debug, Clone)]
+pub struct DtorInfo {
+    /// Name `Spur` of the owning ADT.
+    pub adt: Spur,
+    /// Name `Spur` of the constructor this field belongs to.
+    pub ctor: Spur,
+    /// Field position within the constructor.
+    pub index: usize,
+    /// The field's type.
+    pub ty: Type,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +222,13 @@ impl From<usize> for MemberId {
 pub struct Globals {
     pub signatures: TiVec<MemberId, GlobalSignature>,
     pub symbol_table: HashMap<Spur, MemberId>,
+    /// ADT constructor name (resolved string) → its name `Spur`. Lets passes
+    /// that only hold a `RodeoResolver` (no string lookup) resolve a
+    /// discriminator `is<Ctor>` back to the constructor.
+    pub ctor_by_name: HashMap<String, Spur>,
+    /// Destructor (constructor field) name `Spur` → its info. Lets `e.f` be
+    /// classified as an ADT destructor.
+    pub dtor_by_name: HashMap<Spur, DtorInfo>,
 }
 
 /// A lightweight view into a successfully resolved global symbol.
@@ -267,6 +291,10 @@ pub struct GlobalsCollector<'i> {
     interner: &'i Interner,
     signatures: TiVec<MemberId, GlobalSignature>,
     symbol_table: HashMap<Spur, MemberId>,
+    ctor_by_name: HashMap<String, Spur>,
+    dtor_by_name: HashMap<Spur, DtorInfo>,
+    /// Running per-ADT constructor counter, for assigning tag indices.
+    adt_ctor_count: HashMap<Spur, usize>,
     errors: Vec<DuplicateGlobalError>,
 }
 
@@ -276,6 +304,9 @@ impl<'i> GlobalsCollector<'i> {
             interner,
             signatures: TiVec::new(),
             symbol_table: HashMap::new(),
+            ctor_by_name: HashMap::new(),
+            dtor_by_name: HashMap::new(),
+            adt_ctor_count: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -285,6 +316,8 @@ impl<'i> GlobalsCollector<'i> {
             Ok(Globals {
                 signatures: self.signatures,
                 symbol_table: self.symbol_table,
+                ctor_by_name: self.ctor_by_name,
+                dtor_by_name: self.dtor_by_name,
             })
         } else {
             Err(self.errors)
@@ -374,6 +407,9 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
     }
 
     fn walk_adt_constructor(&mut self, adt_cons: &'ast super::AdtConstructor) {
+        let adt = adt_cons.adt().id();
+        let tag = *self.adt_ctor_count.entry(adt).or_insert(0);
+        self.adt_ctor_count.insert(adt, tag + 1);
         let sig = AdtConstructorSig {
             params: adt_cons
                 .signature
@@ -382,7 +418,23 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
                 .map(|p| Type::from(p.ty()))
                 .collect(),
             ret: Type::from(adt_cons.signature.ret[0].ty()),
+            adt,
+            tag,
         };
+        let name_spur = adt_cons.signature.name.0.id();
+        self.ctor_by_name
+            .insert(self.interner.resolve(&name_spur).to_string(), name_spur);
+        // Register each field as a destructor (first registration wins on a
+        // name clash; full overload handling is deferred).
+        for (index, field) in adt_cons.destructors().enumerate() {
+            let field_spur = field.idn.0.id();
+            self.dtor_by_name.entry(field_spur).or_insert(DtorInfo {
+                adt,
+                ctor: name_spur,
+                index,
+                ty: Type::from(&field.ty),
+            });
+        }
         self.register(
             &adt_cons.signature.name,
             GlobalSignature::AdtConstructor(sig),

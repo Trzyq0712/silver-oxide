@@ -222,11 +222,51 @@ pub(crate) fn lower<Ext: PureExt>(
             Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
         }
         P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
-        P::FunctionCall(_) => Err(TranslationError::Unsupported("function call")),
+        P::FunctionCall(call) => {
+            // Constructors and (heap-independent) user functions. Heap-dependent
+            // functions are a later (purification) concern; pass an empty heap.
+            let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
+            let mut args = Vec::with_capacity(call.args.len());
+            for a in &call.args {
+                args.push(lower(b, env, sink, hctx, a)?);
+            }
+            Ok(sink.emit_pure(
+                ty,
+                PureInst::FunctionCall(HeapVal::Empty, vmir::FunctionCall { function: func, args }),
+            ))
+        }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
         P::AdtDestructor(_, _) => Err(TranslationError::Unsupported("ADT destructor")),
-        P::AdtDiscriminator(_, _) => Err(TranslationError::Unsupported("ADT discriminator")),
+        P::AdtDiscriminator(base, variant) => {
+            // `e.is<Ctor>` ⇒ `Adt@tag(e) == tag_index`. The verifier's tag
+            // reduction folds this to a literal when `e` is a known constructor.
+            let base_v = lower(b, env, sink, hctx, base)?;
+            let &(adt_spur, tag) = b.ctor_tag.get(&variant.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
+            })?;
+            let tag_fn = *b
+                .adt_tag_fn
+                .get(&adt_spur)
+                .expect("adt tag fn declared for a known constructor");
+            let tag_call = sink.emit_pure(
+                vmir::Type::Int,
+                PureInst::FunctionCall(
+                    HeapVal::Empty,
+                    vmir::FunctionCall {
+                        function: tag_fn,
+                        args: vec![base_v],
+                    },
+                ),
+            );
+            let idx = Val::Literal(Literal::Int(num::BigInt::from(tag)));
+            Ok(sink.emit_pure(
+                vmir::Type::Bool,
+                PureInst::Binary(vmir::BinOp::Eq, tag_call, idx),
+            ))
+        }
         P::Ext(ext) => Ext::lower_ext(b, env, sink, hctx, ty, ext),
     }
 }

@@ -21,9 +21,10 @@
 //! and reported in bulk.
 
 use crate::viper::{
-    AssignRhs, Call, Exp, ExpCallKind, ExpKind, Globals, StmtCallKind,
+    AssignRhs, Call, Exp, ExpCallKind, ExpKind, Globals, Ident, StmtCallKind,
     globals::GlobalKind,
     interner::Interner,
+    parsed::ast::InferenceType,
     walk::{AstWalkable, AstWalkerMut},
 };
 
@@ -207,23 +208,49 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                 }
             }
 
-            // Field-access classification: `e.f` must resolve to a Viper
-            // field global. ADT destructors are not yet tracked in
-            // `Globals`; this pass will need to grow once they are.
-            ExpKind::Field(_base, field_name) => {
+            // Field-access classification: `e.f` is either a Viper field
+            // access, an ADT discriminator (`e.is<Ctor>`), or (later) an ADT
+            // destructor. Discriminators are recognised by the `is` prefix +
+            // a known constructor; everything unrecognised is a field error.
+            ExpKind::Field(base, field_name) => {
                 let id = field_name.id();
-                let field_tgt_name = || self.interner.resolve(&id).to_string();
-                match self.globals.resolve(id) {
-                    Some(sym) => {
-                        let sig = sym.signature();
-                        if sig.as_field().is_none() {
-                            self.errors
-                                .push(DisambiguationError::NotAField(field_tgt_name(), sig.kind()));
-                        }
-                    }
-                    None => {
-                        self.errors
-                            .push(DisambiguationError::UnknownField(field_tgt_name()));
+                let is_field = self
+                    .globals
+                    .resolve(id)
+                    .map(|sym| sym.kind())
+                    == Some(GlobalKind::Field);
+                if is_field {
+                    // ok — a genuine field access.
+                } else if let Some(ctor) = self
+                    .interner
+                    .resolve(&id)
+                    .strip_prefix("is")
+                    .and_then(|c| self.globals.ctor_by_name.get(c))
+                    .copied()
+                {
+                    // `e.is<Ctor>` → discriminator on `Ctor`.
+                    let placeholder = Exp {
+                        ty: InferenceType::Unknown,
+                        kind: Box::new(ExpKind::Result),
+                    };
+                    let base = std::mem::replace(base, placeholder);
+                    *exp = ExpKind::AdtDiscriminator(base, Ident::Interned(ctor));
+                } else if self.globals.dtor_by_name.contains_key(&id) {
+                    // `e.f` where `f` is an ADT destructor (constructor field).
+                    let field_name = field_name.clone();
+                    let placeholder = Exp {
+                        ty: InferenceType::Unknown,
+                        kind: Box::new(ExpKind::Result),
+                    };
+                    let base = std::mem::replace(base, placeholder);
+                    *exp = ExpKind::AdtDestructor(base, field_name);
+                } else {
+                    let name = self.interner.resolve(&id).to_string();
+                    match self.globals.resolve(id) {
+                        Some(sym) => self
+                            .errors
+                            .push(DisambiguationError::NotAField(name, sym.kind())),
+                        None => self.errors.push(DisambiguationError::UnknownField(name)),
                     }
                 }
             }

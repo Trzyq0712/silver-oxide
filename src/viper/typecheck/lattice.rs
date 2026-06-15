@@ -1,7 +1,7 @@
 use rusttyc::Constructable;
 use rusttyc::types::{Arity, Partial, Variant};
 
-use crate::viper::typed::Type;
+use crate::viper::typed::{Ident, Type};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ViperTcType {
@@ -10,6 +10,9 @@ pub enum ViperTcType {
     Real,
     Ref,
     Numeric, // supertype of Int and Real
+    /// A domain/ADT type, identified by name. Type arguments are not yet
+    /// tracked (monomorphic ADTs only); see the type-parametric design.
+    Domain(Ident),
     Top,
 }
 
@@ -45,6 +48,7 @@ impl Variant for ViperTcType {
             (Ref, Ref) => Ref,
             (Int, Int) => Int,
             (Real, Real) => Real,
+            (Domain(a), Domain(b)) if a == b => Domain(a),
             (t1, t2) => {
                 return Err(TcTypeErr(format!("Cannot unify {:?} and {:?}", t1, t2)));
             }
@@ -68,6 +72,7 @@ impl Constructable for ViperTcType {
             ViperTcType::Int => Type::Int,
             ViperTcType::Real | ViperTcType::Numeric => Type::Real,
             ViperTcType::Ref => Type::Ref,
+            ViperTcType::Domain(id) => Type::Domain(*id, Vec::new()),
             ViperTcType::Top => {
                 return Err(TcTypeErr("Cannot construct abstract type".to_string()));
             }
@@ -81,6 +86,7 @@ pub fn type_to_tc(ty: &Type) -> ViperTcType {
         Type::Int => ViperTcType::Int,
         Type::Real => ViperTcType::Real,
         Type::Ref => ViperTcType::Ref,
-        Type::Generic(_) | Type::Collection(_) | Type::Domain(..) => ViperTcType::Top,
+        Type::Domain(id, _) => ViperTcType::Domain(*id),
+        Type::Generic(_) | Type::Collection(_) => ViperTcType::Top,
     }
 }

@@ -11,7 +11,7 @@ use lasso::{Rodeo, Spur};
 use std::collections::HashMap;
 use typed_index_collections::TiVec;
 
-use crate::viper::{Globals, Interner, typed};
+use crate::viper::{GlobalSignature, Globals, Interner, typed};
 use crate::vmir;
 
 pub mod errors;
@@ -38,6 +38,10 @@ pub fn translate(
             typed::Declaration::Function(_) | typed::Declaration::Method(_) => {}
         }
     }
+
+    // Phase A2: declare ADTs, their `@tag` functions, constructors, and user
+    // functions, so calls/discriminators resolve in later phases.
+    builder.declare_adts_and_functions();
 
     // Phase B1: emit Resource declarations (predicates + method contracts).
     for decl in &program.0 {
@@ -92,6 +96,12 @@ pub(crate) struct Builder<'a> {
     pub method_requires: HashMap<Spur, vmir::MemberId>,
     /// Maps a method's `Spur` to its `@ensures` Resource MemberId (if any).
     pub method_ensures: HashMap<Spur, vmir::MemberId>,
+    /// Maps an ADT's `Spur` to its synthesized `@tag` Function MemberId.
+    pub adt_tag_fn: HashMap<Spur, vmir::MemberId>,
+    /// Maps a constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
+    pub ctor_tag: HashMap<Spur, (Spur, usize)>,
+    /// ADT metadata for the verifier (tag-fn → ctor → tag index).
+    pub adt_meta: vmir::AdtMeta,
 }
 
 impl<'a> Builder<'a> {
@@ -107,6 +117,9 @@ impl<'a> Builder<'a> {
             field_addr: HashMap::new(),
             method_requires: HashMap::new(),
             method_ensures: HashMap::new(),
+            adt_tag_fn: HashMap::new(),
+            ctor_tag: HashMap::new(),
+            adt_meta: vmir::AdtMeta::default(),
         }
     }
 
@@ -124,6 +137,82 @@ impl<'a> Builder<'a> {
         let slot = &mut self.decls[usize::from(id)];
         debug_assert!(slot.is_none(), "decl slot filled twice");
         *slot = Some(decl);
+    }
+
+    /// Declare VMIR decls for every ADT (a stub `Adt` + a synthesized `@tag`
+    /// function), every ADT constructor, and every user function, populating
+    /// the name map and ADT metadata. ADTs are declared first so a
+    /// constructor can register against its ADT's `@tag` function.
+    fn declare_adts_and_functions(&mut self) {
+        let globals = self.globals;
+        let interner = self.interner;
+        // Deterministic order: by Silver declaration order (global MemberId).
+        let mut entries: Vec<_> = globals.symbol_table.iter().map(|(s, m)| (*s, *m)).collect();
+        entries.sort_by_key(|(_, m)| usize::from(*m));
+
+        // Pass 1: ADTs and their `@tag` functions.
+        for (spur, gmid) in &entries {
+            if let GlobalSignature::Adt(_) = &globals.signatures[*gmid] {
+                let name = interner.resolve(spur).to_string();
+                let adt_id = self.fresh_decl(&name);
+                self.set_decl(adt_id, vmir::Declaration::Adt(vmir::Adt {}));
+                let tag_id = self.fresh_decl(&format!("{name}@tag"));
+                self.set_decl(
+                    tag_id,
+                    vmir::Declaration::Function(vmir::Function {
+                        params: vec![vmir::Type::Ref],
+                        ret: vmir::Type::Int,
+                        body: None,
+                    }),
+                );
+                self.adt_tag_fn.insert(*spur, tag_id);
+                self.adt_meta.tag_fns.insert(tag_id, HashMap::new());
+            }
+        }
+
+        // Pass 2: user functions and ADT constructors.
+        for (spur, gmid) in &entries {
+            match &globals.signatures[*gmid] {
+                GlobalSignature::Function(sig) => {
+                    let name = interner.resolve(spur).to_string();
+                    let id = self.fresh_decl(&name);
+                    let params = sig.params.iter().map(lower_type).collect();
+                    let ret = lower_type(&sig.ret);
+                    self.set_decl(
+                        id,
+                        vmir::Declaration::Function(vmir::Function {
+                            params,
+                            ret,
+                            body: None,
+                        }),
+                    );
+                    self.name_map.insert(*spur, id);
+                }
+                GlobalSignature::AdtConstructor(sig) => {
+                    let name = interner.resolve(spur).to_string();
+                    let id = self.fresh_decl(&name);
+                    let params = sig.params.iter().map(lower_type).collect();
+                    let ret = lower_type(&sig.ret);
+                    self.set_decl(
+                        id,
+                        vmir::Declaration::Function(vmir::Function {
+                            params,
+                            ret,
+                            body: None,
+                        }),
+                    );
+                    self.name_map.insert(*spur, id);
+                    self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
+                    let tag_fn = self.adt_tag_fn[&sig.adt];
+                    self.adt_meta
+                        .tag_fns
+                        .get_mut(&tag_fn)
+                        .expect("adt tag fn declared in pass 1")
+                        .insert(id, sig.tag);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn declare_predicate_accessors(&mut self, p: &typed::Predicate) {
@@ -182,7 +271,7 @@ impl<'a> Builder<'a> {
             pred_id,
             vmir::Declaration::Resource(vmir::Resource {
                 params,
-                requires: None,
+                precond: vmir::Precond::SelfFramed,
                 body,
             }),
         );
@@ -218,7 +307,7 @@ impl<'a> Builder<'a> {
                 req_id,
                 vmir::Declaration::Resource(vmir::Resource {
                     params,
-                    requires: None,
+                    precond: vmir::Precond::SelfFramed,
                     body: Some(body),
                 }),
             );
@@ -244,10 +333,16 @@ impl<'a> Builder<'a> {
             // so a resource named in both requires and ensures isn't counted
             // twice. `heap_base` stays 1 because the verifier still occupies
             // `heaps[0]` with the ctx heap.
-            let resource_requires = self.method_requires.get(&m.name.0).copied().map(|req_id| {
-                let req_args: Vec<vmir::Val> = (0..m.params.len()).map(vmir::Val::Temp).collect();
-                (req_id, req_args)
-            });
+            let precond = self
+                .method_requires
+                .get(&m.name.0)
+                .copied()
+                .map(|req_id| {
+                    let req_args: Vec<vmir::Val> =
+                        (0..m.params.len()).map(vmir::Val::Temp).collect();
+                    vmir::Precond::Ctx(req_id, req_args)
+                })
+                .unwrap_or(vmir::Precond::SelfFramed);
             let body = resource::lower_spatial_ensures(
                 self,
                 &env,
@@ -260,7 +355,7 @@ impl<'a> Builder<'a> {
                 ens_id,
                 vmir::Declaration::Resource(vmir::Resource {
                     params,
-                    requires: resource_requires,
+                    precond,
                     body: Some(body),
                 }),
             );
@@ -289,6 +384,7 @@ impl<'a> Builder<'a> {
         vmir::Program {
             decls,
             interner: self.vmir_interner,
+            adt_meta: self.adt_meta,
         }
     }
 }

@@ -9,7 +9,8 @@ use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
-    Declaration, HeapInst, InstKind, MemberId, Method, Program, PureInst, ResourceBody, Target,
+    Declaration, HeapInst, InstKind, MemberId, Method, Precond, Program, PureInst, ResourceBody,
+    Target,
 };
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
@@ -144,7 +145,7 @@ fn is_schedulable(decl: &Declaration) -> bool {
 fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
     match decl {
         Declaration::Resource(r) => {
-            if let Some((req, _)) = &r.requires {
+            if let Precond::Ctx(req, _) = &r.precond {
                 out.push(*req);
             }
             if let Some(body) = &r.body {
@@ -193,7 +194,8 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
 mod tests {
     use super::*;
     use crate::vmir::{
-        HeapInst, HeapVal, Inst, InstKind, PathConds, Resource, ResourceCall, Sign, Target, write,
+        HeapInst, HeapVal, Inst, InstKind, PathConds, Precond, Resource, ResourceCall, Sign,
+        Target, write,
     };
     use lasso::Rodeo;
     use std::collections::HashSet;
@@ -202,7 +204,10 @@ mod tests {
     fn resource_requiring(req: Option<MemberId>) -> Declaration {
         Declaration::Resource(Resource {
             params: vec![],
-            requires: req.map(|r| (r, vec![])),
+            precond: match req {
+                Some(r) => Precond::Ctx(r, vec![]),
+                None => Precond::SelfFramed,
+            },
             body: None,
         })
     }
@@ -233,6 +238,7 @@ mod tests {
         Program {
             decls: TiVec::from(decls),
             interner,
+            adt_meta: Default::default(),
         }
     }
 

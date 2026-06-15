@@ -614,7 +614,7 @@ pub fn verify_method(
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
-    let mut ctx = VerifyContext::new(&program.interner);
+    let mut ctx = VerifyContext::new(&program.interner, &program.adt_meta);
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -655,7 +655,7 @@ pub fn verify_resource(
         return Ok(None);
     };
 
-    let mut ctx = VerifyContext::new(&program.interner);
+    let mut ctx = VerifyContext::new(&program.interner, &program.adt_meta);
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -772,7 +772,7 @@ mod tests {
     };
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        VerifyContext::new(interner)
+        VerifyContext::new(interner, &vmir::AdtMeta::default())
     }
 
     fn lower(input: &str) -> vmir::Program {
@@ -1391,6 +1391,46 @@ method m(x: Int)
         };
         let certs = build_certs(program);
         verify_method(program, name, m, &certs)
+    }
+
+    #[test]
+    fn adt_discriminator_on_known_constructor() {
+        // `one()` is a known constructor, so `tag(one()) ⇒ 0`; the `istwo`
+        // discriminator desugars to `tag(x) == 1`, which folds to `false`.
+        let input = r#"
+adt MyAdt { one() two() }
+method m()
+{
+    var x: MyAdt := one()
+    assert !x.istwo
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "!one().istwo should verify"
+        );
+    }
+
+    #[test]
+    fn adt_discriminator_wrong_variant_fails() {
+        // `one().istwo` is `false`, so asserting it must fail.
+        let input = r#"
+adt MyAdt { one() two() }
+method m()
+{
+    var x: MyAdt := one()
+    assert x.istwo
+}
+"#;
+        let program = lower(input);
+        assert!(
+            matches!(
+                verify_named_method(&program, "m"),
+                Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
+            ),
+            "asserting one().istwo should fail"
+        );
     }
 
     #[test]

@@ -8,8 +8,30 @@ use std::fmt::{self, Display, Formatter};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub params: Vec<Type>,
-    pub requires: Option<(MemberId, Vec<Val>)>,
+    pub precond: Precond,
     pub body: Option<ResourceBody>,
+}
+
+/// A resource's precondition mode.
+///
+/// - `SelfFramed`: one-state — the body reads only its own footprint. Predicates,
+///   `@requires`, and function preconditions. Snapshottable / foldable.
+/// - `Ctx(req, args)`: two-state — the body additionally reads a context heap
+///   (`HeapVal::Temp(0)`), the delta of the precondition resource `req` applied
+///   to `args` (the caller-supplied pre-state). `@ensures`. Opaque-only; never
+///   snapshotted or folded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Precond {
+    SelfFramed,
+    Ctx(MemberId, Vec<Val>),
+}
+
+impl Resource {
+    /// Whether the body reads only its own footprint (no ctx/pre-state heap).
+    /// Only self-framed resources may be snapshotted / folded / unfolded.
+    pub fn is_self_framed(&self) -> bool {
+        matches!(self.precond, Precond::SelfFramed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -46,9 +68,9 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
             None => Ok(()),
             Some(body) => {
                 write!(f, "[")?;
-                match &self.item.requires {
-                    None => write!(f, "empty")?,
-                    Some((req_id, req_args)) => {
+                match &self.item.precond {
+                    Precond::SelfFramed => write!(f, "empty")?,
+                    Precond::Ctx(req_id, req_args) => {
                         write!(f, "{}(", self.interner.resolve(req_id))?;
                         for (i, arg) in req_args.iter().enumerate() {
                             if i > 0 {

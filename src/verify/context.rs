@@ -9,7 +9,7 @@ use crate::{
         lang::Symbolic,
         rewrite,
     },
-    vmir::{BinOp, FunctionCall, Literal, MemberId, Polarity, Type},
+    vmir::{AdtMeta, BinOp, FunctionCall, Literal, MemberId, Polarity, Type},
 };
 use lasso::Rodeo;
 
@@ -44,10 +44,10 @@ pub(crate) struct VerifyContext<'a> {
 }
 
 impl<'a> VerifyContext<'a> {
-    pub(crate) fn new(interner: &'a Rodeo<MemberId>) -> Self {
+    pub(crate) fn new(interner: &'a Rodeo<MemberId>, adt_meta: &AdtMeta) -> Self {
         Self {
             egraph: egg::EGraph::default(),
-            rules: rewrite::rules(),
+            rules: rewrite::rules(adt_meta),
             fresh_counter: 0,
             interner,
             fresh_types: HashMap::new(),
