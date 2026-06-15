@@ -14,6 +14,10 @@ pub struct AdtMeta {
     /// Per-ADT `@tag` function id → (constructor id → tag index). The tag
     /// reduction `Adt@tag(ctor_C(..)) ⇒ index_C` is generated from this.
     pub tag_fns: HashMap<MemberId, HashMap<MemberId, usize>>,
+    /// Destructor accessor function id → `(constructor id, field index)`. The
+    /// projection reduction `accessor(ctor_C(a0..an)) ⇒ a_index` is generated
+    /// from this.
+    pub dtors: HashMap<MemberId, (MemberId, usize)>,
 }
 
 impl<'a> Display for VmirDisplay<'a, &'a Adt> {

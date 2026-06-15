@@ -239,7 +239,24 @@ pub(crate) fn lower<Ext: PureExt>(
         }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
-        P::AdtDestructor(_, _) => Err(TranslationError::Unsupported("ADT destructor")),
+        P::AdtDestructor(base, field) => {
+            // `e.f` ⇒ `Adt@f(e)` (an accessor FuncApp). The verifier's projection
+            // reduction folds it when `e` is a known constructor.
+            let base_v = lower(b, env, sink, hctx, base)?;
+            let accessor = *b.dtor_accessor.get(&field.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
+            })?;
+            Ok(sink.emit_pure(
+                ty,
+                PureInst::FunctionCall(
+                    HeapVal::Empty,
+                    vmir::FunctionCall {
+                        function: accessor,
+                        args: vec![base_v],
+                    },
+                ),
+            ))
+        }
         P::AdtDiscriminator(base, variant) => {
             // `e.is<Ctor>` ⇒ `Adt@tag(e) == tag_index`. The verifier's tag
             // reduction folds this to a literal when `e` is a known constructor.

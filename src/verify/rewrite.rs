@@ -24,14 +24,27 @@ pub fn rules(adt_meta: &AdtMeta) -> Vec<Rule> {
     for (&tag_fn, ctor_tags) in &adt_meta.tag_fns {
         // `Adt@tag(ctor_C(..)) ⇒ index_C`. FuncApp isn't string-matchable, so
         // both searcher and applier are custom.
-        rules.push(Rewrite::new(
-            format!("tag-{}", usize::from(tag_fn)),
-            TagSearcher { tag_fn },
-            TagApplier {
-                tag_fn,
-                ctor_tags: ctor_tags.clone(),
-            },
-        ).expect("valid tag rewrite"));
+        rules.push(
+            Rewrite::new(
+                format!("tag-{}", usize::from(tag_fn)),
+                UnaryAppSearcher { func: tag_fn },
+                TagApplier {
+                    ctor_tags: ctor_tags.clone(),
+                },
+            )
+            .expect("valid tag rewrite"),
+        );
+    }
+    for (&accessor, &(ctor, index)) in &adt_meta.dtors {
+        // `Adt@f(ctor_C(a0..an)) ⇒ a_index`.
+        rules.push(
+            Rewrite::new(
+                format!("proj-{}", usize::from(accessor)),
+                UnaryAppSearcher { func: accessor },
+                ProjApplier { ctor, index },
+            )
+            .expect("valid proj rewrite"),
+        );
     }
     rules
 }
@@ -122,14 +135,15 @@ fn tag_x() -> Var {
     var("?x")
 }
 
-/// Searcher for `Adt@tag(?x)`: matches any `FuncApp(tag_fn, [x])` node in an
-/// e-class and binds `?x` to the argument. FuncApp isn't string-matchable, so
-/// this is hand-written.
-struct TagSearcher {
-    tag_fn: MemberId,
+/// Searcher for a unary application `func(?x)`: matches any
+/// `FuncApp(func, [x])` node in an e-class and binds `?x` to the argument.
+/// FuncApp isn't string-matchable, so this is hand-written. Shared by the tag
+/// and projection reductions.
+struct UnaryAppSearcher {
+    func: MemberId,
 }
 
-impl Searcher<Symbolic, ConstFold> for TagSearcher {
+impl Searcher<Symbolic, ConstFold> for UnaryAppSearcher {
     fn search_eclass_with_limit(
         &self,
         egraph: &EGraph<Symbolic, ConstFold>,
@@ -139,7 +153,7 @@ impl Searcher<Symbolic, ConstFold> for TagSearcher {
         let mut substs = Vec::new();
         for node in &egraph[eclass].nodes {
             if let Symbolic::FuncApp(f, args) = node
-                && *f == self.tag_fn
+                && *f == self.func
                 && args.len() == 1
             {
                 let mut subst = Subst::default();
@@ -169,7 +183,6 @@ impl Searcher<Symbolic, ConstFold> for TagSearcher {
 /// Applier for the tag reduction: if the argument's e-class holds a constructor
 /// of this ADT, union the `tag(..)` e-class with the constructor's tag literal.
 struct TagApplier {
-    tag_fn: MemberId,
     ctor_tags: HashMap<MemberId, usize>,
 }
 
@@ -182,7 +195,6 @@ impl Applier<Symbolic, ConstFold> for TagApplier {
         _searcher_ast: Option<&PatternAst<Symbolic>>,
         _rule_name: Symbol,
     ) -> Vec<Id> {
-        let _ = self.tag_fn; // identity already enforced by the searcher
         let xc = egraph.find(subst[tag_x()]);
         let mut tag = None;
         for node in &egraph[xc].nodes {
@@ -196,6 +208,47 @@ impl Applier<Symbolic, ConstFold> for TagApplier {
         let Some(t) = tag else { return vec![] };
         let lit = egraph.add(Symbolic::Lit(Literal::Int(num::BigInt::from(t))));
         if egraph.union(eclass, lit) {
+            vec![egraph.find(eclass)]
+        } else {
+            vec![]
+        }
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![tag_x()]
+    }
+}
+
+/// Applier for the projection reduction: if the argument's e-class holds the
+/// matching constructor `ctor`, union the `accessor(..)` e-class with that
+/// constructor's `index`-th argument.
+struct ProjApplier {
+    ctor: MemberId,
+    index: usize,
+}
+
+impl Applier<Symbolic, ConstFold> for ProjApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        let xc = egraph.find(subst[tag_x()]);
+        let mut field = None;
+        for node in &egraph[xc].nodes {
+            if let Symbolic::FuncApp(c, args) = node
+                && *c == self.ctor
+                && self.index < args.len()
+            {
+                field = Some(args[self.index]);
+                break;
+            }
+        }
+        let Some(field) = field else { return vec![] };
+        if egraph.union(eclass, field) {
             vec![egraph.find(eclass)]
         } else {
             vec![]

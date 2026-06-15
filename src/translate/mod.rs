@@ -100,6 +100,8 @@ pub(crate) struct Builder<'a> {
     pub adt_tag_fn: HashMap<Spur, vmir::MemberId>,
     /// Maps a constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
+    /// Maps a destructor's `Spur` to its synthesized accessor Function MemberId.
+    pub dtor_accessor: HashMap<Spur, vmir::MemberId>,
     /// ADT metadata for the verifier (tag-fn → ctor → tag index).
     pub adt_meta: vmir::AdtMeta,
 }
@@ -119,6 +121,7 @@ impl<'a> Builder<'a> {
             method_ensures: HashMap::new(),
             adt_tag_fn: HashMap::new(),
             ctor_tag: HashMap::new(),
+            dtor_accessor: HashMap::new(),
             adt_meta: vmir::AdtMeta::default(),
         }
     }
@@ -212,6 +215,28 @@ impl<'a> Builder<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // Pass 3: destructor accessor functions (constructors are now in the
+        // name map). One accessor per destructor name; `accessor(ctor(..))`
+        // projects the corresponding field.
+        let mut dtors: Vec<_> = globals.dtor_by_name.iter().collect();
+        dtors.sort_by_key(|(s, _)| interner.resolve(s).to_string());
+        for (dtor_spur, info) in dtors {
+            let adt_name = interner.resolve(&info.adt);
+            let dtor_name = interner.resolve(dtor_spur);
+            let id = self.fresh_decl(&format!("{adt_name}@{dtor_name}"));
+            self.set_decl(
+                id,
+                vmir::Declaration::Function(vmir::Function {
+                    params: vec![vmir::Type::Ref],
+                    ret: lower_type(&info.ty),
+                    body: None,
+                }),
+            );
+            self.dtor_accessor.insert(*dtor_spur, id);
+            let ctor_id = self.name_map[&info.ctor];
+            self.adt_meta.dtors.insert(id, (ctor_id, info.index));
         }
     }
 

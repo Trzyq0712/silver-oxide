@@ -1434,6 +1434,44 @@ method m()
     }
 
     #[test]
+    fn adt_destructor_projects_constructor_field() {
+        // `mk(3,4).fst` projects to `3` via the projection reduction.
+        let input = r#"
+adt Pair { mk(fst: Int, snd: Int) }
+method m()
+{
+    var p: Pair := mk(3, 4)
+    assert p.fst == 3
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "mk(3,4).fst == 3 should verify"
+        );
+    }
+
+    #[test]
+    fn adt_destructor_wrong_field_value_fails() {
+        let input = r#"
+adt Pair { mk(fst: Int, snd: Int) }
+method m()
+{
+    var p: Pair := mk(3, 4)
+    assert p.fst == 4
+}
+"#;
+        let program = lower(input);
+        assert!(
+            matches!(
+                verify_named_method(&program, "m"),
+                Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
+            ),
+            "mk(3,4).fst == 4 should fail"
+        );
+    }
+
+    #[test]
     fn inline_inhale_then_exhale_roundtrips() {
         // Inhale a field + a fact about it (read against the growing heap), then
         // exhale the fact (read against the pre-exhale heap) and the permission.
