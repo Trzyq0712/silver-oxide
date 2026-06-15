@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapInst, PureInst, ResourceCall, Type, Val};
+use crate::vmir::{HeapInst, PureInst, Type, Val};
 
 use std::fmt::{self, Display, Formatter};
 
@@ -20,8 +20,6 @@ pub enum InstKind {
     Assume(Val),
     /// Assert a boolean obligation. Produces no value.
     Assert(Val),
-    /// Call a resource, producing a `(heap_delta, bool)` pair.
-    ResourceCall(ResourceCall),
 }
 
 /// Conjunction of literals over previously-emitted `Val`s.
@@ -81,28 +79,11 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                     e_idx += 1;
                 }
                 InstKind::Heap(hi) => {
-                    writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), hi)?;
+                    writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), self.with(hi))?;
                     h_idx += 1;
                 }
                 InstKind::Assume(v) => writeln!(f, "  {}assume {v}", PcPrefix(&inst.pc))?,
                 InstKind::Assert(v) => writeln!(f, "  {}assert {v}", PcPrefix(&inst.pc))?,
-                InstKind::ResourceCall(call) => {
-                    write!(
-                        f,
-                        "  (h{h_idx}, e{e_idx}) := {}call {}(",
-                        PcPrefix(&inst.pc),
-                        self.interner.resolve(&call.resource),
-                    )?;
-                    for (i, arg) in call.args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{arg}")?;
-                    }
-                    writeln!(f, ")[{}]", call.ctx_heap)?;
-                    e_idx += 1;
-                    h_idx += 1;
-                }
             }
         }
         Ok(())

@@ -8,7 +8,7 @@ use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
     self, FALSE, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Polarity, PureInst,
-    ResourceCall, TRUE, Val,
+    ResourceCall, Sign, TRUE, Target, Val,
 };
 
 /// A mutable sink for emitted instructions plus the running counters. The
@@ -112,11 +112,26 @@ impl Sink {
         self.insts.push(Inst::new(pc, InstKind::Assert(v)));
     }
 
-    /// Emit a `ResourceCall`, producing its `(heap_delta, bool)` pair.
-    pub fn emit_resource_call(&mut self, call: ResourceCall) -> (HeapVal, Val) {
-        let pc = self.guard();
-        self.insts.push(Inst::new(pc, InstKind::ResourceCall(call)));
-        (self.next_heap_temp(), self.next_val_temp())
+    /// Emit `h := base <sign> acc <call> <perm>`: combine the resource's delta
+    /// onto `base`, implicitly assuming (`Add`) or asserting (`Sub`) its bool.
+    /// `Add` is total; `Sub` carries the running pc as its side-condition guard.
+    pub fn emit_resource_combine(
+        &mut self,
+        base: HeapVal,
+        sign: Sign,
+        call: ResourceCall,
+        perm: Val,
+    ) -> HeapVal {
+        let inst = HeapInst::Combine {
+            base,
+            sign,
+            target: Target::Resource(call),
+            perm,
+        };
+        match sign {
+            Sign::Add => self.emit_heap(inst),
+            Sign::Sub => self.emit_heap_guarded(inst),
+        }
     }
 }
 

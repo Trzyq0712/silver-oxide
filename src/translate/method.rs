@@ -35,22 +35,17 @@ pub(crate) fn lower_method(
     }
 
     let mut current_heap: HeapVal = HeapVal::Empty;
-    // Heap delta produced by this method's `@requires` resource call,
-    // forwarded as the `@ensures` resource's ctx_heap (since `@ensures`
-    // declares `requires: Some(@requires)`). `HeapVal::Empty` when the
-    // method has no precondition.
-    let mut pre_heap: HeapVal = HeapVal::Empty;
 
-    // Inhale this method's own precondition: call self@requires, add delta,
-    // assume bool. The `@requires` resource has no precondition itself, so
-    // its ctx_heap is `HeapVal::Empty`.
+    // Inhale this method's own precondition: `h := current + acc self@requires`
+    // (implicitly assumes the requires bool).
     if let Some(&req_id) = b.method_requires.get(&m.name.0) {
-        let (h_pre, b_pre) =
-            emit_resource_call(&mut sink, req_id, HeapVal::Empty, param_vals.clone());
-        let h_new = sink.emit_heap(HeapInst::Add(current_heap, h_pre));
-        sink.emit_assume(b_pre);
-        current_heap = h_new;
-        pre_heap = h_pre;
+        current_heap = emit_resource_combine(
+            &mut sink,
+            vmir::Sign::Add,
+            req_id,
+            current_heap,
+            param_vals.clone(),
+        );
     }
 
     // Baseline for unlabeled `old`: the heap right after the precondition is
@@ -70,14 +65,12 @@ pub(crate) fn lower_method(
         )?;
     }
 
-    // Exhale this method's own postcondition: call self@ensures, sub delta,
-    // assert bool. Its ctx_heap is the requires delta (`pre_heap`).
+    // Exhale this method's own postcondition: `h := current - acc self@ensures`
+    // (implicitly asserts the ensures bool).
     if let Some(&ens_id) = b.method_ensures.get(&m.name.0) {
         let mut ens_args = param_vals;
         ens_args.extend(ret_vals);
-        let (h_post, b_post) = emit_resource_call(&mut sink, ens_id, pre_heap, ens_args);
-        let _h_new = sink.emit_heap_guarded(HeapInst::Sub(current_heap, h_post));
-        sink.emit_assert(b_post);
+        let _h_new = emit_resource_combine(&mut sink, vmir::Sign::Sub, ens_id, current_heap, ens_args);
     }
 
     Ok(vmir::Method { insts: sink.insts })
@@ -328,8 +321,13 @@ fn lower_new(
         typed::StarOrFields::Fields(fields) => {
             let mut heap = current_heap;
             for f in fields {
-                let delta = resource::field_acc_delta(b, sink, v.clone(), f.0, vmir::write())?;
-                heap = sink.emit_heap(HeapInst::Add(heap, delta));
+                let (loc, perm) = resource::field_acc(b, sink, v.clone(), f.0, vmir::write())?;
+                heap = sink.emit_heap(HeapInst::Combine {
+                    base: heap,
+                    sign: vmir::Sign::Add,
+                    target: vmir::Target::Loc(loc),
+                    perm,
+                });
             }
             Ok(heap)
         }
@@ -362,18 +360,11 @@ fn lower_method_call(
     }
 
     let mut heap = current_heap;
-    // Callee's requires delta; forwarded as ctx_heap to the callee's
-    // ensures (whose `Resource.requires` is the requires resource).
-    let mut callee_pre_heap: HeapVal = HeapVal::Empty;
 
-    // Exhale precondition (if present): call m@requires, sub delta, assert
-    // bool. `@requires` has no precondition itself → ctx_heap is empty.
+    // Exhale precondition (if present): `h := heap - acc m@requires(args)`
+    // (implicitly asserts the requires bool).
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
-        let (h_pre, b_pre) = emit_resource_call(sink, req_id, HeapVal::Empty, args.clone());
-        let h_new = sink.emit_heap_guarded(HeapInst::Sub(heap, h_pre));
-        sink.emit_assert(b_pre);
-        heap = h_new;
-        callee_pre_heap = h_pre;
+        heap = emit_resource_combine(sink, vmir::Sign::Sub, req_id, heap, args.clone());
     }
 
     // Allocate fresh return values BEFORE the post-condition inhale.
@@ -384,31 +375,39 @@ fn lower_method_call(
         ret_vals.push(v);
     }
 
-    // Inhale postcondition (if present): call m@ensures, add delta, assume
-    // bool. ctx_heap is the requires delta.
+    // Inhale postcondition (if present): `h := heap + acc m@ensures(args, rets)`
+    // (implicitly assumes the ensures bool).
     if let Some(&ens_id) = b.method_ensures.get(&call.name.0) {
         let mut ens_args = args.clone();
         ens_args.extend(ret_vals.iter().cloned());
-        let (h_post, b_post) = emit_resource_call(sink, ens_id, callee_pre_heap, ens_args);
-        let h_new = sink.emit_heap(HeapInst::Add(heap, h_post));
-        sink.emit_assume(b_post);
-        heap = h_new;
+        heap = emit_resource_combine(sink, vmir::Sign::Add, ens_id, heap, ens_args);
     }
 
     Ok(heap)
 }
 
-/// Emit a `ResourceCall` instruction that produces both a `HeapVal::Temp` and
-/// a `Val::Temp`. Returns the produced pair.
-fn emit_resource_call(
+/// Emit `h := base <sign> acc <resource>(args) write`: combine the resource's
+/// full-permission delta onto `base`, implicitly assuming (`Add`) or asserting
+/// (`Sub`) its boolean. Returns the resulting heap.
+///
+/// `ctx_heap` is set to `base`; the verifier currently ignores it (resource
+/// certificates are self-contained, verified against an empty context heap), so
+/// it is bookkeeping only until ctx heaps become live.
+fn emit_resource_combine(
     sink: &mut Sink,
+    sign: vmir::Sign,
     resource: vmir::MemberId,
-    ctx_heap: HeapVal,
+    base: HeapVal,
     args: Vec<Val>,
-) -> (HeapVal, Val) {
-    sink.emit_resource_call(ResourceCall {
-        resource,
-        ctx_heap,
-        args,
-    })
+) -> HeapVal {
+    sink.emit_resource_combine(
+        base,
+        sign,
+        ResourceCall {
+            resource,
+            ctx_heap: base,
+            args,
+        },
+        vmir::write(),
+    )
 }

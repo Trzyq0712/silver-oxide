@@ -45,6 +45,10 @@ pub fn rules() -> Vec<Rule> {
         // x + 0 => x  (Real zero literal `0/1`; `real(0)` const-folds to it)
         rw!("add-zero-real-r"; "(+ ?x 0/1)" => "?x"),
         rw!("add-zero-real-l"; "(+ 0/1 ?x)" => "?x"),
+        // x * 1 => x  (Real one literal `1/1`; resource-delta perm scaling by a
+        // full permission `write` folds away)
+        rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
+        rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
         // (a == b) proven true  =>  a ≡ b   (congruence)
         rw!("eq-true-union"; "(== ?a ?b)" => {
             UnionEqArgs { a: var("?a"), b: var("?b") }

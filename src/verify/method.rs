@@ -9,8 +9,8 @@ use crate::{
         viz::Snapshotter,
     },
     vmir::{
-        self, Acc, Assign, BinOp, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal,
-        MemberId, Method, PathConds, Polarity, PureInst, Resource, ResourceCall, Type, Val,
+        self, Assign, BinOp, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal, MemberId,
+        Method, PathConds, Polarity, PureInst, Resource, ResourceCall, Sign, Target, Type, Val,
     },
 };
 
@@ -126,14 +126,13 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
 }
 
 /// Heaps to visualize for an instruction, labeled as in VMIR (`h0`, `h1`, …).
-/// For heap `add`/`sub` this is the two operands plus the result; for any other
+/// For a heap `combine` this is the base operand plus the result; for any other
 /// instruction it is the current working heap (if any). Called after the
 /// instruction has been evaluated, so the result heap sits at `heaps_before`.
 fn display_heaps(state: &EvalState, kind: &InstKind, heaps_before: usize) -> Vec<(String, Heap)> {
     match kind {
-        InstKind::Heap(HeapInst::Add(h1, h2)) | InstKind::Heap(HeapInst::Sub(h1, h2)) => vec![
-            (h1.to_string(), get_heap(state, h1)),
-            (h2.to_string(), get_heap(state, h2)),
+        InstKind::Heap(HeapInst::Combine { base, .. }) => vec![
+            (base.to_string(), get_heap(state, base)),
             (
                 format!("h{heaps_before}"),
                 state.heaps[heaps_before].clone(),
@@ -239,10 +238,12 @@ fn eval_pure_inst(
     }
 }
 
-fn heap_acc(ctx: &mut VerifyContext<'_>, acc: &Acc, state: &EvalState) -> Heap {
-    let addr = state.get_val(ctx, &acc.loc);
-    let perm = state.get_val(ctx, &acc.perm);
-    // TODO: thread the snapshot's actual value type once `Acc` carries it.
+/// Singleton heap for `acc loc perm`: one chunk at `loc` with permission `perm`
+/// and a fresh held value.
+fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalState) -> Heap {
+    let addr = state.get_val(ctx, loc);
+    let perm = state.get_val(ctx, perm);
+    // TODO: thread the snapshot's actual value type once the target carries it.
     let value = ctx.fresh_symbolic_value(Type::Int);
     Heap::empty().with_chunk(addr, Chunk::new(perm, value))
 }
@@ -409,27 +410,33 @@ fn eval_heap_inst(
     pc: &PathConds,
 ) -> Result<Heap, VerifyError> {
     match inst {
-        HeapInst::Acc(acc) => Ok(heap_acc(ctx, acc, state)),
-        HeapInst::Add(h1, h2) => {
-            let l = get_heap(state, h1);
-            let r = get_heap(state, h2);
+        // `base ± acc loc perm`: build the single chunk, then union (Add) or
+        // subtract (Sub) it. The resource-target case is method-only (it needs
+        // the program + certificates) and is handled in `eval_method_inst`.
+        HeapInst::Combine {
+            base,
+            sign,
+            target: Target::Loc(loc),
+            perm,
+        } => {
+            let base_h = get_heap(state, base);
+            let chunk = heap_acc(ctx, loc, perm, state);
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
-            Ok(heap_union(ctx, &l, &r, &pc_lits))
+            match sign {
+                Sign::Add => Ok(heap_union(ctx, &base_h, &chunk, &pc_lits)),
+                Sign::Sub => heap_subtract(ctx, &base_h, &chunk, &pc_lits),
+            }
         }
-        HeapInst::Sub(h1, h2) => {
-            let l = get_heap(state, h1);
-            let r = get_heap(state, h2);
-            let pc_lits: Vec<(egg::Id, Polarity)> = pc
-                .conds
-                .iter()
-                .map(|(v, p)| (state.get_val(ctx, v), *p))
-                .collect();
-            heap_subtract(ctx, &l, &r, &pc_lits)
-        }
+        HeapInst::Combine {
+            target: Target::Resource(_),
+            ..
+        } => Err(VerifyError::Unimplemented(
+            "resource combine outside method body",
+        )),
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).
         HeapInst::Assign(heap, Assign { loc, val }) => {
@@ -473,7 +480,7 @@ fn eval_resource_body_inst(
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
         }
-        InstKind::Assume(_) | InstKind::Assert(_) | InstKind::ResourceCall(_) => {
+        InstKind::Assume(_) | InstKind::Assert(_) => {
             return Err(VerifyError::Unimplemented(
                 "effectful inst in resource body",
             ));
@@ -526,6 +533,43 @@ fn eval_method_inst(
             let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id);
         }
+        // `base ± acc <resource>(args) perm`: graft the resource's certificate,
+        // scale its delta by `perm`, union (Add) / subtract (Sub) against `base`,
+        // and implicitly assume (Add) / assert (Sub) the resource's boolean.
+        InstKind::Heap(HeapInst::Combine {
+            base,
+            sign,
+            target: Target::Resource(call),
+            perm,
+        }) => {
+            let base_h = get_heap(state, base);
+            let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
+            let scale = state.get_val(ctx, perm);
+            let scaled = scale_heap_perm(ctx, &delta, scale);
+            let pc_lits: Vec<(egg::Id, Polarity)> = inst
+                .pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            let out = match sign {
+                Sign::Add => heap_union(ctx, &base_h, &scaled, &pc_lits),
+                Sign::Sub => heap_subtract(ctx, &base_h, &scaled, &pc_lits)?,
+            };
+            match sign {
+                Sign::Add => {
+                    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+                    ctx.egraph.union(bool_id, true_);
+                    ctx.egraph.rebuild();
+                }
+                Sign::Sub => {
+                    if !ctx.prove_under_pc(bool_id, &pc_lits) {
+                        return Err(VerifyError::AssertionFailed);
+                    }
+                }
+            }
+            state.push_heap(out);
+        }
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -548,13 +592,20 @@ fn eval_method_inst(
                 return Err(VerifyError::AssertionFailed);
             }
         }
-        InstKind::ResourceCall(call) => {
-            let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
-            state.push_heap(delta);
-            state.push_val(bool_id);
-        }
     }
     Ok(())
+}
+
+/// Scale every chunk's permission in `h` by `scale` (`perm := scale * perm`),
+/// leaving values untouched. For the common `scale = 1` case the `1 * x → x`
+/// rewrite folds the multiply away.
+fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Heap {
+    let mut out = Heap::empty();
+    for (addr, chunk) in h.entries() {
+        let perm = ctx.add(Symbolic::Binary(BinOp::Mult, [scale, chunk.perm]));
+        out = out.with_chunk(addr, Chunk::new(perm, chunk.value));
+    }
+    out
 }
 
 pub fn verify_method(
@@ -682,8 +733,8 @@ fn inst_obligations(
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
     match kind {
         // `not(perm < 0)` desugared to an `Ite`.
-        InstKind::Heap(HeapInst::Acc(acc)) => {
-            let perm = state.get_val(ctx, &acc.perm);
+        InstKind::Heap(HeapInst::Combine { perm, .. }) => {
+            let perm = state.get_val(ctx, perm);
             let zero = zero_real(ctx);
             let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));
             let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));

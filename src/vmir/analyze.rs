@@ -8,7 +8,9 @@
 use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::prelude::DiGraphMap;
 
-use crate::vmir::{Declaration, InstKind, MemberId, Method, Program, PureInst, ResourceBody};
+use crate::vmir::{
+    Declaration, HeapInst, InstKind, MemberId, Method, Program, PureInst, ResourceBody, Target,
+};
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
 /// dependent. Acyclic once produced by [`analyze`].
@@ -165,7 +167,10 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
     for inst in &body.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::ResourceCall(c) => out.push(c.resource),
+            InstKind::Heap(HeapInst::Combine {
+                target: Target::Resource(c),
+                ..
+            }) => out.push(c.resource),
             _ => {}
         }
     }
@@ -175,7 +180,10 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
     for inst in &m.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::ResourceCall(c) => out.push(c.resource),
+            InstKind::Heap(HeapInst::Combine {
+                target: Target::Resource(c),
+                ..
+            }) => out.push(c.resource),
             _ => {}
         }
     }
@@ -184,7 +192,9 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmir::{HeapVal, Inst, InstKind, PathConds, Resource, ResourceCall};
+    use crate::vmir::{
+        HeapInst, HeapVal, Inst, InstKind, PathConds, Resource, ResourceCall, Sign, Target, write,
+    };
     use lasso::Rodeo;
     use std::collections::HashSet;
     use typed_index_collections::TiVec;
@@ -205,7 +215,12 @@ mod tests {
         };
         let inst: Inst = Inst {
             pc: PathConds::default(),
-            kind: InstKind::ResourceCall(call),
+            kind: InstKind::Heap(HeapInst::Combine {
+                base: HeapVal::Empty,
+                sign: Sign::Add,
+                target: Target::Resource(call),
+                perm: write(),
+            }),
         };
         Declaration::Method(Method { insts: vec![inst] })
     }

@@ -13,7 +13,7 @@ pub mod display;
 
 pub use ty::Type;
 
-pub use heap::{Acc, Assign, HeapInst, HeapVal};
+pub use heap::{Assign, HeapInst, HeapVal, Sign, Target};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::Adt;

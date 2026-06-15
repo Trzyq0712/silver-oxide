@@ -8,7 +8,8 @@ use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PureExt, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
-    self, Acc, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, TRUE, Type, Val, none,
+    self, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Target, Type,
+    Val, none,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -127,15 +128,24 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     let hctx = mode.heap_ctx(acc_heap, old);
     match &*exp.0 {
         S::Acc(res, perm) => {
-            let delta = lower_acc(b, env, sink, hctx, res, perm)?;
+            let (loc, perm) = lower_acc(b, env, sink, hctx, res, perm)?;
             // Inhale adds the chunk; exhale subtracts it (so a later `perm`
             // observes the reduced heap). The add/sub is unconditional — the
             // branch lives in the (gated) permission fraction.
-            let h_out = match mode {
-                SpatialMode::Inhale => sink.emit_heap(HeapInst::Add(acc_heap, delta)),
-                SpatialMode::Exhale { .. } => {
-                    sink.emit_heap_guarded(HeapInst::Sub(acc_heap, delta))
-                }
+            let (sign, guarded) = match mode {
+                SpatialMode::Inhale => (Sign::Add, false),
+                SpatialMode::Exhale { .. } => (Sign::Sub, true),
+            };
+            let inst = HeapInst::Combine {
+                base: acc_heap,
+                sign,
+                target: Target::Loc(loc),
+                perm,
+            };
+            let h_out = if guarded {
+                sink.emit_heap_guarded(inst)
+            } else {
+                sink.emit_heap(inst)
             };
             Ok((h_out, None))
         }
@@ -217,6 +227,8 @@ fn gate_perm_by_pc(sink: &mut Sink, perm: Val) -> Val {
     v
 }
 
+/// Lower `acc(res, perm)` to its location and (pc-gated) permission amount. The
+/// caller emits the `HeapInst::Combine` that adds/subtracts the chunk.
 fn lower_acc<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -224,14 +236,11 @@ fn lower_acc<Ext: PureExt>(
     hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
-) -> Result<HeapVal, TranslationError> {
+) -> Result<(Val, Val), TranslationError> {
     let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
     let perm_val = gate_perm_by_pc(sink, perm_val);
     let addr = lower_resource_addr(b, env, sink, hctx, res)?;
-    Ok(sink.emit_heap_guarded(HeapInst::Acc(Acc {
-        loc: addr,
-        perm: perm_val,
-    })))
+    Ok((addr, perm_val))
 }
 
 /// Lower a `ResourceExp` to its address: the `@addr` function applied to the
@@ -381,16 +390,16 @@ pub(crate) fn field_addr(
     ))
 }
 
-/// Emit the single-chunk heap delta for `acc(base.fname, perm)`: the field's
-/// `@addr` function applied to `base`, followed by a `HeapInst::Acc`. Returns
-/// the produced delta heap. Shared by `lower_acc` and `new(...)` lowering.
-pub(crate) fn field_acc_delta(
+/// Lower `acc(base.fname, perm)` to its `(loc, perm)`: the field's `@addr`
+/// function applied to `base`, paired with the permission amount. The caller
+/// emits the `HeapInst::Combine`. Shared by `new(...)` lowering.
+pub(crate) fn field_acc(
     b: &Builder<'_>,
     sink: &mut Sink,
     base: Val,
     fname: Spur,
     perm: Val,
-) -> Result<HeapVal, TranslationError> {
+) -> Result<(Val, Val), TranslationError> {
     let addr = field_addr(b, sink, base, fname)?;
-    Ok(sink.emit_heap_guarded(HeapInst::Acc(Acc { loc: addr, perm })))
+    Ok((addr, perm))
 }
