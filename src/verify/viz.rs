@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
 use crate::verify::lang::Symbolic;
+use crate::vmir::display::VmirDisplay;
 use crate::vmir::{MemberId, Type};
 
 pub(crate) struct Snapshotter {
@@ -80,13 +81,21 @@ impl Snapshotter {
             .to_string();
 
         // Resolve `FuncApp` member ids (rendered `fn<id>(..)` by `Symbolic`'s
-        // type-free `Display`) to their source names — the viz holds the
-        // interner, so the e-graph itself need not.
+        // type-free `Display`) to their source names, and annotate `Fresh<id>`
+        // nodes with their type — both live in the viz/context oracles, so the
+        // e-graph itself need not carry them.
         let mut funcs: HashSet<MemberId> = HashSet::new();
+        let mut fresh: HashSet<u32> = HashSet::new();
         for class in ctx.egraph.classes() {
             for node in &class.nodes {
-                if let Symbolic::FuncApp(m, _) = node {
-                    funcs.insert(*m);
+                match node {
+                    Symbolic::FuncApp(m, _) => {
+                        funcs.insert(*m);
+                    }
+                    Symbolic::Fresh(u) => {
+                        fresh.insert(*u);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -95,6 +104,15 @@ impl Snapshotter {
                 &format!("fn{}(..)", m.0),
                 &format!("{}(..)", escape(ctx.interner.resolve(&m))),
             );
+        }
+        // `Symbolic` renders a fresh value as `fresh<id>`; append its type from
+        // the `fresh_types` oracle. Match the trailing `"` so `fresh1` doesn't
+        // also rewrite `fresh10`.
+        for u in fresh {
+            if let Some(ty) = ctx.fresh_types.get(&u) {
+                let label = format!("fresh{u}: {}", VmirDisplay::new(ty, ctx.interner));
+                dot = dot.replace(&format!("fresh{u}\""), &format!("{}\"", escape(&label)));
+            }
         }
 
         // Heap subgraphs (one per labeled heap), injected right after egg's
