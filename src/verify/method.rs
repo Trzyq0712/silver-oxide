@@ -1643,6 +1643,34 @@ method m(x: Ref)
     }
 
     #[test]
+    fn fold_unfold_fractional_with_pure_fact() {
+        // Bare `fold`/`unfold P(x)` syntax, a predicate carrying a pure fact,
+        // unfolding an opaque (requires-held) predicate, and a fractional
+        // exhale/unfold round-trip preserving the snapshot value. (cases/folds.vpr)
+        let input = r#"
+field f: Int
+predicate pos(x: Ref) { acc(x.f) && x.f > 0 }
+method m(x: Ref)
+    requires pos(x)
+{
+    unfold pos(x)
+    assert x.f > 0
+    x.f := 10
+    fold pos(x)
+    exhale acc(pos(x), 1/2)
+    unfold acc(pos(x), 1/2)
+    assert x.f > 0
+    assert x.f == 10
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "folds.vpr scenario should verify"
+        );
+    }
+
+    #[test]
     fn inline_inhale_then_exhale_roundtrips() {
         // Inhale a field + a fact about it (read against the growing heap), then
         // exhale the fact (read against the pre-exhale heap) and the permission.

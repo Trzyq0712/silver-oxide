@@ -86,6 +86,12 @@ peg::parser! {
                 AccExp { loc: Exp::impure(loc), perm: perm.unwrap_or_else(ExpKind::write) }
             }
 
+        /// A `fold`/`unfold` target: either `acc(P(args), perm)` or a bare
+        /// predicate instance `P(args)` (full permission).
+        rule fold_target() -> AccExp
+            = e:acc_exp() { e }
+            / loc:suffix_exp() { AccExp { loc: Exp::impure(loc), perm: ExpKind::write() } }
+
         rule trigger() -> Trigger = "{" _ es:(exp() ** comma()) _ "}" { Trigger { exp: es } }
 
 
@@ -237,8 +243,8 @@ peg::parser! {
             / kw(<"assume">) _ e:exp() { Statement::Assume(e)}
             / kw(<"inhale">) _ e:exp() { Statement::Inhale(e)}
             / kw(<"exhale">) _ e:exp() { Statement::Exhale(e)}
-            / kw(<"fold">) _ e:acc_exp() { Statement::Fold(e)}
-            / kw(<"unfold">) _ e:acc_exp() { Statement::Unfold(e)}
+            / kw(<"fold">) _ e:fold_target() { Statement::Fold(e)}
+            / kw(<"unfold">) _ e:fold_target() { Statement::Unfold(e)}
             / kw(<"goto">) _ id:label() { Statement::Goto(id)}
             / kw(<"label">) _ id:label() _ invs:(invariant() ** _) { Statement::Label(IdnDecl(id), invs)}
             / kw(<"var">) _ args:(formal_arg() ** comma()) _ e:(":=" _ e:assign_rhs() {e})? { Statement::Var(args, e)}
