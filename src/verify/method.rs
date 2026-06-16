@@ -240,11 +240,34 @@ fn eval_pure_inst(
 
 /// Singleton heap for `acc loc perm`: one chunk at `loc` with permission `perm`
 /// and a fresh held value.
+/// The declared return type of a `Function` declaration (`Int` fallback). Used
+/// to type the synthesized `@addr` / snapshot `cons`/`proj` applications.
+fn decl_ret_ty(program: &vmir::Program, id: MemberId) -> Type {
+    match &program.decls[id] {
+        Declaration::Function(f) => f.ret.clone(),
+        _ => Type::Int,
+    }
+}
+
 fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalState) -> Heap {
     let addr = state.get_val(ctx, loc);
     let perm = state.get_val(ctx, perm);
-    // TODO: thread the snapshot's actual value type once the target carries it.
-    let value = ctx.fresh_symbolic_value(Type::Int);
+    // The held value's type is the `T` in the location's `Addr<T>` type (the
+    // `@addr` function's return type) — e.g. a field's type, or a predicate's
+    // `@snap`. Fall back to `Int` if the location type can't be inferred.
+    let value_ty = crate::verify::context::infer_type(
+        &ctx.egraph,
+        &ctx.fresh_types,
+        &ctx.func_ret_types,
+        addr,
+        &mut HashMap::new(),
+    )
+    .and_then(|t| match t {
+        Type::Addr(inner) => Some(*inner),
+        _ => None,
+    })
+    .unwrap_or(Type::Int);
+    let value = ctx.fresh_symbolic_value(value_ty);
     Heap::empty().with_chunk(addr, Chunk::new(perm, value))
 }
 
@@ -616,8 +639,8 @@ fn eval_method_inst(
                 return Err(VerifyError::AssertionFailed);
             }
             let cons_args: Box<[egg::Id]> = values.into_iter().collect();
-            let snap = ctx.add_func_app_id(snap_cons, Type::Int, cons_args);
-            let pred_addr = ctx.add_func_app_id(addr_fn, Type::Int, args.into());
+            let snap = ctx.add_func_app_id(snap_cons, decl_ret_ty(program, snap_cons), cons_args);
+            let pred_addr = ctx.add_func_app_id(addr_fn, decl_ret_ty(program, addr_fn), args.into());
             let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, snap));
             let out = heap_union(ctx, &subtracted, &pred_chunk, &pc_lits);
             state.push_heap(out);
@@ -642,7 +665,8 @@ fn eval_method_inst(
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-            let pred_addr = ctx.add_func_app_id(addr_fn, Type::Int, args.clone().into());
+            let pred_addr =
+                ctx.add_func_app_id(addr_fn, decl_ret_ty(program, addr_fn), args.clone().into());
             let canon = canonicalize_heap(ctx, &base_h, &[]);
             let s = canon
                 .chunk(ctx.egraph.find(pred_addr))
@@ -658,7 +682,7 @@ fn eval_method_inst(
             let mut out = subtracted;
             let mut values = Vec::with_capacity(fp.len());
             for (i, &(addr, bperm)) in fp.iter().enumerate() {
-                let pv = ctx.add_func_app_id(projs[i], Type::Int, Box::new([s]));
+                let pv = ctx.add_func_app_id(projs[i], decl_ret_ty(program, projs[i]), Box::new([s]));
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 let chunk = Heap::empty().with_chunk(addr, Chunk::new(need, pv));
                 out = heap_union(ctx, &out, &chunk, &pc_lits);
