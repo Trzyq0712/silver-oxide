@@ -275,7 +275,7 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             Ok(sink.emit_pure(
                 ret_ty,
                 PureInst::FunctionCall(
-                    HeapVal::Empty,
+                    None,
                     FunctionCall {
                         function: addr_fn,
                         args,
@@ -381,7 +381,7 @@ pub(crate) fn field_addr(
     Ok(sink.emit_pure(
         ret_ty,
         PureInst::FunctionCall(
-            HeapVal::Empty,
+            None,
             FunctionCall {
                 function: addr_fn,
                 args: vec![base],

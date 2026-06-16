@@ -52,7 +52,9 @@ pub enum PureInst {
     Deref(HeapVal, Val),
     /// Query the permission amount of an address in a heap.
     Perm(HeapVal, Val),
-    FunctionCall(HeapVal, FunctionCall),
+    /// A function application. The heap is the function's context heap, present
+    /// only for heap-dependent functions (`None` for heap-independent ones).
+    FunctionCall(Option<HeapVal>, FunctionCall),
 }
 
 // ======================
@@ -114,7 +116,12 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                     }
                     write!(f, "{arg}")?;
                 }
-                write!(f, ")[{heap}]")
+                write!(f, ")")?;
+                // Context heap only for heap-dependent functions.
+                if let Some(heap) = heap {
+                    write!(f, "[{heap}]")?;
+                }
+                Ok(())
             }
             PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
         }

@@ -221,7 +221,7 @@ mod tests {
     fn method_calling(res: MemberId) -> Declaration {
         let call = ResourceCall {
             resource: res,
-            ctx_heap: HeapVal::Empty,
+            ctx_heap: None,
             args: vec![],
         };
         let inst: Inst = Inst {

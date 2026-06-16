@@ -40,6 +40,7 @@ pub(crate) fn lower_method(
     // (implicitly assumes the requires bool).
     if let Some(&req_id) = b.method_requires.get(&m.name.0) {
         current_heap = emit_resource_combine(
+            b,
             &mut sink,
             vmir::Sign::Add,
             req_id,
@@ -70,7 +71,8 @@ pub(crate) fn lower_method(
     if let Some(&ens_id) = b.method_ensures.get(&m.name.0) {
         let mut ens_args = param_vals;
         ens_args.extend(ret_vals);
-        let _h_new = emit_resource_combine(&mut sink, vmir::Sign::Sub, ens_id, current_heap, ens_args);
+        let _h_new =
+            emit_resource_combine(b, &mut sink, vmir::Sign::Sub, ens_id, current_heap, ens_args);
     }
 
     Ok(vmir::Method { insts: sink.insts })
@@ -360,9 +362,10 @@ fn lower_fold_unfold(
         args.push(pure_exp::lower(b, env, sink, hctx, a)?);
     }
     let perm = pure_exp::lower(b, env, sink, hctx, &pwp.perm)?;
+    // Predicates are self-framed (context-free): no ctx heap.
     let call = ResourceCall {
         resource: pred_id,
-        ctx_heap: current_heap,
+        ctx_heap: None,
         args,
     };
     let inst = if is_fold {
@@ -410,7 +413,7 @@ fn lower_method_call(
     // Exhale precondition (if present): `h := heap - acc m@requires(args)`
     // (implicitly asserts the requires bool).
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
-        heap = emit_resource_combine(sink, vmir::Sign::Sub, req_id, heap, args.clone());
+        heap = emit_resource_combine(b, sink, vmir::Sign::Sub, req_id, heap, args.clone());
     }
 
     // Allocate fresh return values BEFORE the post-condition inhale.
@@ -426,7 +429,7 @@ fn lower_method_call(
     if let Some(&ens_id) = b.method_ensures.get(&call.name.0) {
         let mut ens_args = args.clone();
         ens_args.extend(ret_vals.iter().cloned());
-        heap = emit_resource_combine(sink, vmir::Sign::Add, ens_id, heap, ens_args);
+        heap = emit_resource_combine(b, sink, vmir::Sign::Add, ens_id, heap, ens_args);
     }
 
     Ok(heap)
@@ -436,22 +439,25 @@ fn lower_method_call(
 /// full-permission delta onto `base`, implicitly assuming (`Add`) or asserting
 /// (`Sub`) its boolean. Returns the resulting heap.
 ///
-/// `ctx_heap` is set to `base`; the verifier currently ignores it (resource
-/// certificates are self-contained, verified against an empty context heap), so
-/// it is bookkeeping only until ctx heaps become live.
+/// The ctx heap is supplied (`Some(base)`) only when the called resource has a
+/// precondition resource (two-state, e.g. `@ensures`); self-framed resources
+/// (`@requires`, predicates) are context-free (`None`). The verifier currently
+/// ignores it, so it is bookkeeping until ctx heaps become live.
 fn emit_resource_combine(
+    b: &Builder<'_>,
     sink: &mut Sink,
     sign: vmir::Sign,
     resource: vmir::MemberId,
     base: HeapVal,
     args: Vec<Val>,
 ) -> HeapVal {
+    let ctx_heap = b.is_ctx_resource(resource).then_some(base);
     sink.emit_resource_combine(
         base,
         sign,
         ResourceCall {
             resource,
-            ctx_heap: base,
+            ctx_heap,
             args,
         },
         vmir::write(),

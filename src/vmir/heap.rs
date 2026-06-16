@@ -91,6 +91,17 @@ impl Display for Sign {
 
 impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // Render `name(arg, ...)` for a resource call.
+        let call_head = |f: &mut Formatter<'_>, call: &ResourceCall| -> fmt::Result {
+            write!(f, "{}(", self.interner.resolve(&call.resource))?;
+            for (i, arg) in call.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{arg}")?;
+            }
+            write!(f, ")")
+        };
         match self.item {
             HeapInst::Combine {
                 base,
@@ -100,38 +111,27 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             } => match target {
                 Target::Loc(loc) => write!(f, "{base} {sign} acc {loc} {perm}"),
                 Target::Resource(call) => {
-                    write!(f, "{base} {sign} acc {}(", self.interner.resolve(&call.resource))?;
-                    for (i, arg) in call.args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{arg}")?;
+                    write!(f, "{base} {sign} acc ")?;
+                    call_head(f, call)?;
+                    // Context heap only when the resource has a precondition.
+                    if let Some(ctx) = call.ctx_heap {
+                        write!(f, "[{ctx}]")?;
                     }
-                    write!(f, ")[{}] {perm}", call.ctx_heap)
+                    write!(f, " {perm}")
                 }
             },
-            HeapInst::Assign(heap, Assign { loc, val }) => {
-                write!(f, "assign[{heap}] {loc} := {val}")
+            HeapInst::Assign(base, Assign { loc, val }) => {
+                write!(f, "{base} assign {loc} {val}")
             }
             HeapInst::Fold { base, call, perm } => {
-                write!(f, "fold {}(", self.interner.resolve(&call.resource))?;
-                for (i, arg) in call.args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")[{base}] {perm}")
+                write!(f, "{base} fold ")?;
+                call_head(f, call)?;
+                write!(f, " {perm}")
             }
             HeapInst::Unfold { base, call, perm } => {
-                write!(f, "unfold {}(", self.interner.resolve(&call.resource))?;
-                for (i, arg) in call.args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")[{base}] {perm}")
+                write!(f, "{base} unfold ")?;
+                call_head(f, call)?;
+                write!(f, " {perm}")
             }
         }
     }

@@ -43,7 +43,9 @@ pub struct ResourceBody {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceCall {
     pub resource: MemberId,
-    pub ctx_heap: HeapVal,
+    /// The context heap, present only when the called resource has a
+    /// precondition resource. `None` for self-framed (context-free) calls.
+    pub ctx_heap: Option<HeapVal>,
     pub args: Vec<Val>,
 }
 

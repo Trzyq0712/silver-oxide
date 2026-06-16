@@ -139,6 +139,15 @@ impl<'a> Builder<'a> {
         id
     }
 
+    /// Whether `id` is a resource with a precondition resource (two-state, e.g.
+    /// `@ensures`). Such calls carry a context heap; self-framed resources don't.
+    pub(crate) fn is_ctx_resource(&self, id: vmir::MemberId) -> bool {
+        matches!(
+            self.decls.get(usize::from(id)),
+            Some(Some(vmir::Declaration::Resource(r))) if !matches!(r.precond, vmir::Precond::SelfFramed)
+        )
+    }
+
     fn set_decl(&mut self, id: vmir::MemberId, decl: vmir::Declaration) {
         let slot = &mut self.decls[usize::from(id)];
         debug_assert!(slot.is_none(), "decl slot filled twice");

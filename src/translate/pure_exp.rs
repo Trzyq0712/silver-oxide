@@ -234,7 +234,7 @@ pub(crate) fn lower<Ext: PureExt>(
             }
             Ok(sink.emit_pure(
                 ty,
-                PureInst::FunctionCall(HeapVal::Empty, vmir::FunctionCall { function: func, args }),
+                PureInst::FunctionCall(None, vmir::FunctionCall { function: func, args }),
             ))
         }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
@@ -249,7 +249,7 @@ pub(crate) fn lower<Ext: PureExt>(
             Ok(sink.emit_pure(
                 ty,
                 PureInst::FunctionCall(
-                    HeapVal::Empty,
+                    None,
                     vmir::FunctionCall {
                         function: accessor,
                         args: vec![base_v],
@@ -271,7 +271,7 @@ pub(crate) fn lower<Ext: PureExt>(
             let tag_call = sink.emit_pure(
                 vmir::Type::Int,
                 PureInst::FunctionCall(
-                    HeapVal::Empty,
+                    None,
                     vmir::FunctionCall {
                         function: tag_fn,
                         args: vec![base_v],
