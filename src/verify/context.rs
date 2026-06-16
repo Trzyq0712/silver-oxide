@@ -102,7 +102,7 @@ impl<'a> VerifyContext<'a> {
         for (p, a) in cert.params.iter().zip(args) {
             subst.insert(cert.egraph.find(*p), *a);
         }
-        let mut memo: HashMap<Id, Id> = HashMap::new();
+        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let mut delta = Heap::empty();
         for &(addr, perm, value) in &cert.delta {
             let a = transplant(self, cert, addr, &subst, &mut memo);
@@ -127,7 +127,7 @@ impl<'a> VerifyContext<'a> {
         for (p, a) in cert.params.iter().zip(args) {
             subst.insert(cert.egraph.find(*p), *a);
         }
-        let mut memo: HashMap<Id, Id> = HashMap::new();
+        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let out: Vec<(Id, Id)> = cert
             .delta
             .iter()
@@ -158,7 +158,7 @@ impl<'a> VerifyContext<'a> {
         for (slot, &v) in cert.delta.iter().zip(values) {
             subst.insert(cert.egraph.find(slot.2), v);
         }
-        let mut memo: HashMap<Id, Id> = HashMap::new();
+        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let b = transplant(self, cert, cert.bool_id, &subst, &mut memo);
         self.egraph.rebuild();
         b
@@ -252,37 +252,56 @@ impl<'a> VerifyContext<'a> {
 /// Two-phase per e-class (reserve a placeholder, then union every rebuilt node
 /// into it) so cycles terminate and **all merges in the e-class collapse to one
 /// caller e-class** — that is how proven equalities transfer for free.
+/// Per-e-class transplant state: `InProgress` while its nodes are being rebuilt
+/// (carrying a lazily-minted back-edge placeholder iff a cycle is hit), then
+/// `Done` with the resulting caller e-class.
+enum Transplanted {
+    InProgress(Option<Id>),
+    Done(Id),
+}
+
 fn transplant(
     caller: &mut VerifyContext<'_>,
     cert: &ResourceCertificate,
     id: Id,
     subst: &HashMap<Id, Id>,
-    memo: &mut HashMap<Id, Id>,
+    memo: &mut HashMap<Id, Transplanted>,
 ) -> Id {
     let cc = cert.egraph.find(id);
     if let Some(&a) = subst.get(&cc) {
         return a;
     }
-    if let Some(&a) = memo.get(&cc) {
-        return a;
+    let cc_ty = || {
+        infer_type(
+            &cert.egraph,
+            &cert.fresh_types,
+            &cert.func_ret_types,
+            cc,
+            &mut HashMap::new(),
+        )
+        .unwrap_or(Type::Int)
+    };
+    match memo.get(&cc) {
+        Some(Transplanted::Done(a)) => return *a,
+        // Cyclic back-edge: this class is still being built. Mint a placeholder
+        // (once) for the cycle to point at; it's unioned with the result below.
+        Some(Transplanted::InProgress(Some(ph))) => return *ph,
+        Some(Transplanted::InProgress(None)) => {
+            let ph = caller.fresh_symbolic_value(cc_ty());
+            memo.insert(cc, Transplanted::InProgress(Some(ph)));
+            return ph;
+        }
+        None => {}
     }
-    // Reserve a typed placeholder up front (handles cyclic references).
-    let ty = infer_type(
-        &cert.egraph,
-        &cert.fresh_types,
-        &cert.func_ret_types,
-        cc,
-        &mut HashMap::new(),
-    )
-    .unwrap_or(Type::Int);
-    let placeholder = caller.fresh_symbolic_value(ty);
-    memo.insert(cc, placeholder);
+    memo.insert(cc, Transplanted::InProgress(None));
 
     let nodes = cert.egraph[cc].nodes.clone();
+    let mut built: Vec<Id> = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let built = match node {
-            // The placeholder already stands in for a fresh value.
-            Symbolic::Fresh(_) => continue,
+        let b = match node {
+            // A fresh value has no structure to rebuild — mint a fresh of the
+            // same type. (Acyclic classes thus get NO redundant placeholder.)
+            Symbolic::Fresh(_) => caller.fresh_symbolic_value(cc_ty()),
             Symbolic::Lit(l) => caller.add(Symbolic::Lit(l.clone())),
             Symbolic::Binary(op, [l, r]) => {
                 let l = transplant(caller, cert, *l, subst, memo);
@@ -308,9 +327,22 @@ fn transplant(
                 caller.add_func_app_id(*m, ret, fargs)
             }
         };
-        caller.egraph.union(placeholder, built);
+        built.push(b);
     }
-    placeholder
+
+    // egg classes always have ≥1 node; unify all rebuilt nodes (and the back-edge
+    // placeholder, if a cycle minted one) into a single representative.
+    let rep = built[0];
+    for &b in &built[1..] {
+        caller.egraph.union(rep, b);
+    }
+    if let Some(Transplanted::InProgress(Some(ph))) = memo.get(&cc) {
+        let ph = *ph;
+        caller.egraph.union(rep, ph);
+    }
+    let rep = caller.egraph.find(rep);
+    memo.insert(cc, Transplanted::Done(rep));
+    rep
 }
 
 /// Reconstruct an e-class's type from the type-free e-graph (memoized,
