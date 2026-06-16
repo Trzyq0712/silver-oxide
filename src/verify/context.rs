@@ -218,45 +218,67 @@ impl<'a> VerifyContext<'a> {
     /// to `true` (and still commit the vacuously-true implication). This also
     /// avoids `ConstFold`'s conflicting-value panic when unioning into the
     /// `true`/`false` eclass.
+    /// Prove `pc ⇒ goal` against the live e-graph, escalating through three
+    /// tiers (cheapest first) and **memoizing** the result:
+    /// 1. is the implication already known `true`? (O(1) — a prior identical
+    ///    obligation merged it, or it's trivial);
+    /// 2. else saturate the live graph (only **unconditional** facts live there)
+    ///    and re-check — proves any unconditionally-true goal, no clone;
+    /// 3. else clone, assume the path condition, saturate the clone, and check
+    ///    `goal == true` — the only tier that clones, for genuinely
+    ///    path-conditional goals.
+    ///
+    /// On success the implication is merged with `true` in the live graph so the
+    /// next identical obligation hits tier 1. (Tiers 1/2 already have it merged.)
     pub(crate) fn prove_under_pc(
         &mut self,
         goal: egg::Id,
         pc_lits: &[(egg::Id, Polarity)],
     ) -> bool {
-        let mut probe = self.egraph.clone();
-        let true_ = probe.add(Symbolic::Lit(Literal::Bool(true)));
-        let false_ = probe.add(Symbolic::Lit(Literal::Bool(false)));
+        let imp = self.implication(goal, pc_lits.iter().rev().copied());
+        let true_ = self.add(Symbolic::Lit(Literal::Bool(true)));
 
-        let mut proven = false;
+        // Tier 1: already true (memoized / trivial).
+        if self.egraph.find(imp) == self.egraph.find(true_) {
+            return true;
+        }
+        // Tier 2: saturate the live graph and re-check (no clone).
+        self.saturate();
+        if self.egraph.find(imp) == self.egraph.find(true_) {
+            return true;
+        }
+
+        // Tier 3: clone, assume the path condition, saturate the clone, check.
+        let mut probe = self.egraph.clone();
+        let true_p = probe.add(Symbolic::Lit(Literal::Bool(true)));
+        let false_p = probe.add(Symbolic::Lit(Literal::Bool(false)));
         let mut unsat_pc = false;
         for (id, pol) in pc_lits {
             let want_true = matches!(pol, Polarity::Positive);
             match &probe[*id].data.value {
                 Some(Literal::Bool(b)) if *b != want_true => {
-                    // PC literal contradicts its required polarity → off-path.
+                    // PC literal contradicts its required polarity → off-path,
+                    // so `pc ⇒ goal` is vacuously true. (Guard also avoids a
+                    // `true == false` ConstFold conflict from the union below.)
                     unsat_pc = true;
                     break;
                 }
                 _ => {
-                    probe.union(*id, if want_true { true_ } else { false_ });
+                    probe.union(*id, if want_true { true_p } else { false_p });
                 }
             }
         }
-
-        if unsat_pc {
-            proven = true;
+        let proven = if unsat_pc {
+            true
         } else {
             let runner = egg::Runner::default().with_egraph(probe).run(&self.rules);
             let probe = runner.egraph;
-            if probe.find(goal) == probe.find(true_) {
-                proven = true;
-            }
-        }
+            probe.find(goal) == probe.find(true_p)
+        };
 
+        // Persist the result so future identical obligations hit tier 1.
         if proven {
-            let imp = self.implication(goal, pc_lits.iter().rev().copied());
-            let true_live = self.add(Symbolic::Lit(Literal::Bool(true)));
-            self.egraph.union(imp, true_live);
+            self.egraph.union(imp, true_);
             self.egraph.rebuild();
         }
         proven
