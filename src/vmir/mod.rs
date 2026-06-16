@@ -16,7 +16,7 @@ pub use ty::Type;
 pub use heap::{Assign, HeapInst, HeapVal, Sign, Target};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
-pub use adt::{Adt, AdtMeta};
+pub use adt::{Adt, AdtMeta, PredMeta};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
 pub use function::{Function, FunctionCall};
@@ -46,6 +46,8 @@ pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
     pub interner: Rodeo<MemberId>,
     pub adt_meta: AdtMeta,
+    /// Per-predicate `fold`/`unfold` metadata, keyed by predicate `MemberId`.
+    pub pred_meta: std::collections::HashMap<MemberId, PredMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -25,6 +25,22 @@ pub enum HeapInst {
     /// Assign a value to a heap location in a given heap.
     /// SIDECOND: the location must have at least `write` permission.
     Assign(HeapVal, Assign),
+    /// `h := fold call[base] perm`. Consume the predicate's footprint (scaled by
+    /// `perm`) from `base`, assert its body's pure facts, and produce a chunk at
+    /// the predicate address holding the snapshot of the consumed fields.
+    Fold {
+        base: HeapVal,
+        call: ResourceCall,
+        perm: Val,
+    },
+    /// `h := unfold call[base] perm`. Inverse of `Fold`: consume the predicate
+    /// chunk from `base`, reproduce its footprint (fields recovered from the
+    /// snapshot), and assume the body's pure facts.
+    Unfold {
+        base: HeapVal,
+        call: ResourceCall,
+        perm: Val,
+    },
 }
 
 /// Whether a [`HeapInst::Combine`] adds or subtracts its operand.
@@ -96,6 +112,26 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             },
             HeapInst::Assign(heap, Assign { loc, val }) => {
                 write!(f, "assign[{heap}] {loc} := {val}")
+            }
+            HeapInst::Fold { base, call, perm } => {
+                write!(f, "fold {}(", self.interner.resolve(&call.resource))?;
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")[{base}] {perm}")
+            }
+            HeapInst::Unfold { base, call, perm } => {
+                write!(f, "unfold {}(", self.interner.resolve(&call.resource))?;
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")[{base}] {perm}")
             }
         }
     }

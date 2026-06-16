@@ -214,8 +214,10 @@ fn lower_stmt(
         }
         S::If(_, _, _) => Err(TranslationError::Unsupported("if statement")),
         S::Block(_) => Err(TranslationError::Unsupported("nested block")),
-        S::Fold(_) => Err(TranslationError::Unsupported("fold")),
-        S::Unfold(_) => Err(TranslationError::Unsupported("unfold")),
+        S::Fold(pwp) => lower_fold_unfold(b, env, sink, current_heap, baseline, labeled, pwp, true),
+        S::Unfold(pwp) => {
+            lower_fold_unfold(b, env, sink, current_heap, baseline, labeled, pwp, false)
+        }
         // Source-level assert/assume are non-destructive: the assertion is
         // reduced to a boolean over the current heap (each `acc(loc, p)` becomes
         // `perm(loc) >= p`) and asserted/assumed. The heap is unchanged.
@@ -333,6 +335,50 @@ fn lower_new(
         }
         typed::StarOrFields::Star => Err(TranslationError::Unsupported("new(*)")),
     }
+}
+
+/// Lower `fold P(args)` / `unfold P(args)` to a `HeapInst::Fold`/`Unfold`. The
+/// predicate id, args, and perm come from the statement; the resulting heap is
+/// the new working heap.
+fn lower_fold_unfold(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink,
+    current_heap: HeapVal,
+    baseline: HeapVal,
+    labeled: &HashMap<Spur, HeapVal>,
+    pwp: &typed::PredicateWithPerm<typed::MethodBodyExt>,
+    is_fold: bool,
+) -> Result<HeapVal, TranslationError> {
+    let pred_id = *b.name_map.get(&pwp.pred_call.name.0).ok_or_else(|| {
+        TranslationError::UnknownIdent(b.interner.resolve(&pwp.pred_call.name.0).to_string())
+    })?;
+    let old = pure_exp::OldHeaps { baseline, labeled };
+    let hctx = pure_exp::HeapCtx::same_with_old(current_heap, &old);
+    let mut args = Vec::with_capacity(pwp.pred_call.args.len());
+    for a in &pwp.pred_call.args {
+        args.push(pure_exp::lower(b, env, sink, hctx, a)?);
+    }
+    let perm = pure_exp::lower(b, env, sink, hctx, &pwp.perm)?;
+    let call = ResourceCall {
+        resource: pred_id,
+        ctx_heap: current_heap,
+        args,
+    };
+    let inst = if is_fold {
+        HeapInst::Fold {
+            base: current_heap,
+            call,
+            perm,
+        }
+    } else {
+        HeapInst::Unfold {
+            base: current_heap,
+            call,
+            perm,
+        }
+    };
+    Ok(sink.emit_heap_guarded(inst))
 }
 
 fn lower_method_call(

@@ -20,6 +20,20 @@ pub struct AdtMeta {
     pub dtors: HashMap<MemberId, (MemberId, usize)>,
 }
 
+/// Per-predicate ids the verifier needs for `fold`/`unfold`. The snapshot is an
+/// ADT: `snap_cons` packs the footprint field values, `snap_projs[i]` recovers
+/// slot `i` (these are registered in [`AdtMeta::dtors`], so the projection
+/// reduction makes fold→unfold round-trips exact).
+#[derive(Debug, Clone)]
+pub struct PredMeta {
+    /// The predicate's `@addr` function (its chunk address).
+    pub addr_fn: MemberId,
+    /// The snapshot constructor `P@snap@cons`.
+    pub snap_cons: MemberId,
+    /// The snapshot field accessors `P@snap@proj_i`, in footprint slot order.
+    pub snap_projs: Vec<MemberId>,
+}
+
 impl<'a> Display for VmirDisplay<'a, &'a Adt> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let _ = self.item;

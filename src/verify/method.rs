@@ -437,6 +437,11 @@ fn eval_heap_inst(
         } => Err(VerifyError::Unimplemented(
             "resource combine outside method body",
         )),
+        // Fold/Unfold need the program + certificates; handled in
+        // `eval_method_inst`.
+        HeapInst::Fold { .. } | HeapInst::Unfold { .. } => {
+            Err(VerifyError::Unimplemented("fold/unfold outside method body"))
+        }
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).
         HeapInst::Assign(heap, Assign { loc, val }) => {
@@ -568,6 +573,101 @@ fn eval_method_inst(
                     }
                 }
             }
+            state.push_heap(out);
+        }
+        // `fold`: consume the predicate footprint (scaled by `perm`), assert the
+        // body's pure facts, and produce a predicate chunk holding the snapshot
+        // (`cons`) of the consumed field values.
+        InstKind::Heap(HeapInst::Fold { base, call, perm }) => {
+            let base_h = get_heap(state, base);
+            let pmeta = program
+                .pred_meta
+                .get(&call.resource)
+                .ok_or(VerifyError::Unimplemented("fold of non-flat/abstract predicate"))?;
+            let (snap_cons, addr_fn) = (pmeta.snap_cons, pmeta.addr_fn);
+            let n_slots = pmeta.snap_projs.len();
+            let cert = certs
+                .get(&call.resource)
+                .expect("predicate certificate built before fold");
+            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
+            let perm_id = state.get_val(ctx, perm);
+            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+
+            let fp = ctx.graft_footprint(cert, &args);
+            if fp.len() != n_slots {
+                return Err(VerifyError::Unimplemented("predicate footprint shape mismatch"));
+            }
+            let canon = canonicalize_heap(ctx, &base_h, &[]);
+            let mut values = Vec::with_capacity(fp.len());
+            let mut need_heap = Heap::empty();
+            for &(addr, bperm) in &fp {
+                let a = ctx.egraph.find(addr);
+                let v = canon
+                    .chunk(a)
+                    .map(|c| c.value)
+                    .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
+                let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
+                need_heap = need_heap.with_chunk(addr, Chunk::new(need, v));
+                values.push(v);
+            }
+            let subtracted = heap_subtract(ctx, &base_h, &need_heap, &pc_lits)?;
+            let bool_id = ctx.graft_pred_bool(cert, &args, &values);
+            if !ctx.prove_under_pc(bool_id, &pc_lits) {
+                return Err(VerifyError::AssertionFailed);
+            }
+            let cons_args: Box<[egg::Id]> = values.into_iter().collect();
+            let snap = ctx.add_func_app_id(snap_cons, Type::Int, cons_args);
+            let pred_addr = ctx.add_func_app_id(addr_fn, Type::Int, args.into());
+            let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, snap));
+            let out = heap_union(ctx, &subtracted, &pred_chunk, &pc_lits);
+            state.push_heap(out);
+        }
+        // `unfold`: inverse of fold — consume the predicate chunk, reproduce the
+        // footprint (fields recovered by projecting the snapshot), assume the
+        // body's pure facts.
+        InstKind::Heap(HeapInst::Unfold { base, call, perm }) => {
+            let base_h = get_heap(state, base);
+            let pmeta = program
+                .pred_meta
+                .get(&call.resource)
+                .ok_or(VerifyError::Unimplemented(
+                    "unfold of non-flat/abstract predicate",
+                ))?;
+            let addr_fn = pmeta.addr_fn;
+            let projs = pmeta.snap_projs.clone();
+            let cert = certs
+                .get(&call.resource)
+                .expect("predicate certificate built before unfold");
+            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
+            let perm_id = state.get_val(ctx, perm);
+            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+
+            let pred_addr = ctx.add_func_app_id(addr_fn, Type::Int, args.clone().into());
+            let canon = canonicalize_heap(ctx, &base_h, &[]);
+            let s = canon
+                .chunk(ctx.egraph.find(pred_addr))
+                .map(|c| c.value)
+                .ok_or(VerifyError::InsufficientPermission)?;
+            let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, s));
+            let subtracted = heap_subtract(ctx, &base_h, &pred_chunk, &pc_lits)?;
+
+            let fp = ctx.graft_footprint(cert, &args);
+            if fp.len() != projs.len() {
+                return Err(VerifyError::Unimplemented("predicate footprint shape mismatch"));
+            }
+            let mut out = subtracted;
+            let mut values = Vec::with_capacity(fp.len());
+            for (i, &(addr, bperm)) in fp.iter().enumerate() {
+                let pv = ctx.add_func_app_id(projs[i], Type::Int, Box::new([s]));
+                let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
+                let chunk = Heap::empty().with_chunk(addr, Chunk::new(need, pv));
+                out = heap_union(ctx, &out, &chunk, &pc_lits);
+                values.push(pv);
+            }
+            let bool_id = ctx.graft_pred_bool(cert, &args, &values);
+            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+            ctx.egraph.union(bool_id, true_);
+            ctx.egraph.rebuild();
             state.push_heap(out);
         }
         InstKind::Heap(hi) => {
@@ -1468,6 +1568,77 @@ method m()
                 Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
             ),
             "mk(3,4).fst == 4 should fail"
+        );
+    }
+
+    #[test]
+    fn fold_unfold_roundtrip_preserves_field() {
+        // `fold` then `unfold` recovers the exact field value via the snapshot.
+        let input = r#"
+field f: Int
+predicate Cell(x: Ref) { acc(x.f, write) }
+method m(x: Ref)
+  requires acc(x.f, write) && x.f == 5
+{
+  fold acc(Cell(x), write)
+  unfold acc(Cell(x), write)
+  assert x.f == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "fold/unfold round-trip should preserve x.f == 5"
+        );
+    }
+
+    #[test]
+    fn fold_consumes_field_permission() {
+        // After `fold`, the field permission has moved into the predicate, so a
+        // direct read of `x.f` no longer has permission.
+        let input = r#"
+field f: Int
+predicate Cell(x: Ref) { acc(x.f, write) }
+method m(x: Ref)
+  requires acc(x.f, write) && x.f == 5
+{
+  fold acc(Cell(x), write)
+  assert x.f == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            matches!(
+                verify_named_method(&program, "m"),
+                Err(ref e) if matches!(e.root_cause(), VerifyError::InsufficientPermission)
+            ),
+            "reading x.f after fold should lack permission"
+        );
+    }
+
+    #[test]
+    fn fold_unfold_two_field_predicate() {
+        // A two-field predicate round-trips both fields (values set by
+        // assignment to avoid the conjunction-assume gap on `&&` of facts).
+        let input = r#"
+field f: Int
+field g: Int
+predicate Pair(x: Ref) { acc(x.f, write) && acc(x.g, write) }
+method m(x: Ref)
+  requires acc(x.f, write) && acc(x.g, write)
+{
+  x.f := 1
+  x.g := 2
+  fold acc(Pair(x), write)
+  unfold acc(Pair(x), write)
+  assert x.f == 1
+  assert x.g == 2
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "two-field fold/unfold round-trip should preserve both fields"
         );
     }
 

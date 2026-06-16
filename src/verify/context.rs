@@ -115,6 +115,55 @@ impl<'a> VerifyContext<'a> {
         (delta, bool_id)
     }
 
+    /// Transplant a predicate cert's footprint into this e-graph for `args`,
+    /// returning the ordered `(addr, perm)` per slot (cert.delta order). Used by
+    /// `fold`/`unfold`; the caller supplies actual values separately.
+    pub(crate) fn graft_footprint(
+        &mut self,
+        cert: &ResourceCertificate,
+        args: &[Id],
+    ) -> Vec<(Id, Id)> {
+        let mut subst: HashMap<Id, Id> = HashMap::new();
+        for (p, a) in cert.params.iter().zip(args) {
+            subst.insert(cert.egraph.find(*p), *a);
+        }
+        let mut memo: HashMap<Id, Id> = HashMap::new();
+        let out: Vec<(Id, Id)> = cert
+            .delta
+            .iter()
+            .map(|&(addr, perm, _)| {
+                (
+                    transplant(self, cert, addr, &subst, &mut memo),
+                    transplant(self, cert, perm, &subst, &mut memo),
+                )
+            })
+            .collect();
+        self.egraph.rebuild();
+        out
+    }
+
+    /// Transplant a predicate cert's body boolean for `args`, substituting each
+    /// footprint slot's cert value with the caller's actual `values` (so the
+    /// body's pure facts are expressed over the fold/unfold-site values).
+    pub(crate) fn graft_pred_bool(
+        &mut self,
+        cert: &ResourceCertificate,
+        args: &[Id],
+        values: &[Id],
+    ) -> Id {
+        let mut subst: HashMap<Id, Id> = HashMap::new();
+        for (p, a) in cert.params.iter().zip(args) {
+            subst.insert(cert.egraph.find(*p), *a);
+        }
+        for (slot, &v) in cert.delta.iter().zip(values) {
+            subst.insert(cert.egraph.find(slot.2), v);
+        }
+        let mut memo: HashMap<Id, Id> = HashMap::new();
+        let b = transplant(self, cert, cert.bool_id, &subst, &mut memo);
+        self.egraph.rebuild();
+        b
+    }
+
     pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
         let id = self.fresh_counter as u32;
         self.fresh_counter += 1;

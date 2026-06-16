@@ -172,6 +172,9 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
                 target: Target::Resource(c),
                 ..
             }) => out.push(c.resource),
+            InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
+                out.push(call.resource)
+            }
             _ => {}
         }
     }
@@ -185,6 +188,9 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
                 target: Target::Resource(c),
                 ..
             }) => out.push(c.resource),
+            InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
+                out.push(call.resource)
+            }
             _ => {}
         }
     }
@@ -239,6 +245,7 @@ mod tests {
             decls: TiVec::from(decls),
             interner,
             adt_meta: Default::default(),
+            pred_meta: Default::default(),
         }
     }
 

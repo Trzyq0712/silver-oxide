@@ -104,6 +104,8 @@ pub(crate) struct Builder<'a> {
     pub dtor_accessor: HashMap<Spur, vmir::MemberId>,
     /// ADT metadata for the verifier (tag-fn → ctor → tag index).
     pub adt_meta: vmir::AdtMeta,
+    /// Per-predicate fold/unfold metadata (addr fn + snapshot cons/projs).
+    pub pred_meta: HashMap<vmir::MemberId, vmir::PredMeta>,
 }
 
 impl<'a> Builder<'a> {
@@ -123,6 +125,7 @@ impl<'a> Builder<'a> {
             ctor_tag: HashMap::new(),
             dtor_accessor: HashMap::new(),
             adt_meta: vmir::AdtMeta::default(),
+            pred_meta: HashMap::new(),
         }
     }
 
@@ -300,7 +303,74 @@ impl<'a> Builder<'a> {
                 body,
             }),
         );
+
+        // Synthesize the snapshot ADT for a foldable (flat) concrete predicate:
+        // a constructor `P@snap@cons` over the footprint field values and one
+        // accessor `P@snap@proj_i` per slot, registered so the projection
+        // reduction makes fold→unfold round-trips exact. See `PredMeta`.
+        if let Some(body_exp) = &p.body
+            && let Some(types) = self.flat_footprint_types(body_exp)
+        {
+            let snap_id = self.pred_snap[&p.name.0];
+            let addr_id = self.pred_addr[&p.name.0];
+            let cons_id = self.fresh_decl(&format!("{name}@snap@cons"));
+            self.set_decl(
+                cons_id,
+                vmir::Declaration::Function(vmir::Function {
+                    params: types.clone(),
+                    ret: vmir::Type::Domain(snap_id),
+                    body: None,
+                }),
+            );
+            let mut snap_projs = Vec::with_capacity(types.len());
+            for (i, ty) in types.iter().enumerate() {
+                let proj_id = self.fresh_decl(&format!("{name}@snap@proj{i}"));
+                self.set_decl(
+                    proj_id,
+                    vmir::Declaration::Function(vmir::Function {
+                        params: vec![vmir::Type::Domain(snap_id)],
+                        ret: ty.clone(),
+                        body: None,
+                    }),
+                );
+                self.adt_meta.dtors.insert(proj_id, (cons_id, i));
+                snap_projs.push(proj_id);
+            }
+            self.pred_meta.insert(
+                pred_id,
+                vmir::PredMeta {
+                    addr_fn: addr_id,
+                    snap_cons: cons_id,
+                    snap_projs,
+                },
+            );
+        }
         Ok(())
+    }
+
+    /// The ordered field-types of a **flat** predicate body (a conjunction of
+    /// `acc(_.f, _)` over fields, with optional pure conjuncts). Returns `None`
+    /// for bodies with nested predicates or conditionals (not foldable yet),
+    /// which makes the predicate unfoldable in slice 1.
+    fn flat_footprint_types(&self, exp: &typed::SpatialExp<!>) -> Option<Vec<vmir::Type>> {
+        use typed::ResourceExpKind as R;
+        use typed::SpatialExpKind as S;
+        match &*exp.0 {
+            S::Conj(l, r) => {
+                let mut v = self.flat_footprint_types(l)?;
+                v.extend(self.flat_footprint_types(r)?);
+                Some(v)
+            }
+            S::Acc(res, _perm) => match &*res.0 {
+                R::Field(_base, fname) => {
+                    let ty = self.globals.resolve(fname.0)?.as_field()?;
+                    Some(vec![lower_type(ty)])
+                }
+                R::PredicateCall(_) => None,
+            },
+            S::Pure(_) => Some(vec![]),
+            S::Implies(..) | S::Ternary { .. } => None,
+        }
     }
 
     fn emit_method_contracts(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
@@ -410,6 +480,7 @@ impl<'a> Builder<'a> {
             decls,
             interner: self.vmir_interner,
             adt_meta: self.adt_meta,
+            pred_meta: self.pred_meta,
         }
     }
 }
