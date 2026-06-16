@@ -644,6 +644,8 @@ fn eval_method_inst(
             let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, snap));
             let out = heap_union(ctx, &subtracted, &pred_chunk, &pc_lits);
             state.push_heap(out);
+            // Collapse any snapshot tower created by repeated fold/unfold.
+            ctx.reduce();
         }
         // `unfold`: inverse of fold — consume the predicate chunk, reproduce the
         // footprint (fields recovered by projecting the snapshot), assume the
@@ -682,6 +684,10 @@ fn eval_method_inst(
             let mut out = subtracted;
             let mut values = Vec::with_capacity(fp.len());
             for (i, &(addr, bperm)) in fp.iter().enumerate() {
+                // `proj_i(s)`; the post-unfold `reduce()` collapses it to the
+                // constructor's i-th field when `s` is a concrete `cons` (so
+                // repeated fold/unfold doesn't grow the snapshot tower), and
+                // leaves it uninterpreted for an opaque snapshot.
                 let pv = ctx.add_func_app_id(projs[i], decl_ret_ty(program, projs[i]), Box::new([s]));
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 let chunk = Heap::empty().with_chunk(addr, Chunk::new(need, pv));
@@ -693,6 +699,8 @@ fn eval_method_inst(
             ctx.egraph.union(bool_id, true_);
             ctx.egraph.rebuild();
             state.push_heap(out);
+            // Collapse any snapshot tower created by repeated fold/unfold.
+            ctx.reduce();
         }
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;

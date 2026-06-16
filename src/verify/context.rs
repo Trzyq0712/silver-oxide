@@ -33,6 +33,9 @@ pub(crate) struct ResourceCertificate {
 pub(crate) struct VerifyContext<'a> {
     pub(crate) egraph: egg::EGraph<Symbolic, ConstFold>,
     rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
+    /// Terminating structural reductions, run after heap-producing ops to
+    /// normalize (collapse snapshot towers) without a full saturation.
+    reduce_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
     pub(crate) interner: &'a Rodeo<MemberId>,
     /// Type side-oracle: the irreducible type sources that the type-free
@@ -48,6 +51,7 @@ impl<'a> VerifyContext<'a> {
         Self {
             egraph: egg::EGraph::default(),
             rules: rewrite::rules(adt_meta),
+            reduce_rules: rewrite::reduce_rules(adt_meta),
             fresh_counter: 0,
             interner,
             fresh_types: HashMap::new(),
@@ -59,6 +63,18 @@ impl<'a> VerifyContext<'a> {
     pub(crate) fn saturate(&mut self) {
         let egraph = std::mem::take(&mut self.egraph);
         let runner = egg::Runner::default().with_egraph(egraph).run(&self.rules);
+        self.egraph = runner.egraph;
+    }
+
+    /// Run only the terminating structural reductions in place. Used after
+    /// `fold`/`unfold` to collapse snapshot towers (so repeated round-trips
+    /// don't grow the e-graph) without the cost/divergence risk of full
+    /// saturation.
+    pub(crate) fn reduce(&mut self) {
+        let egraph = std::mem::take(&mut self.egraph);
+        let runner = egg::Runner::default()
+            .with_egraph(egraph)
+            .run(&self.reduce_rules);
         self.egraph = runner.egraph;
     }
 

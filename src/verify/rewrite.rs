@@ -21,6 +21,23 @@ fn var(name: &str) -> Var {
 /// generated from `adt_meta` (currently the discriminator tag reduction).
 pub fn rules(adt_meta: &AdtMeta) -> Vec<Rule> {
     let mut rules = static_rules();
+    rules.extend(adt_rules(adt_meta));
+    rules
+}
+
+/// The terminating structural reductions used to **normalize** the e-graph after
+/// heap-producing ops (`fold`/`unfold`) — currently the ADT reductions, which
+/// collapse the `cons(proj(cons(..)))` snapshot towers. Kept separate from
+/// [`rules`] so that future *non-terminating* rules (e.g. recursive function
+/// defining-equations) are run only during full saturation, never here.
+pub fn reduce_rules(adt_meta: &AdtMeta) -> Vec<Rule> {
+    adt_rules(adt_meta)
+}
+
+/// ADT reductions generated from `adt_meta`: the discriminator `tag` reduction
+/// and the constructor-projection reduction. Both are terminating.
+fn adt_rules(adt_meta: &AdtMeta) -> Vec<Rule> {
+    let mut rules = Vec::new();
     for (&tag_fn, ctor_tags) in &adt_meta.tag_fns {
         // `Adt@tag(ctor_C(..)) ⇒ index_C`. FuncApp isn't string-matchable, so
         // both searcher and applier are custom.
