@@ -1739,6 +1739,33 @@ method m(x: Ref)
     }
 
     #[test]
+    fn fold_unfold_mixed_element_types() {
+        // A predicate over an Int and a Bool field: each field's snapshot member
+        // monomorphises a distinct `Option` instance (`Some@Int` vs `Some@Bool`,
+        // distinct member ids), and both round-trip independently.
+        let input = r#"
+field f: Int
+field g: Bool
+predicate Both(x: Ref) { acc(x.f, write) && acc(x.g, write) }
+method m(x: Ref)
+  requires acc(x.f, write) && acc(x.g, write)
+{
+  x.f := 7
+  x.g := true
+  fold acc(Both(x), write)
+  unfold acc(Both(x), write)
+  assert x.f == 7
+  assert x.g == true
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "mixed Int/Bool fold/unfold round-trip should preserve both fields"
+        );
+    }
+
+    #[test]
     fn fold_unfold_fractional_with_pure_fact() {
         // Bare `fold`/`unfold P(x)` syntax, a predicate carrying a pure fact,
         // unfolding an opaque (requires-held) predicate, and a fractional
