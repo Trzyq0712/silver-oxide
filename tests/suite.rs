@@ -6,26 +6,8 @@ fn cases_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SILVER_CASES_DIR") {
         return PathBuf::from(dir);
     }
-    // Walk up from CARGO_MANIFEST_DIR until we find a sibling `cases/` that
-    // contains the sentinel file. Handles both the normal project root and git
-    // worktrees nested several levels deep.
-    let mut search = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .expect("manifest dir");
-    for _ in 0..8 {
-        let candidate = search.join("cases");
-        if candidate.is_dir() && candidate.join("number_pred_simpler.vpr").exists() {
-            return candidate;
-        }
-        match search.parent() {
-            Some(p) => search = p.to_path_buf(),
-            None => break,
-        }
-    }
-    panic!(
-        "cases/ directory not found (searched up from {}); set SILVER_CASES_DIR",
-        env!("CARGO_MANIFEST_DIR")
-    )
+    // The corpus is version-controlled with this crate under `tests/cases/`.
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases")
 }
 
 fn vpr_files(dir: &Path) -> Vec<PathBuf> {

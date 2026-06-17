@@ -1,0 +1,11 @@
+field f: Int
+
+predicate pred(x: Ref, y: Ref, b: Bool, p: Perm) {
+  p >= none && acc(x.f, p) && acc(x.f, 1/8) && acc(y.f, 1/2) && (b ==> x == y)
+}
+
+method client(x: Ref, y: Ref, b: Bool)
+  requires acc(x.f, 3/4) && acc(y.f, 5/8)
+{
+  fold pred(x, y, false, 1/8)
+}

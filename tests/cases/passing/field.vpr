@@ -1,0 +1,7 @@
+field f: Int
+
+method client(x: Ref) 
+    requires acc(x.f, 1/1) && x.f == 42
+{
+    var y: Int := x.f
+}

@@ -1,0 +1,5 @@
+field f: Int
+
+predicate pred(x: Ref) {
+    x.f == 42 // Insufficient permission ro read x.f
+}

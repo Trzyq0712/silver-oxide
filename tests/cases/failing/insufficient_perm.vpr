@@ -1,0 +1,10 @@
+field f: Int
+
+method needs_full(x: Ref)
+    requires acc(x.f, 1/1)
+
+method client(x: Ref)
+    requires acc(x.f, 1/2)
+{
+    needs_full(x) // exhales 1/1 but only 1/2 held -> fails
+}
