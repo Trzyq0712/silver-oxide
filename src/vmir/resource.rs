@@ -69,25 +69,30 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
         match &self.item.body {
             None => Ok(()),
             Some(body) => {
-                write!(f, "[")?;
-                match &self.item.precond {
-                    Precond::SelfFramed => write!(f, "empty")?,
+                // A self-framed resource has no precondition: print no `[..]`
+                // annotation and count emitted heaps from `h0` (its initial heap
+                // is `empty`). A two-state resource shows its context resource
+                // `[req(args)]` and reserves `h0` for that ctx heap, so its body
+                // heaps start at `h1`.
+                let heap_base = match &self.item.precond {
+                    Precond::SelfFramed => 0usize,
                     Precond::Ctx(req_id, req_args) => {
-                        write!(f, "{}(", self.interner.resolve(req_id))?;
+                        write!(f, "[{}(", self.interner.resolve(req_id))?;
                         for (i, arg) in req_args.iter().enumerate() {
                             if i > 0 {
                                 write!(f, ", ")?;
                             }
                             write!(f, "{}", arg)?;
                         }
-                        write!(f, ")")?;
+                        write!(f, ")]")?;
+                        1usize
                     }
-                }
-                writeln!(f, "] {{")?;
+                };
+                writeln!(f, " {{")?;
                 write!(
                     f,
                     "{}",
-                    self.with((self.item.params.len(), 1usize, &body.insts[..]))
+                    self.with((self.item.params.len(), heap_base, &body.insts[..]))
                 )?;
                 writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
                 write!(f, "}}")

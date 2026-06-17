@@ -10,7 +10,8 @@ use crate::{
     },
     vmir::{
         self, Assign, BinOp, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal, MemberId,
-        Method, PathConds, Polarity, PureInst, Resource, ResourceCall, Sign, Target, Type, Val,
+        Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall, Sign, Target, Type,
+        Val,
     },
 };
 
@@ -819,8 +820,13 @@ pub fn verify_resource(
         .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
         .collect();
     let mut state = EvalState::with_args(params.clone());
-    // Parametric ctx heap: an empty heap whose reads yield fresh symbolics.
-    state.push_heap(Heap::empty());
+    // A two-state (`Ctx`) resource reads a parametric context heap as
+    // `HeapVal::Temp(0)` (empty here; reads yield fresh symbolics), so pre-push
+    // it. A self-framed resource has no precondition: its initial heap is
+    // `Empty` and its emitted heaps start at `Temp(0)`, so push nothing.
+    if !matches!(resource.precond, Precond::SelfFramed) {
+        state.push_heap(Heap::empty());
+    }
 
     let mut snap = Snapshotter::from_env(resource_name);
     snap.snapshot(&ctx, &[], "init", None);

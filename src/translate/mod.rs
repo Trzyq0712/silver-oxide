@@ -291,9 +291,9 @@ impl<'a> Builder<'a> {
         let pred_id = self.fresh_decl(&name);
         self.name_map.insert(p.name.0, pred_id);
         let params: Vec<vmir::Type> = p.params.iter().map(|p| lower_type(&p.ty)).collect();
-        // A concrete predicate body lowers to a resource body exactly like a
-        // method precondition: params occupy `Val::Temp(0..n)` and the spatial
-        // assertion accumulates onto the ctx heap (`HeapVal::Temp(0)`).
+        // A concrete predicate body is self-framed (no precondition): params
+        // occupy `Val::Temp(0..n)` and the spatial assertion accumulates onto an
+        // empty initial heap, so emitted heaps start at `HeapVal::Temp(0)`.
         let body = match &p.body {
             None => None,
             Some(body_exp) => {
@@ -306,8 +306,8 @@ impl<'a> Builder<'a> {
                     &env,
                     body_exp,
                     params.len(),
-                    vmir::HeapVal::Temp(0),
-                    1,
+                    vmir::HeapVal::Empty,
+                    0,
                 )?)
             }
         };
@@ -418,13 +418,15 @@ impl<'a> Builder<'a> {
             for (i, p) in m.params.iter().enumerate() {
                 env.insert(p.name.0, vmir::Val::Temp(i));
             }
+            // `@requires` is self-framed: accumulate from an empty initial heap,
+            // emitted heaps start at `HeapVal::Temp(0)`.
             let body = resource::lower_spatial_never(
                 self,
                 &env,
                 requires,
                 params.len(),
-                vmir::HeapVal::Temp(0),
-                1,
+                vmir::HeapVal::Empty,
+                0,
             )?;
             self.set_decl(
                 req_id,
@@ -449,13 +451,13 @@ impl<'a> Builder<'a> {
                 env.insert(r.name.0, vmir::Val::Temp(m.params.len() + i));
             }
             // m@ensures's precondition resource is m@requires (when present).
-            // `HeapVal::Temp(0)` stays the reserved ctx slot (the precondition's
-            // heap delta, supplied by the caller) for future pre-state / `old`
-            // reads — but it must NOT be the permission-accumulation base. The
-            // ensures delta is produced-only: accumulate from `HeapVal::Empty`
+            // The ensures delta is produced-only: accumulate from `HeapVal::Empty`
             // so a resource named in both requires and ensures isn't counted
-            // twice. `heap_base` stays 1 because the verifier still occupies
-            // `heaps[0]` with the ctx heap.
+            // twice. When there *is* a precondition, `HeapVal::Temp(0)` is the
+            // reserved ctx slot (the precondition's heap delta, for future
+            // pre-state / `old` reads), so emitted heaps start at `1`. With no
+            // precondition the resource is self-framed and emitted heaps start at
+            // `0`.
             let precond = self
                 .method_requires
                 .get(&m.name.0)
@@ -466,13 +468,17 @@ impl<'a> Builder<'a> {
                     vmir::Precond::Ctx(req_id, req_args)
                 })
                 .unwrap_or(vmir::Precond::SelfFramed);
+            let heap_base = match &precond {
+                vmir::Precond::Ctx(..) => 1,
+                vmir::Precond::SelfFramed => 0,
+            };
             let body = resource::lower_spatial_ensures(
                 self,
                 &env,
                 ensures,
                 params.len(),
                 vmir::HeapVal::Empty,
-                1,
+                heap_base,
             )?;
             self.set_decl(
                 ens_id,
