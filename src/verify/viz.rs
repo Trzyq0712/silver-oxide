@@ -154,8 +154,17 @@ impl Snapshotter {
                 &mut type_memo,
             );
             let mut attrs = format!("    bgcolor=\"{}\"\n", cluster_color(ty.as_ref()));
+            // Cluster label: the inferred type, plus the const-fold value when
+            // known (two lines).
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(t) = &ty {
+                parts.push(escape(&ctx.type_name(t)));
+            }
             if let Some(lit) = &class.data.value {
-                attrs.push_str(&format!("    label=\"= {}\"\n", escape(&lit.to_string())));
+                parts.push(escape(&format!("= {lit}")));
+            }
+            if !parts.is_empty() {
+                attrs.push_str(&format!("    label=\"{}\"\n", parts.join("\\n")));
             }
             let needle = format!("subgraph cluster_{} {{\n", usize::from(class.id));
             if let Some(pos) = dot.find(&needle) {
