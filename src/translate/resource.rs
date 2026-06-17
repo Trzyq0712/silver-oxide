@@ -130,11 +130,10 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
         S::Acc(res, perm) => {
             let (loc, perm) = lower_acc(b, env, sink, hctx, res, perm)?;
             // Inhale adds the chunk; exhale subtracts it (so a later `perm`
-            // observes the reduced heap). The add/sub is unconditional — the
-            // branch lives in the (gated) permission fraction.
-            let (sign, guarded) = match mode {
-                SpatialMode::Inhale => (Sign::Add, false),
-                SpatialMode::Exhale { .. } => (Sign::Sub, true),
+            // observes the reduced heap).
+            let sign = match mode {
+                SpatialMode::Inhale => Sign::Add,
+                SpatialMode::Exhale { .. } => Sign::Sub,
             };
             let inst = HeapInst::Combine {
                 base: acc_heap,
@@ -142,16 +141,26 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
                 target: Target::Loc(loc),
                 perm,
             };
-            let h_out = if guarded {
-                sink.emit_heap_guarded(inst)
-            } else {
-                sink.emit_heap(inst)
-            };
+            // Always carry the path condition: an `acc` has a permission ≥ 0
+            // side condition that must be discharged under the conditions
+            // reaching it (and an inhale produces a pc-gated assumption). E.g.
+            // in `p >= none && acc(x.f, p)` the threaded `p >= none` is what
+            // makes `p >= 0` provable.
+            let h_out = sink.emit_heap_guarded(inst);
             Ok((h_out, None))
         }
         S::Conj(l, r) => {
             let (h_mid, b_l) = lower_spatial(b, env, sink, acc_heap, mode, old, l)?;
-            let (h_out, b_r) = lower_spatial(b, env, sink, h_mid, mode, old, r)?;
+            // `A && B`: by short-circuit semantics B is only reached when A
+            // holds, so A's boolean is part of B's path condition. Threading it
+            // lets B's side conditions (e.g. an `acc` permission ≥ 0) assume the
+            // facts of A — e.g. `p >= none && acc(x.f, p)` discharges `p >= 0`.
+            let (h_out, b_r) = match b_l.clone() {
+                Some(v) => sink.with_cond(v, Polarity::Positive, |sink| {
+                    lower_spatial(b, env, sink, h_mid, mode, old, r)
+                })?,
+                None => lower_spatial(b, env, sink, h_mid, mode, old, r)?,
+            };
 
             let b_sum = match (b_l, b_r) {
                 (None, None) => None,
