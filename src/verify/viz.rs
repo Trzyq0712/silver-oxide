@@ -101,7 +101,7 @@ impl Snapshotter {
         for m in funcs {
             dot = dot.replace(
                 &format!("fn{}(..)", m.0),
-                &format!("{}(..)", escape(&ctx.member_name(m))),
+                &format!("{}", escape(&ctx.member_name(m))),
             );
         }
         // `Symbolic` renders a fresh value as `fresh<id>`; append its type from
