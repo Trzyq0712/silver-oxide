@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PureExt, Sink};
+use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PcKind, PureExt, Sink};
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
@@ -156,7 +156,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             // lets B's side conditions (e.g. an `acc` permission ≥ 0) assume the
             // facts of A — e.g. `p >= none && acc(x.f, p)` discharges `p >= 0`.
             let (h_out, b_r) = match b_l.clone() {
-                Some(v) => sink.with_cond(v, Polarity::Positive, |sink| {
+                Some(v) => sink.with_cond(v, Polarity::Positive, PcKind::Fact, |sink| {
                     lower_spatial(b, env, sink, h_mid, mode, old, r)
                 })?,
                 None => lower_spatial(b, env, sink, h_mid, mode, old, r)?,
@@ -177,9 +177,10 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             // `with_cond` pushes `c` onto the path condition; that stack is both
             // the body's side-condition guard and the source of the permission
             // gating (see `gate_perm_by_pc`), so no separate guard value is built.
-            let (h_out, b_b) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, old, body)
-            })?;
+            let (h_out, b_b) =
+                sink.with_cond(c.clone(), Polarity::Positive, PcKind::Branch, |sink| {
+                    lower_spatial(b, env, sink, acc_heap, mode, old, body)
+                })?;
             // c ==> b_b  =  c ? b_b : true. When body has no boolean, the
             // whole implication is trivially true.
             let bv = b_b.map(|v| sink.emit_pure(Type::Bool, PureInst::Ternary(c, v, TRUE)));
@@ -191,12 +192,14 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             // then onto `acc_heap`, else onto the then-result. No heap ternary;
             // the else arm's negative polarity is applied by flipping ternary
             // branches in `gate_perm_by_pc`, not by materializing `!c`.
-            let (h_mid, b_t) = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
-                lower_spatial(b, env, sink, acc_heap, mode, old, then)
-            })?;
-            let (h_out, b_e) = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
-                lower_spatial(b, env, sink, h_mid, mode, old, else_)
-            })?;
+            let (h_mid, b_t) =
+                sink.with_cond(c.clone(), Polarity::Positive, PcKind::Branch, |sink| {
+                    lower_spatial(b, env, sink, acc_heap, mode, old, then)
+                })?;
+            let (h_out, b_e) =
+                sink.with_cond(c.clone(), Polarity::Negative, PcKind::Branch, |sink| {
+                    lower_spatial(b, env, sink, h_mid, mode, old, else_)
+                })?;
             let bv = match (b_t, b_e) {
                 (None, None) => None,
                 (Some(vt), None) => {
@@ -225,8 +228,10 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
 /// The empty path condition (top level) returns `perm` unchanged.
 fn gate_perm_by_pc(sink: &mut Sink, perm: Val) -> Val {
     let mut v = perm;
-    // Innermost literal first, so the outermost guard ends up outermost.
-    for (lit, pol) in sink.pc.conds.clone().into_iter().rev() {
+    // Only *branch* conditions gate permissions: a separating-conjunction
+    // `Fact` is an assertion (abort if false), so its `acc` keeps the bare
+    // permission. Innermost literal first, so the outermost guard ends outermost.
+    for (lit, pol) in sink.branch_conds().into_iter().rev() {
         let (then_, else_) = match pol {
             Polarity::Positive => (v, none()),
             Polarity::Negative => (none(), v),
@@ -337,7 +342,7 @@ pub(crate) fn lower_assertion_bool<Ext: PureExt>(
         }
         S::Implies(cond, body) => {
             let c = pure_exp::lower(b, env, sink, hctx, cond)?;
-            let bb = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+            let bb = sink.with_cond(c.clone(), Polarity::Positive, PcKind::Branch, |sink| {
                 lower_assertion_bool(b, env, sink, heap, old, body)
             })?;
             // c ==> bb  =  c ? bb : true
@@ -345,10 +350,10 @@ pub(crate) fn lower_assertion_bool<Ext: PureExt>(
         }
         S::Ternary { if_, then, else_ } => {
             let c = pure_exp::lower(b, env, sink, hctx, if_)?;
-            let bt = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+            let bt = sink.with_cond(c.clone(), Polarity::Positive, PcKind::Branch, |sink| {
                 lower_assertion_bool(b, env, sink, heap, old, then)
             })?;
-            let be = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
+            let be = sink.with_cond(c.clone(), Polarity::Negative, PcKind::Branch, |sink| {
                 lower_assertion_bool(b, env, sink, heap, old, else_)
             })?;
             Ok(match (bt, be) {

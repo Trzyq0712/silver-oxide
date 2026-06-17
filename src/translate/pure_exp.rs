@@ -11,6 +11,20 @@ use crate::vmir::{
     ResourceCall, Sign, TRUE, Target, Val,
 };
 
+/// Why a condition sits on the path-condition stack. Both kinds gate the
+/// **side conditions** of the instructions under them (they go on the emitted
+/// `pc`), but only a `Branch` gates **permission amounts**:
+/// - `Branch` — a case split (`b ==> ..`, `c ? .. : ..`); the dead arm needs 0
+///   permission, so the perm is wrapped `b ? p : 0`.
+/// - `Fact` — the left operand of a separating conjunction `A && B`; an
+///   *assertion* that aborts if false, so `B`'s permissions stay ungated (no
+///   spurious `A ? p : 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PcKind {
+    Branch,
+    Fact,
+}
+
 /// A mutable sink for emitted instructions plus the running counters. The
 /// instruction set is uniform; how the resulting stream is interpreted is the
 /// caller's concern (resource delta+bool, method effects, function result).
@@ -22,6 +36,9 @@ pub(crate) struct Sink {
     /// Running path condition of the lowering point. Sidecond instructions
     /// are emitted gated by this; branch arms push/pop guards via `with_cond`.
     pub pc: PathConds,
+    /// Per-entry kind, parallel to `pc.conds`. Only `Branch` entries gate
+    /// permissions (see `gate_perm_by_pc`); the emitted `pc` carries both.
+    pc_kinds: Vec<PcKind>,
 }
 
 impl Sink {
@@ -32,22 +49,38 @@ impl Sink {
             val_count: 0,
             heap_count: heap_base,
             pc: PathConds::default(),
+            pc_kinds: Vec::new(),
         }
     }
 
-    /// Run `f` with `(cond, pol)` pushed onto the path condition, popping it
-    /// afterwards. The pop runs even when `f` returns `Err`, keeping the
-    /// guard stack balanced.
+    /// Run `f` with `(cond, pol)` of the given `kind` pushed onto the path
+    /// condition, popping it afterwards. The pop runs even when `f` returns
+    /// `Err`, keeping the guard stack balanced.
     pub(crate) fn with_cond<R>(
         &mut self,
         cond: Val,
         pol: Polarity,
+        kind: PcKind,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.pc.conds.push((cond, pol));
+        self.pc_kinds.push(kind);
         let r = f(self);
         self.pc.conds.pop();
+        self.pc_kinds.pop();
         r
+    }
+
+    /// The currently-active **branch** path-condition literals (the ones that
+    /// gate permissions); `Fact` entries are excluded.
+    pub(crate) fn branch_conds(&self) -> Vec<(Val, Polarity)> {
+        self.pc
+            .conds
+            .iter()
+            .zip(&self.pc_kinds)
+            .filter(|(_, k)| **k == PcKind::Branch)
+            .map(|((c, p), _)| (c.clone(), *p))
+            .collect()
     }
 
     pub fn next_val_temp(&mut self) -> Val {
@@ -208,10 +241,10 @@ pub(crate) fn lower<Ext: PureExt>(
         P::Binary(op, l, r) => lower_binary(b, env, sink, hctx, ty, op, l, r),
         P::Ternary { if_, then, else_ } => {
             let c = lower(b, env, sink, hctx, if_)?;
-            let t = sink.with_cond(c.clone(), Polarity::Positive, |sink| {
+            let t = sink.with_cond(c.clone(), Polarity::Positive, PcKind::Branch, |sink| {
                 lower(b, env, sink, hctx, then)
             })?;
-            let e = sink.with_cond(c.clone(), Polarity::Negative, |sink| {
+            let e = sink.with_cond(c.clone(), Polarity::Negative, PcKind::Branch, |sink| {
                 lower(b, env, sink, hctx, else_)
             })?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
@@ -234,7 +267,13 @@ pub(crate) fn lower<Ext: PureExt>(
             }
             Ok(sink.emit_pure(
                 ty,
-                PureInst::FunctionCall(None, vmir::FunctionCall { function: func, args }),
+                PureInst::FunctionCall(
+                    None,
+                    vmir::FunctionCall {
+                        function: func,
+                        args,
+                    },
+                ),
             ))
         }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
@@ -335,21 +374,21 @@ fn lower_binary<Ext: PureExt>(
     match op {
         B::And => {
             // l && r  =  l ? r : false
-            let rv = sink.with_cond(lv.clone(), Polarity::Positive, |sink| {
+            let rv = sink.with_cond(lv.clone(), Polarity::Positive, PcKind::Branch, |sink| {
                 lower(b, env, sink, hctx, r)
             })?;
             return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, rv, FALSE)));
         }
         B::Or => {
             // l || r  =  l ? true : r
-            let rv = sink.with_cond(lv.clone(), Polarity::Negative, |sink| {
+            let rv = sink.with_cond(lv.clone(), Polarity::Negative, PcKind::Branch, |sink| {
                 lower(b, env, sink, hctx, r)
             })?;
             return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, TRUE, rv)));
         }
         B::Implies => {
             // l ==> r  =  l ? r : true
-            let rv = sink.with_cond(lv.clone(), Polarity::Positive, |sink| {
+            let rv = sink.with_cond(lv.clone(), Polarity::Positive, PcKind::Branch, |sink| {
                 lower(b, env, sink, hctx, r)
             })?;
             return Ok(sink.emit_pure(ty, PureInst::Ternary(lv, rv, TRUE)));

@@ -116,11 +116,12 @@ fn static_rules() -> Vec<Rule> {
     rules
 }
 
-/// Terminating `ite`/comparison simplifications. Shared by the saturation rule
-/// set and the post-`fold`/`unfold` reduction set. Includes the distribution of
-/// a comparison over an `ite` (`z < (c ? x : y)` ⇒ `c ? z<x : z<y`), which lets
-/// an optional snapshot member's discriminant `0 < (b ? p : 0)` collapse to the
-/// branch condition `b` (via `ite-ident` after the per-branch comparisons fold).
+/// Terminating `ite` simplifications. Shared by the saturation rule set and the
+/// post-`fold`/`unfold` reduction set. Under an assumed branch literal (on the
+/// instruction's path condition) `ite-true`/`ite-false` reduce a gated
+/// permission `b ? p : 0` to `p` (resp. `0`), which is what discharges a
+/// conditional `acc`'s permission ≥ 0 obligation and peels the optional snapshot
+/// member's discriminant — no comparison-over-`ite` distribution needed.
 fn terminating_ite_rules() -> Vec<Rule> {
     vec![
         // ite(true, x, y) => x
@@ -147,11 +148,6 @@ fn terminating_ite_rules() -> Vec<Rule> {
         rw!("ite-collapse-t"; "(ite ?c (ite ?c ?x ?y) ?y)" => "(ite ?c ?x ?y)"),
         // c ? x : (c ? x : y)  =>  c ? x : y  (Merges outer root directly to inner node)
         rw!("ite-collapse-f"; "(ite ?c ?x (ite ?c ?x ?y))" => "(ite ?c ?x ?y)"),
-        // z < (c ? x : y)  =>  c ? z<x : z<y   (discriminant distribution, RHS)
-        rw!("lt-ite-distribute-r"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
-        // (c ? x : y) < z  =>  c ? x<z : y<z   (LHS; e.g. the perm>=0 obligation
-        // `(b ? p : 0) < 0` collapses to `false` once both branches fold)
-        rw!("lt-ite-distribute-l"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
     ]
 }
 
