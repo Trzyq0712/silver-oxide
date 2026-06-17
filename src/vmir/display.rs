@@ -31,10 +31,20 @@ impl<'a, T> VmirDisplay<'a, T> {
 
 impl Display for Program {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for (idx, item) in self.decls.iter_enumerated().enumerate() {
-            if idx > 0 {
+        let mut first = true;
+        for item in self.decls.iter_enumerated() {
+            // Hide the derived accessor declarations (`@addr`, `@snap` and the
+            // snapshot constructor/projections) — they are mechanically implied
+            // by the resource/predicate/field definition, so they only clutter
+            // the dump.
+            let name = self.interner.resolve(&item.0);
+            if name.contains("@addr") || name.contains("@snap") {
+                continue;
+            }
+            if !first {
                 writeln!(f)?;
             }
+            first = false;
             write!(f, "{}", VmirDisplay::new(item, &self.interner))?;
         }
         Ok(())
