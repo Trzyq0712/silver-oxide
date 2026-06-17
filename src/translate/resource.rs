@@ -271,7 +271,7 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             for a in &call.args {
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
-            let ret_ty = Type::Addr(Box::new(Type::Domain(snap_id)));
+            let ret_ty = Type::Addr(Box::new(Type::domain(snap_id)));
             Ok(sink.emit_pure(
                 ret_ty,
                 PureInst::FunctionCall(

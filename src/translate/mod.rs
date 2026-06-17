@@ -260,7 +260,7 @@ impl<'a> Builder<'a> {
         let addr_id = self.fresh_decl(&format!("{pred_name}@addr"));
         let addr_fn = vmir::Function {
             params: p.params.iter().map(|p| lower_type(&p.ty)).collect(),
-            ret: vmir::Type::Addr(Box::new(vmir::Type::Domain(snap_id))),
+            ret: vmir::Type::Addr(Box::new(vmir::Type::domain(snap_id))),
             body: None,
         };
         self.set_decl(addr_id, vmir::Declaration::Function(addr_fn));
@@ -334,7 +334,7 @@ impl<'a> Builder<'a> {
                 cons_id,
                 vmir::Declaration::Function(vmir::Function {
                     params: types.clone(),
-                    ret: vmir::Type::Domain(snap_id),
+                    ret: vmir::Type::domain(snap_id),
                     body: None,
                 }),
             );
@@ -344,7 +344,7 @@ impl<'a> Builder<'a> {
                 self.set_decl(
                     proj_id,
                     vmir::Declaration::Function(vmir::Function {
-                        params: vec![vmir::Type::Domain(snap_id)],
+                        params: vec![vmir::Type::domain(snap_id)],
                         ret: ty.clone(),
                         body: None,
                     }),
@@ -572,7 +572,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         assert_eq!(addr_fn.params, vec![vmir::Type::Ref]);
         assert!(matches!(
             &addr_fn.ret,
-            vmir::Type::Addr(inner) if **inner == vmir::Type::Domain(snap_id)
+            vmir::Type::Addr(inner) if **inner == vmir::Type::domain(snap_id)
         ));
 
         // Predicate itself is abstract.
