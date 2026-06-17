@@ -1,10 +1,30 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use lasso::Spur;
 use nonmax::NonMaxU32;
 use typed_index_collections::TiVec;
 
 use crate::viper::{IdnDecl, interner::Interner, typed::Type, walk::AstWalker};
+
+/// Rewrite references to a bound type parameter into `Type::Generic`. The parser
+/// emits every named type as `Type::Domain(name, args)`, so a type-parameter use
+/// like `T` arrives as `Domain(T, [])`. Within a generic domain/ADT, such a
+/// nullary domain whose name is one of the declared parameters is actually a
+/// type variable; this turns it into `Generic(T)` so type inference can
+/// instantiate it. Recurses into type arguments (e.g. `List[T]`).
+fn genericize(ty: Type, params: &HashSet<Spur>) -> Type {
+    match ty {
+        Type::Domain(id, args) if args.is_empty() && params.contains(&id.0) => Type::Generic(id),
+        Type::Domain(id, args) => Type::Domain(
+            id,
+            args.into_iter().map(|a| genericize(a, params)).collect(),
+        ),
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FunctionSig {
@@ -26,11 +46,17 @@ pub struct PredicateSig {
 #[derive(Debug, Clone)]
 pub struct DomainSig {
     pub type_arity: usize,
+    /// Type-parameter names, in declaration order (length == `type_arity`).
+    pub params: Vec<Spur>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AdtSig {
     pub type_arity: usize,
+    /// Type-parameter names, in declaration order (length == `type_arity`).
+    /// Lets a destructor's `Generic` field type be mapped to the scrutinee's
+    /// corresponding type argument.
+    pub params: Vec<Spur>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +421,7 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
     fn walk_domain(&mut self, domain: &'ast super::Domain) {
         let sig = DomainSig {
             type_arity: domain.params.len(),
+            params: domain.params.iter().map(|p| p.0.id()).collect(),
         };
         self.register(&domain.name, GlobalSignature::Domain(sig));
     }
@@ -402,6 +429,7 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
     fn walk_adt(&mut self, adt: &'ast super::Adt) {
         let sig = AdtSig {
             type_arity: adt.params.len(),
+            params: adt.params.iter().map(|p| p.0.id()).collect(),
         };
         self.register(&adt.name, GlobalSignature::Adt(sig));
     }
@@ -410,14 +438,22 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
         let adt = adt_cons.adt().id();
         let tag = *self.adt_ctor_count.entry(adt).or_insert(0);
         self.adt_ctor_count.insert(adt, tag + 1);
+        // The ADT (registered before its constructors) supplies the set of bound
+        // type parameters, so generic field/return types lower to `Generic`.
+        let type_params: HashSet<Spur> = self
+            .symbol_table
+            .get(&adt)
+            .and_then(|mid| self.signatures[*mid].as_adt())
+            .map(|s| s.params.iter().copied().collect())
+            .unwrap_or_default();
         let sig = AdtConstructorSig {
             params: adt_cons
                 .signature
                 .args
                 .iter()
-                .map(|p| Type::from(p.ty()))
+                .map(|p| genericize(Type::from(p.ty()), &type_params))
                 .collect(),
-            ret: Type::from(adt_cons.signature.ret[0].ty()),
+            ret: genericize(Type::from(adt_cons.signature.ret[0].ty()), &type_params),
             adt,
             tag,
         };
@@ -432,7 +468,7 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
                 adt,
                 ctor: name_spur,
                 index,
-                ty: Type::from(&field.ty),
+                ty: genericize(Type::from(&field.ty), &type_params),
             });
         }
         self.register(

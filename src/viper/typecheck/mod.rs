@@ -80,12 +80,15 @@ impl<'g> LocalEnv<'g> {
     fn typecheck_pure<Ext: PureExt>(
         &self,
         exp: &mut viper::Exp,
-        expected: ViperTcType,
+        expected: &Type,
         result_ty: Option<Type>,
     ) -> Result<TypedPureExp<Ext>, TypeError> {
         let mut c = ConstraintCtx::new(self, result_ty);
         let root = c.constrain_pure(exp)?;
-        c.tc.impose(root.concretizes_explicit(expected))?;
+        // Impose the expected type with full structure (including any `Domain`
+        // type arguments) so a nested mismatch (e.g. `Option[Int]` vs
+        // `Option[Bool]`) is caught at the root.
+        c.impose_type(root, expected, &HashMap::new())?;
         let table = c.tc.type_check().map_err(TypeError::from)?;
         LoweringCtx::new(self, &table).lower_pure::<Ext>(exp)
     }
@@ -281,6 +284,24 @@ fn lower_ident(ident: &viper::Ident) -> Ident {
     Ident(ident.id())
 }
 
+/// Collect the distinct `Generic` type-parameter names occurring in `ty`
+/// (recursing into `Domain` type arguments), preserving first-seen order.
+fn collect_generics(ty: &Type, acc: &mut Vec<Spur>) {
+    match ty {
+        Type::Generic(id) => {
+            if !acc.contains(&id.0) {
+                acc.push(id.0);
+            }
+        }
+        Type::Domain(_, args) => {
+            for a in args {
+                collect_generics(a, acc);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn write_perm<Ext: PureExt>() -> TypedPureExp<Ext> {
     TypedPureExp {
         ty: Type::Real,
@@ -338,7 +359,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                     let ty = self.env.locals.get(&spur).cloned().ok_or_else(|| {
                         TypeError::UndefinedVariable(self.env.interner.resolve(&spur).to_string())
                     })?;
-                    self.tc.impose(key.concretizes_explicit(type_to_tc(&ty)))?;
+                    self.impose_type(key, &ty, &HashMap::new())?;
                 }
             }
 
@@ -347,7 +368,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                     .result_ty
                     .clone()
                     .ok_or(TypeError::IllegalResultUsage)?;
-                self.tc.impose(key.concretizes_explicit(type_to_tc(&ty)))?;
+                self.impose_type(key, &ty, &HashMap::new())?;
             }
 
             ExpKind::Old(_label, inner) => {
@@ -356,11 +377,10 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             }
 
             ExpKind::Ascribe(inner, ascribed_ty) => {
-                let target = type_to_tc(&Type::from(&*ascribed_ty));
+                let target = Type::from(&*ascribed_ty);
                 let inner_key = self.constrain_pure(inner)?;
-                self.tc
-                    .impose(inner_key.concretizes_explicit(target.clone()))?;
-                self.tc.impose(key.concretizes_explicit(target))?;
+                self.impose_type(inner_key, &target, &HashMap::new())?;
+                self.impose_type(key, &target, &HashMap::new())?;
             }
 
             ExpKind::UnOp(op, inner) => self.constrain_unop(op, inner, key)?,
@@ -418,11 +438,26 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                     })?;
                     (info.adt, info.ty.clone())
                 };
+                let (arity, adt_params) = {
+                    let sig = self.env.globals.resolve(adt).and_then(|s| s.as_adt());
+                    match sig {
+                        Some(s) => (s.type_arity, s.params.clone()),
+                        None => (0, Vec::new()),
+                    }
+                };
                 let base_key = self.constrain_pure(base)?;
-                self.tc
-                    .impose(base_key.concretizes_explicit(ViperTcType::Domain(Ident(adt))))?;
-                self.tc
-                    .impose(key.concretizes_explicit(type_to_tc(&field_ty)))?;
+                self.tc.impose(
+                    base_key.concretizes_explicit(ViperTcType::Domain(Ident(adt), arity)),
+                )?;
+                // Map each of the ADT's type parameters to the scrutinee's
+                // corresponding type argument (its `i`-th child), so a generic
+                // field type `T` resolves to the concrete instantiation.
+                let mut subst = HashMap::new();
+                for (i, pname) in adt_params.iter().enumerate() {
+                    let child = self.tc.get_child_key(base_key, i)?;
+                    subst.insert(*pname, child);
+                }
+                self.impose_type(key, &field_ty, &subst)?;
             }
 
             ExpKind::AdtDiscriminator(base, variant) => {
@@ -444,9 +479,16 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                         })?
                         .adt
                 };
+                let arity = self
+                    .env
+                    .globals
+                    .resolve(adt)
+                    .and_then(|s| s.as_adt())
+                    .map_or(0, |s| s.type_arity);
                 let base_key = self.constrain_pure(base)?;
-                self.tc
-                    .impose(base_key.concretizes_explicit(ViperTcType::Domain(Ident(adt))))?;
+                self.tc.impose(
+                    base_key.concretizes_explicit(ViperTcType::Domain(Ident(adt), arity)),
+                )?;
                 self.tc
                     .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
@@ -576,6 +618,63 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         Ok(())
     }
 
+    /// Impose that `key` has type `ty`, recursing into a `Domain`'s type
+    /// arguments as `rusttyc` children. `subst` instantiates the free type
+    /// parameters (`Generic`) of a generic signature: each is bound to a fresh
+    /// type-variable key, so e.g. `Some(value: T): Option[T]` unifies `T` with
+    /// the argument and propagates it to the result. A non-generic context
+    /// passes an empty `subst`.
+    fn impose_type(
+        &mut self,
+        key: TcKey,
+        ty: &Type,
+        subst: &HashMap<Spur, TcKey>,
+    ) -> Result<(), TypeError> {
+        match ty {
+            Type::Bool => self
+                .tc
+                .impose(key.concretizes_explicit(ViperTcType::Bool))?,
+            Type::Int => self.tc.impose(key.concretizes_explicit(ViperTcType::Int))?,
+            Type::Real => self
+                .tc
+                .impose(key.concretizes_explicit(ViperTcType::Real))?,
+            Type::Ref => self.tc.impose(key.concretizes_explicit(ViperTcType::Ref))?,
+            Type::Generic(id) => {
+                let var = subst.get(&id.0).copied().ok_or_else(|| {
+                    TypeError::UnboundTypeParam(self.env.interner.resolve(&id.0).to_string())
+                })?;
+                if var != key {
+                    self.tc.impose(key.equate_with(var))?;
+                }
+            }
+            Type::Domain(id, args) => {
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Domain(*id, args.len())))?;
+                for (i, arg) in args.iter().enumerate() {
+                    let child = self.tc.get_child_key(key, i)?;
+                    self.impose_type(child, arg, subst)?;
+                }
+            }
+            // Built-in collections are not yet modelled in the lattice; leave
+            // the key unconstrained (Top) as before.
+            Type::Collection(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Instantiate the free type parameters of a callee signature: a fresh
+    /// type-variable key per distinct `Generic` name occurring in `tys`.
+    fn instantiate_generics(&mut self, tys: &[Type]) -> HashMap<Spur, TcKey> {
+        let mut names = Vec::new();
+        for ty in tys {
+            collect_generics(ty, &mut names);
+        }
+        names
+            .into_iter()
+            .map(|n| (n, self.tc.new_term_key()))
+            .collect()
+    }
+
     fn constrain_call(
         &mut self,
         call: &mut viper::Call<viper::ExpCallKind>,
@@ -609,14 +708,17 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                         found: call.args.len(),
                     });
                 }
-                let expected_params: Vec<Type> = params;
-                for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
+                // Instantiate the callee's free type parameters with fresh
+                // type variables (empty for a monomorphic signature), then
+                // unify args and result against the substituted signature.
+                let mut sig_tys = params.clone();
+                sig_tys.push(ret_ty.clone());
+                let subst = self.instantiate_generics(&sig_tys);
+                for (arg, expected) in call.args.iter_mut().zip(params.iter()) {
                     let arg_key = self.constrain_pure(arg)?;
-                    self.tc
-                        .impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
+                    self.impose_type(arg_key, expected, &subst)?;
                 }
-                self.tc
-                    .impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
+                self.impose_type(key, &ret_ty, &subst)?;
                 Ok(())
             }
             ExpCallKind::Macro => Err(TypeError::Other(
@@ -648,8 +750,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         let base_key = self.constrain_pure(base)?;
         self.tc
             .impose(base_key.concretizes_explicit(ViperTcType::Ref))?;
-        self.tc
-            .impose(key.concretizes_explicit(type_to_tc(&ret_ty)))?;
+        self.impose_type(key, &ret_ty, &HashMap::new())?;
         Ok(())
     }
 
@@ -697,8 +798,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         let expected_params: Vec<Type> = sig.params.clone();
         for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
             let arg_key = self.constrain_pure(arg)?;
-            self.tc
-                .impose(arg_key.concretizes_explicit(type_to_tc(expected)))?;
+            self.impose_type(arg_key, expected, &HashMap::new())?;
         }
         Ok(())
     }
@@ -1141,7 +1241,7 @@ fn lower_assign_lhs_typed(
                 .and_then(|s| s.as_field())
                 .cloned()
                 .ok_or_else(|| TypeError::Other("undefined field".to_string()))?;
-            let base_exp = ctx.typecheck_pure::<MethodBodyExt>(base, ViperTcType::Ref, None)?;
+            let base_exp = ctx.typecheck_pure::<MethodBodyExt>(base, &Type::Ref, None)?;
             Ok((typed::AssignLhs::Field(base_exp, Ident(field_id)), field_ty))
         }
     }
@@ -1164,7 +1264,7 @@ fn lower_rhs_against_lhs(
                     found: lhs_types.len(),
                 });
             }
-            let exp = ctx.typecheck_pure::<MethodBodyExt>(e, type_to_tc(&lhs_types[0]), None)?;
+            let exp = ctx.typecheck_pure::<MethodBodyExt>(e, &lhs_types[0], None)?;
             Ok(typed::AssignRhs::Exp(exp))
         }
 
@@ -1234,8 +1334,7 @@ fn lower_rhs_against_lhs(
             // Each arg is constrained by the corresponding parameter type from the signature.
             let mut lowered_args = Vec::with_capacity(call.args.len());
             for (arg, param_ty) in call.args.iter_mut().zip(sig.params.iter()) {
-                let tc = type_to_tc(param_ty);
-                lowered_args.push(ctx.typecheck_pure::<MethodBodyExt>(arg, tc, None)?);
+                lowered_args.push(ctx.typecheck_pure::<MethodBodyExt>(arg, param_ty, None)?);
             }
             Ok(typed::AssignRhs::MethodCall(Call {
                 name: Ident(call_name),
@@ -1335,7 +1434,7 @@ fn typecheck_function(
     let body = func
         .body
         .as_mut()
-        .map(|b| ctx.typecheck_pure::<!>(&mut b.0, type_to_tc(&ret_ty), None))
+        .map(|b| ctx.typecheck_pure::<!>(&mut b.0, &ret_ty, None))
         .transpose()?;
 
     // Postconditions enable `result`, typed as the return type.
@@ -1344,17 +1443,11 @@ fn typecheck_function(
         match iter.next() {
             None => None,
             Some(e) => {
-                let first = ctx.typecheck_pure::<FuncEnsuresExt>(
-                    e,
-                    ViperTcType::Bool,
-                    Some(ret_ty.clone()),
-                )?;
+                let first =
+                    ctx.typecheck_pure::<FuncEnsuresExt>(e, &Type::Bool, Some(ret_ty.clone()))?;
                 let combined = iter.try_fold(first, |acc, e| {
-                    let next = ctx.typecheck_pure::<FuncEnsuresExt>(
-                        e,
-                        ViperTcType::Bool,
-                        Some(ret_ty.clone()),
-                    )?;
+                    let next =
+                        ctx.typecheck_pure::<FuncEnsuresExt>(e, &Type::Bool, Some(ret_ty.clone()))?;
                     Ok::<_, TypeError>(TypedPureExp {
                         ty: Type::Bool,
                         exp: Box::new(PureExpKind::Binary(BinOp::And, acc, next)),
@@ -1493,6 +1586,88 @@ function f(l: List): Int { l.head }
 "#,
         );
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn generic_adt_constructor_infers_type_arg() {
+        // `Some(3)` infers `Option[Int]`, matching the declared return type.
+        let result = run_pipeline(
+            r#"
+adt Option[T] { Some(value: T) None() }
+function f(): Option[Int] { Some(3) }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn generic_adt_constructor_type_arg_mismatch_fails() {
+        // `Some(3) : Option[Int]` cannot satisfy a declared `Option[Bool]`.
+        let result = run_pipeline(
+            r#"
+adt Option[T] { Some(value: T) None() }
+function f(): Option[Bool] { Some(3) }
+"#,
+        );
+        assert!(result.is_err(), "expected type mismatch, got Ok");
+    }
+
+    #[test]
+    fn generic_adt_none_infers_from_context() {
+        // `None()` has no argument to pin `T`; the return type provides it.
+        let result = run_pipeline(
+            r#"
+adt Option[T] { Some(value: T) None() }
+function f(): Option[Int] { None() }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn generic_adt_destructor_resolves_type_arg() {
+        // `o.value` on `Option[Int]` resolves the generic field type `T` to Int.
+        let result = run_pipeline(
+            r#"
+adt Option[T] { Some(value: T) None() }
+function f(o: Option[Int]): Int { o.value }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn generic_adt_destructor_type_arg_mismatch_fails() {
+        // `o.value` on `Option[Bool]` is Bool, not the declared Int return.
+        let result = run_pipeline(
+            r#"
+adt Option[T] { Some(value: T) None() }
+function f(o: Option[Bool]): Int { o.value }
+"#,
+        );
+        assert!(result.is_err(), "expected type mismatch, got Ok");
+    }
+
+    #[test]
+    fn generic_adt_two_params_pinned_independently() {
+        let result = run_pipeline(
+            r#"
+adt Pair[A, B] { mk(fst: A, snd: B) }
+function f(): Pair[Int, Bool] { mk(1, true) }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn generic_adt_two_params_swapped_fails() {
+        let result = run_pipeline(
+            r#"
+adt Pair[A, B] { mk(fst: A, snd: B) }
+function f(): Pair[Int, Bool] { mk(true, 1) }
+"#,
+        );
+        assert!(result.is_err(), "expected type mismatch, got Ok");
     }
 
     #[test]

@@ -10,9 +10,11 @@ pub enum ViperTcType {
     Real,
     Ref,
     Numeric, // supertype of Int and Real
-    /// A domain/ADT type, identified by name. Type arguments are not yet
-    /// tracked (monomorphic ADTs only); see the type-parametric design.
-    Domain(Ident),
+    /// A domain/ADT type, identified by name and its **type arity** (number of
+    /// type parameters). The type *arguments* are tracked as `rusttyc` children
+    /// (see `arity`/`construct`), so `Option[Int]` and `Option[Bool]` are
+    /// distinguished by their child types, not by the variant alone.
+    Domain(Ident, usize),
     Top,
 }
 
@@ -31,7 +33,10 @@ impl Variant for ViperTcType {
     type Err = TcTypeErr;
 
     fn arity(&self) -> Arity {
-        Arity::Fixed(0)
+        match self {
+            ViperTcType::Domain(_, n) => Arity::Fixed(*n),
+            _ => Arity::Fixed(0),
+        }
     }
 
     fn top() -> Self {
@@ -48,14 +53,20 @@ impl Variant for ViperTcType {
             (Ref, Ref) => Ref,
             (Int, Int) => Int,
             (Real, Real) => Real,
-            (Domain(a), Domain(b)) if a == b => Domain(a),
+            (Domain(a, n), Domain(b, m)) if a == b && n == m => Domain(a, n),
             (t1, t2) => {
                 return Err(TcTypeErr(format!("Cannot unify {:?} and {:?}", t1, t2)));
             }
         };
+        // A `Domain(_, n)` has fixed arity `n`, so its `least_arity` must be `n`;
+        // every other variant is 0-ary.
+        let least_arity = match &variant {
+            Domain(_, n) => *n,
+            _ => 0,
+        };
         Ok(Partial {
             variant,
-            least_arity: 0,
+            least_arity,
         })
     }
 }
@@ -65,14 +76,14 @@ impl Constructable for ViperTcType {
 
     fn construct(
         &self,
-        _children: &[Self::Type],
+        children: &[Self::Type],
     ) -> Result<Self::Type, <Self as rusttyc::ContextSensitiveVariant>::Err> {
         Ok(match self {
             ViperTcType::Bool => Type::Bool,
             ViperTcType::Int => Type::Int,
             ViperTcType::Real | ViperTcType::Numeric => Type::Real,
             ViperTcType::Ref => Type::Ref,
-            ViperTcType::Domain(id) => Type::Domain(*id, Vec::new()),
+            ViperTcType::Domain(id, _) => Type::Domain(*id, children.to_vec()),
             ViperTcType::Top => {
                 return Err(TcTypeErr("Cannot construct abstract type".to_string()));
             }
@@ -80,13 +91,17 @@ impl Constructable for ViperTcType {
     }
 }
 
+/// The top-level variant of a `Type`, **without** its type arguments. The
+/// arguments are imposed separately as `rusttyc` children (see
+/// `ConstraintCtx::impose_type`); a bare `Generic` has no top-level variant
+/// (it is bound to a fresh type variable), so it maps to `Top`.
 pub fn type_to_tc(ty: &Type) -> ViperTcType {
     match ty {
         Type::Bool => ViperTcType::Bool,
         Type::Int => ViperTcType::Int,
         Type::Real => ViperTcType::Real,
         Type::Ref => ViperTcType::Ref,
-        Type::Domain(id, _) => ViperTcType::Domain(*id),
+        Type::Domain(id, args) => ViperTcType::Domain(*id, args.len()),
         Type::Generic(_) | Type::Collection(_) => ViperTcType::Top,
     }
 }

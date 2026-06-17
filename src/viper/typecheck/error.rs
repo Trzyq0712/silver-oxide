@@ -27,6 +27,8 @@ pub enum TypeError {
         expected: usize,
         found: usize,
     },
+    /// A `Generic` type parameter occurred outside a scope that binds it.
+    UnboundTypeParam(String),
     Tc(TcErr<ViperTcType>),
     Other(String),
 }
@@ -79,6 +81,9 @@ impl std::fmt::Display for TypeError {
                     f,
                     "assignment expects {expected} target(s) on LHS, found {found}"
                 )
+            }
+            TypeError::UnboundTypeParam(name) => {
+                write!(f, "unbound type parameter `{name}`")
             }
             TypeError::Tc(e) => write!(f, "Constraint error: {e:?}"),
             TypeError::Other(msg) => write!(f, "{msg}"),
