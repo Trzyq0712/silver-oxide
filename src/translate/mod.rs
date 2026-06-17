@@ -30,7 +30,8 @@ pub fn translate(
     let mut builder = Builder::new(interner, globals);
     let mut errors = Vec::new();
 
-    // Phase A: synthesise @snap (predicates) and @addr (predicates + fields).
+    // Phase A: synthesise the predicate `@snap`/`@addr` accessors and the
+    // field address functions (emitted under the field's own name).
     for decl in &program.0 {
         match decl {
             typed::Declaration::Predicate(p) => builder.declare_predicate_accessors(p),
@@ -268,8 +269,14 @@ impl<'a> Builder<'a> {
     }
 
     fn declare_field_accessor(&mut self, f: &typed::Field) {
-        let field_name = self.interner.resolve(&f.0.name.0);
-        let addr_id = self.fresh_decl(&format!("{field_name}@addr"));
+        // A field's address function carries the field's *original* name (no
+        // `@addr` suffix). The field name has exactly one VMIR meaning — its
+        // `Ref -> Addr<T>` accessor — so the bare name is canonical. The `@`
+        // suffixes (`@addr`, `@snap`, …) are reserved for *generated* implicit
+        // members that sit alongside a user-named resource (e.g. a predicate's
+        // `P@addr` / `P@snap`).
+        let field_name = self.interner.resolve(&f.0.name.0).to_owned();
+        let addr_id = self.fresh_decl(&field_name);
         let addr_fn = vmir::Function {
             params: vec![vmir::Type::Ref],
             ret: vmir::Type::Addr(Box::new(lower_type(&f.0.ty))),
