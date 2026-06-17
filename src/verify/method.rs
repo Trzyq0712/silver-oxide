@@ -1694,6 +1694,51 @@ method m(x: Ref)
     }
 
     #[test]
+    fn fold_unfold_conditional_true_branch() {
+        // A predicate with a conditional acc (`b ==> acc(x.f)`): when the guard
+        // is true the field is captured (member `Some(v)`), so the round-trip
+        // recovers it. Exercises conditional folding + the optional discriminant
+        // `0 < (b ? p : 0)` collapsing to `b`.
+        let input = r#"
+field f: Int
+predicate Maybe(x: Ref, b: Bool) { b ==> acc(x.f, write) }
+method m(x: Ref)
+  requires acc(x.f, write) && x.f == 5
+{
+  fold acc(Maybe(x, true), write)
+  unfold acc(Maybe(x, true), write)
+  assert x.f == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "conditional fold/unfold (guard true) should preserve x.f == 5"
+        );
+    }
+
+    #[test]
+    fn fold_unfold_conditional_false_keeps_field() {
+        // With the guard false the predicate captures nothing (member `None`),
+        // so the field permission is retained and `x.f` is still readable.
+        let input = r#"
+field f: Int
+predicate Maybe(x: Ref, b: Bool) { b ==> acc(x.f, write) }
+method m(x: Ref)
+  requires acc(x.f, write) && x.f == 5
+{
+  fold acc(Maybe(x, false), write)
+  assert x.f == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "conditional fold (guard false) should retain the field permission"
+        );
+    }
+
+    #[test]
     fn fold_unfold_fractional_with_pure_fact() {
         // Bare `fold`/`unfold P(x)` syntax, a predicate carrying a pure fact,
         // unfolding an opaque (requires-held) predicate, and a fractional

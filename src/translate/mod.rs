@@ -364,10 +364,14 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// The ordered field-types of a **flat** predicate body (a conjunction of
-    /// `acc(_.f, _)` over fields, with optional pure conjuncts). Returns `None`
-    /// for bodies with nested predicates or conditionals (not foldable yet),
-    /// which makes the predicate unfoldable in slice 1.
+    /// The ordered field-types of a **foldable** predicate body: a conjunction
+    /// of `acc(_.f, _)` over fields (with optional pure conjuncts), now also
+    /// through conditionals (`b ==> acc(..)`, `c ? .. : ..`). The conditional's
+    /// guard is *not* captured here — it lives in the resource body's gated
+    /// permission (`perm = b ? p : 0`), which the verifier lifts to the
+    /// snapshot member's `present` discriminant. Returns `None` for nested
+    /// predicates (not foldable yet). The slot order must match the body
+    /// instruction stream, so conditional branches contribute in source order.
     fn flat_footprint_types(&self, exp: &typed::SpatialExp<!>) -> Option<Vec<vmir::Type>> {
         use typed::ResourceExpKind as R;
         use typed::SpatialExpKind as S;
@@ -385,7 +389,15 @@ impl<'a> Builder<'a> {
                 R::PredicateCall(_) => None,
             },
             S::Pure(_) => Some(vec![]),
-            S::Implies(..) | S::Ternary { .. } => None,
+            // `b ==> A`: A's slots, with permission gated by `b` in the body.
+            S::Implies(_cond, inner) => self.flat_footprint_types(inner),
+            // `c ? A : B`: A's slots then B's slots (each gated by the branch
+            // condition in the body), in source order.
+            S::Ternary { then, else_, .. } => {
+                let mut v = self.flat_footprint_types(then)?;
+                v.extend(self.flat_footprint_types(else_)?);
+                Some(v)
+            }
         }
     }
 

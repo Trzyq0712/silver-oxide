@@ -147,8 +147,11 @@ fn terminating_ite_rules() -> Vec<Rule> {
         rw!("ite-collapse-t"; "(ite ?c (ite ?c ?x ?y) ?y)" => "(ite ?c ?x ?y)"),
         // c ? x : (c ? x : y)  =>  c ? x : y  (Merges outer root directly to inner node)
         rw!("ite-collapse-f"; "(ite ?c ?x (ite ?c ?x ?y))" => "(ite ?c ?x ?y)"),
-        // z < (c ? x : y)  =>  c ? z<x : z<y   (discriminant distribution)
-        rw!("lt-ite-distribute"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
+        // z < (c ? x : y)  =>  c ? z<x : z<y   (discriminant distribution, RHS)
+        rw!("lt-ite-distribute-r"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
+        // (c ? x : y) < z  =>  c ? x<z : y<z   (LHS; e.g. the perm>=0 obligation
+        // `(b ? p : 0) < 0` collapses to `false` once both branches fold)
+        rw!("lt-ite-distribute-l"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
     ]
 }
 
