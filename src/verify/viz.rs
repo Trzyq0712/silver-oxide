@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
 use crate::verify::lang::Symbolic;
-use crate::vmir::display::VmirDisplay;
 use crate::vmir::{MemberId, Type};
 
 pub(crate) struct Snapshotter {
@@ -102,7 +101,7 @@ impl Snapshotter {
         for m in funcs {
             dot = dot.replace(
                 &format!("fn{}(..)", m.0),
-                &format!("{}(..)", escape(ctx.interner.resolve(&m))),
+                &format!("{}(..)", escape(&ctx.member_name(m))),
             );
         }
         // `Symbolic` renders a fresh value as `fresh<id>`; append its type from
@@ -110,7 +109,7 @@ impl Snapshotter {
         // also rewrite `fresh10`.
         for u in fresh {
             if let Some(ty) = ctx.fresh_types.get(&u) {
-                let label = format!("fresh{u}: {}", VmirDisplay::new(ty, ctx.interner));
+                let label = format!("fresh{u}: {}", ctx.type_name(ty));
                 dot = dot.replace(&format!("fresh{u}\""), &format!("{}\"", escape(&label)));
             }
         }

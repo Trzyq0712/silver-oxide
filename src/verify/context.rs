@@ -58,6 +58,10 @@ pub(crate) struct VerifyContext<'a> {
     option_adt_id: MemberId,
     /// Monomorphic `Option` instances, keyed by element type.
     option_mono: HashMap<Type, OptionInstance>,
+    /// Display names for verifier-synthesised member ids (which are not in the
+    /// interner). Consulted by the visualization before falling back to the
+    /// interner.
+    mono_names: HashMap<MemberId, String>,
     pub(crate) interner: &'a Rodeo<MemberId>,
     /// Type side-oracle: the irreducible type sources that the type-free
     /// e-graph nodes no longer carry. Keyed by stable node payloads (the
@@ -72,17 +76,52 @@ impl<'a> VerifyContext<'a> {
         // Synthetic ids start past every real (interned) declaration id; the
         // first synthetic id is reserved for the generic `Option` head.
         let base = interner.len();
+        let option_adt_id = MemberId::from(base);
+        let mut mono_names = HashMap::new();
+        mono_names.insert(option_adt_id, "Option".to_string());
         Self {
             egraph: egg::EGraph::default(),
             rules: rewrite::rules(adt_meta),
             reduce_rules: rewrite::reduce_rules(adt_meta),
             fresh_counter: 0,
             mono_counter: base + 1,
-            option_adt_id: MemberId::from(base),
+            option_adt_id,
             option_mono: HashMap::new(),
+            mono_names,
             interner,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
+        }
+    }
+
+    /// Display name for a member id: the synthetic-name table (verifier-minted
+    /// monomorphic members) falls back to the interner (real declarations).
+    pub(crate) fn member_name(&self, m: MemberId) -> String {
+        if let Some(n) = self.mono_names.get(&m) {
+            return n.clone();
+        }
+        self.interner.resolve(&m).to_string()
+    }
+
+    /// Render a VMIR type using [`Self::member_name`] for `Domain` heads, so
+    /// verifier-synthesised types (e.g. `Option[Int]`) print without panicking
+    /// on the interner.
+    pub(crate) fn type_name(&self, ty: &Type) -> String {
+        match ty {
+            Type::Int => "Int".to_string(),
+            Type::Bool => "Bool".to_string(),
+            Type::Real => "Real".to_string(),
+            Type::Ref => "Ref".to_string(),
+            Type::Addr(t) => format!("&{}", self.type_name(t)),
+            Type::Domain(id, args) => {
+                let head = self.member_name(*id);
+                if args.is_empty() {
+                    head
+                } else {
+                    let inner: Vec<String> = args.iter().map(|a| self.type_name(a)).collect();
+                    format!("{head}[{}]", inner.join(", "))
+                }
+            }
         }
     }
 
@@ -118,6 +157,13 @@ impl<'a> VerifyContext<'a> {
         self.func_ret_types.insert(inst.none, opt_ty);
         self.func_ret_types.insert(inst.value, elem.clone());
         self.func_ret_types.insert(inst.tag_fn, Type::Int);
+        // Display names for the viz (these ids are not in the interner).
+        let en = self.type_name(&elem);
+        self.mono_names.insert(inst.some, format!("Some[{en}]"));
+        self.mono_names.insert(inst.none, format!("None[{en}]"));
+        self.mono_names.insert(inst.value, format!("value[{en}]"));
+        self.mono_names
+            .insert(inst.tag_fn, format!("Option@tag[{en}]"));
         // Register the reductions for the freshly-minted member ids.
         let mut tags = HashMap::new();
         tags.insert(inst.some, 0usize);
