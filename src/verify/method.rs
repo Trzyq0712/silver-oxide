@@ -26,6 +26,9 @@ pub enum VerifyError {
     /// the verifier doesn't yet handle structurally. Reserved for
     /// not-yet-implemented variants.
     Unimplemented(&'static str),
+    /// A call/fold/unfold targets a resource that produced no certificate —
+    /// i.e. the resource itself failed its well-formedness verification.
+    DependencyFailed,
     /// Verification failed while executing a specific instruction.
     AtInst {
         inst: String,
@@ -41,6 +44,9 @@ impl std::fmt::Display for VerifyError {
             Self::AbstractResourceCall => write!(f, "call to abstract resource"),
             Self::SideCondition(what) => write!(f, "side condition may not hold: {what}"),
             Self::Unimplemented(what) => write!(f, "unimplemented: {what}"),
+            Self::DependencyFailed => {
+                write!(f, "depends on a resource that failed to verify")
+            }
             Self::AtInst { inst, source } => write!(f, "{source}\n    instruction: {inst}"),
         }
     }
@@ -538,7 +544,7 @@ fn eval_resource_call(
     }
     let cert = certs
         .get(&call.resource)
-        .expect("resource certificate built before any call (dependency order)");
+        .ok_or(VerifyError::DependencyFailed)?;
 
     let args: Vec<egg::Id> = call
         .args
@@ -614,7 +620,7 @@ fn eval_method_inst(
             let n_slots = projs.len();
             let cert = certs
                 .get(&call.resource)
-                .expect("predicate certificate built before fold");
+                .ok_or(VerifyError::DependencyFailed)?;
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
@@ -675,7 +681,7 @@ fn eval_method_inst(
             let projs = pmeta.snap_projs.clone();
             let cert = certs
                 .get(&call.resource)
-                .expect("predicate certificate built before unfold");
+                .ok_or(VerifyError::DependencyFailed)?;
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
