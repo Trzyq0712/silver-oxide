@@ -161,7 +161,8 @@ impl<'a> VerifyContext<'a> {
         let en = self.type_name(&elem);
         self.mono_names.insert(inst.some, format!("Some[{en}]"));
         self.mono_names.insert(inst.none, format!("None[{en}]"));
-        self.mono_names.insert(inst.value, format!("value[{en}]"));
+        self.mono_names
+            .insert(inst.value, format!("Option@value[{en}]"));
         self.mono_names
             .insert(inst.tag_fn, format!("Option@tag[{en}]"));
         // Register the reductions for the freshly-minted member ids.

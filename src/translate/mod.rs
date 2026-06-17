@@ -340,7 +340,7 @@ impl<'a> Builder<'a> {
             );
             let mut snap_projs = Vec::with_capacity(types.len());
             for (i, ty) in types.iter().enumerate() {
-                let proj_id = self.fresh_decl(&format!("{name}@snap@proj{i}"));
+                let proj_id = self.fresh_decl(&format!("{name}@snap@{i}"));
                 self.set_decl(
                     proj_id,
                     vmir::Declaration::Function(vmir::Function {
