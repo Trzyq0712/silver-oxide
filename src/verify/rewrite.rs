@@ -26,12 +26,40 @@ pub fn rules(adt_meta: &AdtMeta) -> Vec<Rule> {
 }
 
 /// The terminating structural reductions used to **normalize** the e-graph after
-/// heap-producing ops (`fold`/`unfold`) — currently the ADT reductions, which
-/// collapse the `cons(proj(cons(..)))` snapshot towers. Kept separate from
+/// heap-producing ops (`fold`/`unfold`): the ADT reductions (which collapse the
+/// `cons(proj(cons(..)))` snapshot towers) plus the terminating `ite`/optional
+/// simplifications (which peel the `(perm>0) ? Some(v) : None` wrapper down to
+/// `v` whenever the permission is statically positive). Kept separate from
 /// [`rules`] so that future *non-terminating* rules (e.g. recursive function
 /// defining-equations) are run only during full saturation, never here.
 pub fn reduce_rules(adt_meta: &AdtMeta) -> Vec<Rule> {
-    adt_rules(adt_meta)
+    let mut rules = adt_rules(adt_meta);
+    rules.extend(terminating_ite_rules());
+    rules
+}
+
+/// Build the projection reduction `accessor(ctor(a0..an)) ⇒ a_index` for a
+/// single (possibly verifier-synthesised, e.g. monomorphic) member id. Lets the
+/// verifier register reductions for member ids minted after `VerifyContext`
+/// construction (monomorphic Option instances).
+pub fn proj_rule(accessor: MemberId, ctor: MemberId, index: usize) -> Rule {
+    Rewrite::new(
+        format!("proj-{}", usize::from(accessor)),
+        UnaryAppSearcher { func: accessor },
+        ProjApplier { ctor, index },
+    )
+    .expect("valid proj rewrite")
+}
+
+/// Build the discriminator reduction `tag_fn(ctor_C(..)) ⇒ index_C` for a single
+/// (possibly synthesised) tag function. Companion to [`proj_rule`].
+pub fn tag_rule(tag_fn: MemberId, ctor_tags: HashMap<MemberId, usize>) -> Rule {
+    Rewrite::new(
+        format!("tag-{}", usize::from(tag_fn)),
+        UnaryAppSearcher { func: tag_fn },
+        TagApplier { ctor_tags },
+    )
+    .expect("valid tag rewrite")
 }
 
 /// ADT reductions generated from `adt_meta`: the discriminator `tag` reduction
@@ -68,6 +96,32 @@ fn adt_rules(adt_meta: &AdtMeta) -> Vec<Rule> {
 
 /// The static (ADT-independent) rule set run during saturation.
 fn static_rules() -> Vec<Rule> {
+    let mut rules = terminating_ite_rules();
+    rules.extend(vec![
+        // x + 0 => x  (Int)
+        rw!("add-zero-int-r"; "(+ ?x 0)" => "?x"),
+        rw!("add-zero-int-l"; "(+ 0 ?x)" => "?x"),
+        // x + 0 => x  (Real zero literal `0/1`; `real(0)` const-folds to it)
+        rw!("add-zero-real-r"; "(+ ?x 0/1)" => "?x"),
+        rw!("add-zero-real-l"; "(+ 0/1 ?x)" => "?x"),
+        // x * 1 => x  (Real one literal `1/1`; resource-delta perm scaling by a
+        // full permission `write` folds away)
+        rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
+        rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
+        // (a == b) proven true  =>  a ≡ b   (congruence)
+        rw!("eq-true-union"; "(== ?a ?b)" => {
+            UnionEqArgs { a: var("?a"), b: var("?b") }
+        }),
+    ]);
+    rules
+}
+
+/// Terminating `ite`/comparison simplifications. Shared by the saturation rule
+/// set and the post-`fold`/`unfold` reduction set. Includes the distribution of
+/// a comparison over an `ite` (`z < (c ? x : y)` ⇒ `c ? z<x : z<y`), which lets
+/// an optional snapshot member's discriminant `0 < (b ? p : 0)` collapse to the
+/// branch condition `b` (via `ite-ident` after the per-branch comparisons fold).
+fn terminating_ite_rules() -> Vec<Rule> {
     vec![
         // ite(true, x, y) => x
         rw!("ite-true";  "(ite true ?x ?y)"  => "?x"),
@@ -93,20 +147,8 @@ fn static_rules() -> Vec<Rule> {
         rw!("ite-collapse-t"; "(ite ?c (ite ?c ?x ?y) ?y)" => "(ite ?c ?x ?y)"),
         // c ? x : (c ? x : y)  =>  c ? x : y  (Merges outer root directly to inner node)
         rw!("ite-collapse-f"; "(ite ?c ?x (ite ?c ?x ?y))" => "(ite ?c ?x ?y)"),
-        // x + 0 => x  (Int)
-        rw!("add-zero-int-r"; "(+ ?x 0)" => "?x"),
-        rw!("add-zero-int-l"; "(+ 0 ?x)" => "?x"),
-        // x + 0 => x  (Real zero literal `0/1`; `real(0)` const-folds to it)
-        rw!("add-zero-real-r"; "(+ ?x 0/1)" => "?x"),
-        rw!("add-zero-real-l"; "(+ 0/1 ?x)" => "?x"),
-        // x * 1 => x  (Real one literal `1/1`; resource-delta perm scaling by a
-        // full permission `write` folds away)
-        rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
-        rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
-        // (a == b) proven true  =>  a ≡ b   (congruence)
-        rw!("eq-true-union"; "(== ?a ?b)" => {
-            UnionEqArgs { a: var("?a"), b: var("?b") }
-        }),
+        // z < (c ? x : y)  =>  c ? z<x : z<y   (discriminant distribution)
+        rw!("lt-ite-distribute"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
     ]
 }
 

@@ -462,9 +462,9 @@ fn eval_heap_inst(
         )),
         // Fold/Unfold need the program + certificates; handled in
         // `eval_method_inst`.
-        HeapInst::Fold { .. } | HeapInst::Unfold { .. } => {
-            Err(VerifyError::Unimplemented("fold/unfold outside method body"))
-        }
+        HeapInst::Fold { .. } | HeapInst::Unfold { .. } => Err(VerifyError::Unimplemented(
+            "fold/unfold outside method body",
+        )),
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).
         HeapInst::Assign(heap, Assign { loc, val }) => {
@@ -606,9 +606,12 @@ fn eval_method_inst(
             let pmeta = program
                 .pred_meta
                 .get(&call.resource)
-                .ok_or(VerifyError::Unimplemented("fold of non-flat/abstract predicate"))?;
+                .ok_or(VerifyError::Unimplemented(
+                    "fold of non-flat/abstract predicate",
+                ))?;
             let (snap_cons, addr_fn) = (pmeta.snap_cons, pmeta.addr_fn);
-            let n_slots = pmeta.snap_projs.len();
+            let projs = pmeta.snap_projs.clone();
+            let n_slots = projs.len();
             let cert = certs
                 .get(&call.resource)
                 .expect("predicate certificate built before fold");
@@ -618,12 +621,18 @@ fn eval_method_inst(
 
             let fp = ctx.graft_footprint(cert, &args);
             if fp.len() != n_slots {
-                return Err(VerifyError::Unimplemented("predicate footprint shape mismatch"));
+                return Err(VerifyError::Unimplemented(
+                    "predicate footprint shape mismatch",
+                ));
             }
             let canon = canonicalize_heap(ctx, &base_h, &[]);
+            // Raw field values feed the body's pure facts; the snapshot members
+            // wrap each value as `(perm>0) ? Some(v) : None` (const-folds to
+            // `Some(v)` ⇒ `v` for a statically-positive permission).
             let mut values = Vec::with_capacity(fp.len());
+            let mut members = Vec::with_capacity(fp.len());
             let mut need_heap = Heap::empty();
-            for &(addr, bperm) in &fp {
+            for (i, &(addr, bperm)) in fp.iter().enumerate() {
                 let a = ctx.egraph.find(addr);
                 let v = canon
                     .chunk(a)
@@ -631,6 +640,9 @@ fn eval_method_inst(
                     .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 need_heap = need_heap.with_chunk(addr, Chunk::new(need, v));
+                let elem = decl_ret_ty(program, projs[i]);
+                let present = ctx.perm_positive(bperm);
+                members.push(ctx.option_member(elem, present, v));
                 values.push(v);
             }
             let subtracted = heap_subtract(ctx, &base_h, &need_heap, &pc_lits)?;
@@ -638,9 +650,10 @@ fn eval_method_inst(
             if !ctx.prove_under_pc(bool_id, &pc_lits) {
                 return Err(VerifyError::AssertionFailed);
             }
-            let cons_args: Box<[egg::Id]> = values.into_iter().collect();
+            let cons_args: Box<[egg::Id]> = members.into_iter().collect();
             let snap = ctx.add_func_app_id(snap_cons, decl_ret_ty(program, snap_cons), cons_args);
-            let pred_addr = ctx.add_func_app_id(addr_fn, decl_ret_ty(program, addr_fn), args.into());
+            let pred_addr =
+                ctx.add_func_app_id(addr_fn, decl_ret_ty(program, addr_fn), args.into());
             let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, snap));
             let out = heap_union(ctx, &subtracted, &pred_chunk, &pc_lits);
             state.push_heap(out);
@@ -679,16 +692,22 @@ fn eval_method_inst(
 
             let fp = ctx.graft_footprint(cert, &args);
             if fp.len() != projs.len() {
-                return Err(VerifyError::Unimplemented("predicate footprint shape mismatch"));
+                return Err(VerifyError::Unimplemented(
+                    "predicate footprint shape mismatch",
+                ));
             }
             let mut out = subtracted;
             let mut values = Vec::with_capacity(fp.len());
             for (i, &(addr, bperm)) in fp.iter().enumerate() {
-                // `proj_i(s)`; the post-unfold `reduce()` collapses it to the
-                // constructor's i-th field when `s` is a concrete `cons` (so
-                // repeated fold/unfold doesn't grow the snapshot tower), and
-                // leaves it uninterpreted for an opaque snapshot.
-                let pv = ctx.add_func_app_id(projs[i], decl_ret_ty(program, projs[i]), Box::new([s]));
+                // `proj_i(s)` recovers the optional snapshot member; `reduce()`
+                // collapses it to the constructor's i-th member when `s` is a
+                // concrete `cons` (so repeated fold/unfold doesn't grow the
+                // snapshot tower), and leaves it uninterpreted for an opaque
+                // snapshot. `unwrap` then peels the `Option` to the field value.
+                let elem = decl_ret_ty(program, projs[i]);
+                let opt =
+                    ctx.add_func_app_id(projs[i], ctx.option_type(elem.clone()), Box::new([s]));
+                let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 let chunk = Heap::empty().with_chunk(addr, Chunk::new(need, pv));
                 out = heap_union(ctx, &out, &chunk, &pc_lits);

@@ -30,6 +30,19 @@ pub(crate) struct ResourceCertificate {
     pub(crate) bool_id: Id,
 }
 
+/// The verifier-synthesised member ids for one monomorphic `Option[T]`
+/// instance. Option lives entirely at verification time (it is never emitted as
+/// a VMIR declaration): each element type `T` gets its **own** constructor /
+/// destructor / tag member ids, so `Some@Int` and `Some@Bool` never collide
+/// under congruence. `value` is the `Some` field accessor (`unwrap`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OptionInstance {
+    pub(crate) some: MemberId,
+    pub(crate) none: MemberId,
+    pub(crate) value: MemberId,
+    pub(crate) tag_fn: MemberId,
+}
+
 pub(crate) struct VerifyContext<'a> {
     pub(crate) egraph: egg::EGraph<Symbolic, ConstFold>,
     rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
@@ -37,6 +50,14 @@ pub(crate) struct VerifyContext<'a> {
     /// normalize (collapse snapshot towers) without a full saturation.
     reduce_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
+    /// Next synthetic member id, for verifier-minted members (monomorphic
+    /// `Option` instances). Starts past the interner's real ids so it never
+    /// collides with a translated declaration.
+    mono_counter: usize,
+    /// The stable generic `Option` member id (the head of `Option[T]` types).
+    option_adt_id: MemberId,
+    /// Monomorphic `Option` instances, keyed by element type.
+    option_mono: HashMap<Type, OptionInstance>,
     pub(crate) interner: &'a Rodeo<MemberId>,
     /// Type side-oracle: the irreducible type sources that the type-free
     /// e-graph nodes no longer carry. Keyed by stable node payloads (the
@@ -48,15 +69,100 @@ pub(crate) struct VerifyContext<'a> {
 
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(interner: &'a Rodeo<MemberId>, adt_meta: &AdtMeta) -> Self {
+        // Synthetic ids start past every real (interned) declaration id; the
+        // first synthetic id is reserved for the generic `Option` head.
+        let base = interner.len();
         Self {
             egraph: egg::EGraph::default(),
             rules: rewrite::rules(adt_meta),
             reduce_rules: rewrite::reduce_rules(adt_meta),
             fresh_counter: 0,
+            mono_counter: base + 1,
+            option_adt_id: MemberId::from(base),
+            option_mono: HashMap::new(),
             interner,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
         }
+    }
+
+    /// Mint a fresh synthetic member id (for verifier-internal monomorphic
+    /// members that are never emitted as VMIR declarations).
+    fn fresh_member_id(&mut self) -> MemberId {
+        let id = MemberId::from(self.mono_counter);
+        self.mono_counter += 1;
+        id
+    }
+
+    /// The `Option[elem]` type (verifier-internal generic head + element arg).
+    pub(crate) fn option_type(&self, elem: Type) -> Type {
+        Type::Domain(self.option_adt_id, Box::new([elem]))
+    }
+
+    /// Get (or mint) the monomorphic `Option[elem]` instance, registering its
+    /// projection (`value(Some(x)) ⇒ x`) and tag (`Some ⇒ 0`, `None ⇒ 1`)
+    /// reductions so they fire in later saturation/reduction passes.
+    pub(crate) fn mono_option(&mut self, elem: Type) -> OptionInstance {
+        if let Some(inst) = self.option_mono.get(&elem) {
+            return *inst;
+        }
+        let inst = OptionInstance {
+            some: self.fresh_member_id(),
+            none: self.fresh_member_id(),
+            value: self.fresh_member_id(),
+            tag_fn: self.fresh_member_id(),
+        };
+        // Return types for the side-oracle (chunk-value typing / viz).
+        let opt_ty = self.option_type(elem.clone());
+        self.func_ret_types.insert(inst.some, opt_ty.clone());
+        self.func_ret_types.insert(inst.none, opt_ty);
+        self.func_ret_types.insert(inst.value, elem.clone());
+        self.func_ret_types.insert(inst.tag_fn, Type::Int);
+        // Register the reductions for the freshly-minted member ids.
+        let mut tags = HashMap::new();
+        tags.insert(inst.some, 0usize);
+        tags.insert(inst.none, 1usize);
+        let tag_rule = rewrite::tag_rule(inst.tag_fn, tags);
+        let proj_rule = rewrite::proj_rule(inst.value, inst.some, 0);
+        self.rules.push(tag_rule.clone());
+        self.rules.push(proj_rule.clone());
+        self.reduce_rules.push(tag_rule);
+        self.reduce_rules.push(proj_rule);
+        self.option_mono.insert(elem, inst);
+        inst
+    }
+
+    /// Build a snapshot member `present ? Some(value) : None` over `Option[elem]`.
+    /// When `present` const-folds to `true` (statically-positive permission) the
+    /// `ite`/projection reductions peel it back to `value`.
+    pub(crate) fn option_member(
+        &mut self,
+        elem: Type,
+        present: egg::Id,
+        value: egg::Id,
+    ) -> egg::Id {
+        let inst = self.mono_option(elem.clone());
+        let opt_ty = self.option_type(elem);
+        let some = self.add_func_app_id(inst.some, opt_ty.clone(), Box::new([value]));
+        let none = self.add_func_app_id(inst.none, opt_ty, Box::new([]));
+        self.add(Symbolic::Ite([present, some, none]))
+    }
+
+    /// Unwrap a snapshot member: `value(opt)`, the `Some` field accessor. With
+    /// `opt = Some(v)` this reduces to `v`; on an opaque member it stays
+    /// uninterpreted (correct — the value was never present).
+    pub(crate) fn option_unwrap(&mut self, elem: Type, opt: egg::Id) -> egg::Id {
+        let inst = self.mono_option(elem.clone());
+        self.add_func_app_id(inst.value, elem, Box::new([opt]))
+    }
+
+    /// The boolean `0 < perm` (a permission is positive). Lifts a permission
+    /// amount to the snapshot's membership discriminant.
+    pub(crate) fn perm_positive(&mut self, perm: egg::Id) -> egg::Id {
+        let zero = self.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
+            num::BigInt::from(0),
+        ))));
+        self.add(Symbolic::Binary(BinOp::Lt, [zero, perm]))
     }
 
     /// Run rewrite saturation over the e-graph in place.
