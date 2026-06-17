@@ -109,7 +109,7 @@ impl Snapshotter {
         // also rewrite `fresh10`.
         for u in fresh {
             if let Some(ty) = ctx.fresh_types.get(&u) {
-                let label = format!("fresh{u}: {}", ctx.type_name(ty));
+                let label = format!("{}#{u}", ctx.type_name(ty));
                 dot = dot.replace(&format!("fresh{u}\""), &format!("{}\"", escape(&label)));
             }
         }
