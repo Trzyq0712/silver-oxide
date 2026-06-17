@@ -24,8 +24,16 @@ pub(crate) struct ResourceCertificate {
     pub(crate) func_ret_types: HashMap<MemberId, Type>,
     /// Formal-param e-classes, in order (the call's args substitute these).
     pub(crate) params: Vec<Id>,
-    /// Result heap-delta chunks as `(addr, perm, value)` e-classes.
+    /// Result heap-delta chunks as `(addr, perm, value)` e-classes — the
+    /// **merged** (accounting) view, chunks keyed by congruent address with
+    /// perms summed. Used by inhale/exhale grafting (`graft_certificate`).
     pub(crate) delta: Vec<(Id, Id, Id)>,
+    /// **Unmerged, program-ordered** footprint: one `(addr, perm, value)` per
+    /// syntactic `acc`, in body order. Aliased accs (same address) stay
+    /// separate, so the snapshot keeps one member per acc; `value` is the merged
+    /// chunk value at that address, so aliased slots share it. Used by
+    /// fold/unfold (the snapshot layout).
+    pub(crate) footprint: Vec<(Id, Id, Id)>,
     /// Result boolean e-class.
     pub(crate) bool_id: Id,
 }
@@ -297,8 +305,9 @@ impl<'a> VerifyContext<'a> {
             subst.insert(cert.egraph.find(*p), *a);
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
+        // Layout view: one slot per syntactic acc, in program order.
         let out: Vec<(Id, Id)> = cert
-            .delta
+            .footprint
             .iter()
             .map(|&(addr, perm, _)| {
                 (
@@ -324,7 +333,10 @@ impl<'a> VerifyContext<'a> {
         for (p, a) in cert.params.iter().zip(args) {
             subst.insert(cert.egraph.find(*p), *a);
         }
-        for (slot, &v) in cert.delta.iter().zip(values) {
+        // Substitute per-acc (layout) slot value with the fold/unfold-site value.
+        // Aliased slots share their cert value, and the caller supplies the same
+        // (per-location) value for each, so the inserts agree.
+        for (slot, &v) in cert.footprint.iter().zip(values) {
             subst.insert(cert.egraph.find(slot.2), v);
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();

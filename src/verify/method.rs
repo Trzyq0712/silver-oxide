@@ -825,7 +825,20 @@ pub fn verify_resource(
     let mut snap = Snapshotter::from_env(resource_name);
     snap.snapshot(&ctx, &[], "init", None);
 
+    // Ordered per-acc footprint operands `(loc, perm)`, in body order — one per
+    // syntactic `acc` (location target), kept unmerged for the fold/unfold
+    // snapshot layout (the merged `delta` below is for inhale/exhale).
+    let mut footprint_ops: Vec<(Val, Val)> = Vec::new();
+
     for inst in &body.insts {
+        if let InstKind::Heap(HeapInst::Combine {
+            target: Target::Loc(loc),
+            perm,
+            ..
+        }) = &inst.kind
+        {
+            footprint_ops.push((loc.clone(), perm.clone()));
+        }
         let vals_before = state.vals.len();
         let heaps_before = state.heaps.len();
         let inst_text = format_inst(inst, &program.interner, vals_before, heaps_before);
@@ -863,6 +876,23 @@ pub fn verify_resource(
             )
         })
         .collect();
+    // Unmerged, program-ordered footprint: each acc's `(addr, perm)` with the
+    // *merged* chunk value at that address (so aliased slots stay separate yet
+    // share their value). Drives the fold/unfold snapshot layout.
+    let footprint: Vec<(egg::Id, egg::Id, egg::Id)> = footprint_ops
+        .iter()
+        .map(|(loc, perm)| {
+            let addr = state.get_val(&mut ctx, loc);
+            let addr = ctx.egraph.find(addr);
+            let perm = state.get_val(&mut ctx, perm);
+            let perm = ctx.egraph.find(perm);
+            let value = delta_heap
+                .chunk(addr)
+                .map(|c| ctx.egraph.find(c.value))
+                .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
+            (addr, perm, value)
+        })
+        .collect();
     let bool_val = state.get_val(&mut ctx, &body.res.1);
     let bool_id = ctx.egraph.find(bool_val);
     let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
@@ -873,6 +903,7 @@ pub fn verify_resource(
         func_ret_types: ctx.func_ret_types.clone(),
         params,
         delta,
+        footprint,
         bool_id,
     }))
 }
@@ -1772,6 +1803,29 @@ method m(x: Ref)
     }
 
     #[test]
+    fn fold_unfold_aliased_footprint() {
+        // Two `acc` on the *same* location: the footprint has two (unmerged)
+        // slots, so the snapshot keeps two members, even though the merged
+        // accounting view holds a single `x.f` chunk (perm 1/2 + 1/2 = write).
+        let input = r#"
+field f: Int
+predicate dup(x: Ref) { acc(x.f, 1/2) && acc(x.f, 1/2) }
+method m(x: Ref)
+  requires acc(x.f, write) && x.f == 5
+{
+  fold dup(x)
+  unfold dup(x)
+  assert x.f == 5
+}
+"#;
+        let program = lower(input);
+        assert!(
+            verify_named_method(&program, "m").is_ok(),
+            "aliased-footprint fold/unfold should preserve x.f == 5"
+        );
+    }
+
+    #[test]
     fn fold_unfold_fractional_with_pure_fact() {
         // Bare `fold`/`unfold P(x)` syntax, a predicate carrying a pure fact,
         // unfolding an opaque (requires-held) predicate, and a fractional
@@ -2159,6 +2213,7 @@ predicate number(this: Ref) {
             func_ret_types: rctx.func_ret_types.clone(),
             params: vec![rctx.egraph.find(d)],
             delta: vec![],
+            footprint: vec![],
             bool_id: rctx.egraph.find(d_ne0),
         };
 
