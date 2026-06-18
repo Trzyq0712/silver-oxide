@@ -1,0 +1,8 @@
+field f: Int
+
+method no_alias(x: Ref, y: Ref) 
+{
+    inhale acc(x.f, 3/4) && acc(x.f, 1/2)
+
+    assert x != y
+}

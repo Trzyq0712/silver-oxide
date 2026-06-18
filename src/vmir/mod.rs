@@ -48,6 +48,10 @@ pub struct Program {
     pub adt_meta: AdtMeta,
     /// Per-predicate `fold`/`unfold` metadata, keyed by predicate `MemberId`.
     pub pred_meta: std::collections::HashMap<MemberId, PredMeta>,
+    /// Member ids of the field address functions (`field@addr`-style accessors).
+    /// A heap chunk whose address is one of these is a **field** location (perm
+    /// bounded by `1/1`); everything else (predicate `@addr`) is unbounded.
+    pub field_addrs: std::collections::HashSet<MemberId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

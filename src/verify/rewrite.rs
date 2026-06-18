@@ -170,8 +170,8 @@ impl Applier<Symbolic, ConstFold> for UnionEqArgs {
     ) -> Vec<Id> {
         // Only fire once the equality is actually known true. `Assume` seeds
         // this by unioning the `Eq` e-class with `Lit(true)`, which
-        // `ConstFold::merge` records as `data.value = Some(Bool(true))`.
-        if egraph[eclass].data.value != Some(Literal::Bool(true)) {
+        // `ConstFold` records as `Data::Known(Bool(true))`.
+        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(true))) {
             return vec![];
         }
         let a = subst[self.a];

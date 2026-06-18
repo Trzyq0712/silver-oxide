@@ -353,6 +353,44 @@ fn canonicalize_heap(
     out
 }
 
+/// Whether `addr`'s e-class is a **field** location, i.e. it holds a
+/// `FuncApp(m, _)` whose head `m` is a field address function. Field locations
+/// are permission-bounded by `1/1`; predicate `@addr` locations are not.
+fn addr_is_field(ctx: &VerifyContext<'_>, addr: egg::Id) -> bool {
+    let canon = ctx.egraph.find(addr);
+    ctx.egraph[canon]
+        .nodes
+        .iter()
+        .any(|n| matches!(n, Symbolic::FuncApp(m, _) if ctx.field_addrs.contains(m)))
+}
+
+/// Assume the field-permission invariant `perm ≤ 1` at every field location in
+/// `h` (a field cell holds at most full permission). Added as an e-graph fact
+/// (`union((1 < perm) ? false : true, true)`); when a field's permission folds
+/// to `> 1` this unions `false == true`, making the unit inconsistent so any
+/// goal is dischargeable. Predicate locations are skipped (unbounded).
+fn assume_field_perm_bounds(ctx: &mut VerifyContext<'_>, h: &Heap) {
+    let field_perms: Vec<egg::Id> = h
+        .entries()
+        .filter(|(addr, _)| addr_is_field(ctx, *addr))
+        .map(|(_, chunk)| chunk.perm)
+        .collect();
+    if field_perms.is_empty() {
+        return;
+    }
+    let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
+        num::BigInt::from(1),
+    ))));
+    let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+    for perm in field_perms {
+        let gt1 = ctx.add(Symbolic::Binary(BinOp::Lt, [one, perm]));
+        let le1 = ctx.add(Symbolic::Ite([gt1, false_, true_]));
+        ctx.egraph.union(le1, true_);
+    }
+    ctx.egraph.rebuild();
+}
+
 /// Heap addition. Canonicalises both inputs first so chunks at e-class
 /// equivalent addresses merge. On collision, chunks merge via [`merge_chunks`].
 fn heap_union(
@@ -383,6 +421,8 @@ fn heap_union(
             out = out.with_chunk(addr, chunk2);
         }
     }
+    // Every heap `+` re-asserts the field-permission bound on the result.
+    assume_field_perm_bounds(ctx, &out);
     out
 }
 
@@ -772,7 +812,11 @@ pub fn verify_method(
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
-    let mut ctx = VerifyContext::new(&program.interner, &program.adt_meta);
+    let mut ctx = VerifyContext::new(
+        &program.interner,
+        &program.adt_meta,
+        program.field_addrs.clone(),
+    );
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -813,7 +857,11 @@ pub fn verify_resource(
         return Ok(None);
     };
 
-    let mut ctx = VerifyContext::new(&program.interner, &program.adt_meta);
+    let mut ctx = VerifyContext::new(
+        &program.interner,
+        &program.adt_meta,
+        program.field_addrs.clone(),
+    );
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -964,7 +1012,7 @@ mod tests {
     use crate::verify::lang::Symbolic;
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        VerifyContext::new(interner, &vmir::AdtMeta::default())
+        VerifyContext::new(interner, &vmir::AdtMeta::default(), Default::default())
     }
 
     #[test]

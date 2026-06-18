@@ -246,6 +246,7 @@ mod tests {
             interner,
             adt_meta: Default::default(),
             pred_meta: Default::default(),
+            field_addrs: Default::default(),
         }
     }
 

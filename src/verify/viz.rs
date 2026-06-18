@@ -160,8 +160,10 @@ impl Snapshotter {
             if let Some(t) = &ty {
                 parts.push(escape(&ctx.type_name(t)));
             }
-            if let Some(lit) = &class.data.value {
+            if let Some(lit) = class.data.known() {
                 parts.push(escape(&format!("= {lit}")));
+            } else if class.data.is_inconsistent() {
+                parts.push("⊥".to_string());
             }
             if !parts.is_empty() {
                 attrs.push_str(&format!("    label=\"{}\"\n", parts.join("\\n")));
@@ -180,7 +182,7 @@ impl Snapshotter {
         // the shared global literal e-class, so a border + arg arrows out of it
         // are noise — every such step would mark the same node.
         if let Some(id) =
-            highlight.filter(|id| ctx.egraph[ctx.egraph.find(*id)].data.value.is_none())
+            highlight.filter(|id| ctx.egraph[ctx.egraph.find(*id)].data.known().is_none())
         {
             let canon = ctx.egraph.find(id);
             let needle = format!("subgraph cluster_{} {{\n", usize::from(canon));

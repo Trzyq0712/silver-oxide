@@ -77,10 +77,17 @@ pub(crate) struct VerifyContext<'a> {
     /// needed — the visualization reads them directly to reconstruct types.
     pub(crate) fresh_types: HashMap<u32, Type>,
     pub(crate) func_ret_types: HashMap<MemberId, Type>,
+    /// Field address-function member ids (a chunk at such an address is a field
+    /// location, whose permission is bounded by `1/1`).
+    pub(crate) field_addrs: std::collections::HashSet<MemberId>,
 }
 
 impl<'a> VerifyContext<'a> {
-    pub(crate) fn new(interner: &'a Rodeo<MemberId>, adt_meta: &AdtMeta) -> Self {
+    pub(crate) fn new(
+        interner: &'a Rodeo<MemberId>,
+        adt_meta: &AdtMeta,
+        field_addrs: std::collections::HashSet<MemberId>,
+    ) -> Self {
         // Synthetic ids start past every real (interned) declaration id; the
         // first synthetic id is reserved for the generic `Option` head.
         let base = interner.len();
@@ -99,7 +106,16 @@ impl<'a> VerifyContext<'a> {
             interner,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
+            field_addrs,
         }
+    }
+
+    /// Whether the e-graph has reached a contradiction (some e-class merged
+    /// conflicting same-typed literals). Once inconsistent, every goal is
+    /// vacuously provable — used by [`Self::prove_under_pc`] as the implicit
+    /// channel through which an over-permissioned field location proves `false`.
+    pub(crate) fn is_inconsistent(&self) -> bool {
+        self.egraph.classes().any(|c| c.data.is_inconsistent())
     }
 
     /// Display name for a member id: the synthetic-name table (verifier-minted
@@ -403,13 +419,19 @@ impl<'a> VerifyContext<'a> {
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.add(Symbolic::Lit(Literal::Bool(true)));
 
+        // Tier 0: the held facts are contradictory (e.g. a field location holds
+        // > 1/1 permission) — every goal is vacuously provable.
+        if self.is_inconsistent() {
+            return true;
+        }
         // Tier 1: already true (memoized / trivial).
         if self.egraph.find(imp) == self.egraph.find(true_) {
             return true;
         }
-        // Tier 2: saturate the live graph and re-check (no clone).
+        // Tier 2: saturate the live graph and re-check (no clone). Saturation can
+        // also expose a contradiction, so re-check inconsistency too.
         self.saturate();
-        if self.egraph.find(imp) == self.egraph.find(true_) {
+        if self.is_inconsistent() || self.egraph.find(imp) == self.egraph.find(true_) {
             return true;
         }
 
@@ -420,7 +442,7 @@ impl<'a> VerifyContext<'a> {
         let mut unsat_pc = false;
         for (id, pol) in pc_lits {
             let want_true = matches!(pol, Polarity::Positive);
-            match &probe[*id].data.value {
+            match probe[*id].data.known() {
                 Some(Literal::Bool(b)) if *b != want_true => {
                     // PC literal contradicts its required polarity → off-path,
                     // so `pc ⇒ goal` is vacuously true. (Guard also avoids a

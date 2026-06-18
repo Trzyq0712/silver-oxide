@@ -515,6 +515,7 @@ impl<'a> Builder<'a> {
             interner: self.vmir_interner,
             adt_meta: self.adt_meta,
             pred_meta: self.pred_meta,
+            field_addrs: self.field_addr.values().copied().collect(),
         }
     }
 }

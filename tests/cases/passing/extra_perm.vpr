@@ -1,0 +1,15 @@
+field f: Int
+
+method field_(x: Ref) {
+    inhale acc(x.f)
+    inhale acc(x.f, 1/2)
+    assert false
+}
+
+predicate p(x: Ref)
+
+method predicate_(x: Ref) {
+    inhale acc(p(x))
+    inhale acc(p(x), 1/2)
+    assert true
+}

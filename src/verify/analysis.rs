@@ -4,12 +4,46 @@ use num::BigRational;
 use crate::verify::lang::Symbolic;
 use crate::vmir::{BinOp, Literal};
 
-/// Const-fold analysis. **Type-free**: only the folded literal value is tracked
-/// (types are reconstructed for visualization from the side oracle in
-/// `verify::context`, not stored here).
+/// Const-fold analysis data: a three-state lattice over an e-class's folded
+/// value. **Type-free**: only the literal is tracked (types are reconstructed
+/// for visualization from the side oracle in `verify::context`).
+///
+/// - `Unknown`: not (yet) a constant.
+/// - `Known(lit)`: folds to `lit`.
+/// - `Inconsistent`: two **same-typed** literals of differing value were merged
+///   (e.g. `true == false`, `5 == 6`) — the e-class, and thus the whole
+///   verification unit, is contradictory. Merging literals of *different* types
+///   is instead a verifier panic (a genuine type error).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Data {
-    pub value: Option<Literal>,
+pub enum Data {
+    Unknown,
+    Known(Literal),
+    Inconsistent,
+}
+
+impl Data {
+    /// The folded literal, if this e-class is a known constant.
+    pub fn known(&self) -> Option<&Literal> {
+        match self {
+            Data::Known(lit) => Some(lit),
+            _ => None,
+        }
+    }
+
+    /// Whether this e-class merged conflicting same-typed literals.
+    pub fn is_inconsistent(&self) -> bool {
+        matches!(self, Data::Inconsistent)
+    }
+}
+
+/// Whether two literals are of the same VMIR type (so a value conflict is an
+/// inconsistency rather than a type error).
+fn same_type(a: &Literal, b: &Literal) -> bool {
+    use Literal::*;
+    matches!(
+        (a, b),
+        (Bool(_), Bool(_)) | (Int(_), Int(_)) | (Real(_), Real(_)) | (Null, Null)
+    )
 }
 
 #[derive(Default, Debug, Clone)]
@@ -19,62 +53,67 @@ impl Analysis<Symbolic> for ConstFold {
     type Data = Data;
 
     fn make(egraph: &mut EGraph<Symbolic, Self>, enode: &Symbolic, _id: Id) -> Self::Data {
-        let value = match enode {
-            Symbolic::Lit(lit) => Some(lit.clone()),
+        use Data::{Inconsistent, Known, Unknown};
+        match enode {
+            Symbolic::Lit(lit) => Known(lit.clone()),
 
-            Symbolic::Fresh(_) | Symbolic::FuncApp(..) => None,
+            Symbolic::Fresh(_) | Symbolic::FuncApp(..) => Unknown,
 
-            Symbolic::RealCast(c) => match &egraph[*c].data.value {
-                Some(Literal::Int(n)) => Some(Literal::Real(BigRational::from(n.clone()))),
-                Some(_) => unreachable!("RealCast operand must be an integer literal"),
-                _ => None,
+            Symbolic::RealCast(c) => match &egraph[*c].data {
+                Known(Literal::Int(n)) => Known(Literal::Real(BigRational::from(n.clone()))),
+                Known(_) => unreachable!("RealCast operand must be an integer literal"),
+                Inconsistent => Inconsistent,
+                Unknown => Unknown,
             },
 
-            Symbolic::Binary(op, [l, r]) => {
-                match (&egraph[*l].data.value, &egraph[*r].data.value) {
-                    (Some(lv), Some(rv)) => Some(eval_binary(*op, lv, rv)),
-                    _ => None,
-                }
-            }
-
-            Symbolic::Ite([c, t, e]) => match &egraph[*c].data.value {
-                Some(Literal::Bool(true)) => egraph[*t].data.value.clone(),
-                Some(Literal::Bool(false)) => egraph[*e].data.value.clone(),
-                Some(_) => unreachable!("Condition of ITE must be a boolean literal"),
-                _ => None,
+            Symbolic::Binary(op, [l, r]) => match (&egraph[*l].data, &egraph[*r].data) {
+                (Inconsistent, _) | (_, Inconsistent) => Inconsistent,
+                (Known(lv), Known(rv)) => Known(eval_binary(*op, lv, rv)),
+                _ => Unknown,
             },
-        };
-        Data { value }
+
+            Symbolic::Ite([c, t, e]) => match &egraph[*c].data {
+                Known(Literal::Bool(true)) => egraph[*t].data.clone(),
+                Known(Literal::Bool(false)) => egraph[*e].data.clone(),
+                Known(_) => unreachable!("Condition of ITE must be a boolean literal"),
+                Inconsistent => Inconsistent,
+                Unknown => Unknown,
+            },
+        }
     }
 
     fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
-        let mut did_merge = DidMerge(false, false);
-
-        match (&a.value, &b.value) {
-            (Some(va), Some(vb)) if va == vb => {} // Already equal
-            (None, Some(_)) => {
-                a.value = b.value.clone();
-                did_merge.0 = true;
+        use Data::{Inconsistent, Known, Unknown};
+        match (&*a, &b) {
+            (Inconsistent, Inconsistent) => DidMerge(false, false),
+            (Inconsistent, _) => DidMerge(false, true),
+            (_, Inconsistent) => {
+                *a = Inconsistent;
+                DidMerge(true, false)
             }
-            (Some(_), None) => {
-                did_merge.1 = true;
+            (Known(x), Known(y)) => {
+                if x == y {
+                    DidMerge(false, false)
+                } else if same_type(x, y) {
+                    // Same-typed conflict ⇒ contradiction (not a panic).
+                    *a = Inconsistent;
+                    DidMerge(true, true)
+                } else {
+                    panic!("type error: merged literals of different types: {x:?} vs {y:?}");
+                }
             }
-            (None, None) => {}
-            _ => unreachable!(
-                "Conflicting values during merge: {:?} vs {:?}",
-                a.value, b.value
-            ),
+            (Unknown, Known(y)) => {
+                *a = Known(y.clone());
+                DidMerge(true, false)
+            }
+            (Known(_), Unknown) => DidMerge(false, true),
+            (Unknown, Unknown) => DidMerge(false, false),
         }
-
-        did_merge
     }
 
     fn modify(egraph: &mut EGraph<Symbolic, Self>, id: Id) {
-        let data = egraph[id].data.clone();
-
-        if let Some(lit) = data.value {
-            let lit_node = Symbolic::Lit(lit);
-            let lit_id = egraph.add(lit_node);
+        if let Data::Known(lit) = egraph[id].data.clone() {
+            let lit_id = egraph.add(Symbolic::Lit(lit));
             egraph.union(id, lit_id);
         }
     }

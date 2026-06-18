@@ -1,0 +1,15 @@
+field f: Int, g: Int
+
+method might_alias_different_loc(x: Ref, y: Ref)
+{
+    inhale acc(x.f, 3/4) && acc(y.g, 1/2)
+
+    assert x != y
+}
+
+method might_alias_need_more(x: Ref, y: Ref)
+{
+    inhale acc(x.f, 1/2) && acc(y.g, 1/2)
+
+    assert x != y
+}
