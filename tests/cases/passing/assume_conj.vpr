@@ -1,0 +1,5 @@
+method prove_conj(a: Bool, b: Bool) {
+    assume a && b
+    assert a
+    assert b
+}

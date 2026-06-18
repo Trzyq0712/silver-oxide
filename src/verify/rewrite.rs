@@ -112,6 +112,12 @@ fn static_rules() -> Vec<Rule> {
         rw!("eq-true-union"; "(== ?a ?b)" => {
             UnionEqArgs { a: var("?a"), b: var("?b") }
         }),
+        // (a && b) proven true  =>  a and b are each true.
+        // `a && b` is `a ? b : false`; when that e-class is `true`, both
+        // conjuncts hold (e.g. `assume a && b` lets `assert a` / `assert b`).
+        rw!("and-true-decompose"; "(ite ?a ?b false)" => {
+            AndTrueDecompose { a: var("?a"), b: var("?b") }
+        }),
     ]);
     rules
 }
@@ -181,6 +187,42 @@ impl Applier<Symbolic, ConstFold> for UnionEqArgs {
         } else {
             vec![]
         }
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![self.a, self.b]
+    }
+}
+
+/// Applier for `and-true-decompose`: when a matched `a ? b : false` (i.e.
+/// `a && b`) e-class is proven `true`, both conjuncts must be true, so union
+/// each with the `true` literal. Sound and size-bounded (one shared literal).
+struct AndTrueDecompose {
+    a: Var,
+    b: Var,
+}
+
+impl Applier<Symbolic, ConstFold> for AndTrueDecompose {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(true))) {
+            return vec![];
+        }
+        let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+        let mut changed = Vec::new();
+        for v in [self.a, self.b] {
+            let id = subst[v];
+            if egraph.union(id, true_) {
+                changed.push(egraph.find(id));
+            }
+        }
+        changed
     }
 
     fn vars(&self) -> Vec<Var> {
