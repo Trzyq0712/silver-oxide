@@ -642,10 +642,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
                 {
                     saw_addr_call = true;
                 }
-                vmir::InstKind::Heap(vmir::HeapInst::Combine {
-                    target: vmir::Target::Loc(_),
-                    ..
-                }) => saw_acc = true,
+                vmir::InstKind::Heap(vmir::HeapInst::Combine { .. }) => saw_acc = true,
                 _ => {}
             }
         }
@@ -653,35 +650,26 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         assert!(saw_addr_call, "read@requires must call number@addr");
         assert!(saw_acc, "read@requires must contain an acc");
 
-        // The `add` body's method contracts now lower to fused resource
-        // combines: a `Sub` exhale of `add@requires` (implicit assert) and an
-        // `Add` inhale of `add@ensures` (implicit assume), each a
-        // `Combine { target: Resource(..) }`. No standalone Assert/Assume/
-        // ResourceCall remain.
+        // The `add` body's method contracts lower to resource inhale/exhale
+        // instructions: an `exhale` of `add@requires` (implicit assert) and an
+        // `inhale` of `add@ensures` (implicit assume). No standalone
+        // Assert/Assume/ResourceCall remain.
         let add_id = p.interner.get("add").expect("missing add method");
         let vmir::Declaration::Method(add) = &p.decls[add_id] else {
             panic!("add must be a Method");
         };
         let kinds: Vec<_> = add.insts.iter().map(|i| &i.kind).collect();
-        let combine = |sign| {
-            move |k: &&vmir::InstKind| {
-                matches!(
-                    k,
-                    vmir::InstKind::Heap(vmir::HeapInst::Combine {
-                        sign: s,
-                        target: vmir::Target::Resource(_),
-                        ..
-                    }) if *s == sign
-                )
-            }
-        };
         assert!(
-            kinds.iter().any(combine(vmir::Sign::Sub)),
-            "add body must contain a Sub resource combine (requires exhale)"
+            kinds
+                .iter()
+                .any(|k| matches!(k, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. }))),
+            "add body must contain an exhale (requires)"
         );
         assert!(
-            kinds.iter().any(combine(vmir::Sign::Add)),
-            "add body must contain an Add resource combine (ensures inhale)"
+            kinds
+                .iter()
+                .any(|k| matches!(k, vmir::InstKind::Heap(vmir::HeapInst::Inhale { .. }))),
+            "add body must contain an inhale (ensures)"
         );
         assert!(
             !kinds

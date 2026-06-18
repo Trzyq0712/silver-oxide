@@ -10,7 +10,6 @@ use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
     Declaration, HeapInst, InstKind, MemberId, Method, Precond, Program, PureInst, ResourceBody,
-    Target,
 };
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
@@ -168,10 +167,9 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
     for inst in &body.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::Heap(HeapInst::Combine {
-                target: Target::Resource(c),
-                ..
-            }) => out.push(c.resource),
+            InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
+                out.push(call.resource)
+            }
             InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
                 out.push(call.resource)
             }
@@ -184,10 +182,9 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
     for inst in &m.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::Heap(HeapInst::Combine {
-                target: Target::Resource(c),
-                ..
-            }) => out.push(c.resource),
+            InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
+                out.push(call.resource)
+            }
             InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
                 out.push(call.resource)
             }
@@ -200,8 +197,7 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
 mod tests {
     use super::*;
     use crate::vmir::{
-        HeapInst, HeapVal, Inst, InstKind, PathConds, Precond, Resource, ResourceCall, Sign,
-        Target, write,
+        HeapInst, HeapVal, Inst, InstKind, PathConds, Precond, Resource, ResourceCall, write,
     };
     use lasso::Rodeo;
     use std::collections::HashSet;
@@ -226,10 +222,9 @@ mod tests {
         };
         let inst: Inst = Inst {
             pc: PathConds::default(),
-            kind: InstKind::Heap(HeapInst::Combine {
+            kind: InstKind::Heap(HeapInst::Inhale {
                 base: HeapVal::Empty,
-                sign: Sign::Add,
-                target: Target::Resource(call),
+                call,
                 perm: write(),
             }),
         };

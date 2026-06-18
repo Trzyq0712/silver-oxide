@@ -8,7 +8,7 @@ use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
     self, FALSE, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Polarity, PureInst,
-    ResourceCall, Sign, TRUE, Target, Val,
+    ResourceCall, Sign, TRUE, Val,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -150,9 +150,9 @@ impl Sink {
         self.insts.push(Inst::new(pc, InstKind::Refute(v)));
     }
 
-    /// Emit `h := base <sign> acc <call> <perm>`: combine the resource's delta
-    /// onto `base`, implicitly assuming (`Add`) or asserting (`Sub`) its bool.
-    /// `Add` is total; `Sub` carries the running pc as its side-condition guard.
+    /// Emit a resource inhale (`base inhale call perm`, assumes the bool) or
+    /// exhale (`base exhale call perm`, asserts the bool). Inhale is total;
+    /// exhale carries the running pc as its side-condition guard.
     pub fn emit_resource_combine(
         &mut self,
         base: HeapVal,
@@ -160,15 +160,9 @@ impl Sink {
         call: ResourceCall,
         perm: Val,
     ) -> HeapVal {
-        let inst = HeapInst::Combine {
-            base,
-            sign,
-            target: Target::Resource(call),
-            perm,
-        };
         match sign {
-            Sign::Add => self.emit_heap(inst),
-            Sign::Sub => self.emit_heap_guarded(inst),
+            Sign::Add => self.emit_heap(HeapInst::Inhale { base, call, perm }),
+            Sign::Sub => self.emit_heap_guarded(HeapInst::Exhale { base, call, perm }),
         }
     }
 }

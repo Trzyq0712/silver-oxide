@@ -12,14 +12,27 @@ pub enum HeapVal {
 /// Heap instructions. All heap instructions produce new heaps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HeapInst {
-    /// `h := base <sign> acc <target> <perm>`. Adds (or subtracts) the access
-    /// to `target` with permission `perm` to/from `base`. When `target` is a
-    /// `Resource`, the resource's boolean is implicitly assumed (`Add`) or
-    /// asserted (`Sub`).
+    /// `h := base <sign> acc <loc> <perm>`. Adds (or subtracts) the single
+    /// location chunk at `loc` with permission `perm` to/from `base`. Pure heap
+    /// accounting — no boolean is assumed or asserted (cf. `Inhale`/`Exhale`).
     Combine {
         base: HeapVal,
         sign: Sign,
-        target: Target,
+        loc: Val,
+        perm: Val,
+    },
+    /// `h := base inhale <call> <perm>`. Add the resource's delta (scaled by
+    /// `perm`) to `base` **and assume** its boolean condition.
+    Inhale {
+        base: HeapVal,
+        call: ResourceCall,
+        perm: Val,
+    },
+    /// `h := base exhale <call> <perm>`. Subtract the resource's delta (scaled by
+    /// `perm`) from `base` **and assert** its boolean condition.
+    Exhale {
+        base: HeapVal,
+        call: ResourceCall,
         perm: Val,
     },
     /// Assign a value to a heap location in a given heap.
@@ -48,16 +61,6 @@ pub enum HeapInst {
 pub enum Sign {
     Add,
     Sub,
-}
-
-/// What a [`HeapInst::Combine`] accesses.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Target {
-    /// A single location (field/predicate `@addr`): one chunk at `loc`.
-    Loc(Val),
-    /// A whole resource delta (scaled by the combine's `perm`); its boolean is
-    /// implicitly assumed/asserted depending on the combine's `sign`.
-    Resource(ResourceCall),
 }
 
 /// Assign a value to a heap location.
@@ -102,24 +105,29 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             }
             write!(f, ")")
         };
+        // Render `base <kw> call[ctx] perm` for a resource inhale/exhale.
+        let resource_combine =
+            |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &Val| {
+                write!(f, "{base} {kw} ")?;
+                call_head(f, call)?;
+                if let Some(ctx) = call.ctx_heap {
+                    write!(f, "[{ctx}]")?;
+                }
+                write!(f, " {perm}")
+            };
         match self.item {
             HeapInst::Combine {
                 base,
                 sign,
-                target,
+                loc,
                 perm,
-            } => match target {
-                Target::Loc(loc) => write!(f, "{base} {sign} acc {loc} {perm}"),
-                Target::Resource(call) => {
-                    write!(f, "{base} {sign} acc ")?;
-                    call_head(f, call)?;
-                    // Context heap only when the resource has a precondition.
-                    if let Some(ctx) = call.ctx_heap {
-                        write!(f, "[{ctx}]")?;
-                    }
-                    write!(f, " {perm}")
-                }
-            },
+            } => write!(f, "{base} {sign} acc {loc} {perm}"),
+            HeapInst::Inhale { base, call, perm } => {
+                resource_combine(f, base, "inhale", call, perm)
+            }
+            HeapInst::Exhale { base, call, perm } => {
+                resource_combine(f, base, "exhale", call, perm)
+            }
             HeapInst::Assign(base, Assign { loc, val }) => {
                 write!(f, "{base} assign {loc} {val}")
             }

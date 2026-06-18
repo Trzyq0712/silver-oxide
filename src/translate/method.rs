@@ -347,7 +347,7 @@ fn lower_new(
                 heap = sink.emit_heap(HeapInst::Combine {
                     base: heap,
                     sign: vmir::Sign::Add,
-                    target: vmir::Target::Loc(loc),
+                    loc,
                     perm,
                 });
             }

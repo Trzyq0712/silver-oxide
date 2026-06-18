@@ -10,8 +10,7 @@ use crate::{
     },
     vmir::{
         self, Assign, BinOp, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal, MemberId,
-        Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall, Sign, Target, Type,
-        Val,
+        Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall, Sign, Type, Val,
     },
 };
 
@@ -142,7 +141,11 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
 /// instruction has been evaluated, so the result heap sits at `heaps_before`.
 fn display_heaps(state: &EvalState, kind: &InstKind, heaps_before: usize) -> Vec<(String, Heap)> {
     match kind {
-        InstKind::Heap(HeapInst::Combine { base, .. }) => vec![
+        InstKind::Heap(
+            HeapInst::Combine { base, .. }
+            | HeapInst::Inhale { base, .. }
+            | HeapInst::Exhale { base, .. },
+        ) => vec![
             (base.to_string(), get_heap(state, base)),
             (
                 format!("h{heaps_before}"),
@@ -534,12 +537,11 @@ fn eval_heap_inst(
 ) -> Result<Heap, VerifyError> {
     match inst {
         // `base ± acc loc perm`: build the single chunk, then union (Add) or
-        // subtract (Sub) it. The resource-target case is method-only (it needs
-        // the program + certificates) and is handled in `eval_method_inst`.
+        // subtract (Sub) it.
         HeapInst::Combine {
             base,
             sign,
-            target: Target::Loc(loc),
+            loc,
             perm,
         } => {
             let base_h = get_heap(state, base);
@@ -554,11 +556,9 @@ fn eval_heap_inst(
                 Sign::Sub => heap_subtract(ctx, &base_h, &chunk, &pc_lits),
             }
         }
-        HeapInst::Combine {
-            target: Target::Resource(_),
-            ..
-        } => Err(VerifyError::Unimplemented(
-            "resource combine outside method body",
+        // Resource inhale/exhale need the program + certificates; method-only.
+        HeapInst::Inhale { .. } | HeapInst::Exhale { .. } => Err(VerifyError::Unimplemented(
+            "resource inhale/exhale outside method body",
         )),
         // Fold/Unfold need the program + certificates; handled in
         // `eval_method_inst`.
@@ -661,15 +661,13 @@ fn eval_method_inst(
             let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id);
         }
-        // `base ± acc <resource>(args) perm`: graft the resource's certificate,
-        // scale its delta by `perm`, union (Add) / subtract (Sub) against `base`,
-        // and implicitly assume (Add) / assert (Sub) the resource's boolean.
-        InstKind::Heap(HeapInst::Combine {
-            base,
-            sign,
-            target: Target::Resource(call),
-            perm,
-        }) => {
+        // `base inhale <resource>(args) perm`: graft the resource's certificate,
+        // scale its delta by `perm`, union against `base`, and **assume** the
+        // resource's boolean. `base exhale ...` subtracts and **asserts** it.
+        InstKind::Heap(
+            hi @ (HeapInst::Inhale { base, call, perm } | HeapInst::Exhale { base, call, perm }),
+        ) => {
+            let is_inhale = matches!(hi, HeapInst::Inhale { .. });
             let base_h = get_heap(state, base);
             let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
             let scale = state.get_val(ctx, perm);
@@ -680,22 +678,19 @@ fn eval_method_inst(
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
-            let out = match sign {
-                Sign::Add => heap_union(ctx, &base_h, &scaled, &pc_lits),
-                Sign::Sub => heap_subtract(ctx, &base_h, &scaled, &pc_lits)?,
+            let out = if is_inhale {
+                let out = heap_union(ctx, &base_h, &scaled, &pc_lits);
+                let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+                ctx.egraph.union(bool_id, true_);
+                ctx.egraph.rebuild();
+                out
+            } else {
+                let out = heap_subtract(ctx, &base_h, &scaled, &pc_lits)?;
+                if !ctx.prove_under_pc(bool_id, &pc_lits) {
+                    return Err(VerifyError::AssertionFailed);
+                }
+                out
             };
-            match sign {
-                Sign::Add => {
-                    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-                    ctx.egraph.union(bool_id, true_);
-                    ctx.egraph.rebuild();
-                }
-                Sign::Sub => {
-                    if !ctx.prove_under_pc(bool_id, &pc_lits) {
-                        return Err(VerifyError::AssertionFailed);
-                    }
-                }
-            }
             state.push_heap(out);
         }
         // `fold`: consume the predicate footprint (scaled by `perm`), assert the
@@ -951,12 +946,7 @@ pub fn verify_resource(
     let mut footprint_ops: Vec<(Val, Val)> = Vec::new();
 
     for inst in &body.insts {
-        if let InstKind::Heap(HeapInst::Combine {
-            target: Target::Loc(loc),
-            perm,
-            ..
-        }) = &inst.kind
-        {
+        if let InstKind::Heap(HeapInst::Combine { loc, perm, .. }) = &inst.kind {
             footprint_ops.push((loc.clone(), perm.clone()));
         }
         let vals_before = state.vals.len();
@@ -1040,8 +1030,13 @@ fn inst_obligations(
     let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
     match kind {
-        // `not(perm < 0)` desugared to an `Ite`.
-        InstKind::Heap(HeapInst::Combine { perm, .. }) => {
+        // `not(perm < 0)` desugared to an `Ite`. Applies to a location combine
+        // and to a resource inhale/exhale (their permission scale must be ≥ 0).
+        InstKind::Heap(
+            HeapInst::Combine { perm, .. }
+            | HeapInst::Inhale { perm, .. }
+            | HeapInst::Exhale { perm, .. },
+        ) => {
             let perm = state.get_val(ctx, perm);
             let zero = zero_real(ctx);
             let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));

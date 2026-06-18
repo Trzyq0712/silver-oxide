@@ -8,8 +8,7 @@ use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PcKind, PureExt, Sink}
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Target, Type,
-    Val, none,
+    self, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val, none,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -138,7 +137,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             let inst = HeapInst::Combine {
                 base: acc_heap,
                 sign,
-                target: Target::Loc(loc),
+                loc,
                 perm,
             };
             // Always carry the path condition: an `acc` has a permission ≥ 0
