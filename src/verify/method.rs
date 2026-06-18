@@ -18,6 +18,9 @@ use crate::{
 #[derive(Debug)]
 pub enum VerifyError {
     AssertionFailed,
+    /// A `refute` whose expression turned out to be provable (so the refutation
+    /// fails).
+    RefuteFailed,
     InsufficientPermission,
     AbstractResourceCall,
     /// A resource's side condition (e.g. `acc` permission ≥ 0, division divisor
@@ -41,6 +44,7 @@ impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AssertionFailed => write!(f, "assertion failed"),
+            Self::RefuteFailed => write!(f, "refuted expression is actually provable"),
             Self::InsufficientPermission => write!(f, "insufficient permission"),
             Self::AbstractResourceCall => write!(f, "call to abstract resource"),
             Self::SideCondition(what) => write!(f, "side condition may not hold: {what}"),
@@ -353,29 +357,51 @@ fn canonicalize_heap(
     out
 }
 
-/// Whether `addr`'s e-class is a **field** location, i.e. it holds a
-/// `FuncApp(m, _)` whose head `m` is a field address function. Field locations
-/// are permission-bounded by `1/1`; predicate `@addr` locations are not.
-fn addr_is_field(ctx: &VerifyContext<'_>, addr: egg::Id) -> bool {
-    let canon = ctx.egraph.find(addr);
-    ctx.egraph[canon]
-        .nodes
-        .iter()
-        .any(|n| matches!(n, Symbolic::FuncApp(m, _) if ctx.field_addrs.contains(m)))
+/// A field chunk extracted from a heap for the field axioms: its permission, the
+/// field address function (`field_fn`), and the base ref (`field_fn(ref)`).
+struct FieldChunk {
+    perm: egg::Id,
+    field_fn: MemberId,
+    base: egg::Id,
 }
 
-/// Assume the field-permission invariant `perm ≤ 1` at every field location in
-/// `h` (a field cell holds at most full permission). Added as an e-graph fact
-/// (`union((1 < perm) ? false : true, true)`); when a field's permission folds
-/// to `> 1` this unions `false == true`, making the unit inconsistent so any
-/// goal is dischargeable. Predicate locations are skipped (unbounded).
-fn assume_field_perm_bounds(ctx: &mut VerifyContext<'_>, h: &Heap) {
-    let field_perms: Vec<egg::Id> = h
-        .entries()
-        .filter(|(addr, _)| addr_is_field(ctx, *addr))
-        .map(|(_, chunk)| chunk.perm)
-        .collect();
-    if field_perms.is_empty() {
+/// Extract the field chunks of `h`: for each chunk whose canonical address holds
+/// a `FuncApp(m, [ref])` with `m` a field address function, record its perm,
+/// field, and base ref. Predicate locations (head not in `field_addrs`) are
+/// skipped. Relies on the translation invariant that an address is always a bare
+/// `field_fn(ref)` application (arity 1) — never a computed value.
+fn field_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<FieldChunk> {
+    let mut out = Vec::new();
+    for (addr, chunk) in h.entries() {
+        let canon = ctx.egraph.find(addr);
+        let found = ctx.egraph[canon].nodes.iter().find_map(|n| match n {
+            Symbolic::FuncApp(m, args) if ctx.field_addrs.contains(m) && args.len() == 1 => {
+                Some((*m, args[0]))
+            }
+            _ => None,
+        });
+        if let Some((field_fn, base)) = found {
+            out.push(FieldChunk {
+                perm: chunk.perm,
+                field_fn,
+                base,
+            });
+        }
+    }
+    out
+}
+
+/// Emit the field-permission axioms over `h` after a consolidation:
+/// - **bound:** every field cell holds `perm ≤ 1` (`union((1 < perm) ? false :
+///   true, true)`); a permission folding to `> 1` unions `false == true`, making
+///   the unit inconsistent so any goal is dischargeable.
+/// - **non-aliasing:** for two chunks of the *same* field whose permissions sum
+///   (const-folds) to `> 1`, the base refs differ (`union(Eq(x, y), false)`).
+///
+/// Predicate locations are unbounded and never participate.
+fn assume_field_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
+    let fields = field_chunks(ctx, h);
+    if fields.is_empty() {
         return;
     }
     let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
@@ -383,10 +409,36 @@ fn assume_field_perm_bounds(ctx: &mut VerifyContext<'_>, h: &Heap) {
     ))));
     let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-    for perm in field_perms {
-        let gt1 = ctx.add(Symbolic::Binary(BinOp::Lt, [one, perm]));
+
+    // Bound: perm ≤ 1 at each field location.
+    for fc in &fields {
+        let gt1 = ctx.add(Symbolic::Binary(BinOp::Lt, [one, fc.perm]));
         let le1 = ctx.add(Symbolic::Ite([gt1, false_, true_]));
         ctx.egraph.union(le1, true_);
+    }
+
+    // Non-aliasing: same field, perms sum > 1 ⇒ the refs differ.
+    for i in 0..fields.len() {
+        for j in (i + 1)..fields.len() {
+            if fields[i].field_fn != fields[j].field_fn {
+                continue;
+            }
+            let sum = ctx.add(Symbolic::Binary(
+                BinOp::Plus,
+                [fields[i].perm, fields[j].perm],
+            ));
+            let over_one = matches!(
+                ctx.egraph[ctx.egraph.find(sum)].data.known(),
+                Some(Literal::Real(r)) if *r > num::BigRational::from(num::BigInt::from(1))
+            );
+            if over_one {
+                let (x, y) = (fields[i].base, fields[j].base);
+                let eq_xy = ctx.add(Symbolic::Binary(BinOp::Eq, [x, y]));
+                let eq_yx = ctx.add(Symbolic::Binary(BinOp::Eq, [y, x]));
+                ctx.egraph.union(eq_xy, false_);
+                ctx.egraph.union(eq_yx, false_);
+            }
+        }
     }
     ctx.egraph.rebuild();
 }
@@ -421,8 +473,9 @@ fn heap_union(
             out = out.with_chunk(addr, chunk2);
         }
     }
-    // Every heap `+` re-asserts the field-permission bound on the result.
-    assume_field_perm_bounds(ctx, &out);
+    // Every heap `+` re-asserts the field axioms (bound + non-aliasing) on the
+    // consolidated result.
+    assume_field_axioms(ctx, &out);
     out
 }
 
@@ -555,7 +608,7 @@ fn eval_resource_body_inst(
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
         }
-        InstKind::Assume(_) | InstKind::Assert(_) => {
+        InstKind::Assume(_) | InstKind::Assert(_) | InstKind::Refute(_) => {
             return Err(VerifyError::Unimplemented(
                 "effectful inst in resource body",
             ));
@@ -788,6 +841,19 @@ fn eval_method_inst(
                 .collect();
             if !ctx.prove_under_pc(id, &pc_lits) {
                 return Err(VerifyError::AssertionFailed);
+            }
+        }
+        InstKind::Refute(val) => {
+            // `refute A` succeeds iff `A` is NOT provable in this state.
+            let id = state.get_val(ctx, val);
+            let pc_lits: Vec<(egg::Id, Polarity)> = inst
+                .pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            if ctx.prove_under_pc(id, &pc_lits) {
+                return Err(VerifyError::RefuteFailed);
             }
         }
     }

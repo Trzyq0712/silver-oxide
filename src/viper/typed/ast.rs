@@ -207,6 +207,8 @@ pub struct StmtBlock(pub Vec<Statement>);
 pub enum Statement {
     Assume(SpatialMethodExp),
     Assert(SpatialMethodExp),
+    /// `refute A`: succeeds iff `A` is **not** provable in this state.
+    Refute(SpatialMethodExp),
     Inhale(SpatialMethodExp),
     Exhale(SpatialMethodExp),
     If(PureMethodExp, StmtBlock, Option<StmtBlock>),

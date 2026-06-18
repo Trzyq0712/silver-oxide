@@ -145,6 +145,11 @@ impl Sink {
         self.insts.push(Inst::new(pc, InstKind::Assert(v)));
     }
 
+    pub fn emit_refute(&mut self, v: Val) {
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::Refute(v)));
+    }
+
     /// Emit `h := base <sign> acc <call> <perm>`: combine the resource's delta
     /// onto `base`, implicitly assuming (`Add`) or asserting (`Sub`) its bool.
     /// `Add` is total; `Sub` carries the running pc as its side-condition guard.

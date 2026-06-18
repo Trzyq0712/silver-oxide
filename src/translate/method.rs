@@ -71,8 +71,14 @@ pub(crate) fn lower_method(
     if let Some(&ens_id) = b.method_ensures.get(&m.name.0) {
         let mut ens_args = param_vals;
         ens_args.extend(ret_vals);
-        let _h_new =
-            emit_resource_combine(b, &mut sink, vmir::Sign::Sub, ens_id, current_heap, ens_args);
+        let _h_new = emit_resource_combine(
+            b,
+            &mut sink,
+            vmir::Sign::Sub,
+            ens_id,
+            current_heap,
+            ens_args,
+        );
     }
 
     Ok(vmir::Method { insts: sink.insts })
@@ -232,6 +238,18 @@ fn lower_stmt(
                 resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
                 sink.emit_assert(v);
+            }
+            Ok(current_heap)
+        }
+        S::Refute(e) => {
+            let old = pure_exp::OldHeaps {
+                baseline,
+                labeled: &*labeled,
+            };
+            if let Some(v) =
+                resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
+            {
+                sink.emit_refute(v);
             }
             Ok(current_heap)
         }

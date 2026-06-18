@@ -1169,6 +1169,7 @@ fn lower_statement(
     match stmt {
         S::Assume(e) => Ok(typed::Statement::Assume(ctx.typecheck_spatial(e)?)),
         S::Assert(e) => Ok(typed::Statement::Assert(ctx.typecheck_spatial(e)?)),
+        S::Refute(e) => Ok(typed::Statement::Refute(ctx.typecheck_spatial(e)?)),
         S::Inhale(e) => Ok(typed::Statement::Inhale(ctx.typecheck_spatial(e)?)),
         S::Exhale(e) => Ok(typed::Statement::Exhale(ctx.typecheck_spatial(e)?)),
 
@@ -1215,7 +1216,7 @@ fn lower_statement(
         // the label are loop-related and out of scope (ignored).
         S::Label(decl, _invs) => Ok(typed::Statement::Label(decl.0.id())),
 
-        S::If(..) | S::While(..) | S::Goto(..) | S::Refute(..) => Err(TypeError::Other(
+        S::If(..) | S::While(..) | S::Goto(..) => Err(TypeError::Other(
             "statement not yet supported in initial scope".to_string(),
         )),
     }

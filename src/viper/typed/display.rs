@@ -228,6 +228,7 @@ impl<'a> Display for Show<'a, &'a Statement> {
         match self.item {
             Statement::Assume(e) => write!(f, "assume {}", self.with(e)),
             Statement::Assert(e) => write!(f, "assert {}", self.with(e)),
+            Statement::Refute(e) => write!(f, "refute {}", self.with(e)),
             Statement::Inhale(e) => write!(f, "inhale {}", self.with(e)),
             Statement::Exhale(e) => write!(f, "exhale {}", self.with(e)),
             Statement::If(cond, then, else_) => {

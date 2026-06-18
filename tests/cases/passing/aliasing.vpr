@@ -1,8 +1,18 @@
 field f: Int
 
-method no_alias(x: Ref, y: Ref) 
+method no_alias_fields(x: Ref, y: Ref) 
 {
-    inhale acc(x.f, 3/4) && acc(x.f, 1/2)
+    inhale acc(x.f, 3/4) && acc(y.f, 1/2)
 
     assert x != y
+}
+
+predicate p(x: Ref)
+
+method no_alias_preds(x: Ref, y: Ref) 
+{
+    inhale acc(p(x), 3/4) && acc(p(y), 1/2)
+
+    refute x != y
+    refute x == y
 }

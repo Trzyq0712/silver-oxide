@@ -20,6 +20,9 @@ pub enum InstKind {
     Assume(Val),
     /// Assert a boolean obligation. Produces no value.
     Assert(Val),
+    /// Refute a boolean: verification succeeds iff it is **not** provable.
+    /// Produces no value.
+    Refute(Val),
 }
 
 /// Conjunction of literals over previously-emitted `Val`s.
@@ -84,6 +87,7 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                 }
                 InstKind::Assume(v) => writeln!(f, "  {}assume {v}", PcPrefix(&inst.pc))?,
                 InstKind::Assert(v) => writeln!(f, "  {}assert {v}", PcPrefix(&inst.pc))?,
+                InstKind::Refute(v) => writeln!(f, "  {}refute {v}", PcPrefix(&inst.pc))?,
             }
         }
         Ok(())
