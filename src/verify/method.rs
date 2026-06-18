@@ -394,12 +394,17 @@ fn field_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<FieldChunk> {
     out
 }
 
-/// Emit the field-permission axioms over `h` after a consolidation:
-/// - **bound:** every field cell holds `perm ≤ 1` (`union((1 < perm) ? false :
-///   true, true)`); a permission folding to `> 1` unions `false == true`, making
-///   the unit inconsistent so any goal is dischargeable.
-/// - **non-aliasing:** for two chunks of the *same* field whose permissions sum
-///   (const-folds) to `> 1`, the base refs differ (`union(Eq(x, y), false)`).
+/// Emit the field-permission axioms over `h` after a consolidation. Both are
+/// e-graph facts the engine *resolves itself* (no Rust-side const-fold queries):
+/// - **bound:** every field cell holds `perm ≤ 1` — `union((1 < perm) ? false :
+///   true, true)`; if a permission folds to `> 1` this unions `false == true`,
+///   making the unit inconsistent so any goal is dischargeable.
+/// - **non-aliasing:** for two chunks of the *same* field, the implication
+///   `(permᵢ + permⱼ > 1) ⟹ refᵢ ≠ refⱼ`, encoded as
+///   `union(Eq(x, y), (1 < sum) ? false : Eq(x, y))`. When `1 < sum` folds true
+///   the `ite` const-folds to `false`, collapsing `Eq(x, y)` to `false`
+///   (i.e. the refs are distinct); otherwise it is an inert fixpoint, and a
+///   later proof of `1 < sum` triggers the same collapse via `ite-true`.
 ///
 /// Predicate locations are unbounded and never participate.
 fn assume_field_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
@@ -420,7 +425,9 @@ fn assume_field_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
         ctx.egraph.union(le1, true_);
     }
 
-    // Non-aliasing: same field, perms sum > 1 ⇒ the refs differ.
+    // Non-aliasing: same field ⇒ `(perm sum > 1) ⟹ refs differ`, materialised so
+    // the e-graph resolves it. Both `Eq` arg orders are constrained (the goal's
+    // order is source-dependent).
     for i in 0..fields.len() {
         for j in (i + 1)..fields.len() {
             if fields[i].field_fn != fields[j].field_fn {
@@ -430,16 +437,14 @@ fn assume_field_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
                 BinOp::Plus,
                 [fields[i].perm, fields[j].perm],
             ));
-            let over_one = matches!(
-                ctx.egraph[ctx.egraph.find(sum)].data.known(),
-                Some(Literal::Real(r)) if *r > num::BigRational::from(num::BigInt::from(1))
-            );
-            if over_one {
-                let (x, y) = (fields[i].base, fields[j].base);
-                let eq_xy = ctx.add(Symbolic::Binary(BinOp::Eq, [x, y]));
-                let eq_yx = ctx.add(Symbolic::Binary(BinOp::Eq, [y, x]));
-                ctx.egraph.union(eq_xy, false_);
-                ctx.egraph.union(eq_yx, false_);
+            let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [one, sum]));
+            for (a, b) in [
+                (fields[i].base, fields[j].base),
+                (fields[j].base, fields[i].base),
+            ] {
+                let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
+                let imp = ctx.add(Symbolic::Ite([gt, false_, eq]));
+                ctx.egraph.union(eq, imp);
             }
         }
     }
