@@ -57,7 +57,7 @@ impl Analysis<Symbolic> for ConstFold {
         match enode {
             Symbolic::Lit(lit) => Known(lit.clone()),
 
-            Symbolic::Fresh(_) | Symbolic::FuncApp(..) => Unknown,
+            Symbolic::Fresh(_) | Symbolic::FuncApp(..) | Symbolic::Location(..) => Unknown,
 
             Symbolic::RealCast(c) => match &egraph[*c].data {
                 Known(Literal::Int(n)) => Known(Literal::Real(BigRational::from(n.clone()))),

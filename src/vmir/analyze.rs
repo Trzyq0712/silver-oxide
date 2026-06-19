@@ -152,8 +152,9 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             }
         }
         Declaration::Method(m) => method_deps(m, out),
-        // Functions have no body yet; nothing to depend on.
+        // Leaf declarations: nothing to depend on.
         Declaration::Function(_)
+        | Declaration::Location(_)
         | Declaration::Domain(_)
         | Declaration::DomainElement
         | Declaration::Adt(_)
@@ -167,6 +168,7 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
     for inst in &body.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
+            InstKind::Pure(_, PureInst::Location(m, _)) => out.push(*m),
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
                 out.push(call.resource)
             }
@@ -182,6 +184,7 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
     for inst in &m.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
+            InstKind::Pure(_, PureInst::Location(m, _)) => out.push(*m),
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
                 out.push(call.resource)
             }
@@ -241,7 +244,6 @@ mod tests {
             interner,
             adt_meta: Default::default(),
             pred_meta: Default::default(),
-            field_addrs: Default::default(),
         }
     }
 

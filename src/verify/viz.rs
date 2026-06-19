@@ -84,12 +84,16 @@ impl Snapshotter {
         // nodes with their type — both live in the viz/context oracles, so the
         // e-graph itself need not carry them.
         let mut funcs: HashSet<MemberId> = HashSet::new();
+        let mut locs: HashSet<MemberId> = HashSet::new();
         let mut fresh: HashSet<u32> = HashSet::new();
         for class in ctx.egraph.classes() {
             for node in &class.nodes {
                 match node {
                     Symbolic::FuncApp(m, _) => {
                         funcs.insert(*m);
+                    }
+                    Symbolic::Location(m, _) => {
+                        locs.insert(*m);
                     }
                     Symbolic::Fresh(u) => {
                         fresh.insert(*u);
@@ -101,6 +105,12 @@ impl Snapshotter {
         for m in funcs {
             dot = dot.replace(
                 &format!("fn{}(..)", m.0),
+                &format!("{}", escape(&ctx.member_name(m))),
+            );
+        }
+        for m in locs {
+            dot = dot.replace(
+                &format!("loc{}(..)", m.0),
                 &format!("{}", escape(&ctx.member_name(m))),
             );
         }

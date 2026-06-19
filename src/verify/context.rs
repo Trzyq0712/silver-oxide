@@ -9,7 +9,7 @@ use crate::{
         lang::Symbolic,
         rewrite,
     },
-    vmir::{AdtMeta, BinOp, FunctionCall, Literal, MemberId, Polarity, Type},
+    vmir::{AdtMeta, BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
 };
 use lasso::Rodeo;
 
@@ -77,16 +77,26 @@ pub(crate) struct VerifyContext<'a> {
     /// needed — the visualization reads them directly to reconstruct types.
     pub(crate) fresh_types: HashMap<u32, Type>,
     pub(crate) func_ret_types: HashMap<MemberId, Type>,
-    /// Field address-function member ids (a chunk at such an address is a field
-    /// location, whose permission is bounded by `1/1`).
-    pub(crate) field_addrs: std::collections::HashSet<MemberId>,
+    /// Location declarations by member id (the heap-address functions). A chunk
+    /// whose address is a `Symbolic::Location(m, _)` is bounded/non-aliased per
+    /// `locations[m]`.
+    pub(crate) locations: HashMap<MemberId, LocationInfo>,
+}
+
+/// Verifier-side view of a `Declaration::Location`.
+#[derive(Debug, Clone)]
+pub(crate) struct LocationInfo {
+    pub(crate) bound: Bound,
+    /// Held value type `T` (the location value is `Addr<T>`).
+    pub(crate) ret: Type,
+    pub(crate) arity: usize,
 }
 
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
         interner: &'a Rodeo<MemberId>,
         adt_meta: &AdtMeta,
-        field_addrs: std::collections::HashSet<MemberId>,
+        locations: HashMap<MemberId, LocationInfo>,
     ) -> Self {
         // Synthetic ids start past every real (interned) declaration id; the
         // first synthetic id is reserved for the generic `Option` head.
@@ -106,8 +116,18 @@ impl<'a> VerifyContext<'a> {
             interner,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
-            field_addrs,
+            locations,
         }
+    }
+
+    /// Add a location application `f(args)` (an address of type `Addr<ret>`),
+    /// recording its result type in the side-oracle for type inference.
+    pub(crate) fn add_location(&mut self, member: MemberId, args: Box<[egg::Id]>) -> egg::Id {
+        if let Some(info) = self.locations.get(&member) {
+            let addr_ty = Type::Addr(Box::new(info.ret.clone()));
+            self.func_ret_types.entry(member).or_insert(addr_ty);
+        }
+        self.egraph.add(Symbolic::Location(member, args))
     }
 
     /// Whether the e-graph has reached a contradiction (some e-class merged
@@ -551,6 +571,13 @@ fn transplant(
                 let ret = cert.func_ret_types.get(m).cloned().unwrap_or(Type::Int);
                 caller.add_func_app_id(*m, ret, fargs)
             }
+            Symbolic::Location(m, fargs) => {
+                let fargs: Box<[Id]> = fargs
+                    .iter()
+                    .map(|a| transplant(caller, cert, *a, subst, memo))
+                    .collect();
+                caller.add_location(*m, fargs)
+            }
         };
         built.push(b);
     }
@@ -594,7 +621,7 @@ pub(crate) fn infer_type(
             Symbolic::Lit(l) => Some(lit_type(l)),
             Symbolic::RealCast(_) => Some(Type::Real),
             Symbolic::Fresh(u) => fresh_types.get(u).cloned(),
-            Symbolic::FuncApp(m, _) => func_ret_types.get(m).cloned(),
+            Symbolic::FuncApp(m, _) | Symbolic::Location(m, _) => func_ret_types.get(m).cloned(),
             Symbolic::Binary(op, [l, _]) => match op {
                 BinOp::Eq | BinOp::Lt => Some(Type::Bool),
                 _ => infer_type(egraph, fresh_types, func_ret_types, *l, memo),

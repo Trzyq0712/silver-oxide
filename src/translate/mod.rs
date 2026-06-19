@@ -258,12 +258,13 @@ impl<'a> Builder<'a> {
         let snap_id = self.fresh_decl(&format!("{pred_name}@snap"));
         self.set_decl(snap_id, vmir::Declaration::Domain(vmir::Domain {}));
         let addr_id = self.fresh_decl(&format!("{pred_name}@addr"));
-        let addr_fn = vmir::Function {
+        // A predicate is an unbounded location returning its snapshot.
+        let addr_loc = vmir::Location {
             params: p.params.iter().map(|p| lower_type(&p.ty)).collect(),
-            ret: vmir::Type::Addr(Box::new(vmir::Type::domain(snap_id))),
-            body: None,
+            ret: vmir::Type::domain(snap_id),
+            bound: vmir::Bound::Unbounded,
         };
-        self.set_decl(addr_id, vmir::Declaration::Function(addr_fn));
+        self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
         self.pred_snap.insert(p.name.0, snap_id);
         self.pred_addr.insert(p.name.0, addr_id);
     }
@@ -277,12 +278,14 @@ impl<'a> Builder<'a> {
         // `P@addr` / `P@snap`).
         let field_name = self.interner.resolve(&f.0.name.0).to_owned();
         let addr_id = self.fresh_decl(&field_name);
-        let addr_fn = vmir::Function {
+        // A field is a location bounded by full permission `1/1`, returning the
+        // field's value type.
+        let addr_loc = vmir::Location {
             params: vec![vmir::Type::Ref],
-            ret: vmir::Type::Addr(Box::new(lower_type(&f.0.ty))),
-            body: None,
+            ret: lower_type(&f.0.ty),
+            bound: vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
         };
-        self.set_decl(addr_id, vmir::Declaration::Function(addr_fn));
+        self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
         self.field_addr.insert(f.0.name.0, addr_id);
     }
 
@@ -515,7 +518,6 @@ impl<'a> Builder<'a> {
             interner: self.vmir_interner,
             adt_meta: self.adt_meta,
             pred_meta: self.pred_meta,
-            field_addrs: self.field_addr.values().copied().collect(),
         }
     }
 }
@@ -585,14 +587,12 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         assert!(matches!(p.decls[snap_id], vmir::Declaration::Domain(_)));
 
         let addr_id = p.interner.get("number@addr").expect("missing number@addr");
-        let vmir::Declaration::Function(addr_fn) = &p.decls[addr_id] else {
-            panic!("number@addr must be a Function");
+        let vmir::Declaration::Location(addr_loc) = &p.decls[addr_id] else {
+            panic!("number@addr must be a Location");
         };
-        assert_eq!(addr_fn.params, vec![vmir::Type::Ref]);
-        assert!(matches!(
-            &addr_fn.ret,
-            vmir::Type::Addr(inner) if **inner == vmir::Type::domain(snap_id)
-        ));
+        assert_eq!(addr_loc.params, vec![vmir::Type::Ref]);
+        assert_eq!(addr_loc.ret, vmir::Type::domain(snap_id));
+        assert_eq!(addr_loc.bound, vmir::Bound::Unbounded);
 
         // Predicate itself is abstract.
         let pred_id = p.interner.get("number").expect("missing number");
@@ -637,9 +637,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         let mut saw_acc = false;
         for inst in &body.insts {
             match &inst.kind {
-                vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(_, fc))
-                    if fc.function == addr_id =>
-                {
+                vmir::InstKind::Pure(_, vmir::PureInst::Location(m, _)) if *m == addr_id => {
                     saw_addr_call = true;
                 }
                 vmir::InstKind::Heap(vmir::HeapInst::Combine { .. }) => saw_acc = true,

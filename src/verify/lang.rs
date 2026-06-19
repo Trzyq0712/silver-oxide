@@ -12,6 +12,10 @@ pub enum Symbolic {
     Binary(BinOp, [Id; 2]),
     Ite([Id; 3]),
     FuncApp(MemberId, Box<[Id]>),
+    /// A heap-location application `f(args)` (an address). A distinct sort from
+    /// `FuncApp` so function rewrites never touch it; congruence still gives
+    /// `f(x) == f(y) ⟺ x == y`.
+    Location(MemberId, Box<[Id]>),
     RealCast(Id),
 }
 
@@ -22,6 +26,7 @@ pub enum Discriminant {
     Binary(BinOp),
     Ite,
     FuncApp(MemberId),
+    Location(MemberId),
     RealCast,
 }
 
@@ -37,6 +42,7 @@ impl Language for Symbolic {
             S::Binary(op, _) => D::Binary(*op),
             S::Ite(_) => D::Ite,
             S::FuncApp(id, _) => D::FuncApp(*id),
+            S::Location(id, _) => D::Location(*id),
             S::RealCast(_) => D::RealCast,
         }
     }
@@ -50,6 +56,9 @@ impl Language for Symbolic {
             (Ite(_), Ite(_)) => true,
             (RealCast(_), RealCast(_)) => true,
             (FuncApp(id1, args1), FuncApp(id2, args2)) => id1 == id2 && args1.len() == args2.len(),
+            (Location(id1, args1), Location(id2, args2)) => {
+                id1 == id2 && args1.len() == args2.len()
+            }
             _ => false,
         }
     }
@@ -61,7 +70,7 @@ impl Language for Symbolic {
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_ref(id),
-            FuncApp(_, ids) => ids,
+            FuncApp(_, ids) | Location(_, ids) => ids,
         }
     }
 
@@ -72,7 +81,7 @@ impl Language for Symbolic {
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_mut(id),
-            FuncApp(_, ids) => ids,
+            FuncApp(_, ids) | Location(_, ids) => ids,
         }
     }
 }
@@ -88,6 +97,7 @@ impl Display for Symbolic {
             // Id-only label; the viz resolves member ids to source names when it
             // renders the dot (it holds the interner).
             Symbolic::FuncApp(id, _) => write!(f, "fn{}(..)", id.0),
+            Symbolic::Location(id, _) => write!(f, "loc{}(..)", id.0),
         }
     }
 }

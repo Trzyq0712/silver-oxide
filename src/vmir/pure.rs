@@ -55,6 +55,9 @@ pub enum PureInst {
     /// A function application. The heap is the function's context heap, present
     /// only for heap-dependent functions (`None` for heap-independent ones).
     FunctionCall(Option<HeapVal>, FunctionCall),
+    /// A location application `loc f(args)` producing an address (`Addr<ret>`).
+    /// The only producer of address values; never an operand to computation.
+    Location(crate::vmir::MemberId, Vec<Val>),
 }
 
 // ======================
@@ -124,6 +127,16 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 Ok(())
             }
             PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
+            PureInst::Location(member, args) => {
+                write!(f, "loc {}(", self.interner.resolve(member))?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }

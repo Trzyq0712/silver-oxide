@@ -59,6 +59,7 @@ impl<'a> Display for VmirDisplay<'a, (MemberId, &'a Declaration)> {
             Declaration::Domain(domain) => write!(f, "domain {name} {}", self.with(domain)),
             Declaration::DomainElement => write!(f, "domain_element {name}"),
             Declaration::Function(function) => write!(f, "function {name}{}", self.with(function)),
+            Declaration::Location(location) => write!(f, "location {name}{}", self.with(location)),
             Declaration::Method(method) => write!(f, "method {name} {}", self.with(method)),
             Declaration::Resource(resource) => write!(f, "resource {name}{}", self.with(resource)),
             Declaration::Adt(adt) => write!(f, "adt {name} {}", self.with(adt)),

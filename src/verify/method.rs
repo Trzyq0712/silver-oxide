@@ -3,14 +3,15 @@ use std::collections::HashMap;
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
-        context::{ResourceCertificate, VerifyContext},
+        context::{LocationInfo, ResourceCertificate, VerifyContext},
         heap::{Chunk, Heap},
         lang::Symbolic,
         viz::Snapshotter,
     },
     vmir::{
-        self, Assign, BinOp, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal, MemberId,
-        Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall, Sign, Type, Val,
+        self, Assign, BinOp, Bound, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal,
+        MemberId, Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall, Sign,
+        Type, Val,
     },
 };
 
@@ -243,6 +244,10 @@ fn eval_pure_inst(
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add_func_app(fc, ty.clone(), args.into())
         }
+        PureInst::Location(member, args) => {
+            let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+            ctx.add_location(*member, args.into())
+        }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {
             let heap = get_heap(state, hv);
@@ -360,95 +365,118 @@ fn canonicalize_heap(
     out
 }
 
-/// A field chunk extracted from a heap for the field axioms: its permission, the
-/// field address function (`field_fn`), and the base ref (`field_fn(ref)`).
-struct FieldChunk {
+/// A location chunk extracted from a heap for the location axioms: its
+/// permission, the location member, its argument e-classes, and its bound.
+struct LocationChunk {
     perm: egg::Id,
-    field_fn: MemberId,
-    base: egg::Id,
+    member: MemberId,
+    args: Vec<egg::Id>,
+    bound: Bound,
 }
 
-/// Extract the field chunks of `h`: for each chunk whose canonical address holds
-/// a `FuncApp(m, [ref])` with `m` a field address function, record its perm,
-/// field, and base ref. Predicate locations (head not in `field_addrs`) are
-/// skipped. Relies on the translation invariant that an address is always a bare
-/// `field_fn(ref)` application (arity 1) — never a computed value.
-fn field_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<FieldChunk> {
+/// Extract the location chunks of `h`: for each chunk whose canonical address
+/// holds a `Symbolic::Location(m, args)` with `m` a known location, record its
+/// perm, member, args, and bound.
+fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     let mut out = Vec::new();
     for (addr, chunk) in h.entries() {
         let canon = ctx.egraph.find(addr);
         let found = ctx.egraph[canon].nodes.iter().find_map(|n| match n {
-            Symbolic::FuncApp(m, args) if ctx.field_addrs.contains(m) && args.len() == 1 => {
-                Some((*m, args[0]))
+            Symbolic::Location(m, args) if ctx.locations.contains_key(m) => {
+                Some((*m, args.to_vec()))
             }
             _ => None,
         });
-        if let Some((field_fn, base)) = found {
-            out.push(FieldChunk {
+        if let Some((member, args)) = found {
+            out.push(LocationChunk {
                 perm: chunk.perm,
-                field_fn,
-                base,
+                member,
+                bound: ctx.locations[&member].bound.clone(),
+                args,
             });
         }
     }
     out
 }
 
-/// Emit the field-permission axioms over `h` after a consolidation. Both are
-/// e-graph facts the engine *resolves itself* (no Rust-side const-fold queries):
-/// - **bound:** every field cell holds `perm ≤ 1` — `union((1 < perm) ? false :
-///   true, true)`; if a permission folds to `> 1` this unions `false == true`,
+/// Emit the location axioms over `h` after a consolidation. Both are e-graph
+/// facts the engine *resolves itself* (no Rust-side const-fold queries):
+/// - **bound:** a `Bounded(b)` cell holds `perm ≤ b` — `union((b < perm) ?
+///   false : true, true)`; a permission folding to `> b` unions `false == true`,
 ///   making the unit inconsistent so any goal is dischargeable.
-/// - **non-aliasing:** for two chunks of the *same* field, the implication
-///   `(permᵢ + permⱼ > 1) ⟹ refᵢ ≠ refⱼ`, encoded as
-///   `union(Eq(x, y), (1 < sum) ? false : Eq(x, y))`. When `1 < sum` folds true
-///   the `ite` const-folds to `false`, collapsing `Eq(x, y)` to `false`
-///   (i.e. the refs are distinct); otherwise it is an inert fixpoint, and a
-///   later proof of `1 < sum` triggers the same collapse via `ite-true`.
+/// - **non-aliasing:** two chunks of the *same* bounded location satisfy
+///   `(permᵢ + permⱼ > b) ⟹ ¬(args equal)`, encoded as
+///   `union(conj, (b < sum) ? false : conj)` where `conj = a0==b0 && a1==b1 …`.
+///   When `b < sum` folds true the `ite` collapses `conj` to `false`. For arity
+///   1 this is the single-`Eq` collapse (drives `a0 != a1`); for higher arity it
+///   sets the whole conjunction false (the de-Morgan disjunction — the e-graph
+///   won't pick a branch, SMT does later).
 ///
-/// Predicate locations are unbounded and never participate.
-fn assume_field_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
-    let fields = field_chunks(ctx, h);
-    if fields.is_empty() {
+/// Unbounded locations (predicates) never participate.
+fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
+    let chunks = location_chunks(ctx, h);
+    if chunks.is_empty() {
         return;
     }
-    let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
-        num::BigInt::from(1),
-    ))));
     let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
     let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
 
-    // Bound: perm ≤ 1 at each field location.
-    for fc in &fields {
-        let gt1 = ctx.add(Symbolic::Binary(BinOp::Lt, [one, fc.perm]));
-        let le1 = ctx.add(Symbolic::Ite([gt1, false_, true_]));
-        ctx.egraph.union(le1, true_);
+    // Bound: perm ≤ b at each bounded location.
+    for c in &chunks {
+        let Bound::Bounded(b) = &c.bound else {
+            continue;
+        };
+        let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
+        let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [b, c.perm]));
+        let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
+        ctx.egraph.union(le, true_);
     }
 
-    // Non-aliasing: same field ⇒ `(perm sum > 1) ⟹ refs differ`, materialised so
-    // the e-graph resolves it. Both `Eq` arg orders are constrained (the goal's
-    // order is source-dependent).
-    for i in 0..fields.len() {
-        for j in (i + 1)..fields.len() {
-            if fields[i].field_fn != fields[j].field_fn {
+    // Non-aliasing: same bounded location, perms sum > bound ⇒ args differ.
+    for i in 0..chunks.len() {
+        for j in (i + 1)..chunks.len() {
+            if chunks[i].member != chunks[j].member {
                 continue;
             }
+            let Bound::Bounded(b) = &chunks[i].bound else {
+                continue;
+            };
+            let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
             let sum = ctx.add(Symbolic::Binary(
                 BinOp::Plus,
-                [fields[i].perm, fields[j].perm],
+                [chunks[i].perm, chunks[j].perm],
             ));
-            let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [one, sum]));
-            for (a, b) in [
-                (fields[i].base, fields[j].base),
-                (fields[j].base, fields[i].base),
+            let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [b, sum]));
+            // Both arg orders (the `!=` goal's `Eq` order is source-dependent).
+            for (xs, ys) in [
+                (&chunks[i].args, &chunks[j].args),
+                (&chunks[j].args, &chunks[i].args),
             ] {
-                let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
-                let imp = ctx.add(Symbolic::Ite([gt, false_, eq]));
-                ctx.egraph.union(eq, imp);
+                let conj = conj_args_eq(ctx, xs, ys, true_, false_);
+                let imp = ctx.add(Symbolic::Ite([gt, false_, conj]));
+                ctx.egraph.union(conj, imp);
             }
         }
     }
     ctx.egraph.rebuild();
+}
+
+/// Build `xs0==ys0 && xs1==ys1 && …` as a right-nested `ite(eq, rest, false)`
+/// chain (seeded `true`). For a single argument this is `ite(a==b, true, false)`,
+/// which `ite-ident` collapses to `a==b`.
+fn conj_args_eq(
+    ctx: &mut VerifyContext<'_>,
+    xs: &[egg::Id],
+    ys: &[egg::Id],
+    true_: egg::Id,
+    false_: egg::Id,
+) -> egg::Id {
+    let mut acc = true_;
+    for k in (0..xs.len()).rev() {
+        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [xs[k], ys[k]]));
+        acc = ctx.add(Symbolic::Ite([eq, acc, false_]));
+    }
+    acc
 }
 
 /// Heap addition. Canonicalises both inputs first so chunks at e-class
@@ -483,7 +511,7 @@ fn heap_union(
     }
     // Every heap `+` re-asserts the field axioms (bound + non-aliasing) on the
     // consolidated result.
-    assume_field_axioms(ctx, &out);
+    assume_location_axioms(ctx, &out);
     out
 }
 
@@ -752,8 +780,7 @@ fn eval_method_inst(
             }
             let cons_args: Box<[egg::Id]> = members.into_iter().collect();
             let snap = ctx.add_func_app_id(snap_cons, decl_ret_ty(program, snap_cons), cons_args);
-            let pred_addr =
-                ctx.add_func_app_id(addr_fn, decl_ret_ty(program, addr_fn), args.into());
+            let pred_addr = ctx.add_location(addr_fn, args.into());
             let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, snap));
             let out = heap_union(ctx, &subtracted, &pred_chunk, &pc_lits);
             state.push_heap(out);
@@ -780,8 +807,7 @@ fn eval_method_inst(
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-            let pred_addr =
-                ctx.add_func_app_id(addr_fn, decl_ret_ty(program, addr_fn), args.clone().into());
+            let pred_addr = ctx.add_location(addr_fn, args.clone().into());
             let canon = canonicalize_heap(ctx, &base_h, &[]);
             let s = canon
                 .chunk(ctx.egraph.find(pred_addr))
@@ -872,6 +898,25 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
     out
 }
 
+/// Index the program's `Location` declarations for the verifier.
+fn build_locations(program: &vmir::Program) -> HashMap<MemberId, LocationInfo> {
+    program
+        .decls
+        .iter_enumerated()
+        .filter_map(|(id, d)| match d {
+            Declaration::Location(loc) => Some((
+                id,
+                LocationInfo {
+                    bound: loc.bound.clone(),
+                    ret: loc.ret.clone(),
+                    arity: loc.params.len(),
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn verify_method(
     program: &vmir::Program,
     method_name: &str,
@@ -881,7 +926,7 @@ pub fn verify_method(
     let mut ctx = VerifyContext::new(
         &program.interner,
         &program.adt_meta,
-        program.field_addrs.clone(),
+        build_locations(program),
     );
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
@@ -926,7 +971,7 @@ pub fn verify_resource(
     let mut ctx = VerifyContext::new(
         &program.interner,
         &program.adt_meta,
-        program.field_addrs.clone(),
+        build_locations(program),
     );
     let params: Vec<egg::Id> = resource
         .params
@@ -1079,6 +1124,57 @@ mod tests {
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
         VerifyContext::new(interner, &vmir::AdtMeta::default(), Default::default())
+    }
+
+    fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
+        ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::new(
+            num::BigInt::from(n),
+            num::BigInt::from(d),
+        ))))
+    }
+
+    // A multi-arg bounded location (not Viper-reachable; only via direct VMIR):
+    // two chunks of the same location whose perms sum > bound, with all args
+    // forced equal, must contradict (the conjunction of arg-equalities collapses
+    // to false against the assumed-true equalities).
+    #[test]
+    fn multiarg_location_nonaliasing_all_args_equal_is_inconsistent() {
+        let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let g = interner.get_or_intern("g");
+        let locations = std::collections::HashMap::from([(
+            g,
+            LocationInfo {
+                bound: Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
+                ret: Type::Int,
+                arity: 2,
+            },
+        )]);
+        let mut ctx = VerifyContext::new(&interner, &vmir::AdtMeta::default(), locations);
+
+        let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
+        let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
+        let a0 = ctx.add_location(g, Box::new([x0, y0]));
+        let a1 = ctx.add_location(g, Box::new([x1, y1]));
+        let (v0, v1) = (ctx.add(Symbolic::Fresh(4)), ctx.add(Symbolic::Fresh(5)));
+        let (p0, p1) = (real(&mut ctx, 3, 4), real(&mut ctx, 1, 2)); // sum 5/4 > 1
+        let heap = Heap::empty()
+            .with_chunk(a0, Chunk::new(p0, v0))
+            .with_chunk(a1, Chunk::new(p1, v1));
+
+        // Assume both argument pairs are equal: x0==x1, y0==y1.
+        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        for (a, b) in [(x0, x1), (y0, y1)] {
+            let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
+            ctx.egraph.union(eq, true_);
+        }
+        ctx.egraph.rebuild();
+
+        assume_location_axioms(&mut ctx, &heap);
+        ctx.saturate();
+        assert!(
+            ctx.is_inconsistent(),
+            "holding 5/4 across a 2-arg location with all args equal must contradict"
+        );
     }
 
     #[test]

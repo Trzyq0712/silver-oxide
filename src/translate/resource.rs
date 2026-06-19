@@ -8,7 +8,7 @@ use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PcKind, PureExt, Sink}
 use crate::translate::{Builder, TranslationError, lower_type};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, FunctionCall, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val, none,
+    self, FALSE, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val, none,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -285,16 +285,7 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
             let ret_ty = Type::Addr(Box::new(Type::domain(snap_id)));
-            Ok(sink.emit_pure(
-                ret_ty,
-                PureInst::FunctionCall(
-                    None,
-                    FunctionCall {
-                        function: addr_fn,
-                        args,
-                    },
-                ),
-            ))
+            Ok(sink.emit_pure(ret_ty, PureInst::Location(addr_fn, args)))
         }
     }
 }
@@ -391,16 +382,7 @@ pub(crate) fn field_addr(
         .and_then(|s| s.as_field().cloned())
         .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
     let ret_ty = Type::Addr(Box::new(lower_type(&field_ty)));
-    Ok(sink.emit_pure(
-        ret_ty,
-        PureInst::FunctionCall(
-            None,
-            FunctionCall {
-                function: addr_fn,
-                args: vec![base],
-            },
-        ),
-    ))
+    Ok(sink.emit_pure(ret_ty, PureInst::Location(addr_fn, vec![base])))
 }
 
 /// Lower `acc(base.fname, perm)` to its `(loc, perm)`: the field's `@addr`
