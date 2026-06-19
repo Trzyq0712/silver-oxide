@@ -241,6 +241,7 @@ mod tests {
         Program {
             decls: TiVec::from(decls),
             interner,
+            option_instances: std::collections::HashMap::new(),
         }
     }
 

@@ -41,10 +41,20 @@ unsafe impl Key for MemberId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OptionInstance {
+    pub adt_id: MemberId,
+    pub some: MemberId,
+    pub none: MemberId,
+    pub value: MemberId,
+    pub tag_fn: MemberId,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
     pub interner: Rodeo<MemberId>,
+    pub option_instances: std::collections::HashMap<Type, OptionInstance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

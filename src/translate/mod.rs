@@ -101,8 +101,8 @@ pub(crate) struct Builder<'a> {
     pub adt_tag_fn: HashMap<Spur, vmir::MemberId>,
     /// Maps a constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
-    /// Maps a destructor's `Spur` to its synthesized accessor Function MemberId.
     pub dtor_accessor: HashMap<Spur, vmir::MemberId>,
+    pub option_instances: HashMap<vmir::Type, vmir::OptionInstance>,
 }
 
 impl<'a> Builder<'a> {
@@ -121,6 +121,7 @@ impl<'a> Builder<'a> {
             adt_tag_fn: HashMap::new(),
             ctor_tag: HashMap::new(),
             dtor_accessor: HashMap::new(),
+            option_instances: HashMap::new(),
         }
     }
 
@@ -274,8 +275,85 @@ impl<'a> Builder<'a> {
             bound: vmir::Bound::Unbounded,
         };
         self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
+        
+        if let Some(body) = p.body.as_ref() {
+            if let Some(types) = self.flat_footprint_types(body) {
+                for ty in types {
+                    self.get_option_mono(&ty);
+                }
+            }
+        }
+        
         self.pred_snap.insert(p.name.0, snap_id);
         self.pred_addr.insert(p.name.0, addr_id);
+    }
+
+    pub(crate) fn get_option_mono(&mut self, ty: &vmir::Type) -> vmir::OptionInstance {
+        if let Some(inst) = self.option_instances.get(ty) {
+            return *inst;
+        }
+        
+        let type_name = format!("T{}", self.option_instances.len());
+        let adt_id = self.fresh_decl(&format!("Option[{type_name}]"));
+        let some = self.fresh_decl(&format!("Some[{type_name}]"));
+        let none = self.fresh_decl(&format!("None[{type_name}]"));
+        let value = self.fresh_decl(&format!("Option@value[{type_name}]"));
+        let tag_fn = self.fresh_decl(&format!("Option@tag[{type_name}]"));
+
+        self.set_decl(
+            tag_fn,
+            vmir::Declaration::Function(vmir::Function {
+                params: vec![vmir::Type::domain(adt_id)],
+                ret: vmir::Type::Int,
+                body: None,
+            }),
+        );
+        self.set_decl(
+            some,
+            vmir::Declaration::Function(vmir::Function {
+                params: vec![ty.clone()],
+                ret: vmir::Type::domain(adt_id),
+                body: None,
+            }),
+        );
+        self.set_decl(
+            none,
+            vmir::Declaration::Function(vmir::Function {
+                params: vec![],
+                ret: vmir::Type::domain(adt_id),
+                body: None,
+            }),
+        );
+        self.set_decl(
+            value,
+            vmir::Declaration::Function(vmir::Function {
+                params: vec![vmir::Type::domain(adt_id)],
+                ret: ty.clone(),
+                body: None,
+            }),
+        );
+        self.set_decl(
+            adt_id,
+            vmir::Declaration::Adt(vmir::Adt {
+                tag_fn,
+                constructors: vec![
+                    vmir::AdtConstructor {
+                        ctor_fn: some,
+                        tag: 0,
+                        projections: vec![value],
+                    },
+                    vmir::AdtConstructor {
+                        ctor_fn: none,
+                        tag: 1,
+                        projections: vec![],
+                    },
+                ],
+            }),
+        );
+
+        let inst = vmir::OptionInstance { adt_id, some, none, value, tag_fn };
+        self.option_instances.insert(ty.clone(), inst);
+        inst
     }
 
     fn declare_field_accessor(&mut self, f: &typed::Field) {
@@ -526,6 +604,7 @@ impl<'a> Builder<'a> {
         vmir::Program {
             decls,
             interner: self.vmir_interner,
+            option_instances: self.option_instances,
         }
     }
 }

@@ -1,0 +1,18 @@
+- Heap handling. Big issues.
+  - Heaps are always to be top-level -- no path conditions for heaps, path conditions are included in the perm amounts, and thus through merge semantics, in the values.
+  - No need to canonicalize the heaps. The heap subtractions are only with one "field".
+  - Same for additions, only single location.
+  - After subtraction, if the location has provably zero permission, we can safely remove it from the heap.
+- Bad naming: why do we call it method when we use it to verify not only methods?
+- Pred meta -> predicates are Viper constructs, in vmir we have resources.
+- Inconsistent structuring adt meta vs pred meta.
+- Reevaluate VMIR declarations:
+  - Adt structuring, maybe remove adt constructors and domain element
+  - We should populate adt declarations
+- Adt meta and pred meta (resource meta) should not be part of vmir program, but rather only appear in verification structures.
+- Option adt should be part of VMIR "prelude", it should not be custom handled in the verifier -- it's a completely standard ADT.
+- Rethink the usage of `MemberId`. Should they be used in verification (egraph). I think we should opt for something different especially since we would be generating on-demand members for generic types.
+- Should we split up the VMIR `MemberId` into separate subkinds for adts, functions, etc.? Not that important right now.
+
+- Add true/false functinos that take an egraph and return the true/false enode ids. Replace use places.
+- As a general rule, avoid constant folding "manually", it should happen through the egraph. This pre-folding is a premature optimization.

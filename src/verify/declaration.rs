@@ -706,7 +706,7 @@ fn eval_method_inst(
                 out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
                 let elem = decl_ret_ty(program, projs[i]);
                 let present = ctx.perm_positive(bperm);
-                members.push(ctx.option_member(elem, present, v));
+                members.push(ctx.option_member(program, elem, present, v));
                 values.push(v);
             }
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);
@@ -762,9 +762,9 @@ fn eval_method_inst(
                 // snapshot tower), and leaves it uninterpreted for an opaque
                 // snapshot. `unwrap` then peels the `Option` to the field value.
                 let elem = decl_ret_ty(program, projs[i]);
-                let opt =
-                    ctx.add_func_app_id(projs[i], ctx.option_type(elem.clone()), Box::new([s]));
-                let pv = ctx.option_unwrap(elem, opt);
+                let opt_ty = vmir::Type::domain(program.option_instances.get(&elem).unwrap().adt_id);
+                let opt = ctx.add_func_app_id(projs[i], opt_ty, Box::new([s]));
+                let pv = ctx.option_unwrap(program, elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
                 values.push(pv);
