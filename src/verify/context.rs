@@ -279,6 +279,16 @@ impl<'a> VerifyContext<'a> {
         self.egraph.add(node)
     }
 
+    /// The `true` boolean-literal e-class.
+    pub(crate) fn true_(&mut self) -> egg::Id {
+        self.add(Symbolic::Lit(Literal::Bool(true)))
+    }
+
+    /// The `false` boolean-literal e-class.
+    pub(crate) fn false_(&mut self) -> egg::Id {
+        self.add(Symbolic::Lit(Literal::Bool(false)))
+    }
+
     /// Add a `FuncApp`, recording its return type in the side-oracle so the
     /// viz can color the result (the node itself is type-free).
     pub(crate) fn add_func_app(
@@ -398,7 +408,7 @@ impl<'a> VerifyContext<'a> {
         consequent: egg::Id,
         antecedents: impl Iterator<Item = (egg::Id, Polarity)>,
     ) -> egg::Id {
-        let true_ = self.add(Symbolic::Lit(Literal::Bool(true)));
+        let true_ = self.true_();
         let mut imp = consequent;
         for (id, pol) in antecedents {
             imp = match pol {
@@ -437,7 +447,7 @@ impl<'a> VerifyContext<'a> {
         pc_lits: &[(egg::Id, Polarity)],
     ) -> bool {
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
-        let true_ = self.add(Symbolic::Lit(Literal::Bool(true)));
+        let true_ = self.true_();
 
         // Tier 0: the held facts are contradictory (e.g. a field location holds
         // > 1/1 permission) — every goal is vacuously provable.

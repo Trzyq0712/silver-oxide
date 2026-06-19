@@ -197,19 +197,6 @@ fn check_deref_permission(
     }
 }
 
-/// Best-effort literal extraction: scan the e-class for a real literal
-/// node. Returns the first one found. Used by heap arithmetic to fold
-/// concrete-perm operations and detect zero/negative permission.
-fn extract_real_literal(ctx: &VerifyContext<'_>, id: egg::Id) -> Option<num::BigRational> {
-    let canon = ctx.egraph.find(id);
-    for node in &ctx.egraph[canon].nodes {
-        if let Symbolic::Lit(Literal::Real(r)) = node {
-            return Some(r.clone());
-        }
-    }
-    None
-}
-
 /// Evaluate a `PureInst` into its symbolic e-class id.
 fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
@@ -322,7 +309,7 @@ fn merge_chunks(
 
     // `(PC ∧ p0 > 0 ∧ p1 > 0) ==> (v0 == v1)` as the golden-rule ITE chain.
     // Fold innermost-first: p1_pos, p0_pos, then PC literals in reverse.
-    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+    let true_ = ctx.true_();
     let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [v0, v1]));
     let antecedents = [(p1_pos, Polarity::Positive), (p0_pos, Polarity::Positive)]
         .into_iter()
@@ -418,8 +405,8 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     if chunks.is_empty() {
         return;
     }
-    let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+    let false_ = ctx.false_();
+    let true_ = ctx.true_();
 
     // Bound: perm ≤ b at each bounded location.
     for c in &chunks {
@@ -542,8 +529,8 @@ fn heap_subtract(
         // Sufficiency goal: `existing.perm >= chunk2.perm`, i.e.
         // `not(existing.perm < chunk2.perm)`, desugared to an `Ite`.
         let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
-        let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-        let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+        let false_ = ctx.false_();
+        let true_ = ctx.true_();
         let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
         if !ctx.prove_under_pc(goal, pc_lits) {
             return Err(VerifyError::InsufficientPermission);
@@ -552,7 +539,11 @@ fn heap_subtract(
         ctx.egraph.union(existing.value, chunk2.value);
 
         let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
-        if extract_real_literal(ctx, remainder).as_ref() == Some(&zero_rat) {
+        // Drop chunks the analysis folds to zero permission. (Symbolic
+        // zero-permission pruning is handled in Stage 5d.)
+        let remainder_zero =
+            matches!(ctx.egraph[remainder].data.known(), Some(Literal::Real(r)) if *r == zero_rat);
+        if remainder_zero {
             out = out.without_chunk(addr);
         } else {
             out = out.with_chunk(addr, Chunk::new(remainder, existing.value));
@@ -613,8 +604,8 @@ fn eval_heap_inst(
                 .collect();
             let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
             let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, write]));
-            let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+            let false_ = ctx.false_();
+            let true_ = ctx.true_();
             let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
             if !ctx.prove_under_pc(goal, &pc_lits) {
                 return Err(VerifyError::InsufficientPermission);
@@ -713,7 +704,7 @@ fn eval_method_inst(
                 .collect();
             let out = if is_inhale {
                 let out = heap_union(ctx, &base_h, &scaled, &pc_lits);
-                let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+                let true_ = ctx.true_();
                 ctx.egraph.union(bool_id, true_);
                 ctx.egraph.rebuild();
                 out
@@ -731,12 +722,13 @@ fn eval_method_inst(
         // (`cons`) of the consumed field values.
         InstKind::Heap(HeapInst::Fold { base, call, perm }) => {
             let base_h = get_heap(state, base);
-            let pmeta = program
-                .pred_meta
-                .get(&call.resource)
-                .ok_or(VerifyError::Unimplemented(
-                    "fold of non-flat/abstract predicate",
-                ))?;
+            let pmeta =
+                program
+                    .resource_meta
+                    .get(&call.resource)
+                    .ok_or(VerifyError::Unimplemented(
+                        "fold of non-flat/abstract predicate",
+                    ))?;
             let (snap_cons, addr_fn) = (pmeta.snap_cons, pmeta.addr_fn);
             let projs = pmeta.snap_projs.clone();
             let n_slots = projs.len();
@@ -792,12 +784,13 @@ fn eval_method_inst(
         // body's pure facts.
         InstKind::Heap(HeapInst::Unfold { base, call, perm }) => {
             let base_h = get_heap(state, base);
-            let pmeta = program
-                .pred_meta
-                .get(&call.resource)
-                .ok_or(VerifyError::Unimplemented(
-                    "unfold of non-flat/abstract predicate",
-                ))?;
+            let pmeta =
+                program
+                    .resource_meta
+                    .get(&call.resource)
+                    .ok_or(VerifyError::Unimplemented(
+                        "unfold of non-flat/abstract predicate",
+                    ))?;
             let addr_fn = pmeta.addr_fn;
             let projs = pmeta.snap_projs.clone();
             let cert = certs
@@ -840,7 +833,7 @@ fn eval_method_inst(
                 values.push(pv);
             }
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+            let true_ = ctx.true_();
             ctx.egraph.union(bool_id, true_);
             ctx.egraph.rebuild();
             state.push_heap(out);
@@ -853,7 +846,7 @@ fn eval_method_inst(
         }
         InstKind::Assume(val) => {
             let id = state.get_val(ctx, val);
-            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+            let true_ = ctx.true_();
             ctx.egraph.union(id, true_);
             ctx.egraph.rebuild();
         }

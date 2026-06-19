@@ -16,7 +16,7 @@ pub use ty::Type;
 pub use heap::{Assign, HeapInst, HeapVal, Sign};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
-pub use adt::{Adt, AdtMeta, PredMeta};
+pub use adt::{Adt, AdtMeta, ResourceMeta};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
 pub use function::{Bound, Function, FunctionCall, Location};
@@ -46,18 +46,16 @@ pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
     pub interner: Rodeo<MemberId>,
     pub adt_meta: AdtMeta,
-    /// Per-predicate `fold`/`unfold` metadata, keyed by predicate `MemberId`.
-    pub pred_meta: std::collections::HashMap<MemberId, PredMeta>,
+    /// Per-resource `fold`/`unfold` metadata, keyed by resource `MemberId`.
+    pub resource_meta: std::collections::HashMap<MemberId, ResourceMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Declaration {
     Domain(Domain),
-    DomainElement,
     Function(Function),
     Location(Location),
     Method(Method),
     Resource(Resource),
     Adt(Adt),
-    AdtConstructor,
 }

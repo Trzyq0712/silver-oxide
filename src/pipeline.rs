@@ -48,14 +48,14 @@ impl std::fmt::Display for PhaseTimings {
 
 /// Run the full pipeline on a `.vpr` file. Returns per-method results on
 /// success, or a `PipelineError` if any pre-verification stage fails.
-pub fn run_file(path: &Path) -> Result<Vec<verify::MethodResult>, PipelineError> {
+pub fn run_file(path: &Path) -> Result<Vec<verify::VerifyResult>, PipelineError> {
     run_file_timed(path).map(|(results, _)| results)
 }
 
 /// Like [`run_file`] but also returns the [`PhaseTimings`] for each phase.
 pub fn run_file_timed(
     path: &Path,
-) -> Result<(Vec<verify::MethodResult>, PhaseTimings), PipelineError> {
+) -> Result<(Vec<verify::VerifyResult>, PhaseTimings), PipelineError> {
     let mut timings = PhaseTimings::default();
     let overall = Instant::now();
 

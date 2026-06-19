@@ -20,13 +20,14 @@ pub struct AdtMeta {
     pub dtors: HashMap<MemberId, (MemberId, usize)>,
 }
 
-/// Per-predicate ids the verifier needs for `fold`/`unfold`. The snapshot is an
-/// ADT: `snap_cons` packs the footprint field values, `snap_projs[i]` recovers
-/// slot `i` (these are registered in [`AdtMeta::dtors`], so the projection
-/// reduction makes fold→unfold round-trips exact).
+/// Per-resource ids the verifier needs for `fold`/`unfold`. (Predicates are a
+/// Viper concept; in VMIR they are resources.) The snapshot is an ADT:
+/// `snap_cons` packs the footprint field values, `snap_projs[i]` recovers slot
+/// `i` (these are registered in [`AdtMeta::dtors`], so the projection reduction
+/// makes fold→unfold round-trips exact).
 #[derive(Debug, Clone)]
-pub struct PredMeta {
-    /// The predicate's `@addr` function (its chunk address).
+pub struct ResourceMeta {
+    /// The resource's `@addr` function (its chunk address).
     pub addr_fn: MemberId,
     /// The snapshot constructor `P@snap@cons`.
     pub snap_cons: MemberId,

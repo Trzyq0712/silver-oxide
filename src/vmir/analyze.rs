@@ -156,9 +156,7 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
         Declaration::Function(_)
         | Declaration::Location(_)
         | Declaration::Domain(_)
-        | Declaration::DomainElement
-        | Declaration::Adt(_)
-        | Declaration::AdtConstructor => {}
+        | Declaration::Adt(_) => {}
     }
 }
 
@@ -243,7 +241,7 @@ mod tests {
             decls: TiVec::from(decls),
             interner,
             adt_meta: Default::default(),
-            pred_meta: Default::default(),
+            resource_meta: Default::default(),
         }
     }
 

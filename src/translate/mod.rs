@@ -105,8 +105,8 @@ pub(crate) struct Builder<'a> {
     pub dtor_accessor: HashMap<Spur, vmir::MemberId>,
     /// ADT metadata for the verifier (tag-fn → ctor → tag index).
     pub adt_meta: vmir::AdtMeta,
-    /// Per-predicate fold/unfold metadata (addr fn + snapshot cons/projs).
-    pub pred_meta: HashMap<vmir::MemberId, vmir::PredMeta>,
+    /// Per-resource fold/unfold metadata (addr fn + snapshot cons/projs).
+    pub resource_meta: HashMap<vmir::MemberId, vmir::ResourceMeta>,
 }
 
 impl<'a> Builder<'a> {
@@ -126,7 +126,7 @@ impl<'a> Builder<'a> {
             ctor_tag: HashMap::new(),
             dtor_accessor: HashMap::new(),
             adt_meta: vmir::AdtMeta::default(),
-            pred_meta: HashMap::new(),
+            resource_meta: HashMap::new(),
         }
     }
 
@@ -326,7 +326,7 @@ impl<'a> Builder<'a> {
         // Synthesize the snapshot ADT for a foldable (flat) concrete predicate:
         // a constructor `P@snap@cons` over the footprint field values and one
         // accessor `P@snap@proj_i` per slot, registered so the projection
-        // reduction makes fold→unfold round-trips exact. See `PredMeta`.
+        // reduction makes fold→unfold round-trips exact. See `ResourceMeta`.
         if let Some(body_exp) = &p.body
             && let Some(types) = self.flat_footprint_types(body_exp)
         {
@@ -355,9 +355,9 @@ impl<'a> Builder<'a> {
                 self.adt_meta.dtors.insert(proj_id, (cons_id, i));
                 snap_projs.push(proj_id);
             }
-            self.pred_meta.insert(
+            self.resource_meta.insert(
                 pred_id,
-                vmir::PredMeta {
+                vmir::ResourceMeta {
                     addr_fn: addr_id,
                     snap_cons: cons_id,
                     snap_projs,
@@ -517,7 +517,7 @@ impl<'a> Builder<'a> {
             decls,
             interner: self.vmir_interner,
             adt_meta: self.adt_meta,
-            pred_meta: self.pred_meta,
+            resource_meta: self.resource_meta,
         }
     }
 }

@@ -214,11 +214,8 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
             // a known constructor; everything unrecognised is a field error.
             ExpKind::Field(base, field_name) => {
                 let id = field_name.id();
-                let is_field = self
-                    .globals
-                    .resolve(id)
-                    .map(|sym| sym.kind())
-                    == Some(GlobalKind::Field);
+                let is_field =
+                    self.globals.resolve(id).map(|sym| sym.kind()) == Some(GlobalKind::Field);
                 if is_field {
                     // ok — a genuine field access.
                 } else if let Some(ctor) = self
