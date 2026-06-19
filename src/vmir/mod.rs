@@ -16,13 +16,13 @@ pub use ty::Type;
 pub use heap::{Assign, HeapInst, HeapVal, Sign};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
-pub use adt::{Adt, AdtMeta, ResourceMeta};
+pub use adt::{Adt, AdtConstructor};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
 pub use function::{Bound, Function, FunctionCall, Location};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;
-pub use resource::{Precond, Resource, ResourceBody, ResourceCall};
+pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
 
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
@@ -45,9 +45,6 @@ unsafe impl Key for MemberId {
 pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
     pub interner: Rodeo<MemberId>,
-    pub adt_meta: AdtMeta,
-    /// Per-resource `fold`/`unfold` metadata, keyed by resource `MemberId`.
-    pub resource_meta: std::collections::HashMap<MemberId, ResourceMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

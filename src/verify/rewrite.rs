@@ -9,7 +9,8 @@ use egg::{
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::Symbolic;
-use crate::vmir::{AdtMeta, Literal, MemberId};
+use crate::verify::meta::AdtMeta;
+use crate::vmir::{Literal, MemberId};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 

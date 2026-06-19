@@ -10,6 +10,24 @@ pub struct Resource {
     pub params: Vec<Type>,
     pub precond: Precond,
     pub body: Option<ResourceBody>,
+    /// Snapshot descriptor for a flat, foldable concrete predicate (`None`
+    /// otherwise). The snapshot is a single-constructor ADT; the verifier
+    /// derives its projection reductions from this (see `verify::meta`) and
+    /// uses it to drive `fold`/`unfold`.
+    pub snapshot: Option<Snapshot>,
+}
+
+/// Snapshot accessors for a foldable predicate resource. The snapshot packs the
+/// footprint field values: `cons(v0..vn)` builds it, `projs[i]` recovers slot
+/// `i` (registered as a destructor so fold→unfold round-trips are exact).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Snapshot {
+    /// The resource's `@addr` function (its chunk address).
+    pub addr_fn: MemberId,
+    /// The snapshot constructor `P@snap@cons`.
+    pub cons: MemberId,
+    /// The snapshot field accessors `P@snap@i`, in footprint slot order.
+    pub projs: Vec<MemberId>,
 }
 
 /// A resource's precondition mode.

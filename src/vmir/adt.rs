@@ -1,43 +1,37 @@
 use crate::vmir::MemberId;
 use crate::vmir::display::VmirDisplay;
-use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
+/// An algebraic data type: its discriminator `@tag` function and its
+/// constructors. The verifier derives its constructor/discriminator reduction
+/// rules from this structure (see `verify::meta`); no separate side-table is
+/// carried on the `Program`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Adt {}
-
-/// ADT structure the verifier needs to drive constructor/discriminator
-/// reductions. Built during translation (it spans the synthesized constructor
-/// and `@tag` declarations) and carried on the `Program`.
-#[derive(Debug, Clone, Default)]
-pub struct AdtMeta {
-    /// Per-ADT `@tag` function id → (constructor id → tag index). The tag
-    /// reduction `Adt@tag(ctor_C(..)) ⇒ index_C` is generated from this.
-    pub tag_fns: HashMap<MemberId, HashMap<MemberId, usize>>,
-    /// Destructor accessor function id → `(constructor id, field index)`. The
-    /// projection reduction `accessor(ctor_C(a0..an)) ⇒ a_index` is generated
-    /// from this.
-    pub dtors: HashMap<MemberId, (MemberId, usize)>,
+pub struct Adt {
+    /// The `@tag` discriminator function id (`Adt@tag(ctor_C(..)) ⇒ tag_C`).
+    pub tag_fn: MemberId,
+    pub constructors: Vec<AdtConstructor>,
 }
 
-/// Per-resource ids the verifier needs for `fold`/`unfold`. (Predicates are a
-/// Viper concept; in VMIR they are resources.) The snapshot is an ADT:
-/// `snap_cons` packs the footprint field values, `snap_projs[i]` recovers slot
-/// `i` (these are registered in [`AdtMeta::dtors`], so the projection reduction
-/// makes fold→unfold round-trips exact).
-#[derive(Debug, Clone)]
-pub struct ResourceMeta {
-    /// The resource's `@addr` function (its chunk address).
-    pub addr_fn: MemberId,
-    /// The snapshot constructor `P@snap@cons`.
-    pub snap_cons: MemberId,
-    /// The snapshot field accessors `P@snap@proj_i`, in footprint slot order.
-    pub snap_projs: Vec<MemberId>,
+/// One constructor of an [`Adt`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AdtConstructor {
+    /// The constructor function id.
+    pub ctor_fn: MemberId,
+    /// The constructor's discriminator tag (its `@tag` value).
+    pub tag: usize,
+    /// The field destructor/accessor function ids, in field order: `projections[i]`
+    /// projects field `i` (`projections[i](ctor_fn(a0..an)) ⇒ a_i`).
+    pub projections: Vec<MemberId>,
 }
 
 impl<'a> Display for VmirDisplay<'a, &'a Adt> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let _ = self.item;
-        write!(f, "{{}}")
+        let adt = self.item;
+        write!(f, "{{ @tag = fn{}", usize::from(adt.tag_fn))?;
+        for c in &adt.constructors {
+            write!(f, ", fn{}#{}", usize::from(c.ctor_fn), c.tag)?;
+        }
+        write!(f, " }}")
     }
 }

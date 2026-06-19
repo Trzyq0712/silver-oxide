@@ -722,15 +722,14 @@ fn eval_method_inst(
         // (`cons`) of the consumed field values.
         InstKind::Heap(HeapInst::Fold { base, call, perm }) => {
             let base_h = get_heap(state, base);
-            let pmeta =
-                program
-                    .resource_meta
-                    .get(&call.resource)
-                    .ok_or(VerifyError::Unimplemented(
-                        "fold of non-flat/abstract predicate",
-                    ))?;
-            let (snap_cons, addr_fn) = (pmeta.snap_cons, pmeta.addr_fn);
-            let projs = pmeta.snap_projs.clone();
+            let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
+                return Err(VerifyError::DependencyFailed);
+            };
+            let sd = r.snapshot.as_ref().ok_or(
+                VerifyError::Unimplemented("fold of non-flat/abstract predicate"),
+            )?;
+            let (snap_cons, addr_fn) = (sd.cons, sd.addr_fn);
+            let projs = sd.projs.clone();
             let n_slots = projs.len();
             let cert = certs
                 .get(&call.resource)
@@ -784,15 +783,14 @@ fn eval_method_inst(
         // body's pure facts.
         InstKind::Heap(HeapInst::Unfold { base, call, perm }) => {
             let base_h = get_heap(state, base);
-            let pmeta =
-                program
-                    .resource_meta
-                    .get(&call.resource)
-                    .ok_or(VerifyError::Unimplemented(
-                        "unfold of non-flat/abstract predicate",
-                    ))?;
-            let addr_fn = pmeta.addr_fn;
-            let projs = pmeta.snap_projs.clone();
+            let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
+                return Err(VerifyError::DependencyFailed);
+            };
+            let sd = r.snapshot.as_ref().ok_or(
+                VerifyError::Unimplemented("unfold of non-flat/abstract predicate"),
+            )?;
+            let addr_fn = sd.addr_fn;
+            let projs = sd.projs.clone();
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -916,11 +914,8 @@ pub fn verify_method(
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
-    let mut ctx = VerifyContext::new(
-        &program.interner,
-        &program.adt_meta,
-        build_locations(program),
-    );
+    let adt_meta = crate::verify::meta::derive_adt_meta(program);
+    let mut ctx = VerifyContext::new(&program.interner, &adt_meta, build_locations(program));
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -961,11 +956,8 @@ pub fn verify_resource(
         return Ok(None);
     };
 
-    let mut ctx = VerifyContext::new(
-        &program.interner,
-        &program.adt_meta,
-        build_locations(program),
-    );
+    let adt_meta = crate::verify::meta::derive_adt_meta(program);
+    let mut ctx = VerifyContext::new(&program.interner, &adt_meta, build_locations(program));
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1116,7 +1108,7 @@ mod tests {
     use crate::verify::lang::Symbolic;
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        VerifyContext::new(interner, &vmir::AdtMeta::default(), Default::default())
+        VerifyContext::new(interner, &crate::verify::meta::AdtMeta::default(), Default::default())
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1142,7 +1134,7 @@ mod tests {
                 arity: 2,
             },
         )]);
-        let mut ctx = VerifyContext::new(&interner, &vmir::AdtMeta::default(), locations);
+        let mut ctx = VerifyContext::new(&interner, &crate::verify::meta::AdtMeta::default(), locations);
 
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));

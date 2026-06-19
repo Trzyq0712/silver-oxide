@@ -212,6 +212,7 @@ mod tests {
                 None => Precond::SelfFramed,
             },
             body: None,
+            snapshot: None,
         })
     }
 
@@ -240,8 +241,6 @@ mod tests {
         Program {
             decls: TiVec::from(decls),
             interner,
-            adt_meta: Default::default(),
-            resource_meta: Default::default(),
         }
     }
 

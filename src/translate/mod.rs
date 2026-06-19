@@ -103,10 +103,6 @@ pub(crate) struct Builder<'a> {
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
     /// Maps a destructor's `Spur` to its synthesized accessor Function MemberId.
     pub dtor_accessor: HashMap<Spur, vmir::MemberId>,
-    /// ADT metadata for the verifier (tag-fn → ctor → tag index).
-    pub adt_meta: vmir::AdtMeta,
-    /// Per-resource fold/unfold metadata (addr fn + snapshot cons/projs).
-    pub resource_meta: HashMap<vmir::MemberId, vmir::ResourceMeta>,
 }
 
 impl<'a> Builder<'a> {
@@ -125,8 +121,6 @@ impl<'a> Builder<'a> {
             adt_tag_fn: HashMap::new(),
             ctor_tag: HashMap::new(),
             dtor_accessor: HashMap::new(),
-            adt_meta: vmir::AdtMeta::default(),
-            resource_meta: HashMap::new(),
         }
     }
 
@@ -171,7 +165,6 @@ impl<'a> Builder<'a> {
             if let GlobalSignature::Adt(_) = &globals.signatures[*gmid] {
                 let name = interner.resolve(spur).to_string();
                 let adt_id = self.fresh_decl(&name);
-                self.set_decl(adt_id, vmir::Declaration::Adt(vmir::Adt {}));
                 let tag_id = self.fresh_decl(&format!("{name}@tag"));
                 self.set_decl(
                     tag_id,
@@ -182,7 +175,14 @@ impl<'a> Builder<'a> {
                     }),
                 );
                 self.adt_tag_fn.insert(*spur, tag_id);
-                self.adt_meta.tag_fns.insert(tag_id, HashMap::new());
+                self.set_decl(
+                    adt_id,
+                    vmir::Declaration::Adt(vmir::Adt {
+                        tag_fn: tag_id,
+                        constructors: Vec::new(),
+                    }),
+                );
+                self.name_map.insert(*spur, adt_id);
             }
         }
 
@@ -219,12 +219,14 @@ impl<'a> Builder<'a> {
                     );
                     self.name_map.insert(*spur, id);
                     self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
-                    let tag_fn = self.adt_tag_fn[&sig.adt];
-                    self.adt_meta
-                        .tag_fns
-                        .get_mut(&tag_fn)
-                        .expect("adt tag fn declared in pass 1")
-                        .insert(id, sig.tag);
+                    let adt_id = self.name_map[&sig.adt];
+                    if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
+                        adt.constructors.push(vmir::AdtConstructor {
+                            ctor_fn: id,
+                            tag: sig.tag,
+                            projections: Vec::new(),
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -249,7 +251,14 @@ impl<'a> Builder<'a> {
             );
             self.dtor_accessor.insert(*dtor_spur, id);
             let ctor_id = self.name_map[&info.ctor];
-            self.adt_meta.dtors.insert(id, (ctor_id, info.index));
+            let adt_id = self.name_map[&info.adt];
+            if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
+                let ctor = adt.constructors.iter_mut().find(|c| c.ctor_fn == ctor_id).unwrap();
+                if ctor.projections.len() <= info.index {
+                    ctor.projections.resize(info.index + 1, vmir::MemberId(0));
+                }
+                ctor.projections[info.index] = id;
+            }
         }
     }
 
@@ -320,6 +329,7 @@ impl<'a> Builder<'a> {
                 params,
                 precond: vmir::Precond::SelfFramed,
                 body,
+                snapshot: None, // Will be filled below if needed
             }),
         );
 
@@ -352,17 +362,15 @@ impl<'a> Builder<'a> {
                         body: None,
                     }),
                 );
-                self.adt_meta.dtors.insert(proj_id, (cons_id, i));
                 snap_projs.push(proj_id);
             }
-            self.resource_meta.insert(
-                pred_id,
-                vmir::ResourceMeta {
+            if let Some(vmir::Declaration::Resource(r)) = self.decls[usize::from(pred_id)].as_mut() {
+                r.snapshot = Some(vmir::Snapshot {
                     addr_fn: addr_id,
-                    snap_cons: cons_id,
-                    snap_projs,
-                },
-            );
+                    cons: cons_id,
+                    projs: snap_projs,
+                });
+            }
         }
         Ok(())
     }
@@ -437,6 +445,7 @@ impl<'a> Builder<'a> {
                     params,
                     precond: vmir::Precond::SelfFramed,
                     body: Some(body),
+                    snapshot: None,
                 }),
             );
         }
@@ -489,6 +498,7 @@ impl<'a> Builder<'a> {
                     params,
                     precond,
                     body: Some(body),
+                    snapshot: None,
                 }),
             );
         }
@@ -516,8 +526,6 @@ impl<'a> Builder<'a> {
         vmir::Program {
             decls,
             interner: self.vmir_interner,
-            adt_meta: self.adt_meta,
-            resource_meta: self.resource_meta,
         }
     }
 }

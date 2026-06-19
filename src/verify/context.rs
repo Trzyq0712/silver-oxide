@@ -7,9 +7,10 @@ use crate::{
         analysis::ConstFold,
         heap::{Chunk, Heap},
         lang::Symbolic,
+        meta::AdtMeta,
         rewrite,
     },
-    vmir::{AdtMeta, BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
+    vmir::{BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
 };
 use lasso::Rodeo;
 
