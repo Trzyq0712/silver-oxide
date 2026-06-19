@@ -320,38 +320,6 @@ fn merge_chunks(
     Chunk::new(perm, value)
 }
 
-/// Re-key a heap's chunks under the egraph's current canonical ids. When
-/// two source addresses collapse to the same canonical id, merge their
-/// chunks via [`merge_chunks`].
-fn canonicalize_heap(
-    ctx: &mut VerifyContext<'_>,
-    h: &Heap,
-    pc_lits: &[(egg::Id, Polarity)],
-) -> Heap {
-    let mut out = Heap::empty();
-    let entries: Vec<(egg::Id, Chunk)> = h
-        .entries()
-        .map(|(addr, chunk)| (addr, chunk.clone()))
-        .collect();
-    for (addr, chunk) in entries {
-        let canon = ctx.egraph.find(addr);
-        if let Some(existing) = out.chunk(canon).cloned() {
-            let merged = merge_chunks(
-                ctx,
-                existing.perm,
-                existing.value,
-                chunk.perm,
-                chunk.value,
-                pc_lits,
-            );
-            out = out.with_chunk(canon, merged);
-        } else {
-            out = out.with_chunk(canon, chunk);
-        }
-    }
-    out
-}
-
 /// A location chunk extracted from a heap for the location axioms: its
 /// permission, the location member, its argument e-classes, and its bound.
 struct LocationChunk {
@@ -466,88 +434,68 @@ fn conj_args_eq(
     acc
 }
 
-/// Heap addition. Canonicalises both inputs first so chunks at e-class
-/// equivalent addresses merge. On collision, chunks merge via [`merge_chunks`].
+/// Heap addition for a single location chunk.
 fn heap_union(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
-    h2: &Heap,
+    addr: egg::Id,
+    chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Heap {
-    let c1 = canonicalize_heap(ctx, h1, pc_lits);
-    let c2 = canonicalize_heap(ctx, h2, pc_lits);
-    let mut out = c1;
-    let entries: Vec<(egg::Id, Chunk)> = c2
-        .entries()
-        .map(|(addr, chunk)| (addr, chunk.clone()))
-        .collect();
-    for (addr, chunk2) in entries {
-        if let Some(existing) = out.chunk(addr).cloned() {
-            let merged = merge_chunks(
-                ctx,
-                existing.perm,
-                existing.value,
-                chunk2.perm,
-                chunk2.value,
-                pc_lits,
-            );
-            out = out.with_chunk(addr, merged);
-        } else {
-            out = out.with_chunk(addr, chunk2);
-        }
+    let mut out = h1.clone();
+    let addr = ctx.egraph.find(addr);
+    let existing = out.entries().find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
+    if let Some(existing) = existing {
+        let merged = merge_chunks(
+            ctx,
+            existing.perm,
+            existing.value,
+            chunk2.perm,
+            chunk2.value,
+            pc_lits,
+        );
+        out = out.with_chunk(addr, merged);
+    } else {
+        out = out.with_chunk(addr, chunk2);
     }
-    // Every heap `+` re-asserts the field axioms (bound + non-aliasing) on the
-    // consolidated result.
     assume_location_axioms(ctx, &out);
     out
 }
 
-/// Heap subtraction. Canonicalises both inputs first. Each canonical addr
-/// of `h2` must be present in `h1` with sufficient permission. When both
-/// existing and subtracted perms are concrete `Real` literals, the
-/// arithmetic is folded: negative result → `InsufficientPermission`, zero
-/// → chunk dropped, positive → chunk kept with the literal remainder.
+/// Heap subtraction for a single location chunk.
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
-    h2: &Heap,
+    addr: egg::Id,
+    chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
-    let c1 = canonicalize_heap(ctx, h1, &[]);
-    let c2 = canonicalize_heap(ctx, h2, &[]);
-    let mut out = c1;
-    let entries: Vec<(egg::Id, Chunk)> = c2
-        .entries()
-        .map(|(addr, chunk)| (addr, chunk.clone()))
-        .collect();
-    let zero_rat = num::BigRational::from(num::BigInt::from(0));
-    for (addr, chunk2) in entries {
-        let Some(existing) = out.chunk(addr).cloned() else {
-            return Err(VerifyError::InsufficientPermission);
-        };
+    let mut out = h1.clone();
+    let addr = ctx.egraph.find(addr);
+    let existing = out.entries().find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
+    let Some(existing) = existing else {
+        return Err(VerifyError::InsufficientPermission);
+    };
 
-        // Sufficiency goal: `existing.perm >= chunk2.perm`, i.e.
-        // `not(existing.perm < chunk2.perm)`, desugared to an `Ite`.
-        let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
-        let false_ = ctx.false_();
-        let true_ = ctx.true_();
-        let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-        if !ctx.prove_under_pc(goal, pc_lits) {
-            return Err(VerifyError::InsufficientPermission);
-        }
+    let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
+    let false_ = ctx.false_();
+    let true_ = ctx.true_();
+    let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+    if !ctx.prove_under_pc(goal, pc_lits) {
+        return Err(VerifyError::InsufficientPermission);
+    }
 
-        ctx.egraph.union(existing.value, chunk2.value);
+    ctx.egraph.union(existing.value, chunk2.value);
 
-        let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
-        // Drop chunks the analysis folds to zero permission. (Symbolic
-        // zero-permission pruning is handled in Stage 5d.)
-        let remainder_zero =
-            matches!(ctx.egraph[remainder].data.known(), Some(Literal::Real(r)) if *r == zero_rat);
-        if remainder_zero {
-            out = out.without_chunk(addr);
-        } else {
-            out = out.with_chunk(addr, Chunk::new(remainder, existing.value));
-        }
+    let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+    let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [remainder, zero]));
+    if ctx.prove_under_pc(eq, pc_lits) {
+        // Find the actual key used in `out` to remove it
+        let key = out.entries().find_map(|(k, _)| (ctx.egraph.find(k) == addr).then(|| k)).unwrap();
+        out = out.without_chunk(key);
+    } else {
+        out = out.with_chunk(addr, Chunk::new(remainder, existing.value));
     }
     Ok(out)
 }
@@ -575,9 +523,10 @@ fn eval_heap_inst(
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
+            let (addr, ch) = chunk.entries().next().unwrap();
             match sign {
-                Sign::Add => Ok(heap_union(ctx, &base_h, &chunk, &pc_lits)),
-                Sign::Sub => heap_subtract(ctx, &base_h, &chunk, &pc_lits),
+                Sign::Add => Ok(heap_union(ctx, &base_h, addr, ch.clone(), &pc_lits)),
+                Sign::Sub => heap_subtract(ctx, &base_h, addr, ch.clone(), &pc_lits),
             }
         }
         // Resource inhale/exhale need the program + certificates; method-only.
@@ -703,17 +652,23 @@ fn eval_method_inst(
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
             let out = if is_inhale {
-                let out = heap_union(ctx, &base_h, &scaled, &pc_lits);
+                let mut h = base_h.clone();
+                for (addr, ch) in scaled.entries() {
+                    h = heap_union(ctx, &h, addr, ch.clone(), &pc_lits);
+                }
                 let true_ = ctx.true_();
                 ctx.egraph.union(bool_id, true_);
                 ctx.egraph.rebuild();
-                out
+                h
             } else {
-                let out = heap_subtract(ctx, &base_h, &scaled, &pc_lits)?;
+                let mut h = base_h.clone();
+                for (addr, ch) in scaled.entries() {
+                    h = heap_subtract(ctx, &h, addr, ch.clone(), &pc_lits)?;
+                }
                 if !ctx.prove_under_pc(bool_id, &pc_lits) {
                     return Err(VerifyError::AssertionFailed);
                 }
-                out
+                h
             };
             state.push_heap(out);
         }
@@ -730,7 +685,6 @@ fn eval_method_inst(
             )?;
             let (snap_cons, addr_fn) = (sd.cons, sd.addr_fn);
             let projs = sd.projs.clone();
-            let n_slots = projs.len();
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -739,32 +693,22 @@ fn eval_method_inst(
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
             let fp = ctx.graft_footprint(cert, &args);
-            if fp.len() != n_slots {
-                return Err(VerifyError::Unimplemented(
-                    "predicate footprint shape mismatch",
-                ));
-            }
-            let canon = canonicalize_heap(ctx, &base_h, &[]);
-            // Raw field values feed the body's pure facts; the snapshot members
-            // wrap each value as `(perm>0) ? Some(v) : None` (const-folds to
-            // `Some(v)` ⇒ `v` for a statically-positive permission).
+            let mut out = base_h.clone();
             let mut values = Vec::with_capacity(fp.len());
             let mut members = Vec::with_capacity(fp.len());
-            let mut need_heap = Heap::empty();
+
             for (i, &(addr, bperm)) in fp.iter().enumerate() {
-                let a = ctx.egraph.find(addr);
-                let v = canon
-                    .chunk(a)
-                    .map(|c| c.value)
+                let p = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
+                let v = base_h
+                    .entries()
+                    .find_map(|(k, c)| (ctx.egraph.find(k) == ctx.egraph.find(addr)).then(|| c.value))
                     .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
-                let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
-                need_heap = need_heap.with_chunk(addr, Chunk::new(need, v));
+                out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
                 let elem = decl_ret_ty(program, projs[i]);
                 let present = ctx.perm_positive(bperm);
                 members.push(ctx.option_member(elem, present, v));
                 values.push(v);
             }
-            let subtracted = heap_subtract(ctx, &base_h, &need_heap, &pc_lits)?;
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);
             if !ctx.prove_under_pc(bool_id, &pc_lits) {
                 return Err(VerifyError::AssertionFailed);
@@ -772,10 +716,8 @@ fn eval_method_inst(
             let cons_args: Box<[egg::Id]> = members.into_iter().collect();
             let snap = ctx.add_func_app_id(snap_cons, decl_ret_ty(program, snap_cons), cons_args);
             let pred_addr = ctx.add_location(addr_fn, args.into());
-            let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, snap));
-            let out = heap_union(ctx, &subtracted, &pred_chunk, &pc_lits);
+            let out = heap_union(ctx, &out, pred_addr, Chunk::new(perm_id, snap), &pc_lits);
             state.push_heap(out);
-            // Collapse any snapshot tower created by repeated fold/unfold.
             ctx.reduce();
         }
         // `unfold`: inverse of fold — consume the predicate chunk, reproduce the
@@ -799,13 +741,12 @@ fn eval_method_inst(
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
             let pred_addr = ctx.add_location(addr_fn, args.clone().into());
-            let canon = canonicalize_heap(ctx, &base_h, &[]);
-            let s = canon
-                .chunk(ctx.egraph.find(pred_addr))
-                .map(|c| c.value)
+            let a = ctx.egraph.find(pred_addr);
+            let s = base_h
+                .entries()
+                .find_map(|(k, c)| (ctx.egraph.find(k) == a).then(|| c.value))
                 .ok_or(VerifyError::InsufficientPermission)?;
-            let pred_chunk = Heap::empty().with_chunk(pred_addr, Chunk::new(perm_id, s));
-            let subtracted = heap_subtract(ctx, &base_h, &pred_chunk, &pc_lits)?;
+            let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
 
             let fp = ctx.graft_footprint(cert, &args);
             if fp.len() != projs.len() {
@@ -813,7 +754,6 @@ fn eval_method_inst(
                     "predicate footprint shape mismatch",
                 ));
             }
-            let mut out = subtracted;
             let mut values = Vec::with_capacity(fp.len());
             for (i, &(addr, bperm)) in fp.iter().enumerate() {
                 // `proj_i(s)` recovers the optional snapshot member; `reduce()`
@@ -826,8 +766,7 @@ fn eval_method_inst(
                     ctx.add_func_app_id(projs[i], ctx.option_type(elem.clone()), Box::new([s]));
                 let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
-                let chunk = Heap::empty().with_chunk(addr, Chunk::new(need, pv));
-                out = heap_union(ctx, &out, &chunk, &pc_lits);
+                out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
                 values.push(pv);
             }
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);
@@ -1175,12 +1114,10 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let h2 = Heap::empty().with_chunk(b, Chunk::new(p2, v2));
-
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let merged = heap_union(&mut ctx, &h1, &h2, &[]);
+        let merged = heap_union(&mut ctx, &h1, b, Chunk::new(p2, v2), &[]);
 
         let canon = ctx.egraph.find(a);
         let chunk = merged.chunk(canon).expect("merged chunk missing");
@@ -1206,9 +1143,7 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-
-        let merged = heap_union(&mut ctx, &h1, &h2, &[]);
+        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[]);
         let chunk = merged
             .chunk(ctx.egraph.find(a))
             .expect("merged chunk missing");
@@ -1231,9 +1166,7 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-
-        let merged = heap_union(&mut ctx, &h1, &h2, &[]);
+        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[]);
         let chunk = merged
             .chunk(ctx.egraph.find(a))
             .expect("merged chunk missing");
@@ -1257,9 +1190,7 @@ mod tests {
         let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-
-        let merged = heap_union(&mut ctx, &h1, &h2, &[(false_lit, Polarity::Positive)]);
+        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[(false_lit, Polarity::Positive)]);
         let chunk = merged
             .chunk(ctx.egraph.find(a))
             .expect("merged chunk missing");
@@ -1285,9 +1216,7 @@ mod tests {
         let true_lit = ctx.add(Symbolic::Lit(Literal::Bool(true)));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-
-        let merged = heap_union(&mut ctx, &h1, &h2, &[(true_lit, Polarity::Positive)]);
+        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[(true_lit, Polarity::Positive)]);
         let _chunk = merged
             .chunk(ctx.egraph.find(a))
             .expect("merged chunk missing");
@@ -1373,10 +1302,8 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(4));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p_have, v1));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p_take, v2));
-
         // Symbolic perms → `have >= take` not provable by equality saturation.
-        let err = heap_subtract(&mut ctx, &h1, &h2, &[])
+        let err = heap_subtract(&mut ctx, &h1, a, Chunk::new(p_take, v2), &[])
             .err()
             .expect("symbolic-perm exhale must fail without a proof");
         assert!(matches!(
@@ -1398,12 +1325,10 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p2, v1));
-        let h2 = Heap::empty().with_chunk(b, Chunk::new(p1, v2));
-
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let result = heap_subtract(&mut ctx, &h1, &h2, &[]).expect("subtract should succeed");
+        let result = heap_subtract(&mut ctx, &h1, b, Chunk::new(p1, v2), &[]).expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         let chunk = result.chunk(canon).expect("result chunk missing");
@@ -1424,9 +1349,7 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v2));
-
-        let result = heap_subtract(&mut ctx, &h1, &h2, &[]).expect("subtract should succeed");
+        let result = heap_subtract(&mut ctx, &h1, a, Chunk::new(p1, v2), &[]).expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         assert!(
@@ -1447,9 +1370,7 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p2, v2));
-
-        let err = heap_subtract(&mut ctx, &h1, &h2, &[])
+        let err = heap_subtract(&mut ctx, &h1, a, Chunk::new(p2, v2), &[])
             .err()
             .expect("over-consumption must fail");
         assert!(matches!(
@@ -1469,10 +1390,7 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty();
-        let h2 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let _ = b;
-
-        let err = heap_subtract(&mut ctx, &h1, &h2, &[])
+        let err = heap_subtract(&mut ctx, &h1, a, Chunk::new(p1, v1), &[])
             .err()
             .expect("subtract from empty must fail");
         assert!(matches!(
