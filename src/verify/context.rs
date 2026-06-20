@@ -11,7 +11,7 @@ use crate::{
         mono::MonoRegistry,
         rewrite,
     },
-    vmir::{self, BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
+    vmir::{BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
 };
 use lasso::Rodeo;
 
@@ -158,33 +158,22 @@ impl<'a> VerifyContext<'a> {
     /// `ite`/projection reductions peel it back to `value`.
     pub(crate) fn option_member(
         &mut self,
-        program: &vmir::Program,
         elem: Type,
         present: egg::Id,
         value: egg::Id,
     ) -> egg::Id {
-        let inst = program.option_instances.get(&elem).copied().unwrap();
-        let opt_ty = Type::domain(inst.adt_id);
-        // `Some` = variant 0, `None` = variant 1 of the `Option[elem]` ADT.
-        let some_id = self.registry.cons(inst.adt_id, 0);
-        let none_id = self.registry.cons(inst.adt_id, 1);
-        let some = self.add_func_app_id(some_id, opt_ty.clone(), Box::new([value]));
-        let none = self.add_func_app_id(none_id, opt_ty, Box::new([]));
+        let ids = self.registry.option(&elem);
+        let opt_ty = self.registry.option_type(elem);
+        let some = self.add_func_app_id(ids.some, opt_ty.clone(), Box::new([value]));
+        let none = self.add_func_app_id(ids.none, opt_ty, Box::new([]));
         self.add(Symbolic::Ite([present, some, none]))
     }
 
     /// Unwrap a snapshot member: `value(opt)`, the `Some` field accessor. With
     /// `opt = Some(v)` this reduces to `v`; on an opaque member it stays
     /// uninterpreted (correct — the value was never present).
-    pub(crate) fn option_unwrap(
-        &mut self,
-        program: &vmir::Program,
-        elem: Type,
-        opt: egg::Id,
-    ) -> egg::Id {
-        let inst = program.option_instances.get(&elem).copied().unwrap();
-        // `value` = field 0 of `Some` (variant 0) of the `Option[elem]` ADT.
-        let value_id = self.registry.proj(inst.adt_id, 0, 0);
+    pub(crate) fn option_unwrap(&mut self, elem: Type, opt: egg::Id) -> egg::Id {
+        let value_id = self.registry.option(&elem).value;
         self.add_func_app_id(value_id, elem, Box::new([opt]))
     }
 

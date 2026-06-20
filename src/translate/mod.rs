@@ -102,7 +102,6 @@ pub(crate) struct Builder<'a> {
     /// Maps a destructor's `Spur` to the semantic `(adt id, variant, field)` it
     /// projects — the operands of a `PureInst::AdtProj`.
     pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
-    pub option_instances: HashMap<vmir::Type, vmir::OptionInstance>,
 }
 
 impl<'a> Builder<'a> {
@@ -120,7 +119,6 @@ impl<'a> Builder<'a> {
             method_ensures: HashMap::new(),
             ctor_tag: HashMap::new(),
             dtor_sem: HashMap::new(),
-            option_instances: HashMap::new(),
         }
     }
 
@@ -255,46 +253,8 @@ impl<'a> Builder<'a> {
         };
         self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
 
-        if let Some(body) = p.body.as_ref() {
-            if let Some(types) = self.flat_footprint_types(body) {
-                for ty in types {
-                    self.get_option_mono(&ty);
-                }
-            }
-        }
-
         self.pred_snap.insert(p.name.0, snap_id);
         self.pred_addr.insert(p.name.0, addr_id);
-    }
-
-    pub(crate) fn get_option_mono(&mut self, ty: &vmir::Type) -> vmir::OptionInstance {
-        if let Some(inst) = self.option_instances.get(ty) {
-            return *inst;
-        }
-
-        let type_name = format!("T{}", self.option_instances.len());
-        let adt_id = self.fresh_decl(&format!("Option[{type_name}]"));
-
-        // A semantic two-variant ADT: `Some(elem)` (variant 0), `None` (variant
-        // 1). The verifier mints the constructor/projection/tag ids and their
-        // reductions (see `verify::mono`); no accessor declarations are emitted.
-        self.set_decl(
-            adt_id,
-            vmir::Declaration::Adt(vmir::Adt {
-                variants: vec![
-                    vmir::AdtVariant {
-                        field_types: vec![ty.clone()],
-                    },
-                    vmir::AdtVariant {
-                        field_types: vec![],
-                    },
-                ],
-            }),
-        );
-
-        let inst = vmir::OptionInstance { adt_id };
-        self.option_instances.insert(ty.clone(), inst);
-        inst
     }
 
     fn declare_field_accessor(&mut self, f: &typed::Field) {
@@ -546,7 +506,6 @@ impl<'a> Builder<'a> {
         vmir::Program {
             decls,
             interner: self.vmir_interner,
-            option_instances: self.option_instances,
         }
     }
 }

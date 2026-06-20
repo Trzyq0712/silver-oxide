@@ -41,19 +41,10 @@ unsafe impl Key for MemberId {
     }
 }
 
-/// The monomorphic `Option[T]` ADT declaration id for one element type. The
-/// constructor/projection/tag ids are minted by the verifier (`verify::mono`),
-/// keyed by this `adt_id`, so only the declaration id is recorded here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OptionInstance {
-    pub adt_id: MemberId,
-}
-
 #[derive(Debug, Clone)]
 pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
     pub interner: Rodeo<MemberId>,
-    pub option_instances: std::collections::HashMap<Type, OptionInstance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
