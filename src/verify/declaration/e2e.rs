@@ -117,16 +117,23 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
     let vmir::Declaration::Resource(r) = &program.decls[id] else {
         panic!("{name} must be a Resource");
     };
-    verify_resource(program, name, r).map(|_| ())
+    let mut alloc = crate::verify::mono::Allocator::new(program);
+    verify_resource(program, name, r, &mut alloc).map(|_| ())
 }
 
-/// Build certificates for every resource in `program` (test helper).
-fn build_certs(program: &vmir::Program) -> HashMap<MemberId, ResourceCertificate> {
+/// Build certificates for every resource in `program` (test helper). Shares the
+/// `alloc` so certificate ids match the method's later use.
+fn build_certs(
+    program: &vmir::Program,
+    alloc: &mut crate::verify::mono::Allocator,
+) -> HashMap<MemberId, ResourceCertificate> {
     let mut certs = HashMap::new();
     for (id, decl) in program.decls.iter_enumerated() {
         if let vmir::Declaration::Resource(r) = decl {
             let name = program.interner.resolve(&id).to_string();
-            if let Some(cert) = verify_resource(program, &name, r).expect("resource verifies") {
+            if let Some(cert) =
+                verify_resource(program, &name, r, alloc).expect("resource verifies")
+            {
                 certs.insert(id, cert);
             }
         }
@@ -188,8 +195,9 @@ fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), Verify
     let vmir::Declaration::Method(m) = &program.decls[id] else {
         panic!("{name} must be a Method");
     };
-    let certs = build_certs(program);
-    verify_method(program, name, m, &certs)
+    let mut alloc = crate::verify::mono::Allocator::new(program);
+    let certs = build_certs(program, &mut alloc);
+    verify_method(program, name, m, &certs, &mut alloc)
 }
 
 #[test]
@@ -267,6 +275,48 @@ method m()
             Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
         ),
         "mk(3,4).fst == 4 should fail"
+    );
+}
+
+#[test]
+fn generic_adt_two_monomorphizations() {
+    // A user-written generic ADT used at two element types. Each
+    // monomorphization (`Box[Int]`, `Box[Bool]`) gets its own verifier ids, so
+    // both projections reduce correctly and don't congruence-merge.
+    let input = r#"
+adt Box[T] { mk(v: T) }
+method m()
+{
+    var bi: Box[Int] := mk(5)
+    var bb: Box[Bool] := mk(true)
+    assert bi.v == 5
+    assert bb.v == true
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "generic Box at Int and Bool should verify"
+    );
+}
+
+#[test]
+fn generic_adt_wrong_field_value_fails() {
+    let input = r#"
+adt Box[T] { mk(v: T) }
+method m()
+{
+    var bi: Box[Int] := mk(5)
+    assert bi.v == 6
+}
+"#;
+    let program = lower(input);
+    assert!(
+        matches!(
+            verify_named_method(&program, "m"),
+            Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
+        ),
+        "mk(5).v == 6 should fail"
     );
 }
 

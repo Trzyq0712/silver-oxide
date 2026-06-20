@@ -7,7 +7,7 @@ use crate::{
         analysis::ConstFold,
         heap::{Chunk, Heap},
         lang::Symbolic,
-        mono::MonoRegistry,
+        mono::Allocator,
         rewrite,
     },
     vmir::{BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
@@ -41,15 +41,18 @@ pub(crate) struct ResourceCertificate {
 
 pub(crate) struct VerifyContext<'a> {
     pub(crate) egraph: egg::EGraph<Symbolic, ConstFold>,
-    rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
+    /// Static structural rules. The ADT cons/proj/tag reductions are pulled from
+    /// the [`Allocator`] at saturation time (it grows as instances are minted).
+    static_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     /// Terminating structural reductions, run after heap-producing ops to
     /// normalize (collapse snapshot towers) without a full saturation.
-    reduce_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
+    static_reduce: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
     pub(crate) interner: &'a Rodeo<MemberId>,
-    /// Verifier-minted ADT constructor/projection/tag ids + their reduction
-    /// rules, derived once per program (see [`MonoRegistry`]).
-    pub(crate) registry: &'a MonoRegistry,
+    /// Shared verifier id allocator (minted ADT cons/proj/tag ids + their rules).
+    /// Owned by `verify::verify`, threaded `&mut` through each unit so ids stay
+    /// consistent across certificate grafts.
+    pub(crate) alloc: &'a mut Allocator,
     /// Type side-oracle: the irreducible type sources that the type-free
     /// e-graph nodes no longer carry. Keyed by stable node payloads (the
     /// `Fresh` counter and the `FuncApp` member id), so no union upkeep is
@@ -74,24 +77,16 @@ pub(crate) struct LocationInfo {
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
         interner: &'a Rodeo<MemberId>,
-        registry: &'a MonoRegistry,
+        alloc: &'a mut Allocator,
         locations: HashMap<MemberId, LocationInfo>,
     ) -> Self {
-        // Saturation rules: the static structural set + the ADT constructor /
-        // projection / tag reductions (from the registry). The registry rules
-        // are also reductions, so they join `reduce_rules` (run after
-        // heap-producing ops).
-        let mut rules = rewrite::rules();
-        rules.extend(registry.rules().iter().cloned());
-        let mut reduce_rules = rewrite::reduce_rules();
-        reduce_rules.extend(registry.rules().iter().cloned());
         Self {
             egraph: egg::EGraph::default(),
-            rules,
-            reduce_rules,
+            static_rules: rewrite::rules(),
+            static_reduce: rewrite::reduce_rules(),
             fresh_counter: 0,
             interner,
-            registry,
+            alloc,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
             locations,
@@ -122,7 +117,7 @@ impl<'a> VerifyContext<'a> {
         if usize::from(m) < self.interner.len() {
             self.interner.resolve(&m).to_string()
         } else {
-            self.registry
+            self.alloc
                 .name(m)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("m{}", m.0))
@@ -163,10 +158,10 @@ impl<'a> VerifyContext<'a> {
     ) -> egg::Id {
         // `Option` is an ordinary generic ADT: `Some` is variant 0, `None`
         // variant 1, monomorphized at `[elem]`.
-        let opt = self.registry.option_adt();
+        let opt = self.alloc.option_adt();
         let args = [elem];
-        let some_id = self.registry.cons(opt, &args, 0);
-        let none_id = self.registry.cons(opt, &args, 1);
+        let some_id = self.alloc.cons(opt, &args, 0);
+        let none_id = self.alloc.cons(opt, &args, 1);
         let opt_ty = Type::Domain(opt, Box::new(args));
         let some = self.add_func_app_id(some_id, opt_ty.clone(), Box::new([value]));
         let none = self.add_func_app_id(none_id, opt_ty, Box::new([]));
@@ -178,8 +173,8 @@ impl<'a> VerifyContext<'a> {
     /// uninterpreted (correct — the value was never present).
     pub(crate) fn option_unwrap(&mut self, elem: Type, opt: egg::Id) -> egg::Id {
         // `value` = field 0 of `Some` (variant 0) of `Option[elem]`.
-        let opt_adt = self.registry.option_adt();
-        let value_id = self.registry.proj(opt_adt, &[elem.clone()], 0, 0);
+        let opt_adt = self.alloc.option_adt();
+        let value_id = self.alloc.proj(opt_adt, &[elem.clone()], 0, 0);
         self.add_func_app_id(value_id, elem, Box::new([opt]))
     }
 
@@ -192,10 +187,17 @@ impl<'a> VerifyContext<'a> {
         self.add(Symbolic::Binary(BinOp::Lt, [zero, perm]))
     }
 
-    /// Run rewrite saturation over the e-graph in place.
+    /// Run rewrite saturation over the e-graph in place. The rule set is the
+    /// static rules plus the ADT reductions minted so far by the allocator.
     pub(crate) fn saturate(&mut self) {
+        let rules: Vec<_> = self
+            .static_rules
+            .iter()
+            .chain(self.alloc.rules())
+            .cloned()
+            .collect();
         let egraph = std::mem::take(&mut self.egraph);
-        let runner = egg::Runner::default().with_egraph(egraph).run(&self.rules);
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         self.egraph = runner.egraph;
     }
 
@@ -204,10 +206,14 @@ impl<'a> VerifyContext<'a> {
     /// don't grow the e-graph) without the cost/divergence risk of full
     /// saturation.
     pub(crate) fn reduce(&mut self) {
+        let rules: Vec<_> = self
+            .static_reduce
+            .iter()
+            .chain(self.alloc.rules())
+            .cloned()
+            .collect();
         let egraph = std::mem::take(&mut self.egraph);
-        let runner = egg::Runner::default()
-            .with_egraph(egraph)
-            .run(&self.reduce_rules);
+        let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         self.egraph = runner.egraph;
     }
 
@@ -424,7 +430,13 @@ impl<'a> VerifyContext<'a> {
         let proven = if unsat_pc {
             true
         } else {
-            let runner = egg::Runner::default().with_egraph(probe).run(&self.rules);
+            let rules: Vec<_> = self
+                .static_rules
+                .iter()
+                .chain(self.alloc.rules())
+                .cloned()
+                .collect();
+            let runner = egg::Runner::default().with_egraph(probe).run(&rules);
             let probe = runner.egraph;
             probe.find(goal) == probe.find(true_p)
         };

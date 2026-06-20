@@ -36,22 +36,26 @@ pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<VerifyResult> {
     // call sites rather than re-walking the body.
     let mut certs: std::collections::HashMap<vmir::MemberId, context::ResourceCertificate> =
         std::collections::HashMap::new();
+    // Shared id allocator: one per run so minted ADT ids stay consistent across
+    // certificate grafts (see `verify::mono`). Threaded `&mut` into each unit.
+    let mut alloc = mono::Allocator::new(program);
     for id in order {
         let name = program.interner.resolve(&id).to_string();
         let outcome = match &program.decls[id] {
-            vmir::Declaration::Resource(r) => match declaration::verify_resource(program, &name, r)
-            {
-                Ok(cert) => {
-                    if let Some(cert) = cert {
-                        certs.insert(id, cert);
+            vmir::Declaration::Resource(r) => {
+                match declaration::verify_resource(program, &name, r, &mut alloc) {
+                    Ok(cert) => {
+                        if let Some(cert) = cert {
+                            certs.insert(id, cert);
+                        }
+                        Some(Ok(()))
                     }
-                    Some(Ok(()))
+                    Err(e) => Some(Err(e)),
                 }
-                Err(e) => Some(Err(e)),
-            },
-            vmir::Declaration::Method(m) => {
-                Some(declaration::verify_method(program, &name, m, &certs))
             }
+            vmir::Declaration::Method(m) => Some(declaration::verify_method(
+                program, &name, m, &certs, &mut alloc,
+            )),
             _ => None,
         };
         if let Some(outcome) = outcome {

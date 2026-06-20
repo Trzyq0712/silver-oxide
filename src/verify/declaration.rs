@@ -250,7 +250,7 @@ fn eval_pure_inst(
             variant,
             args,
         } => {
-            let cons = ctx.registry.cons(*adt, type_args, *variant);
+            let cons = ctx.alloc.cons(*adt, type_args, *variant);
             let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add_func_app_id(cons, ty.clone(), args.into())
         }
@@ -261,7 +261,7 @@ fn eval_pure_inst(
             field,
             base,
         } => {
-            let proj = ctx.registry.proj(*adt, type_args, *variant, *field);
+            let proj = ctx.alloc.proj(*adt, type_args, *variant, *field);
             let base = state.get_val(ctx, base);
             ctx.add_func_app_id(proj, ty.clone(), Box::new([base]))
         }
@@ -270,7 +270,7 @@ fn eval_pure_inst(
             type_args,
             base,
         } => {
-            let tag = ctx.registry.tag(*adt, type_args);
+            let tag = ctx.alloc.tag(*adt, type_args);
             let base = state.get_val(ctx, base);
             ctx.add_func_app_id(tag, Type::Int, Box::new([base]))
         }
@@ -751,7 +751,7 @@ fn eval_method_inst(
             }
             // The snapshot is a single-variant ADT (head = the `@snap` Domain).
             let cons_args: Box<[egg::Id]> = members.into_iter().collect();
-            let snap_cons = ctx.registry.cons(snap_head, &[], 0);
+            let snap_cons = ctx.alloc.cons(snap_head, &[], 0);
             let snap_ty = Type::Domain(snap_head, Box::new([]));
             let snap = ctx.add_func_app_id(snap_cons, snap_ty, cons_args);
             let pred_addr = ctx.add_location(addr_fn, args.into());
@@ -801,8 +801,8 @@ fn eval_method_inst(
                 // snapshot tower), and leaves it uninterpreted for an opaque
                 // snapshot. `unwrap` then peels the `Option` to the field value.
                 let elem = field_types[i].clone();
-                let proj_id = ctx.registry.proj(snap_head, &[], 0, i);
-                let opt_ty = Type::Domain(ctx.registry.option_adt(), Box::new([elem.clone()]));
+                let proj_id = ctx.alloc.proj(snap_head, &[], 0, i);
+                let opt_ty = Type::Domain(ctx.alloc.option_adt(), Box::new([elem.clone()]));
                 let opt = ctx.add_func_app_id(proj_id, opt_ty, Box::new([s]));
                 let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
@@ -892,9 +892,9 @@ pub fn verify_method(
     method_name: &str,
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
+    alloc: &mut crate::verify::mono::Allocator,
 ) -> Result<(), VerifyError> {
-    let registry = crate::verify::mono::MonoRegistry::build(program);
-    let mut ctx = VerifyContext::new(&program.interner, &registry, build_locations(program));
+    let mut ctx = VerifyContext::new(&program.interner, alloc, build_locations(program));
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -929,14 +929,14 @@ pub fn verify_resource(
     program: &vmir::Program,
     resource_name: &str,
     resource: &Resource,
+    alloc: &mut crate::verify::mono::Allocator,
 ) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
         // Abstract resource: nothing to prove, no certificate.
         return Ok(None);
     };
 
-    let registry = crate::verify::mono::MonoRegistry::build(program);
-    let mut ctx = VerifyContext::new(&program.interner, &registry, build_locations(program));
+    let mut ctx = VerifyContext::new(&program.interner, alloc, build_locations(program));
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1087,9 +1087,9 @@ mod tests {
     use crate::verify::lang::Symbolic;
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        // Leak a `'static` empty registry so the returned context can borrow it.
-        let registry: &'static _ = Box::leak(Box::new(crate::verify::mono::MonoRegistry::empty()));
-        VerifyContext::new(interner, registry, Default::default())
+        // Leak a `'static` empty allocator so the returned context can borrow it.
+        let alloc: &'static mut _ = Box::leak(Box::new(crate::verify::mono::Allocator::empty()));
+        VerifyContext::new(interner, alloc, Default::default())
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1115,8 +1115,8 @@ mod tests {
                 arity: 2,
             },
         )]);
-        let registry = crate::verify::mono::MonoRegistry::empty();
-        let mut ctx = VerifyContext::new(&interner, &registry, locations);
+        let mut alloc = crate::verify::mono::Allocator::empty();
+        let mut ctx = VerifyContext::new(&interner, &mut alloc, locations);
 
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
