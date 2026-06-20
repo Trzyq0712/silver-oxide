@@ -239,6 +239,12 @@ fn eval_pure_inst(
             let addr = state.get_val(ctx, loc);
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
+        // Semantic ADT nodes. The translator does not yet emit these (S2); the
+        // verifier interpretation (verifier-owned FuncIds + lazy cons/proj/tag
+        // rule injection + monomorphization) lands in S3/S4.
+        PureInst::AdtCons { .. } | PureInst::AdtProj { .. } | PureInst::AdtTag { .. } => {
+            unimplemented!("semantic ADT nodes are interpreted by the verifier in S3")
+        }
     }
 }
 

@@ -58,6 +58,30 @@ pub enum PureInst {
     /// A location application `loc f(args)` producing an address (`Addr<ret>`).
     /// The only producer of address values; never an operand to computation.
     Location(crate::vmir::MemberId, Vec<Val>),
+    /// Construct ADT value: variant `variant` of ADT `adt` over `args`. The ADT
+    /// is named by its (possibly generic) declaration `MemberId`; the verifier
+    /// monomorphizes by the argument types. Replaces a synthetic-constructor
+    /// `FunctionCall`.
+    AdtCons {
+        adt: crate::vmir::MemberId,
+        variant: usize,
+        args: Vec<Val>,
+    },
+    /// Project field `field` of variant `variant` of ADT `adt` from `base`
+    /// (`field`-th constructor argument). Replaces a synthetic-destructor
+    /// `FunctionCall`.
+    AdtProj {
+        adt: crate::vmir::MemberId,
+        variant: usize,
+        field: usize,
+        base: Val,
+    },
+    /// The discriminator tag (variant index) of `base : adt`. Replaces a
+    /// synthetic `@tag` `FunctionCall`.
+    AdtTag {
+        adt: crate::vmir::MemberId,
+        base: Val,
+    },
 }
 
 // ======================
@@ -136,6 +160,29 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                     write!(f, "{arg}")?;
                 }
                 write!(f, ")")
+            }
+            PureInst::AdtCons { adt, variant, args } => {
+                write!(f, "{}#{variant}(", self.interner.resolve(adt))?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
+            PureInst::AdtProj {
+                adt,
+                variant,
+                field,
+                base,
+            } => write!(
+                f,
+                "{}#{variant}.{field}({base})",
+                self.interner.resolve(adt)
+            ),
+            PureInst::AdtTag { adt, base } => {
+                write!(f, "tag[{}]({base})", self.interner.resolve(adt))
             }
         }
     }
