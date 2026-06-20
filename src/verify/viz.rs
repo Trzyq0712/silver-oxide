@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
 use crate::verify::lang::Symbolic;
-use crate::vmir::{MemberId, Type};
+use crate::vmir::Type;
 
 pub(crate) struct Snapshotter {
     /// `None` = disabled (env var unset).
@@ -83,8 +83,8 @@ impl Snapshotter {
         // type-free `Display`) to their source names, and annotate `Fresh<id>`
         // nodes with their type — both live in the viz/context oracles, so the
         // e-graph itself need not carry them.
-        let mut funcs: HashSet<MemberId> = HashSet::new();
-        let mut locs: HashSet<MemberId> = HashSet::new();
+        let mut funcs: HashSet<crate::verify::lang::FuncId> = HashSet::new();
+        let mut locs: HashSet<crate::verify::lang::LocId> = HashSet::new();
         let mut fresh: HashSet<u32> = HashSet::new();
         for class in ctx.egraph.classes() {
             for node in &class.nodes {
@@ -105,13 +105,13 @@ impl Snapshotter {
         for m in funcs {
             dot = dot.replace(
                 &format!("fn{}(..)", m.0),
-                &format!("{}", escape(&ctx.member_name(m))),
+                &format!("{}", escape(&ctx.func_name(m))),
             );
         }
         for m in locs {
             dot = dot.replace(
                 &format!("loc{}(..)", m.0),
-                &format!("{}", escape(&ctx.member_name(m))),
+                &format!("{}", escape(&ctx.loc_name(m))),
             );
         }
         // `Symbolic` renders a fresh value as `fresh<id>`; append its type from

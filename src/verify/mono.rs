@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::verify::analysis::ConstFold;
-use crate::verify::lang::Symbolic;
+use crate::verify::lang::{FuncId, Symbolic};
 use crate::verify::prelude::OPTION;
 use crate::verify::rewrite::{proj_rule, tag_rule};
 use crate::vmir::{Declaration, MemberId, Program, Type};
@@ -30,13 +30,14 @@ type Rule = egg::Rewrite<Symbolic, ConstFold>;
 /// Lazily allocates and names the verifier ids for monomorphic ADT
 /// constructors / projections / tags, and accumulates their reduction rules.
 pub struct Allocator {
-    /// Next member id to mint (starts past every real declaration id).
+    /// Next func id to mint (starts past every real declaration id, so a minted
+    /// id never collides with a plain function reusing its declaration index).
     next: usize,
-    cons: HashMap<(MemberId, Vec<Type>, usize), MemberId>,
-    proj: HashMap<(MemberId, Vec<Type>, usize, usize), MemberId>,
-    tag: HashMap<(MemberId, Vec<Type>), MemberId>,
+    cons: HashMap<(MemberId, Vec<Type>, usize), FuncId>,
+    proj: HashMap<(MemberId, Vec<Type>, usize, usize), FuncId>,
+    tag: HashMap<(MemberId, Vec<Type>), FuncId>,
     /// Display names for minted ids (which are outside the interner).
-    names: HashMap<MemberId, String>,
+    names: HashMap<FuncId, String>,
     rules: Vec<Rule>,
     /// Per ADT *head* (an `Adt` decl id or a predicate `@snap` Domain id), its
     /// per-variant field counts — the shape needed to mint an instance.
@@ -103,19 +104,19 @@ impl Allocator {
 
     /// Constructor id for variant `variant` of `adt[args]` (minting the instance
     /// on first use).
-    pub fn cons(&mut self, adt: MemberId, args: &[Type], variant: usize) -> MemberId {
+    pub fn cons(&mut self, adt: MemberId, args: &[Type], variant: usize) -> FuncId {
         self.ensure(adt, args);
         self.cons[&(adt, args.to_vec(), variant)]
     }
 
     /// Field-`field` projection id of variant `variant` of `adt[args]`.
-    pub fn proj(&mut self, adt: MemberId, args: &[Type], variant: usize, field: usize) -> MemberId {
+    pub fn proj(&mut self, adt: MemberId, args: &[Type], variant: usize, field: usize) -> FuncId {
         self.ensure(adt, args);
         self.proj[&(adt, args.to_vec(), variant, field)]
     }
 
     /// Discriminator-tag id of `adt[args]`.
-    pub fn tag(&mut self, adt: MemberId, args: &[Type]) -> MemberId {
+    pub fn tag(&mut self, adt: MemberId, args: &[Type]) -> FuncId {
         self.ensure(adt, args);
         self.tag[&(adt, args.to_vec())]
     }
@@ -130,9 +131,9 @@ impl Allocator {
         &self.rules
     }
 
-    /// Display name for a minted id (`None` if `m` is not allocator-minted).
-    pub fn name(&self, m: MemberId) -> Option<&str> {
-        self.names.get(&m).map(String::as_str)
+    /// Display name for a minted id (`None` if `f` is not allocator-minted).
+    pub fn name(&self, f: FuncId) -> Option<&str> {
+        self.names.get(&f).map(String::as_str)
     }
 
     /// Mint the instance `adt[args]` (tag + all constructors + all projections +
@@ -166,8 +167,8 @@ impl Allocator {
         self.rules.push(tag_rule(tag_id, ctor_tags));
     }
 
-    fn mint(&mut self, name: String) -> MemberId {
-        let id = MemberId(self.next);
+    fn mint(&mut self, name: String) -> FuncId {
+        let id = FuncId(self.next);
         self.next += 1;
         self.names.insert(id, name);
         id

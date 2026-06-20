@@ -8,8 +8,8 @@ use egg::{
 };
 
 use crate::verify::analysis::ConstFold;
-use crate::verify::lang::Symbolic;
-use crate::vmir::{Literal, MemberId};
+use crate::verify::lang::{FuncId, Symbolic};
+use crate::vmir::Literal;
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 
@@ -38,9 +38,9 @@ pub fn reduce_rules() -> Vec<Rule> {
 /// single (possibly verifier-synthesised, e.g. monomorphic) member id. Lets the
 /// verifier register reductions for member ids minted after `VerifyContext`
 /// construction (monomorphic Option instances).
-pub fn proj_rule(accessor: MemberId, ctor: MemberId, index: usize) -> Rule {
+pub fn proj_rule(accessor: FuncId, ctor: FuncId, index: usize) -> Rule {
     Rewrite::new(
-        format!("proj-{}", usize::from(accessor)),
+        format!("proj-{}", accessor.0),
         UnaryAppSearcher { func: accessor },
         ProjApplier { ctor, index },
     )
@@ -49,9 +49,9 @@ pub fn proj_rule(accessor: MemberId, ctor: MemberId, index: usize) -> Rule {
 
 /// Build the discriminator reduction `tag_fn(ctor_C(..)) ⇒ index_C` for a single
 /// (possibly synthesised) tag function. Companion to [`proj_rule`].
-pub fn tag_rule(tag_fn: MemberId, ctor_tags: HashMap<MemberId, usize>) -> Rule {
+pub fn tag_rule(tag_fn: FuncId, ctor_tags: HashMap<FuncId, usize>) -> Rule {
     Rewrite::new(
-        format!("tag-{}", usize::from(tag_fn)),
+        format!("tag-{}", tag_fn.0),
         UnaryAppSearcher { func: tag_fn },
         TagApplier { ctor_tags },
     )
@@ -204,7 +204,7 @@ fn tag_x() -> Var {
 /// FuncApp isn't string-matchable, so this is hand-written. Shared by the tag
 /// and projection reductions.
 struct UnaryAppSearcher {
-    func: MemberId,
+    func: FuncId,
 }
 
 impl Searcher<Symbolic, ConstFold> for UnaryAppSearcher {
@@ -247,7 +247,7 @@ impl Searcher<Symbolic, ConstFold> for UnaryAppSearcher {
 /// Applier for the tag reduction: if the argument's e-class holds a constructor
 /// of this ADT, union the `tag(..)` e-class with the constructor's tag literal.
 struct TagApplier {
-    ctor_tags: HashMap<MemberId, usize>,
+    ctor_tags: HashMap<FuncId, usize>,
 }
 
 impl Applier<Symbolic, ConstFold> for TagApplier {
@@ -287,7 +287,7 @@ impl Applier<Symbolic, ConstFold> for TagApplier {
 /// matching constructor `ctor`, union the `accessor(..)` e-class with that
 /// constructor's `index`-th argument.
 struct ProjApplier {
-    ctor: MemberId,
+    ctor: FuncId,
     index: usize,
 }
 

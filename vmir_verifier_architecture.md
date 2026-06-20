@@ -27,9 +27,14 @@ VMIR is SSA: a body is a list of `Inst { pc: PathConds, kind: InstKind }`, and
 **`PureInst` variants**, naming the ADT by its declaration `MemberId` plus
 structural indices — never by a synthetic accessor id:
 
-- `PureInst::AdtCons { adt, variant, args }` — construct variant `variant`.
-- `PureInst::AdtProj { adt, variant, field, base }` — project a field.
-- `PureInst::AdtTag  { adt, base }` — the discriminator (variant index).
+- `PureInst::AdtCons { adt, type_args, variant, args }` — construct variant `variant`.
+- `PureInst::AdtProj { adt, type_args, variant, field, base }` — project a field.
+- `PureInst::AdtTag  { adt, type_args, base }` — the discriminator (variant index).
+
+`type_args` is the ADT's monomorphization (empty for non-generic), filled by
+translate from the use-site typed types, so the verifier needs no per-value type
+environment. `Type::Generic(usize)` denotes a type parameter inside a generic
+ADT declaration.
 
 Address / snapshot operations reuse existing nodes: a resource address is a
 `PureInst::Location` (an `Addr<…>`), and a snapshot read is a `PureInst::Deref`
@@ -48,24 +53,30 @@ emit `@tag` or `@dtor` declarations.
 
 ---
 
-## 3. The verifier id registry (`verify::mono`)
-`MonoRegistry::build(program)` derives, once per program, a stable id for every
-ADT constructor / projection / tag, and the reduction rules over them:
+## 3. The verifier id allocator (`verify::mono`)
+The e-graph is **disconnected from VMIR `MemberId`**: `Symbolic::FuncApp` carries
+a `FuncId` and `Symbolic::Location` a `LocId` (`verify::lang`). A plain function
+or location reuses its declaration index as its id; ADT constructor / projection
+/ tag ops get **freshly-minted** ids.
 
-- minted ids start past every real declaration id (`program.interner.len()`), so
-  they never collide with a declaration;
-- ids are a **deterministic function of declaration order** — the same concept
-  gets the same id in every verification context (see §5 for why this matters);
-- monomorphization is keyed by `(adt, type-args)`: a non-generic ADT has a
-  single `args = []` instance; a generic ADT gets one instance per concrete
-  type-argument tuple it is used at;
-- for each `(adt, args, variant, field)` it builds a `proj_rule`, and for each
-  `(adt, args)` a `tag_rule`, mapping each constructor id to its variant index.
+`Allocator` (owned by `verify::verify`) mints these **lazily on first use** of a
+monomorphic instance `(adt, type-args)`:
 
-Each `VerifyContext` injects the registry's rules into its rewrite/reduce sets,
-and `eval_pure_inst` interprets `AdtCons/AdtProj/AdtTag` as `Symbolic::FuncApp`
-over the registry id. Names for minted ids (outside the interner) come from the
-registry, so visualization never panics.
+- minting an instance mints its tag + every constructor + every projection, and
+  appends their `proj_rule`/`tag_rule` reductions; minted ids start past every
+  real declaration id;
+- monomorphization is keyed by `(adt, type-args)`: a non-generic ADT is the
+  empty-args instance; a generic ADT (user-written or `Option`) gets one instance
+  per concrete type-argument tuple, discovered on use;
+- the allocator is threaded **`&mut`** through each (sequential) verification
+  unit — no interior mutability — so an instance keeps the **same** id wherever
+  it appears. This is what makes certificate grafting sound: `transplant` copies
+  cert nodes carrying the id verbatim (see §5).
+
+`VerifyContext::saturate`/`reduce` use the static rules plus `alloc.rules()`
+(which grows as instances are minted). `eval_pure_inst` interprets
+`AdtCons/AdtProj/AdtTag` via `alloc.cons/proj/tag`. Names for minted ids come
+from the allocator's reverse table (`ctx.func_name`), so viz never panics.
 
 ### `Option` is a builtin generic ADT
 `Option` is an ordinary generic ADT — there is **no** Option-specific
@@ -86,10 +97,10 @@ helpers over `registry.cons`/`registry.proj` for that ADT.
 ---
 
 ## 4. Snapshots
-A foldable predicate's snapshot is described by `Resource.snapshot`
-(`{ addr_fn, cons, projs }`, real declarations). Its projection reductions are
-still derived by `verify::meta::derive_adt_meta` (now snapshot-only). Folding the
-snapshot into the same registry mechanism is a possible future unification.
+A foldable predicate's snapshot is a **single-variant ADT** in the allocator,
+keyed by its `@snap` Domain id. `Resource.snapshot = { addr_fn, snap, field_types }`
+is semantic — no `cons`/`proj` declarations. fold/unfold build and recover it via
+`alloc.cons/proj` like any other ADT. (There is no `verify::meta`.)
 
 ---
 
@@ -99,35 +110,36 @@ snapshot into the same registry mechanism is a possible future unification.
 became `PureInst` variants; a constructor node (`AdtCons`) — absent from the
 draft — is required, since projections presuppose a constructor.
 
-**Ids must be program-stable, so monomorphization is *derived*, not lazily
-minted per context.** A resource is verified once into a certificate, then
-**grafted** at each call site by copying its e-graph nodes (with formal params
-substituted by actuals). A node is `FuncApp(id, args)`; if two contexts minted
-different ids for the same concept, the grafted nodes would not congruence-match
-the caller's. Hence ids are assigned deterministically up front.
+**Ids must be consistent across contexts, but may be allocated lazily.** A
+resource is verified once into a certificate, then **grafted** at each call site
+by copying its e-graph nodes (with formal params substituted by actuals). A node
+is `FuncApp(id, args)`; if two contexts used different ids for the same instance,
+the grafted nodes would not congruence-match the caller's. The allocator solves
+this not by pre-deriving everything, but by being **shared** (`&mut`-threaded,
+owned by `verify::verify`): the same instance is minted once and reused, so its
+id is consistent wherever it appears. Contexts run sequentially, so a plain
+`&mut` suffices.
 
-Rewrite **rules**, by contrast, *can* be added dynamically: a rule is a
-per-context object keyed on an id, a graft transfers proven equalities (not
-rules), and a missing rule costs only completeness, never soundness. So a future
-on-demand monomorphizer may mint ids lazily **provided** it draws them from a
-shared, deterministic concept→id map; the rules can then be injected per context
-as concepts appear.
+Rewrite **rules** are likewise fine to add dynamically: a rule is keyed on an id,
+a graft transfers proven equalities (not rules), and a missing rule costs only
+completeness, never soundness. Each context's `saturate` pulls the allocator's
+current rules, so instances minted while building a cert are available to later
+units.
 
 ---
 
 ## 6. Status and follow-ups
-Built and green (`cargo test`): semantic ADT nodes; registry-derived
-`(adt, type-args)` reductions; `Option` a builtin generic ADT injected on entry.
+Built and green (`cargo test`, 109 lib + 2 suite): semantic ADT nodes with
+`type_args`; a lazy `&mut`-shared allocator; predicate snapshots and `Option` as
+ordinary ADTs in it; `Option` a builtin injected on verify entry; the e-graph on
+distinct `FuncId`/`LocId` (no `MemberId`); general user generic ADTs verify.
 
 Deferred / optional:
-- Fold predicate snapshots into the registry (drop the `derive_adt_meta`
-  snapshot path).
-- Rename `Symbolic::FuncApp/Location`'s `MemberId` payload to distinct
-  `FuncId`/`LocId` types — now cosmetic, since the registry already provides the
-  indirection.
 - Drop the dead constructor `Function` declarations (real Silver decls, now
   unreferenced once `AdtCons` is used).
-- Use-site type-args for `AdtProj`/`AdtTag` over *user* generic ADTs: the
-  registry already supports type-arg monomorphization, but eval currently passes
-  `[]` for projection/tag (it would need the base value's type threaded through
-  `EvalState`). None exercised today; `AdtCons` already keys off its result type.
+- Use-site `type_args` for `AdtProj`/`AdtTag` over *user* generic ADTs is taken
+  from the destructor/discriminator base's typed type at lowering; the allocator
+  already supports it. (`AdtCons` keys off its result type.)
+- Location result types are no longer reconstructed by `infer_type` (returns
+  `None` for addresses); `heap_acc` falls back to `Int` for the held-value type
+  (viz/inference cosmetics only — not soundness).

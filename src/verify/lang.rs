@@ -3,7 +3,18 @@ use std::fmt::{Display, Formatter};
 
 use crate::vmir::BinOp;
 use crate::vmir::Literal;
-use crate::vmir::MemberId;
+
+/// A verifier-allocated function-application id in the e-graph. **Disconnected
+/// from VMIR `MemberId`**: the verifier assigns these (see `verify::mono`) — a
+/// plain function reuses its declaration's index, ADT constructor/projection/tag
+/// ops get freshly-minted indices per monomorphic instance.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FuncId(pub usize);
+
+/// A verifier-allocated heap-location (address) id in the e-graph. Like
+/// [`FuncId`] but a distinct sort so function rewrites never touch addresses.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocId(pub usize);
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
@@ -11,11 +22,11 @@ pub enum Symbolic {
     Lit(Literal),
     Binary(BinOp, [Id; 2]),
     Ite([Id; 3]),
-    FuncApp(MemberId, Box<[Id]>),
+    FuncApp(FuncId, Box<[Id]>),
     /// A heap-location application `f(args)` (an address). A distinct sort from
     /// `FuncApp` so function rewrites never touch it; congruence still gives
     /// `f(x) == f(y) ⟺ x == y`.
-    Location(MemberId, Box<[Id]>),
+    Location(LocId, Box<[Id]>),
     RealCast(Id),
 }
 
@@ -25,8 +36,8 @@ pub enum Discriminant {
     Lit(Literal),
     Binary(BinOp),
     Ite,
-    FuncApp(MemberId),
-    Location(MemberId),
+    FuncApp(FuncId),
+    Location(LocId),
     RealCast,
 }
 

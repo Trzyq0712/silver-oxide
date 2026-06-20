@@ -6,7 +6,7 @@ use crate::{
     verify::{
         analysis::ConstFold,
         heap::{Chunk, Heap},
-        lang::Symbolic,
+        lang::{FuncId, LocId, Symbolic},
         mono::Allocator,
         rewrite,
     },
@@ -22,7 +22,7 @@ use lasso::Rodeo;
 pub(crate) struct ResourceCertificate {
     pub(crate) egraph: EGraph<Symbolic, ConstFold>,
     pub(crate) fresh_types: HashMap<u32, Type>,
-    pub(crate) func_ret_types: HashMap<MemberId, Type>,
+    pub(crate) func_ret_types: HashMap<FuncId, Type>,
     /// Formal-param e-classes, in order (the call's args substitute these).
     pub(crate) params: Vec<Id>,
     /// Result heap-delta chunks as `(addr, perm, value)` e-classes — the
@@ -58,7 +58,7 @@ pub(crate) struct VerifyContext<'a> {
     /// `Fresh` counter and the `FuncApp` member id), so no union upkeep is
     /// needed — the visualization reads them directly to reconstruct types.
     pub(crate) fresh_types: HashMap<u32, Type>,
-    pub(crate) func_ret_types: HashMap<MemberId, Type>,
+    pub(crate) func_ret_types: HashMap<FuncId, Type>,
     /// Location declarations by member id (the heap-address functions). A chunk
     /// whose address is a `Symbolic::Location(m, _)` is bounded/non-aliased per
     /// `locations[m]`.
@@ -96,11 +96,14 @@ impl<'a> VerifyContext<'a> {
     /// Add a location application `f(args)` (an address of type `Addr<ret>`),
     /// recording its result type in the side-oracle for type inference.
     pub(crate) fn add_location(&mut self, member: MemberId, args: Box<[egg::Id]>) -> egg::Id {
-        if let Some(info) = self.locations.get(&member) {
-            let addr_ty = Type::Addr(Box::new(info.ret.clone()));
-            self.func_ret_types.entry(member).or_insert(addr_ty);
-        }
-        self.egraph.add(Symbolic::Location(member, args))
+        // A location reuses its declaration's index as its `LocId`.
+        self.add_location_id(LocId(usize::from(member)), args)
+    }
+
+    /// Add a `Location` over an already-allocated [`LocId`] (used by grafting,
+    /// which carries the id verbatim).
+    pub(crate) fn add_location_id(&mut self, id: LocId, args: Box<[egg::Id]>) -> egg::Id {
+        self.egraph.add(Symbolic::Location(id, args))
     }
 
     /// Whether the e-graph has reached a contradiction (some e-class merged
@@ -117,10 +120,29 @@ impl<'a> VerifyContext<'a> {
         if usize::from(m) < self.interner.len() {
             self.interner.resolve(&m).to_string()
         } else {
+            format!("d{}", m.0)
+        }
+    }
+
+    /// Display name for an e-graph function id: a real declaration index resolves
+    /// via the interner; an allocator-minted id via its name table.
+    pub(crate) fn func_name(&self, f: FuncId) -> String {
+        if f.0 < self.interner.len() {
+            self.interner.resolve(&MemberId::from(f.0)).to_string()
+        } else {
             self.alloc
-                .name(m)
+                .name(f)
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("m{}", m.0))
+                .unwrap_or_else(|| format!("f{}", f.0))
+        }
+    }
+
+    /// Display name for an e-graph location id (always a real location decl).
+    pub(crate) fn loc_name(&self, l: LocId) -> String {
+        if l.0 < self.interner.len() {
+            self.interner.resolve(&MemberId::from(l.0)).to_string()
+        } else {
+            format!("loc{}", l.0)
         }
     }
 
@@ -239,18 +261,21 @@ impl<'a> VerifyContext<'a> {
         ret_ty: Type,
         args: Box<[egg::Id]>,
     ) -> egg::Id {
-        self.add_func_app_id(fc.function, ret_ty, args)
+        // A plain function reuses its declaration's index as its `FuncId`.
+        self.add_func_app_id(FuncId(usize::from(fc.function)), ret_ty, args)
     }
 
-    /// As [`Self::add_func_app`] but from a bare member id (used by grafting).
+    /// Add a `FuncApp` over an already-allocated [`FuncId`] (a plain function,
+    /// or an ADT constructor/projection/tag id from the allocator). Also used by
+    /// grafting, which carries the id verbatim.
     pub(crate) fn add_func_app_id(
         &mut self,
-        member: MemberId,
+        id: FuncId,
         ret_ty: Type,
         args: Box<[egg::Id]>,
     ) -> egg::Id {
-        self.func_ret_types.entry(member).or_insert(ret_ty);
-        self.egraph.add(Symbolic::FuncApp(member, args))
+        self.func_ret_types.entry(id).or_insert(ret_ty);
+        self.egraph.add(Symbolic::FuncApp(id, args))
     }
 
     /// Graft a resource certificate into this (caller) e-graph, substituting the
@@ -534,7 +559,7 @@ fn transplant(
                     .iter()
                     .map(|a| transplant(caller, cert, *a, subst, memo))
                     .collect();
-                caller.add_location(*m, fargs)
+                caller.add_location_id(*m, fargs)
             }
         };
         built.push(b);
@@ -563,7 +588,7 @@ fn transplant(
 pub(crate) fn infer_type(
     egraph: &EGraph<Symbolic, ConstFold>,
     fresh_types: &HashMap<u32, Type>,
-    func_ret_types: &HashMap<MemberId, Type>,
+    func_ret_types: &HashMap<FuncId, Type>,
     id: Id,
     memo: &mut HashMap<Id, Option<Type>>,
 ) -> Option<Type> {
@@ -579,7 +604,10 @@ pub(crate) fn infer_type(
             Symbolic::Lit(l) => Some(lit_type(l)),
             Symbolic::RealCast(_) => Some(Type::Real),
             Symbolic::Fresh(u) => fresh_types.get(u).cloned(),
-            Symbolic::FuncApp(m, _) | Symbolic::Location(m, _) => func_ret_types.get(m).cloned(),
+            Symbolic::FuncApp(f, _) => func_ret_types.get(f).cloned(),
+            // Address types (`Addr<T>`) are reconstructed by `heap_acc` from the
+            // location declaration, not here.
+            Symbolic::Location(..) => None,
             Symbolic::Binary(op, [l, _]) => match op {
                 BinOp::Eq | BinOp::Lt => Some(Type::Bool),
                 _ => infer_type(egraph, fresh_types, func_ret_types, *l, memo),

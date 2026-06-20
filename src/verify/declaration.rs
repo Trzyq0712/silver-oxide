@@ -359,8 +359,9 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     for (addr, chunk) in h.entries() {
         let canon = ctx.egraph.find(addr);
         let found = ctx.egraph[canon].nodes.iter().find_map(|n| match n {
-            Symbolic::Location(m, args) if ctx.locations.contains_key(m) => {
-                Some((*m, args.to_vec()))
+            Symbolic::Location(l, args) => {
+                let m = MemberId::from(l.0);
+                ctx.locations.contains_key(&m).then(|| (m, args.to_vec()))
             }
             _ => None,
         });
@@ -1560,7 +1561,7 @@ mod tests {
     #[test]
     fn eq_true_propagates_through_congruence() {
         let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
-        let f = interner.get_or_intern("f");
+        let f = crate::verify::lang::FuncId(usize::from(interner.get_or_intern("f")));
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
