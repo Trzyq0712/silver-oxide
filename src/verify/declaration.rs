@@ -240,9 +240,13 @@ fn eval_pure_inst(
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
         // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted id
-        // (see `verify::mono`), over which the cons/proj/tag reductions fire.
+        // (see `verify::mono`), monomorphized by the ADT's type arguments, over
+        // which the cons/proj/tag reductions fire. The constructor's type-args
+        // are its result type's; projection/tag over non-generic user ADTs use
+        // the empty argument tuple.
         PureInst::AdtCons { adt, variant, args } => {
-            let cons = ctx.registry.cons(*adt, *variant);
+            let type_args = adt_type_args(ty);
+            let cons = ctx.registry.cons(*adt, &type_args, *variant);
             let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add_func_app_id(cons, ty.clone(), args.into())
         }
@@ -252,15 +256,24 @@ fn eval_pure_inst(
             field,
             base,
         } => {
-            let proj = ctx.registry.proj(*adt, *variant, *field);
+            let proj = ctx.registry.proj(*adt, &[], *variant, *field);
             let base = state.get_val(ctx, base);
             ctx.add_func_app_id(proj, ty.clone(), Box::new([base]))
         }
         PureInst::AdtTag { adt, base } => {
-            let tag = ctx.registry.tag(*adt);
+            let tag = ctx.registry.tag(*adt, &[]);
             let base = state.get_val(ctx, base);
             ctx.add_func_app_id(tag, Type::Int, Box::new([base]))
         }
+    }
+}
+
+/// The type arguments of an ADT-typed value (`Domain(_, args)`), else empty —
+/// the monomorphization key for a constructor.
+fn adt_type_args(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Domain(_, args) => args.to_vec(),
+        _ => Vec::new(),
     }
 }
 
@@ -791,7 +804,7 @@ fn eval_method_inst(
                 // snapshot tower), and leaves it uninterpreted for an opaque
                 // snapshot. `unwrap` then peels the `Option` to the field value.
                 let elem = decl_ret_ty(program, projs[i]);
-                let opt_ty = ctx.registry.option_type(elem.clone());
+                let opt_ty = Type::Domain(ctx.registry.option_adt(), Box::new([elem.clone()]));
                 let opt = ctx.add_func_app_id(projs[i], opt_ty, Box::new([s]));
                 let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));

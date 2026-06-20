@@ -56,23 +56,32 @@ ADT constructor / projection / tag, and the reduction rules over them:
   they never collide with a declaration;
 - ids are a **deterministic function of declaration order** — the same concept
   gets the same id in every verification context (see §5 for why this matters);
-- for each `(adt, variant, field)` it builds a `proj_rule`, and for each `adt` a
-  `tag_rule`, mapping each constructor id to its variant index.
+- monomorphization is keyed by `(adt, type-args)`: a non-generic ADT has a
+  single `args = []` instance; a generic ADT gets one instance per concrete
+  type-argument tuple it is used at;
+- for each `(adt, args, variant, field)` it builds a `proj_rule`, and for each
+  `(adt, args)` a `tag_rule`, mapping each constructor id to its variant index.
 
 Each `VerifyContext` injects the registry's rules into its rewrite/reduce sets,
 and `eval_pure_inst` interprets `AdtCons/AdtProj/AdtTag` as `Symbolic::FuncApp`
 over the registry id. Names for minted ids (outside the interner) come from the
 registry, so visualization never panics.
 
-### `Option` is verifier-internal
-`Option` is **not** a VMIR declaration. It is the snapshot-membership type used
-by `fold`/`unfold`: each footprint field value becomes `(perm>0) ? Some(v) :
-None`. The registry monomorphizes it: scanning predicate snapshots, for each
-distinct field (element) type it mints a stable `Some`/`None`/`value`/`tag` id
-set and the corresponding reductions. `option_member` / `option_unwrap` resolve
-through the registry by element type; the `Option[elem]` value type uses a
-reserved verifier `Option` head. No translation-time monomorphization, no
-`Program.option_instances`.
+### `Option` is a builtin generic ADT
+`Option` is an ordinary generic ADT — there is **no** Option-specific
+monomorphization machinery. It is a **builtin**, injected on verifier entry
+(`verify::prelude::with_prelude`, like a Rust lang item) rather than produced by
+translation, so directly-authored VMIR is valid too. The injected declaration is
+`Adt { variants: [ Some{Generic(0)}, None ] }`, interned under the well-known
+name `"Option"`.
+
+It is used as the snapshot-membership type by `fold`/`unfold`: each footprint
+field value becomes `(perm>0) ? Some(v) : None`. The only Option-specific thing
+in the backend is that it **queries the Option ADT's id**
+(`registry.option_adt()`); from there the general `(adt, type-args)`
+monomorphization applies — the registry instantiates `Option[elem]` at each
+predicate-snapshot element type. `option_member`/`option_unwrap` are thin
+helpers over `registry.cons`/`registry.proj` for that ADT.
 
 ---
 
@@ -107,8 +116,8 @@ as concepts appear.
 ---
 
 ## 6. Status and follow-ups
-Built and green (`cargo test --lib`): semantic ADT nodes; registry-derived ADT
-reductions; Option fully verifier-internal.
+Built and green (`cargo test`): semantic ADT nodes; registry-derived
+`(adt, type-args)` reductions; `Option` a builtin generic ADT injected on entry.
 
 Deferred / optional:
 - Fold predicate snapshots into the registry (drop the `derive_adt_meta`
@@ -118,5 +127,7 @@ Deferred / optional:
   indirection.
 - Drop the dead constructor `Function` declarations (real Silver decls, now
   unreferenced once `AdtCons` is used).
-- Type-argument monomorphization for *user* generic ADTs (none exercised today;
-  matches prior behaviour).
+- Use-site type-args for `AdtProj`/`AdtTag` over *user* generic ADTs: the
+  registry already supports type-arg monomorphization, but eval currently passes
+  `[]` for projection/tag (it would need the base value's type threaded through
+  `EvalState`). None exercised today; `AdtCons` already keys off its result type.

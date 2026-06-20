@@ -7,6 +7,7 @@ mod heap;
 pub mod lang;
 mod meta;
 mod mono;
+mod prelude;
 mod rewrite;
 mod viz;
 
@@ -21,7 +22,10 @@ pub type VerifyResult = (String, Result<(), VerifyError>);
 /// side conditions) ahead of the methods that use them; methods are then
 /// verified, reusing the resources' established proofs.
 pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<VerifyResult> {
-    let program = &analyzed.program;
+    // Inject verifier builtins (the `Option` ADT) on entry, so the rest of the
+    // pipeline treats them like any other declaration.
+    let program = prelude::with_prelude(&analyzed.program);
+    let program = &program;
     let mut results = Vec::new();
     // Derive a linear order from the dependency graph; acyclicity was already
     // proven by `analyze`. A future parallel scheduler consumes the graph

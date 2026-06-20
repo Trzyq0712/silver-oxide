@@ -14,6 +14,10 @@ pub enum Type {
     /// verifier mints distinct monomorphic member ids per `(id, args)` instance.
     Domain(MemberId, Box<[Type]>),
     Addr(Box<Type>),
+    /// A type parameter of the enclosing generic declaration, by 0-based index
+    /// (e.g. `Generic(0)` is the `Some` field type of the generic `Option` ADT).
+    /// Substituted by the type arguments at monomorphization.
+    Generic(usize),
 }
 
 impl Type {
@@ -35,6 +39,7 @@ impl Display for Type {
                 fmt_args(f, args, |a, f| write!(f, "{a}"))
             }
             Type::Addr(ty) => write!(f, "&{ty}"),
+            Type::Generic(i) => write!(f, "?{i}"),
         }
     }
 }

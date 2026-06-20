@@ -150,6 +150,7 @@ impl<'a> VerifyContext<'a> {
                     format!("{head}[{}]", inner.join(", "))
                 }
             }
+            Type::Generic(i) => format!("?{i}"),
         }
     }
 
@@ -162,10 +163,15 @@ impl<'a> VerifyContext<'a> {
         present: egg::Id,
         value: egg::Id,
     ) -> egg::Id {
-        let ids = self.registry.option(&elem);
-        let opt_ty = self.registry.option_type(elem);
-        let some = self.add_func_app_id(ids.some, opt_ty.clone(), Box::new([value]));
-        let none = self.add_func_app_id(ids.none, opt_ty, Box::new([]));
+        // `Option` is an ordinary generic ADT: `Some` is variant 0, `None`
+        // variant 1, monomorphized at `[elem]`.
+        let opt = self.registry.option_adt();
+        let args = [elem];
+        let some_id = self.registry.cons(opt, &args, 0);
+        let none_id = self.registry.cons(opt, &args, 1);
+        let opt_ty = Type::Domain(opt, Box::new(args));
+        let some = self.add_func_app_id(some_id, opt_ty.clone(), Box::new([value]));
+        let none = self.add_func_app_id(none_id, opt_ty, Box::new([]));
         self.add(Symbolic::Ite([present, some, none]))
     }
 
@@ -173,7 +179,9 @@ impl<'a> VerifyContext<'a> {
     /// `opt = Some(v)` this reduces to `v`; on an opaque member it stays
     /// uninterpreted (correct — the value was never present).
     pub(crate) fn option_unwrap(&mut self, elem: Type, opt: egg::Id) -> egg::Id {
-        let value_id = self.registry.option(&elem).value;
+        // `value` = field 0 of `Some` (variant 0) of `Option[elem]`.
+        let opt_adt = self.registry.option_adt();
+        let value_id = self.registry.proj(opt_adt, &[elem.clone()], 0, 0);
         self.add_func_app_id(value_id, elem, Box::new([opt]))
     }
 
