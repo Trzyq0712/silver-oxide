@@ -198,6 +198,7 @@ fn check_deref_permission(
 /// Evaluate a `PureInst` into its symbolic e-class id.
 fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
     state: &EvalState,
     ty: &Type,
     pi: &PureInst,
@@ -239,13 +240,42 @@ fn eval_pure_inst(
             let addr = state.get_val(ctx, loc);
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
-        // Semantic ADT nodes. The translator does not yet emit these (S2); the
-        // verifier interpretation (verifier-owned FuncIds + lazy cons/proj/tag
-        // rule injection + monomorphization) lands in S3/S4.
-        PureInst::AdtCons { .. } | PureInst::AdtProj { .. } | PureInst::AdtTag { .. } => {
-            unimplemented!("semantic ADT nodes are interpreted by the verifier in S3")
+        // Semantic ADT nodes. Resolved against the `Adt` declaration: the
+        // constructor / field-projection / discriminator-tag application is the
+        // ADT's corresponding accessor function, over which the cons/tag/proj
+        // reductions (see `verify::meta`) already fire.
+        PureInst::AdtCons { adt, variant, args } => {
+            let ctor_fn = adt_variant(program, *adt, *variant).ctor_fn;
+            let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+            ctx.add_func_app_id(ctor_fn, ty.clone(), args.into())
+        }
+        PureInst::AdtProj {
+            adt,
+            variant,
+            field,
+            base,
+        } => {
+            let accessor = adt_variant(program, *adt, *variant).projections[*field];
+            let base = state.get_val(ctx, base);
+            ctx.add_func_app_id(accessor, ty.clone(), Box::new([base]))
+        }
+        PureInst::AdtTag { adt, base } => {
+            let Declaration::Adt(a) = &program.decls[*adt] else {
+                panic!("AdtTag references non-Adt declaration");
+            };
+            let tag_fn = a.tag_fn;
+            let base = state.get_val(ctx, base);
+            ctx.add_func_app_id(tag_fn, Type::Int, Box::new([base]))
         }
     }
+}
+
+/// The `AdtConstructor` for `variant` of the ADT declared at `adt`.
+fn adt_variant(program: &vmir::Program, adt: MemberId, variant: usize) -> &vmir::AdtConstructor {
+    let Declaration::Adt(a) = &program.decls[adt] else {
+        panic!("semantic ADT node references non-Adt declaration");
+    };
+    &a.constructors[variant]
 }
 
 /// Singleton heap for `acc loc perm`: one chunk at `loc` with permission `perm`
@@ -580,12 +610,13 @@ fn eval_heap_inst(
 /// produced there (a follow-up enables inline `assume`).
 fn eval_resource_body_inst(
     ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
     state: &mut EvalState,
     inst: &Inst,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
-            let id = eval_pure_inst(ctx, state, ty, pi);
+            let id = eval_pure_inst(ctx, program, state, ty, pi);
             state.push_val(id);
         }
         InstKind::Heap(hi) => {
@@ -642,7 +673,7 @@ fn eval_method_inst(
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
-            let id = eval_pure_inst(ctx, state, ty, pi);
+            let id = eval_pure_inst(ctx, program, state, ty, pi);
             state.push_val(id);
         }
         // `base inhale <resource>(args) perm`: graft the resource's certificate,
@@ -952,7 +983,7 @@ pub fn verify_resource(
             }
         }
 
-        if let Err(err) = eval_resource_body_inst(&mut ctx, &mut state, inst) {
+        if let Err(err) = eval_resource_body_inst(&mut ctx, program, &mut state, inst) {
             return Err(err.with_inst(inst_text));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);

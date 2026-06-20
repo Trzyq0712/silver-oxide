@@ -257,13 +257,19 @@ pub(crate) fn lower<Ext: PureExt>(
         P::FunctionCall(call) => {
             // Constructors and (heap-independent) user functions. Heap-dependent
             // functions are a later (purification) concern; pass an empty heap.
-            let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
-                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
-            })?;
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(lower(b, env, sink, hctx, a)?);
             }
+            // An ADT constructor lowers to the semantic `AdtCons` node, not a
+            // `FunctionCall` to the constructor's synthetic declaration.
+            if let Some(&(adt_spur, variant)) = b.ctor_tag.get(&call.name.0) {
+                let adt = b.name_map[&adt_spur];
+                return Ok(sink.emit_pure(ty, PureInst::AdtCons { adt, variant, args }));
+            }
+            let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
             Ok(sink.emit_pure(
                 ty,
                 PureInst::FunctionCall(
@@ -278,44 +284,31 @@ pub(crate) fn lower<Ext: PureExt>(
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
         P::AdtDestructor(base, field) => {
-            // `e.f` ⇒ `Adt@f(e)` (an accessor FuncApp). The verifier's projection
-            // reduction folds it when `e` is a known constructor.
+            // `e.f` ⇒ `AdtProj{adt, variant, field}(e)`. The verifier's
+            // projection reduction folds it when `e` is a known constructor.
             let base_v = lower(b, env, sink, hctx, base)?;
-            let accessor = *b.dtor_accessor.get(&field.0).ok_or_else(|| {
+            let &(adt, variant, field) = b.dtor_sem.get(&field.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
             })?;
             Ok(sink.emit_pure(
                 ty,
-                PureInst::FunctionCall(
-                    None,
-                    vmir::FunctionCall {
-                        function: accessor,
-                        args: vec![base_v],
-                    },
-                ),
+                PureInst::AdtProj {
+                    adt,
+                    variant,
+                    field,
+                    base: base_v,
+                },
             ))
         }
         P::AdtDiscriminator(base, variant) => {
-            // `e.is<Ctor>` ⇒ `Adt@tag(e) == tag_index`. The verifier's tag
+            // `e.is<Ctor>` ⇒ `AdtTag{adt}(e) == tag_index`. The verifier's tag
             // reduction folds this to a literal when `e` is a known constructor.
             let base_v = lower(b, env, sink, hctx, base)?;
             let &(adt_spur, tag) = b.ctor_tag.get(&variant.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
             })?;
-            let tag_fn = *b
-                .adt_tag_fn
-                .get(&adt_spur)
-                .expect("adt tag fn declared for a known constructor");
-            let tag_call = sink.emit_pure(
-                vmir::Type::Int,
-                PureInst::FunctionCall(
-                    None,
-                    vmir::FunctionCall {
-                        function: tag_fn,
-                        args: vec![base_v],
-                    },
-                ),
-            );
+            let adt = b.name_map[&adt_spur];
+            let tag_call = sink.emit_pure(vmir::Type::Int, PureInst::AdtTag { adt, base: base_v });
             let idx = Val::Literal(Literal::Int(num::BigInt::from(tag)));
             Ok(sink.emit_pure(
                 vmir::Type::Bool,

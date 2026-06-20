@@ -101,7 +101,9 @@ pub(crate) struct Builder<'a> {
     pub adt_tag_fn: HashMap<Spur, vmir::MemberId>,
     /// Maps a constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
-    pub dtor_accessor: HashMap<Spur, vmir::MemberId>,
+    /// Maps a destructor's `Spur` to the semantic `(adt id, variant, field)` it
+    /// projects — the operands of a `PureInst::AdtProj`.
+    pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
     pub option_instances: HashMap<vmir::Type, vmir::OptionInstance>,
 }
 
@@ -120,7 +122,7 @@ impl<'a> Builder<'a> {
             method_ensures: HashMap::new(),
             adt_tag_fn: HashMap::new(),
             ctor_tag: HashMap::new(),
-            dtor_accessor: HashMap::new(),
+            dtor_sem: HashMap::new(),
             option_instances: HashMap::new(),
         }
     }
@@ -221,7 +223,9 @@ impl<'a> Builder<'a> {
                     self.name_map.insert(*spur, id);
                     self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
                     let adt_id = self.name_map[&sig.adt];
-                    if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
+                    if let Some(vmir::Declaration::Adt(adt)) =
+                        self.decls[usize::from(adt_id)].as_mut()
+                    {
                         adt.constructors.push(vmir::AdtConstructor {
                             ctor_fn: id,
                             tag: sig.tag,
@@ -250,11 +254,17 @@ impl<'a> Builder<'a> {
                     body: None,
                 }),
             );
-            self.dtor_accessor.insert(*dtor_spur, id);
             let ctor_id = self.name_map[&info.ctor];
             let adt_id = self.name_map[&info.adt];
+            let variant = self.ctor_tag[&info.ctor].1;
+            self.dtor_sem
+                .insert(*dtor_spur, (adt_id, variant, info.index));
             if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
-                let ctor = adt.constructors.iter_mut().find(|c| c.ctor_fn == ctor_id).unwrap();
+                let ctor = adt
+                    .constructors
+                    .iter_mut()
+                    .find(|c| c.ctor_fn == ctor_id)
+                    .unwrap();
                 if ctor.projections.len() <= info.index {
                     ctor.projections.resize(info.index + 1, vmir::MemberId(0));
                 }
@@ -275,7 +285,7 @@ impl<'a> Builder<'a> {
             bound: vmir::Bound::Unbounded,
         };
         self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
-        
+
         if let Some(body) = p.body.as_ref() {
             if let Some(types) = self.flat_footprint_types(body) {
                 for ty in types {
@@ -283,7 +293,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        
+
         self.pred_snap.insert(p.name.0, snap_id);
         self.pred_addr.insert(p.name.0, addr_id);
     }
@@ -292,7 +302,7 @@ impl<'a> Builder<'a> {
         if let Some(inst) = self.option_instances.get(ty) {
             return *inst;
         }
-        
+
         let type_name = format!("T{}", self.option_instances.len());
         let adt_id = self.fresh_decl(&format!("Option[{type_name}]"));
         let some = self.fresh_decl(&format!("Some[{type_name}]"));
@@ -351,7 +361,13 @@ impl<'a> Builder<'a> {
             }),
         );
 
-        let inst = vmir::OptionInstance { adt_id, some, none, value, tag_fn };
+        let inst = vmir::OptionInstance {
+            adt_id,
+            some,
+            none,
+            value,
+            tag_fn,
+        };
         self.option_instances.insert(ty.clone(), inst);
         inst
     }
@@ -442,7 +458,8 @@ impl<'a> Builder<'a> {
                 );
                 snap_projs.push(proj_id);
             }
-            if let Some(vmir::Declaration::Resource(r)) = self.decls[usize::from(pred_id)].as_mut() {
+            if let Some(vmir::Declaration::Resource(r)) = self.decls[usize::from(pred_id)].as_mut()
+            {
                 r.snapshot = Some(vmir::Snapshot {
                     addr_fn: addr_id,
                     cons: cons_id,
