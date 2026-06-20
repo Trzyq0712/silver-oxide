@@ -7,7 +7,6 @@ use crate::{
         analysis::ConstFold,
         heap::{Chunk, Heap},
         lang::Symbolic,
-        meta::AdtMeta,
         mono::MonoRegistry,
         rewrite,
     },
@@ -75,17 +74,16 @@ pub(crate) struct LocationInfo {
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
         interner: &'a Rodeo<MemberId>,
-        adt_meta: &AdtMeta,
         registry: &'a MonoRegistry,
         locations: HashMap<MemberId, LocationInfo>,
     ) -> Self {
-        // Saturation rules: the static structural set + snapshot projections
-        // (from `adt_meta`) + the ADT constructor/projection/tag reductions
-        // (from the registry). The registry rules are also reductions, so they
-        // join `reduce_rules` (run after heap-producing ops).
-        let mut rules = rewrite::rules(adt_meta);
+        // Saturation rules: the static structural set + the ADT constructor /
+        // projection / tag reductions (from the registry). The registry rules
+        // are also reductions, so they join `reduce_rules` (run after
+        // heap-producing ops).
+        let mut rules = rewrite::rules();
         rules.extend(registry.rules().iter().cloned());
-        let mut reduce_rules = rewrite::reduce_rules(adt_meta);
+        let mut reduce_rules = rewrite::reduce_rules();
         reduce_rules.extend(registry.rules().iter().cloned());
         Self {
             egraph: egg::EGraph::default(),

@@ -9,7 +9,6 @@ use egg::{
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::Symbolic;
-use crate::verify::meta::AdtMeta;
 use crate::vmir::{Literal, MemberId};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
@@ -18,25 +17,21 @@ fn var(name: &str) -> Var {
     name.parse().expect("valid pattern var")
 }
 
-/// The full rule set: the static structural rules plus per-ADT reductions
-/// generated from `adt_meta` (currently the discriminator tag reduction).
-pub fn rules(adt_meta: &AdtMeta) -> Vec<Rule> {
-    let mut rules = static_rules();
-    rules.extend(adt_rules(adt_meta));
-    rules
+/// The static structural rule set. Per-ADT cons/proj/tag reductions are minted
+/// by the registry (`verify::mono`) and appended by `VerifyContext::new`.
+pub fn rules() -> Vec<Rule> {
+    static_rules()
 }
 
 /// The terminating structural reductions used to **normalize** the e-graph after
-/// heap-producing ops (`fold`/`unfold`): the ADT reductions (which collapse the
-/// `cons(proj(cons(..)))` snapshot towers) plus the terminating `ite`/optional
+/// heap-producing ops (`fold`/`unfold`): the terminating `ite`/optional
 /// simplifications (which peel the `(perm>0) ? Some(v) : None` wrapper down to
-/// `v` whenever the permission is statically positive). Kept separate from
-/// [`rules`] so that future *non-terminating* rules (e.g. recursive function
-/// defining-equations) are run only during full saturation, never here.
-pub fn reduce_rules(adt_meta: &AdtMeta) -> Vec<Rule> {
-    let mut rules = adt_rules(adt_meta);
-    rules.extend(terminating_ite_rules());
-    rules
+/// `v` whenever the permission is statically positive). The registry's ADT
+/// reductions (which collapse `cons(proj(cons(..)))` snapshot towers) are
+/// appended by `VerifyContext::new`. Kept separate from [`rules`] so that future
+/// *non-terminating* rules are run only during full saturation, never here.
+pub fn reduce_rules() -> Vec<Rule> {
+    terminating_ite_rules()
 }
 
 /// Build the projection reduction `accessor(ctor(a0..an)) ⇒ a_index` for a
@@ -61,38 +56,6 @@ pub fn tag_rule(tag_fn: MemberId, ctor_tags: HashMap<MemberId, usize>) -> Rule {
         TagApplier { ctor_tags },
     )
     .expect("valid tag rewrite")
-}
-
-/// ADT reductions generated from `adt_meta`: the discriminator `tag` reduction
-/// and the constructor-projection reduction. Both are terminating.
-fn adt_rules(adt_meta: &AdtMeta) -> Vec<Rule> {
-    let mut rules = Vec::new();
-    for (&tag_fn, ctor_tags) in &adt_meta.tag_fns {
-        // `Adt@tag(ctor_C(..)) ⇒ index_C`. FuncApp isn't string-matchable, so
-        // both searcher and applier are custom.
-        rules.push(
-            Rewrite::new(
-                format!("tag-{}", usize::from(tag_fn)),
-                UnaryAppSearcher { func: tag_fn },
-                TagApplier {
-                    ctor_tags: ctor_tags.clone(),
-                },
-            )
-            .expect("valid tag rewrite"),
-        );
-    }
-    for (&accessor, &(ctor, index)) in &adt_meta.dtors {
-        // `Adt@f(ctor_C(a0..an)) ⇒ a_index`.
-        rules.push(
-            Rewrite::new(
-                format!("proj-{}", usize::from(accessor)),
-                UnaryAppSearcher { func: accessor },
-                ProjApplier { ctor, index },
-            )
-            .expect("valid proj rewrite"),
-        );
-    }
-    rules
 }
 
 /// The static (ADT-independent) rule set run during saturation.

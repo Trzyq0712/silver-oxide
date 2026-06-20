@@ -312,43 +312,21 @@ impl<'a> Builder<'a> {
             }),
         );
 
-        // Synthesize the snapshot ADT for a foldable (flat) concrete predicate:
-        // a constructor `P@snap@cons` over the footprint field values and one
-        // accessor `P@snap@proj_i` per slot, registered so the projection
-        // reduction makes fold→unfold round-trips exact. See `ResourceMeta`.
+        // A foldable (flat) concrete predicate has a snapshot: a single-variant
+        // ADT (head = the `@snap` Domain) over the footprint field values. The
+        // verifier mints its constructor/projection ids and reductions (see
+        // `verify::mono`); no accessor declarations are emitted here.
         if let Some(body_exp) = &p.body
             && let Some(types) = self.flat_footprint_types(body_exp)
         {
             let snap_id = self.pred_snap[&p.name.0];
             let addr_id = self.pred_addr[&p.name.0];
-            let cons_id = self.fresh_decl(&format!("{name}@snap@cons"));
-            self.set_decl(
-                cons_id,
-                vmir::Declaration::Function(vmir::Function {
-                    params: types.clone(),
-                    ret: vmir::Type::domain(snap_id),
-                    body: None,
-                }),
-            );
-            let mut snap_projs = Vec::with_capacity(types.len());
-            for (i, ty) in types.iter().enumerate() {
-                let proj_id = self.fresh_decl(&format!("{name}@snap@{i}"));
-                self.set_decl(
-                    proj_id,
-                    vmir::Declaration::Function(vmir::Function {
-                        params: vec![vmir::Type::domain(snap_id)],
-                        ret: ty.clone(),
-                        body: None,
-                    }),
-                );
-                snap_projs.push(proj_id);
-            }
             if let Some(vmir::Declaration::Resource(r)) = self.decls[usize::from(pred_id)].as_mut()
             {
                 r.snapshot = Some(vmir::Snapshot {
                     addr_fn: addr_id,
-                    cons: cons_id,
-                    projs: snap_projs,
+                    snap: snap_id,
+                    field_types: types,
                 });
             }
         }

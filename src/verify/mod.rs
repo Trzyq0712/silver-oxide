@@ -5,7 +5,6 @@ mod context;
 mod declaration;
 mod heap;
 pub mod lang;
-mod meta;
 mod mono;
 mod prelude;
 mod rewrite;

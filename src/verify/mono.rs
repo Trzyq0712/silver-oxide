@@ -76,54 +76,40 @@ impl MonoRegistry {
         };
         let mut next = program.interner.len();
 
-        // Which (adt, type-args) instances to mint, in deterministic order:
-        // every non-generic ADT at `[]`, plus `Option[elem]` for each distinct
-        // predicate-snapshot element type. (Generic user ADTs are not used
-        // today; one would need its concrete type-args collected from use sites.)
-        let mut specs: Vec<(MemberId, Vec<Type>)> = Vec::new();
+        // Which monomorphic instances to mint, in deterministic order. Each is
+        // `(adt-head, type-args, per-variant field counts)`:
+        // - every non-generic ADT declaration at `[]`;
+        // - `Option[elem]` for each distinct predicate-snapshot field type;
+        // - each foldable predicate's snapshot: a single-variant ADT (head = the
+        //   `@snap` Domain) over the footprint field types.
+        // (Generic *user* ADTs at non-empty args are minted lazily on use once
+        // allocation is dynamic; the eager build covers what static decls imply.)
+        let mut specs: Vec<(MemberId, Vec<Type>, Vec<usize>)> = Vec::new();
         for (adt_id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Adt(adt) = decl
                 && !is_generic(adt)
             {
-                specs.push((adt_id, Vec::new()));
+                specs.push((adt_id, Vec::new(), variant_field_counts(adt)));
             }
         }
-        if let Some(opt) = reg.option_adt {
+        if let Some(opt) = reg.option_adt
+            && let Declaration::Adt(adt) = &program.decls[opt]
+        {
+            let counts = variant_field_counts(adt);
             for elem in option_element_types(program) {
-                specs.push((opt, vec![elem]));
+                specs.push((opt, vec![elem], counts.clone()));
+            }
+        }
+        for decl in &program.decls {
+            if let Declaration::Resource(r) = decl
+                && let Some(snap) = &r.snapshot
+            {
+                specs.push((snap.snap, Vec::new(), vec![snap.field_types.len()]));
             }
         }
 
-        for (adt_id, args) in specs {
-            let Declaration::Adt(adt) = &program.decls[adt_id] else {
-                continue;
-            };
-            let label = mono_label(program, adt_id, &args);
-
-            let tag_id = MemberId(next);
-            next += 1;
-            reg.names.insert(tag_id, format!("{label}@tag"));
-            reg.tag.insert((adt_id, args.clone()), tag_id);
-
-            let mut ctor_tags = HashMap::new();
-            for (variant, ctor) in adt.variants.iter().enumerate() {
-                let cons_id = MemberId(next);
-                next += 1;
-                reg.names.insert(cons_id, format!("{label}#{variant}"));
-                reg.cons.insert((adt_id, args.clone(), variant), cons_id);
-                ctor_tags.insert(cons_id, variant);
-
-                for field in 0..ctor.field_types.len() {
-                    let proj_id = MemberId(next);
-                    next += 1;
-                    reg.names
-                        .insert(proj_id, format!("{label}#{variant}.{field}"));
-                    reg.proj
-                        .insert((adt_id, args.clone(), variant, field), proj_id);
-                    reg.rules.push(proj_rule(proj_id, cons_id, field));
-                }
-            }
-            reg.rules.push(tag_rule(tag_id, ctor_tags));
+        for (adt_id, args, field_counts) in specs {
+            mint_mono(&mut reg, &mut next, program, adt_id, &args, &field_counts);
         }
         reg
     }
@@ -159,9 +145,51 @@ impl MonoRegistry {
     }
 }
 
-/// The distinct element types `Option` is monomorphized at: the declared return
-/// type of each predicate-snapshot projection (a snapshot member is
-/// `(perm>0) ? Some(field) : None`). Order-stable, de-duplicated.
+/// Mint the constructor / projection / tag ids and reduction rules for one
+/// monomorphic instance `adt[args]` whose variants have the given field counts.
+fn mint_mono(
+    reg: &mut MonoRegistry,
+    next: &mut usize,
+    program: &Program,
+    adt: MemberId,
+    args: &[Type],
+    field_counts: &[usize],
+) {
+    let label = mono_label(program, adt, args);
+    let mut mint = |reg: &mut MonoRegistry, name: String| {
+        let id = MemberId(*next);
+        *next += 1;
+        reg.names.insert(id, name);
+        id
+    };
+
+    let tag_id = mint(reg, format!("{label}@tag"));
+    reg.tag.insert((adt, args.to_vec()), tag_id);
+
+    let mut ctor_tags = HashMap::new();
+    for (variant, &fields) in field_counts.iter().enumerate() {
+        let cons_id = mint(reg, format!("{label}#{variant}"));
+        reg.cons.insert((adt, args.to_vec(), variant), cons_id);
+        ctor_tags.insert(cons_id, variant);
+
+        for field in 0..fields {
+            let proj_id = mint(reg, format!("{label}#{variant}.{field}"));
+            reg.proj
+                .insert((adt, args.to_vec(), variant, field), proj_id);
+            reg.rules.push(proj_rule(proj_id, cons_id, field));
+        }
+    }
+    reg.rules.push(tag_rule(tag_id, ctor_tags));
+}
+
+/// Per-variant field counts of an ADT declaration, in variant order.
+fn variant_field_counts(adt: &Adt) -> Vec<usize> {
+    adt.variants.iter().map(|v| v.field_types.len()).collect()
+}
+
+/// The distinct element types `Option` is monomorphized at: each predicate
+/// snapshot's field types (a snapshot member is `(perm>0) ? Some(field) :
+/// None`). Order-stable, de-duplicated.
 fn option_element_types(program: &Program) -> Vec<Type> {
     let mut elems: Vec<Type> = Vec::new();
     for decl in &program.decls {
@@ -169,13 +197,9 @@ fn option_element_types(program: &Program) -> Vec<Type> {
             continue;
         };
         let Some(snap) = &r.snapshot else { continue };
-        for &proj in &snap.projs {
-            let elem = match &program.decls[proj] {
-                Declaration::Function(f) => f.ret.clone(),
-                _ => Type::Int,
-            };
-            if !elems.contains(&elem) {
-                elems.push(elem);
+        for elem in &snap.field_types {
+            if !elems.contains(elem) {
+                elems.push(elem.clone());
             }
         }
     }

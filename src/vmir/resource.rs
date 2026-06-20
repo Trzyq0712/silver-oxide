@@ -17,17 +17,18 @@ pub struct Resource {
     pub snapshot: Option<Snapshot>,
 }
 
-/// Snapshot accessors for a foldable predicate resource. The snapshot packs the
-/// footprint field values: `cons(v0..vn)` builds it, `projs[i]` recovers slot
-/// `i` (registered as a destructor so fold→unfold round-trips are exact).
+/// Snapshot descriptor for a foldable predicate resource. The snapshot is a
+/// single-variant ADT (head = the `@snap` Domain) packing the footprint field
+/// values in order. The verifier mints its constructor/projection ids and
+/// reductions from this (see `verify::mono`); no accessor declarations exist.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Snapshot {
     /// The resource's `@addr` function (its chunk address).
     pub addr_fn: MemberId,
-    /// The snapshot constructor `P@snap@cons`.
-    pub cons: MemberId,
-    /// The snapshot field accessors `P@snap@i`, in footprint slot order.
-    pub projs: Vec<MemberId>,
+    /// The `@snap` Domain id — the snapshot ADT's head (and value type).
+    pub snap: MemberId,
+    /// The footprint field types, in slot order (the single variant's fields).
+    pub field_types: Vec<Type>,
 }
 
 /// A resource's precondition mode.

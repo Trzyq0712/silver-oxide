@@ -277,17 +277,6 @@ fn eval_pure_inst(
     }
 }
 
-/// Singleton heap for `acc loc perm`: one chunk at `loc` with permission `perm`
-/// and a fresh held value.
-/// The declared return type of a `Function` declaration (`Int` fallback). Used
-/// to type the synthesized `@addr` / snapshot `cons`/`proj` applications.
-fn decl_ret_ty(program: &vmir::Program, id: MemberId) -> Type {
-    match &program.decls[id] {
-        Declaration::Function(f) => f.ret.clone(),
-        _ => Type::Int,
-    }
-}
-
 fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalState) -> Heap {
     let addr = state.get_val(ctx, loc);
     let perm = state.get_val(ctx, perm);
@@ -723,8 +712,8 @@ fn eval_method_inst(
             let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
                 "fold of non-flat/abstract predicate",
             ))?;
-            let (snap_cons, addr_fn) = (sd.cons, sd.addr_fn);
-            let projs = sd.projs.clone();
+            let (snap_head, addr_fn) = (sd.snap, sd.addr_fn);
+            let field_types = sd.field_types.clone();
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -733,6 +722,11 @@ fn eval_method_inst(
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
             let fp = ctx.graft_footprint(cert, &args);
+            if fp.len() != field_types.len() {
+                return Err(VerifyError::Unimplemented(
+                    "predicate footprint shape mismatch",
+                ));
+            }
             let mut out = base_h.clone();
             let mut values = Vec::with_capacity(fp.len());
             let mut members = Vec::with_capacity(fp.len());
@@ -746,7 +740,7 @@ fn eval_method_inst(
                     })
                     .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
                 out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
-                let elem = decl_ret_ty(program, projs[i]);
+                let elem = field_types[i].clone();
                 let present = ctx.perm_positive(bperm);
                 members.push(ctx.option_member(elem, present, v));
                 values.push(v);
@@ -755,8 +749,11 @@ fn eval_method_inst(
             if !ctx.prove_under_pc(bool_id, &pc_lits) {
                 return Err(VerifyError::AssertionFailed);
             }
+            // The snapshot is a single-variant ADT (head = the `@snap` Domain).
             let cons_args: Box<[egg::Id]> = members.into_iter().collect();
-            let snap = ctx.add_func_app_id(snap_cons, decl_ret_ty(program, snap_cons), cons_args);
+            let snap_cons = ctx.registry.cons(snap_head, &[], 0);
+            let snap_ty = Type::Domain(snap_head, Box::new([]));
+            let snap = ctx.add_func_app_id(snap_cons, snap_ty, cons_args);
             let pred_addr = ctx.add_location(addr_fn, args.into());
             let out = heap_union(ctx, &out, pred_addr, Chunk::new(perm_id, snap), &pc_lits);
             state.push_heap(out);
@@ -773,8 +770,8 @@ fn eval_method_inst(
             let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
                 "unfold of non-flat/abstract predicate",
             ))?;
-            let addr_fn = sd.addr_fn;
-            let projs = sd.projs.clone();
+            let (snap_head, addr_fn) = (sd.snap, sd.addr_fn);
+            let field_types = sd.field_types.clone();
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -791,7 +788,7 @@ fn eval_method_inst(
             let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
 
             let fp = ctx.graft_footprint(cert, &args);
-            if fp.len() != projs.len() {
+            if fp.len() != field_types.len() {
                 return Err(VerifyError::Unimplemented(
                     "predicate footprint shape mismatch",
                 ));
@@ -803,9 +800,10 @@ fn eval_method_inst(
                 // concrete `cons` (so repeated fold/unfold doesn't grow the
                 // snapshot tower), and leaves it uninterpreted for an opaque
                 // snapshot. `unwrap` then peels the `Option` to the field value.
-                let elem = decl_ret_ty(program, projs[i]);
+                let elem = field_types[i].clone();
+                let proj_id = ctx.registry.proj(snap_head, &[], 0, i);
                 let opt_ty = Type::Domain(ctx.registry.option_adt(), Box::new([elem.clone()]));
-                let opt = ctx.add_func_app_id(projs[i], opt_ty, Box::new([s]));
+                let opt = ctx.add_func_app_id(proj_id, opt_ty, Box::new([s]));
                 let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
@@ -895,14 +893,8 @@ pub fn verify_method(
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
-    let adt_meta = crate::verify::meta::derive_adt_meta(program);
     let registry = crate::verify::mono::MonoRegistry::build(program);
-    let mut ctx = VerifyContext::new(
-        &program.interner,
-        &adt_meta,
-        &registry,
-        build_locations(program),
-    );
+    let mut ctx = VerifyContext::new(&program.interner, &registry, build_locations(program));
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -943,14 +935,8 @@ pub fn verify_resource(
         return Ok(None);
     };
 
-    let adt_meta = crate::verify::meta::derive_adt_meta(program);
     let registry = crate::verify::mono::MonoRegistry::build(program);
-    let mut ctx = VerifyContext::new(
-        &program.interner,
-        &adt_meta,
-        &registry,
-        build_locations(program),
-    );
+    let mut ctx = VerifyContext::new(&program.interner, &registry, build_locations(program));
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1103,12 +1089,7 @@ mod tests {
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
         // Leak a `'static` empty registry so the returned context can borrow it.
         let registry: &'static _ = Box::leak(Box::new(crate::verify::mono::MonoRegistry::empty()));
-        VerifyContext::new(
-            interner,
-            &crate::verify::meta::AdtMeta::default(),
-            registry,
-            Default::default(),
-        )
+        VerifyContext::new(interner, registry, Default::default())
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1135,12 +1116,7 @@ mod tests {
             },
         )]);
         let registry = crate::verify::mono::MonoRegistry::empty();
-        let mut ctx = VerifyContext::new(
-            &interner,
-            &crate::verify::meta::AdtMeta::default(),
-            &registry,
-            locations,
-        );
+        let mut ctx = VerifyContext::new(&interner, &registry, locations);
 
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
