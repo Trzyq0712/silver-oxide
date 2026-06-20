@@ -1,36 +1,39 @@
-use crate::vmir::MemberId;
+use crate::vmir::Type;
 use crate::vmir::display::VmirDisplay;
 use std::fmt::{self, Display, Formatter};
 
-/// An algebraic data type: its discriminator `@tag` function and its
-/// constructors. The verifier derives its constructor/discriminator reduction
-/// rules from this structure (see `verify::meta`); no separate side-table is
-/// carried on the `Program`.
+/// An algebraic data type: a list of variants (constructors), variant index =
+/// discriminator tag. Purely semantic — no synthetic `@tag` / accessor member
+/// ids. The verifier mints its own ids and reduction rules from this structure
+/// (see `verify::mono`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Adt {
-    /// The `@tag` discriminator function id (`Adt@tag(ctor_C(..)) ⇒ tag_C`).
-    pub tag_fn: MemberId,
-    pub constructors: Vec<AdtConstructor>,
+    pub variants: Vec<AdtVariant>,
 }
 
-/// One constructor of an [`Adt`].
+/// One variant (constructor) of an [`Adt`]: just its field types, in field
+/// order. The constructor / projection / tag operations over it are the
+/// semantic `PureInst::{AdtCons,AdtProj,AdtTag}` nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AdtConstructor {
-    /// The constructor function id.
-    pub ctor_fn: MemberId,
-    /// The constructor's discriminator tag (its `@tag` value).
-    pub tag: usize,
-    /// The field destructor/accessor function ids, in field order: `projections[i]`
-    /// projects field `i` (`projections[i](ctor_fn(a0..an)) ⇒ a_i`).
-    pub projections: Vec<MemberId>,
+pub struct AdtVariant {
+    pub field_types: Vec<Type>,
 }
 
 impl<'a> Display for VmirDisplay<'a, &'a Adt> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let adt = self.item;
-        write!(f, "{{ @tag = fn{}", usize::from(adt.tag_fn))?;
-        for c in &adt.constructors {
-            write!(f, ", fn{}#{}", usize::from(c.ctor_fn), c.tag)?;
+        write!(f, "{{ ")?;
+        for (v, ctor) in self.item.variants.iter().enumerate() {
+            if v > 0 {
+                write!(f, " | ")?;
+            }
+            write!(f, "#{v}(")?;
+            for (i, ty) in ctor.field_types.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", self.with(ty))?;
+            }
+            write!(f, ")")?;
         }
         write!(f, " }}")
     }

@@ -8,6 +8,7 @@ use crate::{
         heap::{Chunk, Heap},
         lang::Symbolic,
         meta::AdtMeta,
+        mono::MonoRegistry,
         rewrite,
     },
     vmir::{self, BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
@@ -47,6 +48,9 @@ pub(crate) struct VerifyContext<'a> {
     reduce_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
     pub(crate) interner: &'a Rodeo<MemberId>,
+    /// Verifier-minted ADT constructor/projection/tag ids + their reduction
+    /// rules, derived once per program (see [`MonoRegistry`]).
+    pub(crate) registry: &'a MonoRegistry,
     /// Type side-oracle: the irreducible type sources that the type-free
     /// e-graph nodes no longer carry. Keyed by stable node payloads (the
     /// `Fresh` counter and the `FuncApp` member id), so no union upkeep is
@@ -72,14 +76,24 @@ impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
         interner: &'a Rodeo<MemberId>,
         adt_meta: &AdtMeta,
+        registry: &'a MonoRegistry,
         locations: HashMap<MemberId, LocationInfo>,
     ) -> Self {
+        // Saturation rules: the static structural set + snapshot projections
+        // (from `adt_meta`) + the ADT constructor/projection/tag reductions
+        // (from the registry). The registry rules are also reductions, so they
+        // join `reduce_rules` (run after heap-producing ops).
+        let mut rules = rewrite::rules(adt_meta);
+        rules.extend(registry.rules().iter().cloned());
+        let mut reduce_rules = rewrite::reduce_rules(adt_meta);
+        reduce_rules.extend(registry.rules().iter().cloned());
         Self {
             egraph: egg::EGraph::default(),
-            rules: rewrite::rules(adt_meta),
-            reduce_rules: rewrite::reduce_rules(adt_meta),
+            rules,
+            reduce_rules,
             fresh_counter: 0,
             interner,
+            registry,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
             locations,
@@ -104,9 +118,17 @@ impl<'a> VerifyContext<'a> {
         self.egraph.classes().any(|c| c.data.is_inconsistent())
     }
 
-    /// Display name for a member id
+    /// Display name for a member id. Registry-minted ids (outside the interner)
+    /// resolve via the registry's name table.
     pub(crate) fn member_name(&self, m: MemberId) -> String {
-        self.interner.resolve(&m).to_string()
+        if usize::from(m) < self.interner.len() {
+            self.interner.resolve(&m).to_string()
+        } else {
+            self.registry
+                .name(m)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("m{}", m.0))
+        }
     }
 
     /// Render a VMIR type using [`Self::member_name`] for `Domain` heads, so
@@ -143,17 +165,27 @@ impl<'a> VerifyContext<'a> {
     ) -> egg::Id {
         let inst = program.option_instances.get(&elem).copied().unwrap();
         let opt_ty = Type::domain(inst.adt_id);
-        let some = self.add_func_app_id(inst.some, opt_ty.clone(), Box::new([value]));
-        let none = self.add_func_app_id(inst.none, opt_ty, Box::new([]));
+        // `Some` = variant 0, `None` = variant 1 of the `Option[elem]` ADT.
+        let some_id = self.registry.cons(inst.adt_id, 0);
+        let none_id = self.registry.cons(inst.adt_id, 1);
+        let some = self.add_func_app_id(some_id, opt_ty.clone(), Box::new([value]));
+        let none = self.add_func_app_id(none_id, opt_ty, Box::new([]));
         self.add(Symbolic::Ite([present, some, none]))
     }
 
     /// Unwrap a snapshot member: `value(opt)`, the `Some` field accessor. With
     /// `opt = Some(v)` this reduces to `v`; on an opaque member it stays
     /// uninterpreted (correct — the value was never present).
-    pub(crate) fn option_unwrap(&mut self, program: &vmir::Program, elem: Type, opt: egg::Id) -> egg::Id {
+    pub(crate) fn option_unwrap(
+        &mut self,
+        program: &vmir::Program,
+        elem: Type,
+        opt: egg::Id,
+    ) -> egg::Id {
         let inst = program.option_instances.get(&elem).copied().unwrap();
-        self.add_func_app_id(inst.value, elem, Box::new([opt]))
+        // `value` = field 0 of `Some` (variant 0) of the `Option[elem]` ADT.
+        let value_id = self.registry.proj(inst.adt_id, 0, 0);
+        self.add_func_app_id(value_id, elem, Box::new([opt]))
     }
 
     /// The boolean `0 < perm` (a permission is positive). Lifts a permission

@@ -16,7 +16,7 @@ pub use ty::Type;
 pub use heap::{Assign, HeapInst, HeapVal, Sign};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
-pub use adt::{Adt, AdtConstructor};
+pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
 pub use function::{Bound, Function, FunctionCall, Location};
@@ -41,13 +41,12 @@ unsafe impl Key for MemberId {
     }
 }
 
+/// The monomorphic `Option[T]` ADT declaration id for one element type. The
+/// constructor/projection/tag ids are minted by the verifier (`verify::mono`),
+/// keyed by this `adt_id`, so only the declaration id is recorded here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OptionInstance {
     pub adt_id: MemberId,
-    pub some: MemberId,
-    pub none: MemberId,
-    pub value: MemberId,
-    pub tag_fn: MemberId,
 }
 
 #[derive(Debug, Clone)]

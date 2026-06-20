@@ -25,26 +25,16 @@ pub struct AdtMeta {
 /// projections must also reduce).
 pub fn derive_adt_meta(program: &Program) -> AdtMeta {
     let mut meta = AdtMeta::default();
+    // ADT constructor/projection/tag reductions are owned by `verify::mono`
+    // (verifier-minted ids). Here we derive only predicate-snapshot projections
+    // (single-constructor ADTs whose accessors are real declarations).
     for decl in &program.decls {
-        match decl {
-            Declaration::Adt(adt) => {
-                let mut ctor_tags = HashMap::new();
-                for c in &adt.constructors {
-                    ctor_tags.insert(c.ctor_fn, c.tag);
-                    for (i, &proj) in c.projections.iter().enumerate() {
-                        meta.dtors.insert(proj, (c.ctor_fn, i));
-                    }
-                }
-                meta.tag_fns.insert(adt.tag_fn, ctor_tags);
+        if let Declaration::Resource(r) = decl
+            && let Some(snap) = &r.snapshot
+        {
+            for (i, &proj) in snap.projs.iter().enumerate() {
+                meta.dtors.insert(proj, (snap.cons, i));
             }
-            Declaration::Resource(r) => {
-                if let Some(snap) = &r.snapshot {
-                    for (i, &proj) in snap.projs.iter().enumerate() {
-                        meta.dtors.insert(proj, (snap.cons, i));
-                    }
-                }
-            }
-            _ => {}
         }
     }
     meta

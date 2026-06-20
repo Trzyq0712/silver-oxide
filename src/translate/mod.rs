@@ -97,8 +97,6 @@ pub(crate) struct Builder<'a> {
     pub method_requires: HashMap<Spur, vmir::MemberId>,
     /// Maps a method's `Spur` to its `@ensures` Resource MemberId (if any).
     pub method_ensures: HashMap<Spur, vmir::MemberId>,
-    /// Maps an ADT's `Spur` to its synthesized `@tag` Function MemberId.
-    pub adt_tag_fn: HashMap<Spur, vmir::MemberId>,
     /// Maps a constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
     /// Maps a destructor's `Spur` to the semantic `(adt id, variant, field)` it
@@ -120,7 +118,6 @@ impl<'a> Builder<'a> {
             field_addr: HashMap::new(),
             method_requires: HashMap::new(),
             method_ensures: HashMap::new(),
-            adt_tag_fn: HashMap::new(),
             ctor_tag: HashMap::new(),
             dtor_sem: HashMap::new(),
             option_instances: HashMap::new(),
@@ -163,26 +160,16 @@ impl<'a> Builder<'a> {
         let mut entries: Vec<_> = globals.symbol_table.iter().map(|(s, m)| (*s, *m)).collect();
         entries.sort_by_key(|(_, m)| usize::from(*m));
 
-        // Pass 1: ADTs and their `@tag` functions.
+        // Pass 1: ADTs (semantic — no synthetic `@tag` function; the verifier
+        // mints its own ids and reductions, see `verify::mono`).
         for (spur, gmid) in &entries {
             if let GlobalSignature::Adt(_) = &globals.signatures[*gmid] {
                 let name = interner.resolve(spur).to_string();
                 let adt_id = self.fresh_decl(&name);
-                let tag_id = self.fresh_decl(&format!("{name}@tag"));
-                self.set_decl(
-                    tag_id,
-                    vmir::Declaration::Function(vmir::Function {
-                        params: vec![vmir::Type::Ref],
-                        ret: vmir::Type::Int,
-                        body: None,
-                    }),
-                );
-                self.adt_tag_fn.insert(*spur, tag_id);
                 self.set_decl(
                     adt_id,
                     vmir::Declaration::Adt(vmir::Adt {
-                        tag_fn: tag_id,
-                        constructors: Vec::new(),
+                        variants: Vec::new(),
                     }),
                 );
                 self.name_map.insert(*spur, adt_id);
@@ -223,53 +210,35 @@ impl<'a> Builder<'a> {
                     self.name_map.insert(*spur, id);
                     self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
                     let adt_id = self.name_map[&sig.adt];
+                    let field_types: Vec<vmir::Type> = sig.params.iter().map(lower_type).collect();
                     if let Some(vmir::Declaration::Adt(adt)) =
                         self.decls[usize::from(adt_id)].as_mut()
                     {
-                        adt.constructors.push(vmir::AdtConstructor {
-                            ctor_fn: id,
-                            tag: sig.tag,
-                            projections: Vec::new(),
-                        });
+                        if adt.variants.len() <= sig.tag {
+                            adt.variants.resize(
+                                sig.tag + 1,
+                                vmir::AdtVariant {
+                                    field_types: Vec::new(),
+                                },
+                            );
+                        }
+                        adt.variants[sig.tag] = vmir::AdtVariant { field_types };
                     }
                 }
                 _ => {}
             }
         }
 
-        // Pass 3: destructor accessor functions (constructors are now in the
-        // name map). One accessor per destructor name; `accessor(ctor(..))`
-        // projects the corresponding field.
+        // Pass 3: record destructor semantics `(adt, variant, field)` for use
+        // sites (`PureInst::AdtProj`). No accessor declarations are emitted —
+        // the verifier mints projection ids (see `verify::mono`).
         let mut dtors: Vec<_> = globals.dtor_by_name.iter().collect();
         dtors.sort_by_key(|(s, _)| interner.resolve(s).to_string());
         for (dtor_spur, info) in dtors {
-            let adt_name = interner.resolve(&info.adt);
-            let dtor_name = interner.resolve(dtor_spur);
-            let id = self.fresh_decl(&format!("{adt_name}@{dtor_name}"));
-            self.set_decl(
-                id,
-                vmir::Declaration::Function(vmir::Function {
-                    params: vec![vmir::Type::Ref],
-                    ret: lower_type(&info.ty),
-                    body: None,
-                }),
-            );
-            let ctor_id = self.name_map[&info.ctor];
             let adt_id = self.name_map[&info.adt];
             let variant = self.ctor_tag[&info.ctor].1;
             self.dtor_sem
                 .insert(*dtor_spur, (adt_id, variant, info.index));
-            if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
-                let ctor = adt
-                    .constructors
-                    .iter_mut()
-                    .find(|c| c.ctor_fn == ctor_id)
-                    .unwrap();
-                if ctor.projections.len() <= info.index {
-                    ctor.projections.resize(info.index + 1, vmir::MemberId(0));
-                }
-                ctor.projections[info.index] = id;
-            }
         }
     }
 
@@ -305,69 +274,25 @@ impl<'a> Builder<'a> {
 
         let type_name = format!("T{}", self.option_instances.len());
         let adt_id = self.fresh_decl(&format!("Option[{type_name}]"));
-        let some = self.fresh_decl(&format!("Some[{type_name}]"));
-        let none = self.fresh_decl(&format!("None[{type_name}]"));
-        let value = self.fresh_decl(&format!("Option@value[{type_name}]"));
-        let tag_fn = self.fresh_decl(&format!("Option@tag[{type_name}]"));
 
-        self.set_decl(
-            tag_fn,
-            vmir::Declaration::Function(vmir::Function {
-                params: vec![vmir::Type::domain(adt_id)],
-                ret: vmir::Type::Int,
-                body: None,
-            }),
-        );
-        self.set_decl(
-            some,
-            vmir::Declaration::Function(vmir::Function {
-                params: vec![ty.clone()],
-                ret: vmir::Type::domain(adt_id),
-                body: None,
-            }),
-        );
-        self.set_decl(
-            none,
-            vmir::Declaration::Function(vmir::Function {
-                params: vec![],
-                ret: vmir::Type::domain(adt_id),
-                body: None,
-            }),
-        );
-        self.set_decl(
-            value,
-            vmir::Declaration::Function(vmir::Function {
-                params: vec![vmir::Type::domain(adt_id)],
-                ret: ty.clone(),
-                body: None,
-            }),
-        );
+        // A semantic two-variant ADT: `Some(elem)` (variant 0), `None` (variant
+        // 1). The verifier mints the constructor/projection/tag ids and their
+        // reductions (see `verify::mono`); no accessor declarations are emitted.
         self.set_decl(
             adt_id,
             vmir::Declaration::Adt(vmir::Adt {
-                tag_fn,
-                constructors: vec![
-                    vmir::AdtConstructor {
-                        ctor_fn: some,
-                        tag: 0,
-                        projections: vec![value],
+                variants: vec![
+                    vmir::AdtVariant {
+                        field_types: vec![ty.clone()],
                     },
-                    vmir::AdtConstructor {
-                        ctor_fn: none,
-                        tag: 1,
-                        projections: vec![],
+                    vmir::AdtVariant {
+                        field_types: vec![],
                     },
                 ],
             }),
         );
 
-        let inst = vmir::OptionInstance {
-            adt_id,
-            some,
-            none,
-            value,
-            tag_fn,
-        };
+        let inst = vmir::OptionInstance { adt_id };
         self.option_instances.insert(ty.clone(), inst);
         inst
     }
