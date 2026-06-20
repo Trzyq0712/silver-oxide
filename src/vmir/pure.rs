@@ -58,28 +58,31 @@ pub enum PureInst {
     /// A location application `loc f(args)` producing an address (`Addr<ret>`).
     /// The only producer of address values; never an operand to computation.
     Location(crate::vmir::MemberId, Vec<Val>),
-    /// Construct ADT value: variant `variant` of ADT `adt` over `args`. The ADT
-    /// is named by its (possibly generic) declaration `MemberId`; the verifier
-    /// monomorphizes by the argument types. Replaces a synthetic-constructor
-    /// `FunctionCall`.
+    /// Construct ADT value: variant `variant` of the ADT `adt` instantiated at
+    /// `type_args`, over `args`. The ADT is named by its (possibly generic)
+    /// declaration `MemberId`; `type_args` is its monomorphization (empty for a
+    /// non-generic ADT). Replaces a synthetic-constructor `FunctionCall`.
     AdtCons {
         adt: crate::vmir::MemberId,
+        type_args: Vec<crate::vmir::Type>,
         variant: usize,
         args: Vec<Val>,
     },
-    /// Project field `field` of variant `variant` of ADT `adt` from `base`
-    /// (`field`-th constructor argument). Replaces a synthetic-destructor
-    /// `FunctionCall`.
+    /// Project field `field` of variant `variant` of the ADT `adt` instantiated
+    /// at `type_args`, from `base` (`field`-th constructor argument). Replaces a
+    /// synthetic-destructor `FunctionCall`.
     AdtProj {
         adt: crate::vmir::MemberId,
+        type_args: Vec<crate::vmir::Type>,
         variant: usize,
         field: usize,
         base: Val,
     },
-    /// The discriminator tag (variant index) of `base : adt`. Replaces a
-    /// synthetic `@tag` `FunctionCall`.
+    /// The discriminator tag (variant index) of `base : adt[type_args]`.
+    /// Replaces a synthetic `@tag` `FunctionCall`.
     AdtTag {
         adt: crate::vmir::MemberId,
+        type_args: Vec<crate::vmir::Type>,
         base: Val,
     },
 }
@@ -161,7 +164,9 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 }
                 write!(f, ")")
             }
-            PureInst::AdtCons { adt, variant, args } => {
+            PureInst::AdtCons {
+                adt, variant, args, ..
+            } => {
                 write!(f, "{}#{variant}(", self.interner.resolve(adt))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -176,12 +181,13 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 variant,
                 field,
                 base,
+                ..
             } => write!(
                 f,
                 "{}#{variant}.{field}({base})",
                 self.interner.resolve(adt)
             ),
-            PureInst::AdtTag { adt, base } => {
+            PureInst::AdtTag { adt, base, .. } => {
                 write!(f, "tag[{}]({base})", self.interner.resolve(adt))
             }
         }

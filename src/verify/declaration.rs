@@ -244,36 +244,36 @@ fn eval_pure_inst(
         // which the cons/proj/tag reductions fire. The constructor's type-args
         // are its result type's; projection/tag over non-generic user ADTs use
         // the empty argument tuple.
-        PureInst::AdtCons { adt, variant, args } => {
-            let type_args = adt_type_args(ty);
-            let cons = ctx.registry.cons(*adt, &type_args, *variant);
+        PureInst::AdtCons {
+            adt,
+            type_args,
+            variant,
+            args,
+        } => {
+            let cons = ctx.registry.cons(*adt, type_args, *variant);
             let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
             ctx.add_func_app_id(cons, ty.clone(), args.into())
         }
         PureInst::AdtProj {
             adt,
+            type_args,
             variant,
             field,
             base,
         } => {
-            let proj = ctx.registry.proj(*adt, &[], *variant, *field);
+            let proj = ctx.registry.proj(*adt, type_args, *variant, *field);
             let base = state.get_val(ctx, base);
             ctx.add_func_app_id(proj, ty.clone(), Box::new([base]))
         }
-        PureInst::AdtTag { adt, base } => {
-            let tag = ctx.registry.tag(*adt, &[]);
+        PureInst::AdtTag {
+            adt,
+            type_args,
+            base,
+        } => {
+            let tag = ctx.registry.tag(*adt, type_args);
             let base = state.get_val(ctx, base);
             ctx.add_func_app_id(tag, Type::Int, Box::new([base]))
         }
-    }
-}
-
-/// The type arguments of an ADT-typed value (`Domain(_, args)`), else empty —
-/// the monomorphization key for a constructor.
-fn adt_type_args(ty: &Type) -> Vec<Type> {
-    match ty {
-        Type::Domain(_, args) => args.to_vec(),
-        _ => Vec::new(),
     }
 }
 

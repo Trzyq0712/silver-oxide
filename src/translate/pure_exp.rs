@@ -265,7 +265,16 @@ pub(crate) fn lower<Ext: PureExt>(
             // `FunctionCall` to the constructor's synthetic declaration.
             if let Some(&(adt_spur, variant)) = b.ctor_tag.get(&call.name.0) {
                 let adt = b.name_map[&adt_spur];
-                return Ok(sink.emit_pure(ty, PureInst::AdtCons { adt, variant, args }));
+                let type_args = adt_type_args(&exp.ty);
+                return Ok(sink.emit_pure(
+                    ty,
+                    PureInst::AdtCons {
+                        adt,
+                        type_args,
+                        variant,
+                        args,
+                    },
+                ));
             }
             let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
@@ -290,10 +299,12 @@ pub(crate) fn lower<Ext: PureExt>(
             let &(adt, variant, field) = b.dtor_sem.get(&field.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
             })?;
+            let type_args = adt_type_args(&base.ty);
             Ok(sink.emit_pure(
                 ty,
                 PureInst::AdtProj {
                     adt,
+                    type_args,
                     variant,
                     field,
                     base: base_v,
@@ -308,7 +319,15 @@ pub(crate) fn lower<Ext: PureExt>(
                 TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
-            let tag_call = sink.emit_pure(vmir::Type::Int, PureInst::AdtTag { adt, base: base_v });
+            let type_args = adt_type_args(&base.ty);
+            let tag_call = sink.emit_pure(
+                vmir::Type::Int,
+                PureInst::AdtTag {
+                    adt,
+                    type_args,
+                    base: base_v,
+                },
+            );
             let idx = Val::Literal(Literal::Int(num::BigInt::from(tag)));
             Ok(sink.emit_pure(
                 vmir::Type::Bool,
@@ -316,6 +335,16 @@ pub(crate) fn lower<Ext: PureExt>(
             ))
         }
         P::Ext(ext) => Ext::lower_ext(b, env, sink, hctx, ty, ext),
+    }
+}
+
+/// The type arguments of an ADT-typed expression (`Domain(_, args)`), lowered;
+/// empty for a non-generic ADT. The monomorphization key carried on the
+/// semantic ADT nodes.
+fn adt_type_args(ty: &typed::Type) -> Vec<vmir::Type> {
+    match ty {
+        typed::Type::Domain(_, args) => args.iter().map(lower_type).collect(),
+        _ => Vec::new(),
     }
 }
 
