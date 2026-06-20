@@ -22,7 +22,6 @@ pub enum VerifyError {
     /// fails).
     RefuteFailed,
     InsufficientPermission,
-    AbstractResourceCall,
     /// A resource's side condition (e.g. `acc` permission ≥ 0, division divisor
     /// ≠ 0) could not be discharged. Carries a human-readable description.
     SideCondition(&'static str),
@@ -46,7 +45,6 @@ impl std::fmt::Display for VerifyError {
             Self::AssertionFailed => write!(f, "assertion failed"),
             Self::RefuteFailed => write!(f, "refuted expression is actually provable"),
             Self::InsufficientPermission => write!(f, "insufficient permission"),
-            Self::AbstractResourceCall => write!(f, "call to abstract resource"),
             Self::SideCondition(what) => write!(f, "side condition may not hold: {what}"),
             Self::Unimplemented(what) => write!(f, "unimplemented: {what}"),
             Self::DependencyFailed => {
@@ -444,7 +442,9 @@ fn heap_union(
 ) -> Heap {
     let mut out = h1.clone();
     let addr = ctx.egraph.find(addr);
-    let existing = out.entries().find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
+    let existing = out
+        .entries()
+        .find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
     if let Some(existing) = existing {
         let merged = merge_chunks(
             ctx,
@@ -472,7 +472,9 @@ fn heap_subtract(
 ) -> Result<Heap, VerifyError> {
     let mut out = h1.clone();
     let addr = ctx.egraph.find(addr);
-    let existing = out.entries().find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
+    let existing = out
+        .entries()
+        .find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
     let Some(existing) = existing else {
         return Err(VerifyError::InsufficientPermission);
     };
@@ -492,7 +494,10 @@ fn heap_subtract(
     let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [remainder, zero]));
     if ctx.prove_under_pc(eq, pc_lits) {
         // Find the actual key used in `out` to remove it
-        let key = out.entries().find_map(|(k, _)| (ctx.egraph.find(k) == addr).then(|| k)).unwrap();
+        let key = out
+            .entries()
+            .find_map(|(k, _)| (ctx.egraph.find(k) == addr).then(|| k))
+            .unwrap();
         out = out.without_chunk(key);
     } else {
         out = out.with_chunk(addr, Chunk::new(remainder, existing.value));
@@ -607,7 +612,7 @@ fn eval_resource_call(
         panic!("ResourceCall targets non-Resource declaration");
     };
     if r.body.is_none() {
-        return Err(VerifyError::AbstractResourceCall);
+        panic!("call to abstract resource");
     }
     let cert = certs
         .get(&call.resource)
@@ -680,9 +685,9 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let sd = r.snapshot.as_ref().ok_or(
-                VerifyError::Unimplemented("fold of non-flat/abstract predicate"),
-            )?;
+            let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
+                "fold of non-flat/abstract predicate",
+            ))?;
             let (snap_cons, addr_fn) = (sd.cons, sd.addr_fn);
             let projs = sd.projs.clone();
             let cert = certs
@@ -701,7 +706,9 @@ fn eval_method_inst(
                 let p = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 let v = base_h
                     .entries()
-                    .find_map(|(k, c)| (ctx.egraph.find(k) == ctx.egraph.find(addr)).then(|| c.value))
+                    .find_map(|(k, c)| {
+                        (ctx.egraph.find(k) == ctx.egraph.find(addr)).then(|| c.value)
+                    })
                     .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
                 out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
                 let elem = decl_ret_ty(program, projs[i]);
@@ -728,9 +735,9 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let sd = r.snapshot.as_ref().ok_or(
-                VerifyError::Unimplemented("unfold of non-flat/abstract predicate"),
-            )?;
+            let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
+                "unfold of non-flat/abstract predicate",
+            ))?;
             let addr_fn = sd.addr_fn;
             let projs = sd.projs.clone();
             let cert = certs
@@ -762,7 +769,8 @@ fn eval_method_inst(
                 // snapshot tower), and leaves it uninterpreted for an opaque
                 // snapshot. `unwrap` then peels the `Option` to the field value.
                 let elem = decl_ret_ty(program, projs[i]);
-                let opt_ty = vmir::Type::domain(program.option_instances.get(&elem).unwrap().adt_id);
+                let opt_ty =
+                    vmir::Type::domain(program.option_instances.get(&elem).unwrap().adt_id);
                 let opt = ctx.add_func_app_id(projs[i], opt_ty, Box::new([s]));
                 let pv = ctx.option_unwrap(program, elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
@@ -1047,7 +1055,11 @@ mod tests {
     use crate::verify::lang::Symbolic;
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        VerifyContext::new(interner, &crate::verify::meta::AdtMeta::default(), Default::default())
+        VerifyContext::new(
+            interner,
+            &crate::verify::meta::AdtMeta::default(),
+            Default::default(),
+        )
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1073,7 +1085,11 @@ mod tests {
                 arity: 2,
             },
         )]);
-        let mut ctx = VerifyContext::new(&interner, &crate::verify::meta::AdtMeta::default(), locations);
+        let mut ctx = VerifyContext::new(
+            &interner,
+            &crate::verify::meta::AdtMeta::default(),
+            locations,
+        );
 
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
@@ -1190,7 +1206,13 @@ mod tests {
         let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[(false_lit, Polarity::Positive)]);
+        let merged = heap_union(
+            &mut ctx,
+            &h1,
+            a,
+            Chunk::new(p1, v1),
+            &[(false_lit, Polarity::Positive)],
+        );
         let chunk = merged
             .chunk(ctx.egraph.find(a))
             .expect("merged chunk missing");
@@ -1216,7 +1238,13 @@ mod tests {
         let true_lit = ctx.add(Symbolic::Lit(Literal::Bool(true)));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[(true_lit, Polarity::Positive)]);
+        let merged = heap_union(
+            &mut ctx,
+            &h1,
+            a,
+            Chunk::new(p1, v1),
+            &[(true_lit, Polarity::Positive)],
+        );
         let _chunk = merged
             .chunk(ctx.egraph.find(a))
             .expect("merged chunk missing");
@@ -1328,7 +1356,8 @@ mod tests {
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let result = heap_subtract(&mut ctx, &h1, b, Chunk::new(p1, v2), &[]).expect("subtract should succeed");
+        let result = heap_subtract(&mut ctx, &h1, b, Chunk::new(p1, v2), &[])
+            .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         let chunk = result.chunk(canon).expect("result chunk missing");
@@ -1349,7 +1378,8 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let result = heap_subtract(&mut ctx, &h1, a, Chunk::new(p1, v2), &[]).expect("subtract should succeed");
+        let result = heap_subtract(&mut ctx, &h1, a, Chunk::new(p1, v2), &[])
+            .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         assert!(
