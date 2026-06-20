@@ -193,19 +193,10 @@ impl<'a> Builder<'a> {
                     self.name_map.insert(*spur, id);
                 }
                 GlobalSignature::AdtConstructor(sig) => {
-                    let name = interner.resolve(spur).to_string();
-                    let id = self.fresh_decl(&name);
-                    let params = sig.params.iter().map(lower_type).collect();
-                    let ret = lower_type(&sig.ret);
-                    self.set_decl(
-                        id,
-                        vmir::Declaration::Function(vmir::Function {
-                            params,
-                            ret,
-                            body: None,
-                        }),
-                    );
-                    self.name_map.insert(*spur, id);
+                    // No declaration is emitted for a constructor: it lowers to a
+                    // semantic `AdtCons` node, and the verifier mints its id.
+                    // Only the `(adt, tag)` mapping and the ADT's variant shape
+                    // are recorded.
                     self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
                     let adt_id = self.name_map[&sig.adt];
                     let field_types: Vec<vmir::Type> = sig.params.iter().map(lower_type).collect();
