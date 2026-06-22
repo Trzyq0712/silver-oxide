@@ -4,6 +4,7 @@ mod domain;
 mod function;
 mod heap;
 mod inst;
+mod location;
 mod method;
 mod pure;
 mod resource;
@@ -19,8 +20,9 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
-pub use function::{Bound, Function, FunctionCall, Location};
+pub use function::{Function, FunctionCall};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
+pub use location::{Bound, Location};
 pub use method::Method;
 pub use resource::{Precond, Resource, ResourceBody, ResourceCall};
 
