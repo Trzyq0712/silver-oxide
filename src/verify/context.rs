@@ -305,32 +305,40 @@ impl<'a> VerifyContext<'a> {
         (delta, bool_id)
     }
 
-    /// Transplant a predicate cert's footprint into this e-graph for `args`,
-    /// returning the ordered `(addr, perm)` per slot (cert.delta order). Used by
-    /// `fold`/`unfold`; the caller supplies actual values separately.
-    pub(crate) fn graft_footprint(
-        &mut self,
+    /// Seed a footprint-graft substitution with the call's `args` bound to the
+    /// cert's formal params (keyed in the cert's id space). `fold`/`unfold` grow
+    /// this map slot-by-slot with each slot's actual value (see
+    /// [`graft_footprint_slot`](Self::graft_footprint_slot)) so that
+    /// value-dependent addresses — e.g. an inner predicate `P(this.f)` whose
+    /// argument is a field read — resolve against the real field values.
+    pub(crate) fn footprint_param_subst(
+        &self,
         cert: &ResourceCertificate,
         args: &[Id],
-    ) -> Vec<(Id, Id)> {
+    ) -> HashMap<Id, Id> {
         let mut subst: HashMap<Id, Id> = HashMap::new();
         for (p, a) in cert.params.iter().zip(args) {
             subst.insert(cert.egraph.find(*p), *a);
         }
+        subst
+    }
+
+    /// Transplant one footprint slot's `(addr, perm)` into this e-graph under
+    /// `subst` (the call's params plus any already-resolved earlier-slot values).
+    /// The caller binds `cert.egraph.find(slot.value) -> actual` after reading the
+    /// slot, so a later slot's value-dependent address resolves correctly.
+    pub(crate) fn graft_footprint_slot(
+        &mut self,
+        cert: &ResourceCertificate,
+        addr: Id,
+        perm: Id,
+        subst: &HashMap<Id, Id>,
+    ) -> (Id, Id) {
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        // Layout view: one slot per syntactic acc, in program order.
-        let out: Vec<(Id, Id)> = cert
-            .footprint
-            .iter()
-            .map(|&(addr, perm, _)| {
-                (
-                    transplant(self, cert, addr, &subst, &mut memo),
-                    transplant(self, cert, perm, &subst, &mut memo),
-                )
-            })
-            .collect();
+        let a = transplant(self, cert, addr, subst, &mut memo);
+        let p = transplant(self, cert, perm, subst, &mut memo);
         self.egraph.rebuild();
-        out
+        (a, p)
     }
 
     /// Transplant a predicate cert's body boolean for `args`, substituting each

@@ -501,6 +501,17 @@ fn heap_subtract(
         .entries()
         .find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
     let Some(existing) = existing else {
+        // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
+        // conditional footprint slot whose guard is false — a nested predicate
+        // `b ==> P(..)` with `b` false) is a no-op, so it need not be held.
+        let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+        let pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, chunk2.perm]));
+        let false_ = ctx.false_();
+        let true_ = ctx.true_();
+        let nonpos = ctx.add(Symbolic::Ite([pos, false_, true_]));
+        if ctx.prove_under_pc(nonpos, pc_lits) {
+            return Ok(out);
+        }
         return Err(VerifyError::InsufficientPermission);
     };
 
@@ -722,28 +733,33 @@ fn eval_method_inst(
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-            let fp = ctx.graft_footprint(cert, &args);
-            if fp.len() != field_types.len() {
+            if cert.footprint.len() != field_types.len() {
                 return Err(VerifyError::Unimplemented(
                     "predicate footprint shape mismatch",
                 ));
             }
             let mut out = base_h.clone();
-            let mut values = Vec::with_capacity(fp.len());
-            let mut members = Vec::with_capacity(fp.len());
+            let mut values = Vec::with_capacity(cert.footprint.len());
+            let mut members = Vec::with_capacity(cert.footprint.len());
 
-            for (i, &(addr, bperm)) in fp.iter().enumerate() {
+            // Grow `subst` slot-by-slot so a value-dependent address (e.g. an
+            // inner predicate `P(this.next)`) resolves against the actual field
+            // value read for an earlier slot.
+            let mut subst = ctx.footprint_param_subst(cert, &args);
+            for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
+                let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
                 let p = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 let v = base_h
                     .entries()
                     .find_map(|(k, c)| {
                         (ctx.egraph.find(k) == ctx.egraph.find(addr)).then(|| c.value)
                     })
-                    .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
+                    .unwrap_or_else(|| ctx.fresh_symbolic_value(field_types[i].clone()));
                 out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
                 let elem = field_types[i].clone();
                 let present = ctx.perm_positive(bperm);
                 members.push(ctx.option_member(elem, present, v));
+                subst.insert(cert.egraph.find(c_val), v);
                 values.push(v);
             }
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);
@@ -788,14 +804,18 @@ fn eval_method_inst(
                 .ok_or(VerifyError::InsufficientPermission)?;
             let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
 
-            let fp = ctx.graft_footprint(cert, &args);
-            if fp.len() != field_types.len() {
+            if cert.footprint.len() != field_types.len() {
                 return Err(VerifyError::Unimplemented(
                     "predicate footprint shape mismatch",
                 ));
             }
-            let mut values = Vec::with_capacity(fp.len());
-            for (i, &(addr, bperm)) in fp.iter().enumerate() {
+            let mut values = Vec::with_capacity(cert.footprint.len());
+            // As in fold, grow `subst` with each recovered slot value so a
+            // value-dependent address (an inner predicate `P(this.next)`) resolves
+            // against the projected field value.
+            let mut subst = ctx.footprint_param_subst(cert, &args);
+            for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
+                let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
                 // `proj_i(s)` recovers the optional snapshot member; `reduce()`
                 // collapses it to the constructor's i-th member when `s` is a
                 // concrete `cons` (so repeated fold/unfold doesn't grow the
@@ -808,6 +828,7 @@ fn eval_method_inst(
                 let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
+                subst.insert(cert.egraph.find(c_val), pv);
                 values.push(pv);
             }
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);

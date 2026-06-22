@@ -1125,3 +1125,161 @@ method m(x: Ref)
         "field write with no permission held must fail"
     );
 }
+
+// ============================================================================
+// Nested & recursive predicates (fold & unfold)
+//
+// A predicate whose body holds another predicate instance — nested
+// (`Outer{ Inner(x) }`) or recursive (`List{ .. List(this.next) }`) — is folded
+// by consuming the already-held inner chunk as one opaque footprint slot (its
+// value = the inner predicate's snapshot). Folding is NOT recursive: the inner
+// instance must already be folded, and is never expanded here. So a
+// nested-predicate slot is structurally identical to a field slot, and
+// recursion works for free (the self-referential snapshot type is opaque).
+// ============================================================================
+
+/// A recursive linked-list predicate lowers through the whole pipeline without
+/// error.
+#[test]
+fn recursive_predicate_lowers() {
+    let input = r#"
+field val: Int
+field next: Ref
+predicate List(this: Ref) {
+  acc(this.val, write) && acc(this.next, write) &&
+  (this.next != null ==> List(this.next))
+}
+"#;
+    // Must not panic / error during parse → typecheck → translate.
+    let _ = lower(input);
+}
+
+/// Base case: a recursive `List` whose tail is `null` has its inner-list slot
+/// absent (`None`), so fold/unfold round-trips the two fields.
+#[test]
+fn recursive_predicate_base_case_roundtrip() {
+    let input = r#"
+field val: Int
+field next: Ref
+predicate List(this: Ref) {
+  acc(this.val, write) && acc(this.next, write) &&
+  (this.next != null ==> List(this.next))
+}
+method m(this: Ref)
+  requires acc(this.val, write) && acc(this.next, write) && this.next == null
+{
+  this.val := 5
+  fold acc(List(this), write)
+  unfold acc(List(this), write)
+  assert this.val == 5
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "base-case List fold/unfold round-trip should preserve this.val"
+    );
+}
+
+/// Unfolding a held recursive `List(this)` opens it back into its footprint
+/// (two fields + the conditional inner list), so the fields become readable.
+#[test]
+fn recursive_predicate_unfold_exposes_fields() {
+    let input = r#"
+field val: Int
+field next: Ref
+predicate List(this: Ref) {
+  acc(this.val, write) && acc(this.next, write) &&
+  (this.next != null ==> List(this.next))
+}
+method m(this: Ref)
+  requires acc(List(this), write)
+{
+  unfold acc(List(this), write)
+  this.val := 7
+  assert this.val == 7
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "unfolding List(this) should expose its fields for read/write"
+    );
+}
+
+/// Recursive one level: holding the fields plus the inner `List(this.next)`
+/// (with `next != null`) lets `List(this)` fold — the inner list chunk moves
+/// into the outer predicate.
+#[test]
+fn recursive_predicate_one_level_fold() {
+    let input = r#"
+field val: Int
+field next: Ref
+predicate List(this: Ref) {
+  acc(this.val, write) && acc(this.next, write) &&
+  (this.next != null ==> List(this.next))
+}
+method m(this: Ref)
+  requires acc(this.val, write) && acc(this.next, write) &&
+           this.next != null && acc(List(this.next), write)
+{
+  fold acc(List(this), write)
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "folding List(this) with a held inner List(this.next) should succeed"
+    );
+}
+
+/// Nested non-recursive: `Outer{ Inner(x) }` round-trips through the held
+/// `Inner(x)` chunk and recovers the inner field after both unfolds.
+#[test]
+fn nested_predicate_fold_unfold_roundtrip() {
+    let input = r#"
+field f: Int
+predicate Inner(x: Ref) { acc(x.f, write) }
+predicate Outer(x: Ref) { Inner(x) }
+method m(x: Ref)
+  requires acc(x.f, write)
+{
+  x.f := 5
+  fold acc(Inner(x), write)
+  fold acc(Outer(x), write)
+  unfold acc(Outer(x), write)
+  unfold acc(Inner(x), write)
+  assert x.f == 5
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "Outer Inner(x) fold/unfold round-trip should recover x.f == 5"
+    );
+}
+
+/// Folding `Outer(x)` consumes the inner `Inner(x)` chunk: unfolding `Inner(x)`
+/// directly afterwards must fail for lack of permission (it moved into `Outer`).
+#[test]
+fn nested_predicate_fold_consumes_inner() {
+    let input = r#"
+field f: Int
+predicate Inner(x: Ref) { acc(x.f, write) }
+predicate Outer(x: Ref) { Inner(x) }
+method m(x: Ref)
+  requires acc(Inner(x), write)
+{
+  fold acc(Outer(x), write)
+  unfold acc(Inner(x), write)
+}
+"#;
+    let program = lower(input);
+    assert!(
+        matches!(
+            verify_named_method(&program, "m"),
+            Err(ref e) if matches!(e.root_cause(), VerifyError::InsufficientPermission)
+        ),
+        "unfolding Inner(x) after it was folded into Outer(x) must lack permission"
+    );
+}

@@ -303,12 +303,13 @@ impl<'a> Builder<'a> {
             }),
         );
 
-        // A foldable (flat) concrete predicate has a snapshot: a single-variant
-        // ADT (head = the `@snap` Domain) over the footprint field values. The
-        // verifier mints its constructor/projection ids and reductions (see
-        // `verify::mono`); no accessor declarations are emitted here.
+        // A concrete predicate has a snapshot: a single-variant ADT (head = the
+        // `@snap` Domain) over the footprint slot values. The verifier mints its
+        // constructor/projection ids and reductions (see `verify::mono`); no
+        // accessor declarations are emitted here. Only abstract (bodyless)
+        // predicates remain snapshot-less.
         if let Some(body_exp) = &p.body
-            && let Some(types) = self.flat_footprint_types(body_exp)
+            && let Some(types) = self.footprint_types(body_exp)
         {
             let snap_id = self.pred_snap[&p.name.0];
             let addr_id = self.pred_addr[&p.name.0];
@@ -324,21 +325,21 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// The ordered field-types of a **foldable** predicate body: a conjunction
-    /// of `acc(_.f, _)` over fields (with optional pure conjuncts), now also
-    /// through conditionals (`b ==> acc(..)`, `c ? .. : ..`). The conditional's
-    /// guard is *not* captured here — it lives in the resource body's gated
-    /// permission (`perm = b ? p : 0`), which the verifier lifts to the
-    /// snapshot member's `present` discriminant. Returns `None` for nested
-    /// predicates (not foldable yet). The slot order must match the body
-    /// instruction stream, so conditional branches contribute in source order.
-    fn flat_footprint_types(&self, exp: &typed::SpatialExp<!>) -> Option<Vec<vmir::Type>> {
+    /// The ordered slot-types of a foldable predicate body: a conjunction of
+    /// `acc(_, _)` over fields (slot type = field type) and nested predicates
+    /// (slot type = inner `@snap`), with optional pure conjuncts, through
+    /// conditionals (`b ==> acc(..)`, `c ? .. : ..`). The conditional's guard is
+    /// *not* captured here — it lives in the resource body's gated permission
+    /// (`perm = b ? p : 0`), which the verifier lifts to the snapshot member's
+    /// `present` discriminant. The slot order must match the body instruction
+    /// stream, so conditional branches contribute in source order.
+    fn footprint_types(&self, exp: &typed::SpatialExp<!>) -> Option<Vec<vmir::Type>> {
         use typed::ResourceExpKind as R;
         use typed::SpatialExpKind as S;
         match &*exp.0 {
             S::Conj(l, r) => {
-                let mut v = self.flat_footprint_types(l)?;
-                v.extend(self.flat_footprint_types(r)?);
+                let mut v = self.footprint_types(l)?;
+                v.extend(self.footprint_types(r)?);
                 Some(v)
             }
             S::Acc(res, _perm) => match &*res.0 {
@@ -346,16 +347,23 @@ impl<'a> Builder<'a> {
                     let ty = self.globals.resolve(fname.0)?.as_field()?;
                     Some(vec![lower_type(ty)])
                 }
-                R::PredicateCall(_) => None,
+                // A nested predicate is one opaque footprint slot whose value is
+                // the inner predicate's snapshot (treated like a field of type
+                // `Inner@snap`). Fold consumes the held `Inner(args)` chunk; the
+                // inner instance is never expanded here, so recursion is fine.
+                R::PredicateCall(call) => {
+                    let snap = *self.pred_snap.get(&call.name.0)?;
+                    Some(vec![vmir::Type::domain(snap)])
+                }
             },
             S::Pure(_) => Some(vec![]),
             // `b ==> A`: A's slots, with permission gated by `b` in the body.
-            S::Implies(_cond, inner) => self.flat_footprint_types(inner),
+            S::Implies(_cond, inner) => self.footprint_types(inner),
             // `c ? A : B`: A's slots then B's slots (each gated by the branch
             // condition in the body), in source order.
             S::Ternary { then, else_, .. } => {
-                let mut v = self.flat_footprint_types(then)?;
-                v.extend(self.flat_footprint_types(else_)?);
+                let mut v = self.footprint_types(then)?;
+                v.extend(self.footprint_types(else_)?);
                 Some(v)
             }
         }
