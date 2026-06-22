@@ -489,7 +489,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         // Abstract predicate (no body) derives an opaque empty Domain snapshot.
         assert!(matches!(
             pred.derive_snapshot(),
-            Some(vmir::Snapshot::Domain(_))
+            Some(vmir::Snapshot::Abstract(_))
         ));
 
         // Method contracts.

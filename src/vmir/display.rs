@@ -51,14 +51,14 @@ impl Program {
             // (self-framed) resource: a concrete one is an `adt` with a single
             // constructor; an abstract one is an opaque empty `domain`.
             match r.derive_snapshot() {
-                Some(Snapshot::Adt(adt)) => {
+                Some(Snapshot::Concrete(adt)) => {
                     let _ = writeln!(
                         out,
                         "adt {name}@snap {}",
                         VmirDisplay::new(&adt, &self.interner)
                     );
                 }
-                Some(Snapshot::Domain(domain)) => {
+                Some(Snapshot::Abstract(domain)) => {
                     let _ = writeln!(
                         out,
                         "domain {name}@snap {}",

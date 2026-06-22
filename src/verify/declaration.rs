@@ -721,7 +721,7 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let Some(vmir::Snapshot::Adt(snap)) = r.derive_snapshot() else {
+            let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
                 return Err(VerifyError::Unimplemented("fold of abstract predicate"));
             };
             let (snap_head, addr_fn) = (call.resource, call.resource);
@@ -783,7 +783,7 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let Some(vmir::Snapshot::Adt(snap)) = r.derive_snapshot() else {
+            let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
                 return Err(VerifyError::Unimplemented("unfold of abstract predicate"));
             };
             let (snap_head, addr_fn) = (call.resource, call.resource);

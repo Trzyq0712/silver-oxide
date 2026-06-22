@@ -70,7 +70,7 @@ impl Resource {
             return None;
         }
         let Some(body) = &self.body else {
-            return Some(Snapshot::Domain(Domain {}));
+            return Some(Snapshot::Abstract(Domain {}));
         };
         let mut val_types: Vec<Type> = self.params.clone();
         let mut field_types = Vec::new();
@@ -89,7 +89,7 @@ impl Resource {
                 _ => {}
             }
         }
-        Some(Snapshot::Adt(Adt {
+        Some(Snapshot::Concrete(Adt {
             variants: vec![AdtVariant { field_types }],
         }))
     }
@@ -101,14 +101,14 @@ impl Resource {
 /// empty [`Domain`]. Never stored in the IR.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Snapshot {
-    Adt(Adt),
-    Domain(Domain),
+    Concrete(Adt),
+    Abstract(Domain),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceBody {
     pub insts: Vec<Inst>,
-    pub res: (crate::vmir::HeapVal, Val),
+    pub res: (HeapVal, Val),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

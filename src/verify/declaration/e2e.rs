@@ -21,10 +21,9 @@ fn lower(input: &str) -> vmir::Program {
     disambiguate(&mut program, &interner, &globals).expect("disambiguation");
     inline_macros(&mut program, &interner).expect("macros");
     let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck");
-    let program = translate::translate(&typed, &interner, &globals).expect("translate");
-    // The verifier injects its builtins (the `Option` ADT) on entry; these
-    // helpers call the verification functions directly, so apply it here too.
-    crate::verify::prelude::with_prelude(&program)
+    // `Option` is a verifier builtin (the mono allocator registers it), not a
+    // program declaration — nothing to inject here.
+    translate::translate(&typed, &interner, &globals).expect("translate")
 }
 
 #[test]

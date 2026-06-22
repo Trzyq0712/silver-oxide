@@ -21,7 +21,6 @@ use std::collections::HashMap;
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{FuncId, Symbolic};
-use crate::verify::prelude::OPTION;
 use crate::verify::rewrite::{proj_rule, tag_rule};
 use crate::vmir::{Declaration, MemberId, Program, Type};
 
@@ -56,6 +55,16 @@ impl Allocator {
     pub fn new(program: &Program) -> Self {
         let mut shapes = HashMap::new();
         let mut head_names = HashMap::new();
+
+        // The builtin `Option` ADT (`vmir::Type::Option`): `Some(T)` (variant 0,
+        // one field) and `None` (variant 1, no fields). It is not a program
+        // declaration, so it gets a synthetic head id one past the last decl; its
+        // values are typed `Type::Option`, never `Type::Domain(option_head, …)`,
+        // so the head id is only ever a mono key (never resolved via the interner).
+        let option_head = MemberId(program.interner.len());
+        shapes.insert(option_head, vec![1, 0]);
+        head_names.insert(option_head, "Option".to_string());
+
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Adt(adt) = decl {
                 shapes.insert(
@@ -67,7 +76,7 @@ impl Allocator {
         }
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Resource(r) = decl
-                && let Some(crate::vmir::Snapshot::Adt(adt)) = r.derive_snapshot()
+                && let Some(crate::vmir::Snapshot::Concrete(adt)) = r.derive_snapshot()
             {
                 // A concrete predicate's snapshot is a single-variant ADT over
                 // the footprint slots, headed by the predicate's own id
@@ -82,7 +91,9 @@ impl Allocator {
             }
         }
         Allocator {
-            next: program.interner.len(),
+            // Mint func ids past the synthetic `Option` head, so neither a plain
+            // function (which reuses its decl index) nor the head id collides.
+            next: program.interner.len() + 1,
             cons: HashMap::new(),
             proj: HashMap::new(),
             tag: HashMap::new(),
@@ -90,7 +101,7 @@ impl Allocator {
             rules: Vec::new(),
             shapes,
             head_names,
-            option_adt: program.interner.get(OPTION),
+            option_adt: Some(option_head),
         }
     }
 
@@ -129,9 +140,9 @@ impl Allocator {
         self.tag[&(adt, args.to_vec())]
     }
 
-    /// The builtin `Option` ADT's declaration id.
+    /// The builtin `Option` ADT's (synthetic) head id.
     pub fn option_adt(&self) -> MemberId {
-        self.option_adt.expect("Option prelude not injected")
+        self.option_adt.expect("builtin Option head not registered")
     }
 
     // ---- Builtin `Option` resolution -------------------------------------
@@ -140,9 +151,9 @@ impl Allocator {
     // coding `cons`/`proj` against `option_adt()`. (Future `Seq`/`Set` follow the
     // same shape.)
 
-    /// `Option[elem]` as a concrete (monomorphic) ADT type.
+    /// `Option[elem]` as a vmir type (the builtin parametric `Type::Option`).
     pub fn option_type(&self, elem: Type) -> Type {
-        Type::Domain(self.option_adt(), Box::new([elem]))
+        Type::Option(Box::new(elem))
     }
 
     /// Constructor id of `Some` (variant 0) of `Option[elem]`.
