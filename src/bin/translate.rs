@@ -1,7 +1,11 @@
 //! Parse a Silver file, typecheck it, lower to VMIR, and print the resulting
 //! `vmir::Program`.
 //!
-//! Usage: `cargo run --bin translate -- cases/foo.vpr`
+//! Usage: `cargo run --bin translate -- cases/foo.vpr [--derived]`
+//!
+//! With `--derived`, also dump each resource's derived members (its address
+//! location and snapshot) — which are *not* stored in plain VMIR but computed on
+//! demand via `Resource::derive_location` / `derive_snapshot`.
 
 use silver_oxide::translate;
 use silver_oxide::viper::{
@@ -11,10 +15,13 @@ use silver_oxide::viper::{
 use std::{error::Error, fs};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let file = std::env::args()
-        .nth(1)
-        .ok_or("usage: translate <file.vpr>")?;
-    let input = fs::read_to_string(&file)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let derived = args.iter().any(|a| a == "--derived");
+    let file = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .ok_or("usage: translate <file.vpr> [--derived]")?;
+    let input = fs::read_to_string(file)?;
 
     let mut program = viper_parser::vpr_program(&input)?;
 
@@ -36,5 +43,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("translation failed: {e:?}"))?;
 
     println!("{}", vmir);
+    if derived {
+        println!("\n; --- derived members ---");
+        print!("{}", vmir.derived_dump());
+    }
     Ok(())
 }

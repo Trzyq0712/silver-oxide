@@ -67,11 +67,17 @@ impl Allocator {
         }
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Resource(r) = decl
-                && let Some(snap) = &r.snapshot
+                && let Some(Declaration::Adt(adt)) = r.derive_snapshot()
             {
-                // A snapshot is a single-variant ADT over the footprint slots,
-                // headed by the predicate's own id (`Type::Snap(id)`).
-                shapes.insert(id, vec![snap.field_types.len()]);
+                // A concrete predicate's snapshot is a single-variant ADT over
+                // the footprint slots, headed by the predicate's own id
+                // (`Type::Snap(id)`). Derived from the body — only the variant
+                // field counts are needed here. (An abstract predicate derives an
+                // opaque Domain, which has no constructor to register.)
+                shapes.insert(
+                    id,
+                    adt.variants.iter().map(|v| v.field_types.len()).collect(),
+                );
                 head_names.insert(id, format!("{}@snap", program.interner.resolve(&id)));
             }
         }

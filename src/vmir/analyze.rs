@@ -161,12 +161,15 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
 }
 
 fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
-    // Resource bodies reference members through `FunctionCall`s (e.g. `@addr`
-    // functions) and `ResourceCall`s.
+    // Resource bodies reference members through `FunctionCall`s and the
+    // resource of a `ResourceCall`/fold/unfold. A `PureInst::Location` is NOT a
+    // dependency: forming an address needs no certificate, and a predicate's
+    // address `LocId` is the predicate's own id, so treating it as a dependency
+    // would make a recursive predicate (`acc(P(this.next))` in `P`'s body) a
+    // self-cycle.
     for inst in &body.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::Pure(_, PureInst::Location(m, _)) => out.push(*m),
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
                 out.push(call.resource)
             }
@@ -182,7 +185,6 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
     for inst in &m.insts {
         match &inst.kind {
             InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
-            InstKind::Pure(_, PureInst::Location(m, _)) => out.push(*m),
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
                 out.push(call.resource)
             }
@@ -212,7 +214,6 @@ mod tests {
                 None => Precond::SelfFramed,
             },
             body: None,
-            snapshot: None,
         })
     }
 

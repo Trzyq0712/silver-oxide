@@ -721,11 +721,11 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
-                "fold of non-flat/abstract predicate",
-            ))?;
-            let (snap_head, addr_fn) = (call.resource, sd.addr_fn);
-            let field_types = sd.field_types.clone();
+            let Some(vmir::Declaration::Adt(snap)) = r.derive_snapshot() else {
+                return Err(VerifyError::Unimplemented("fold of abstract predicate"));
+            };
+            let (snap_head, addr_fn) = (call.resource, call.resource);
+            let field_types = snap.variants[0].field_types.clone();
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -733,11 +733,6 @@ fn eval_method_inst(
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-            if cert.footprint.len() != field_types.len() {
-                return Err(VerifyError::Unimplemented(
-                    "predicate footprint shape mismatch",
-                ));
-            }
             let mut out = base_h.clone();
             let mut values = Vec::with_capacity(cert.footprint.len());
             let mut members = Vec::with_capacity(cert.footprint.len());
@@ -784,11 +779,11 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
-                "unfold of non-flat/abstract predicate",
-            ))?;
-            let (snap_head, addr_fn) = (call.resource, sd.addr_fn);
-            let field_types = sd.field_types.clone();
+            let Some(vmir::Declaration::Adt(snap)) = r.derive_snapshot() else {
+                return Err(VerifyError::Unimplemented("unfold of abstract predicate"));
+            };
+            let (snap_head, addr_fn) = (call.resource, call.resource);
+            let field_types = snap.variants[0].field_types.clone();
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -804,11 +799,6 @@ fn eval_method_inst(
                 .ok_or(VerifyError::InsufficientPermission)?;
             let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
 
-            if cert.footprint.len() != field_types.len() {
-                return Err(VerifyError::Unimplemented(
-                    "predicate footprint shape mismatch",
-                ));
-            }
             let mut values = Vec::with_capacity(cert.footprint.len());
             // As in fold, grow `subst` with each recovered slot value so a
             // value-dependent address (an inner predicate `P(this.next)`) resolves
@@ -890,21 +880,28 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
     out
 }
 
-/// Index the program's `Location` declarations for the verifier.
+/// Index the program's location signatures for the verifier: the emitted
+/// `Location` decls (fields) plus the derived address location of every
+/// `Resource` (a predicate's address `LocId` is the predicate's own id; the
+/// signature comes from `Resource::derive_location`, not a decl).
 fn build_locations(program: &vmir::Program) -> HashMap<MemberId, LocationInfo> {
     program
         .decls
         .iter_enumerated()
-        .filter_map(|(id, d)| match d {
-            Declaration::Location(loc) => Some((
+        .filter_map(|(id, d)| {
+            let loc = match d {
+                Declaration::Location(loc) => loc.clone(),
+                Declaration::Resource(r) => r.derive_location(id),
+                _ => return None,
+            };
+            Some((
                 id,
                 LocationInfo {
-                    bound: loc.bound.clone(),
-                    ret: loc.ret.clone(),
+                    bound: loc.bound,
+                    ret: loc.ret,
                     arity: loc.params.len(),
                 },
-            )),
-            _ => None,
+            ))
         })
         .collect()
 }

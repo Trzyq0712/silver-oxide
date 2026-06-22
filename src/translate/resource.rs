@@ -273,16 +273,18 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             field_addr(b, sink, base_val, fname.0)
         }
         R::PredicateCall(call) => {
-            let &addr_fn = b.pred_addr.get(&call.name.0).ok_or_else(|| {
+            // The predicate's address location IS the predicate itself: its id is
+            // the `LocId`; the verifier synthesizes the signature via
+            // `Resource::derive_location`. No `@addr` decl exists.
+            let &pred_id = b.name_map.get(&call.name.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
             })?;
-            let &pred_id = b.name_map.get(&call.name.0).expect("predicate id missing");
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
             let ret_ty = Type::Addr(Box::new(Type::Snap(pred_id)));
-            Ok(sink.emit_pure(ret_ty, PureInst::Location(addr_fn, args)))
+            Ok(sink.emit_pure(ret_ty, PureInst::Location(pred_id, args)))
         }
     }
 }

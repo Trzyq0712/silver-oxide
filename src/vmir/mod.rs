@@ -22,7 +22,7 @@ pub use domain::Domain;
 pub use function::{Bound, Function, FunctionCall, Location};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;
-pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
+pub use resource::{Precond, Resource, ResourceBody, ResourceCall};
 
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};

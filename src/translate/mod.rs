@@ -87,9 +87,7 @@ pub(crate) struct Builder<'a> {
     decls: Vec<Option<vmir::Declaration>>,
     /// Maps Silver `Spur` names to VMIR `MemberId`s.
     pub name_map: HashMap<Spur, vmir::MemberId>,
-    /// Maps a predicate's `Spur` to its `@addr` Function MemberId.
-    pub pred_addr: HashMap<Spur, vmir::MemberId>,
-    /// Maps a field's `Spur` to its `@addr` Function MemberId.
+    /// Maps a field's `Spur` to its address-location MemberId (its bare name).
     pub field_addr: HashMap<Spur, vmir::MemberId>,
     /// Maps a method's `Spur` to its `@requires` Resource MemberId (if any).
     pub method_requires: HashMap<Spur, vmir::MemberId>,
@@ -110,7 +108,6 @@ impl<'a> Builder<'a> {
             vmir_interner: Rodeo::new(),
             decls: Vec::new(),
             name_map: HashMap::new(),
-            pred_addr: HashMap::new(),
             field_addr: HashMap::new(),
             method_requires: HashMap::new(),
             method_ensures: HashMap::new(),
@@ -231,21 +228,12 @@ impl<'a> Builder<'a> {
     fn declare_predicate_accessors(&mut self, p: &typed::Predicate) {
         let pred_name = self.interner.resolve(&p.name.0).to_owned();
         // Reserve the predicate's Resource slot now (filled by `emit_predicate`)
-        // so its id can serve as the snapshot ADT head (`Type::Snap(pred_id)`) and
-        // be referenced by sibling predicates' footprints (self & mutual
-        // recursion).
+        // so its id can serve as the snapshot ADT head (`Type::Snap(pred_id)`),
+        // its address `LocId`, and be referenced by sibling predicates' footprints
+        // (self & mutual recursion). The address location and snapshot are derived
+        // on demand (`Resource::derive_location`/`derive_snapshot`) — not emitted.
         let pred_id = self.fresh_decl(&pred_name);
         self.name_map.insert(p.name.0, pred_id);
-        let addr_id = self.fresh_decl(&format!("{pred_name}@addr"));
-        // A predicate is an unbounded location returning its snapshot.
-        let addr_loc = vmir::Location {
-            params: p.params.iter().map(|p| lower_type(&p.ty)).collect(),
-            ret: vmir::Type::Snap(pred_id),
-            bound: vmir::Bound::Unbounded,
-        };
-        self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
-
-        self.pred_addr.insert(p.name.0, addr_id);
     }
 
     fn declare_field_accessor(&mut self, f: &typed::Field) {
@@ -298,72 +286,9 @@ impl<'a> Builder<'a> {
                 params,
                 precond: vmir::Precond::SelfFramed,
                 body,
-                snapshot: None, // Will be filled below if needed
             }),
         );
-
-        // A concrete predicate has a snapshot: a single-variant ADT (head = the
-        // predicate's own id, i.e. `Type::Snap(pred_id)`) over the footprint slot
-        // values. The verifier mints its constructor/projection ids and reductions
-        // (see `verify::mono`); no accessor declarations are emitted here. Only
-        // abstract (bodyless) predicates remain snapshot-less.
-        if let Some(body_exp) = &p.body
-            && let Some(types) = self.footprint_types(body_exp)
-        {
-            let addr_id = self.pred_addr[&p.name.0];
-            if let Some(vmir::Declaration::Resource(r)) = self.decls[usize::from(pred_id)].as_mut()
-            {
-                r.snapshot = Some(vmir::Snapshot {
-                    addr_fn: addr_id,
-                    field_types: types,
-                });
-            }
-        }
         Ok(())
-    }
-
-    /// The ordered slot-types of a foldable predicate body: a conjunction of
-    /// `acc(_, _)` over fields (slot type = field type) and nested predicates
-    /// (slot type = inner `@snap`), with optional pure conjuncts, through
-    /// conditionals (`b ==> acc(..)`, `c ? .. : ..`). The conditional's guard is
-    /// *not* captured here — it lives in the resource body's gated permission
-    /// (`perm = b ? p : 0`), which the verifier lifts to the snapshot member's
-    /// `present` discriminant. The slot order must match the body instruction
-    /// stream, so conditional branches contribute in source order.
-    fn footprint_types(&self, exp: &typed::SpatialExp<!>) -> Option<Vec<vmir::Type>> {
-        use typed::ResourceExpKind as R;
-        use typed::SpatialExpKind as S;
-        match &*exp.0 {
-            S::Conj(l, r) => {
-                let mut v = self.footprint_types(l)?;
-                v.extend(self.footprint_types(r)?);
-                Some(v)
-            }
-            S::Acc(res, _perm) => match &*res.0 {
-                R::Field(_base, fname) => {
-                    let ty = self.globals.resolve(fname.0)?.as_field()?;
-                    Some(vec![lower_type(ty)])
-                }
-                // A nested predicate is one opaque footprint slot whose value is
-                // the inner predicate's snapshot (treated like a field of type
-                // `Inner@snap`). Fold consumes the held `Inner(args)` chunk; the
-                // inner instance is never expanded here, so recursion is fine.
-                R::PredicateCall(call) => {
-                    let pred_id = *self.name_map.get(&call.name.0)?;
-                    Some(vec![vmir::Type::Snap(pred_id)])
-                }
-            },
-            S::Pure(_) => Some(vec![]),
-            // `b ==> A`: A's slots, with permission gated by `b` in the body.
-            S::Implies(_cond, inner) => self.footprint_types(inner),
-            // `c ? A : B`: A's slots then B's slots (each gated by the branch
-            // condition in the body), in source order.
-            S::Ternary { then, else_, .. } => {
-                let mut v = self.footprint_types(then)?;
-                v.extend(self.footprint_types(else_)?);
-                Some(v)
-            }
-        }
     }
 
     fn emit_method_contracts(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
@@ -399,7 +324,6 @@ impl<'a> Builder<'a> {
                     params,
                     precond: vmir::Precond::SelfFramed,
                     body: Some(body),
-                    snapshot: None,
                 }),
             );
         }
@@ -452,7 +376,6 @@ impl<'a> Builder<'a> {
                     params,
                     precond,
                     body: Some(body),
-                    snapshot: None,
                 }),
             );
         }
@@ -544,22 +467,14 @@ method add(this: Ref, other: Ref) returns (res: Ref)
 "#;
         let p = run(input);
 
-        // No `@snap` decl is emitted; the snapshot type is the derived
-        // `Type::Snap(pred_id)`.
+        // No `@snap`/`@addr` decls are emitted; the snapshot type and address
+        // location are derived from the predicate's own id.
         assert!(p.interner.get("number@snap").is_none());
+        assert!(p.interner.get("number@addr").is_none());
 
         let pred_id = p.interner.get("number").expect("missing number");
 
-        // Auto-emitted `@addr` for the predicate, returning its `Snap` type.
-        let addr_id = p.interner.get("number@addr").expect("missing number@addr");
-        let vmir::Declaration::Location(addr_loc) = &p.decls[addr_id] else {
-            panic!("number@addr must be a Location");
-        };
-        assert_eq!(addr_loc.params, vec![vmir::Type::Ref]);
-        assert_eq!(addr_loc.ret, vmir::Type::Snap(pred_id));
-        assert_eq!(addr_loc.bound, vmir::Bound::Unbounded);
-
-        // Predicate itself is abstract.
+        // Predicate itself is abstract; its address location is derived.
         let vmir::Declaration::Resource(pred) = &p.decls[pred_id] else {
             panic!("number must be a Resource");
         };
@@ -567,6 +482,15 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             pred.body.is_none(),
             "abstract predicate must have body=None"
         );
+        let addr_loc = pred.derive_location(pred_id);
+        assert_eq!(addr_loc.params, vec![vmir::Type::Ref]);
+        assert_eq!(addr_loc.ret, vmir::Type::Snap(pred_id));
+        assert_eq!(addr_loc.bound, vmir::Bound::Unbounded);
+        // Abstract predicate (no body) derives an opaque empty Domain snapshot.
+        assert!(matches!(
+            pred.derive_snapshot(),
+            Some(vmir::Declaration::Domain(_))
+        ));
 
         // Method contracts.
         for name in [
@@ -590,8 +514,9 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             "assign has no precondition; @requires must not exist"
         );
 
-        // The read@requires body must contain a FunctionCall to number@addr
-        // and an Acc on its result, NOT a ResourceCall on number.
+        // The read@requires body must reference the predicate's address
+        // location (`Location(number_id, ..)` — the predicate's own id) and an
+        // Acc on its result, NOT a ResourceCall on number.
         let read_req_id = p.interner.get("read@requires").unwrap();
         let vmir::Declaration::Resource(read_req) = &p.decls[read_req_id] else {
             unreachable!();
@@ -601,15 +526,14 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         let mut saw_acc = false;
         for inst in &body.insts {
             match &inst.kind {
-                vmir::InstKind::Pure(_, vmir::PureInst::Location(m, _)) if *m == addr_id => {
+                vmir::InstKind::Pure(_, vmir::PureInst::Location(m, _)) if *m == pred_id => {
                     saw_addr_call = true;
                 }
                 vmir::InstKind::Heap(vmir::HeapInst::Combine { .. }) => saw_acc = true,
                 _ => {}
             }
         }
-        let _ = pred_id;
-        assert!(saw_addr_call, "read@requires must call number@addr");
+        assert!(saw_addr_call, "read@requires must address number");
         assert!(saw_acc, "read@requires must contain an acc");
 
         // The `add` body's method contracts lower to resource inhale/exhale

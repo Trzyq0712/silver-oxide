@@ -1,33 +1,21 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapVal, Inst, MemberId, Type, Val};
+use crate::vmir::{
+    Adt, AdtVariant, Bound, Declaration, Domain, HeapInst, HeapVal, Inst, InstKind, Location,
+    MemberId, Type, Val,
+};
 use std::fmt::{self, Display, Formatter};
 
 /// A reusable unit of proof.
 ///
-/// A resource computes a heap delta and a boolean condition.
+/// A resource computes a heap delta and a boolean condition. Its address
+/// location and snapshot type are not stored — they are mechanically implied by
+/// the definition and derived on demand (see [`Resource::derive_location`] and
+/// [`Resource::derive_snapshot`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub params: Vec<Type>,
     pub precond: Precond,
     pub body: Option<ResourceBody>,
-    /// Snapshot descriptor for a flat, foldable concrete predicate (`None`
-    /// otherwise). The snapshot is a single-constructor ADT; the verifier
-    /// derives its projection reductions from this (see `verify::meta`) and
-    /// uses it to drive `fold`/`unfold`.
-    pub snapshot: Option<Snapshot>,
-}
-
-/// Snapshot descriptor for a foldable predicate resource. The snapshot is a
-/// single-variant ADT (head = the owning predicate's own Resource id, i.e. its
-/// `Type::Snap` head) packing the footprint slot values in order. The verifier
-/// mints its constructor/projection ids and reductions from this (see
-/// `verify::mono`); no `@snap` declaration is emitted.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Snapshot {
-    /// The resource's `@addr` function (its chunk address).
-    pub addr_fn: MemberId,
-    /// The footprint slot types, in slot order (the single variant's fields).
-    pub field_types: Vec<Type>,
 }
 
 /// A resource's precondition mode.
@@ -49,6 +37,60 @@ impl Resource {
     /// Only self-framed resources may be snapshotted / folded / unfolded.
     pub fn is_self_framed(&self) -> bool {
         matches!(self.precond, Precond::SelfFramed)
+    }
+
+    /// Derive this resource's address location: `params -> Addr<Snap(id)>`,
+    /// unbounded. `id` is the resource's own `MemberId` (its address `LocId` and
+    /// `Type::Snap` head). Not emitted as a declaration — synthesized on demand.
+    pub fn derive_location(&self, id: MemberId) -> Location {
+        Location {
+            params: self.params.clone(),
+            ret: Type::Snap(id),
+            bound: Bound::Unbounded,
+        }
+    }
+
+    /// Derive this resource's snapshot type as a stand-alone declaration:
+    /// - a concrete predicate → an [`Adt`] with a single constructor over the
+    ///   ordered footprint slot types (the snapshot ADT);
+    /// - an abstract (bodyless) predicate → an opaque empty [`Domain`].
+    ///
+    /// `None` for a non self-framed resource (two-state; no foldable snapshot).
+    /// Not stored in the IR — the verifier mints the snapshot's
+    /// constructor/projection ids from this on demand.
+    ///
+    /// Slot types come from the body: only `Pure` insts produce a `Val`, and
+    /// params occupy `Val::Temp(0..n)`, so a `Val -> Type` map is just the params
+    /// followed by each `Pure`'s result type. Every footprint slot is a
+    /// `HeapInst::Combine` whose `loc` is an address of type `Addr<T>`; the slot
+    /// type is `T`.
+    pub fn derive_snapshot(&self) -> Option<Declaration> {
+        if !self.is_self_framed() {
+            return None;
+        }
+        let Some(body) = &self.body else {
+            return Some(Declaration::Domain(Domain {}));
+        };
+        let mut val_types: Vec<Type> = self.params.clone();
+        let mut field_types = Vec::new();
+        for inst in &body.insts {
+            match &inst.kind {
+                InstKind::Pure(ty, _) => val_types.push(ty.clone()),
+                InstKind::Heap(HeapInst::Combine { loc, .. }) => {
+                    let ty = match loc {
+                        Val::Temp(n) => val_types.get(*n),
+                        Val::Literal(_) => None,
+                    };
+                    if let Some(Type::Addr(inner)) = ty {
+                        field_types.push((**inner).clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(Declaration::Adt(Adt {
+            variants: vec![AdtVariant { field_types }],
+        }))
     }
 }
 

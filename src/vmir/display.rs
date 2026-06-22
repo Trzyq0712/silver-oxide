@@ -6,7 +6,7 @@
 
 use crate::vmir::{Declaration, MemberId, Program};
 use lasso::Rodeo;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Formatter, Write};
 
 /// Helper wrapper for interner-aware VMIR formatting. Fields are
 /// `pub(super)` so sibling modules can implement `Display` impls on
@@ -29,17 +29,56 @@ impl<'a, T> VmirDisplay<'a, T> {
     }
 }
 
+impl Program {
+    /// Render the resources' *derived* members — the address location and
+    /// snapshot that plain VMIR does not store (`Resource::derive_location` /
+    /// `derive_snapshot`). For `--derived` debug dumps.
+    pub fn derived_dump(&self) -> String {
+        let mut out = String::new();
+        for (id, decl) in self.decls.iter_enumerated() {
+            let Declaration::Resource(r) = decl else {
+                continue;
+            };
+            let name = self.interner.resolve(&id);
+            // The derived address location (kind `location`, like a real decl).
+            let loc = r.derive_location(id);
+            let _ = writeln!(
+                out,
+                "location {name}@addr{}",
+                VmirDisplay::new(&loc, &self.interner)
+            );
+            // The derived snapshot type, printed by kind for every snapshottable
+            // (self-framed) resource: a concrete one is an `adt` with a single
+            // constructor; an abstract one is an opaque empty `domain`.
+            match r.derive_snapshot() {
+                Some(Declaration::Adt(adt)) => {
+                    let _ = writeln!(
+                        out,
+                        "adt {name}@snap {}",
+                        VmirDisplay::new(&adt, &self.interner)
+                    );
+                }
+                Some(Declaration::Domain(domain)) => {
+                    let _ = writeln!(
+                        out,
+                        "domain {name}@snap {}",
+                        VmirDisplay::new(&domain, &self.interner)
+                    );
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 impl Display for Program {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for item in self.decls.iter_enumerated() {
-            // Hide the derived `@addr` accessor declarations — mechanically
-            // implied by the resource/predicate/field definition, so they only
-            // clutter the dump. (`@snap` is no longer a decl; it is `Type::Snap`.)
-            let name = self.interner.resolve(&item.0);
-            if name.contains("@addr") {
-                continue;
-            }
+            // No `@addr`/`@snap` decls are emitted anymore — a predicate's address
+            // location and snapshot are derived (`Resource::derive_location` /
+            // `derive_snapshot`); fields are bare-named. So nothing to hide here.
             if !first {
                 writeln!(f)?;
             }
