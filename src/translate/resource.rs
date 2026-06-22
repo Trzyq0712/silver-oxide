@@ -276,15 +276,12 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             let &addr_fn = b.pred_addr.get(&call.name.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
             })?;
-            let &snap_id = b
-                .pred_snap
-                .get(&call.name.0)
-                .expect("predicate snap missing");
+            let &pred_id = b.name_map.get(&call.name.0).expect("predicate id missing");
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
-            let ret_ty = Type::Addr(Box::new(Type::domain(snap_id)));
+            let ret_ty = Type::Addr(Box::new(Type::Snap(pred_id)));
             Ok(sink.emit_pure(ret_ty, PureInst::Location(addr_fn, args)))
         }
     }

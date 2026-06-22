@@ -18,16 +18,15 @@ pub struct Resource {
 }
 
 /// Snapshot descriptor for a foldable predicate resource. The snapshot is a
-/// single-variant ADT (head = the `@snap` Domain) packing the footprint field
-/// values in order. The verifier mints its constructor/projection ids and
-/// reductions from this (see `verify::mono`); no accessor declarations exist.
+/// single-variant ADT (head = the owning predicate's own Resource id, i.e. its
+/// `Type::Snap` head) packing the footprint slot values in order. The verifier
+/// mints its constructor/projection ids and reductions from this (see
+/// `verify::mono`); no `@snap` declaration is emitted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Snapshot {
     /// The resource's `@addr` function (its chunk address).
     pub addr_fn: MemberId,
-    /// The `@snap` Domain id — the snapshot ADT's head (and value type).
-    pub snap: MemberId,
-    /// The footprint field types, in slot order (the single variant's fields).
+    /// The footprint slot types, in slot order (the single variant's fields).
     pub field_types: Vec<Type>,
 }
 

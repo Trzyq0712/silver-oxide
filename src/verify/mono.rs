@@ -39,8 +39,9 @@ pub struct Allocator {
     /// Display names for minted ids (which are outside the interner).
     names: HashMap<FuncId, String>,
     rules: Vec<Rule>,
-    /// Per ADT *head* (an `Adt` decl id or a predicate `@snap` Domain id), its
-    /// per-variant field counts — the shape needed to mint an instance.
+    /// Per ADT *head* (an `Adt` decl id, or a predicate's own Resource id for its
+    /// snapshot ADT — see `Type::Snap`), its per-variant field counts — the shape
+    /// needed to mint an instance.
     shapes: HashMap<MemberId, Vec<usize>>,
     /// Base display name per ADT head.
     head_names: HashMap<MemberId, String>,
@@ -50,8 +51,8 @@ pub struct Allocator {
 
 impl Allocator {
     /// Build an allocator for `program`: records the shape of every ADT head
-    /// (ADT declarations and predicate-snapshot `@snap` domains) so instances
-    /// can be minted on demand. Mints nothing yet.
+    /// (ADT declarations and predicate snapshots, keyed by the predicate's own
+    /// Resource id) so instances can be minted on demand. Mints nothing yet.
     pub fn new(program: &Program) -> Self {
         let mut shapes = HashMap::new();
         let mut head_names = HashMap::new();
@@ -64,13 +65,14 @@ impl Allocator {
                 head_names.insert(id, program.interner.resolve(&id).to_string());
             }
         }
-        for decl in &program.decls {
+        for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Resource(r) = decl
                 && let Some(snap) = &r.snapshot
             {
-                // A snapshot is a single-variant ADT over the footprint fields.
-                shapes.insert(snap.snap, vec![snap.field_types.len()]);
-                head_names.insert(snap.snap, program.interner.resolve(&snap.snap).to_string());
+                // A snapshot is a single-variant ADT over the footprint slots,
+                // headed by the predicate's own id (`Type::Snap(id)`).
+                shapes.insert(id, vec![snap.field_types.len()]);
+                head_names.insert(id, format!("{}@snap", program.interner.resolve(&id)));
             }
         }
         Allocator {

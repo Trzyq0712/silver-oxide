@@ -724,7 +724,7 @@ fn eval_method_inst(
             let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
                 "fold of non-flat/abstract predicate",
             ))?;
-            let (snap_head, addr_fn) = (sd.snap, sd.addr_fn);
+            let (snap_head, addr_fn) = (call.resource, sd.addr_fn);
             let field_types = sd.field_types.clone();
             let cert = certs
                 .get(&call.resource)
@@ -769,7 +769,7 @@ fn eval_method_inst(
             // The snapshot is a single-variant ADT (head = the `@snap` Domain).
             let cons_args: Box<[egg::Id]> = members.into_iter().collect();
             let snap_cons = ctx.alloc.cons(snap_head, &[], 0);
-            let snap_ty = Type::Domain(snap_head, Box::new([]));
+            let snap_ty = Type::Snap(snap_head);
             let snap = ctx.add_func_app_id(snap_cons, snap_ty, cons_args);
             let pred_addr = ctx.add_location(addr_fn, args.into());
             let out = heap_union(ctx, &out, pred_addr, Chunk::new(perm_id, snap), &pc_lits);
@@ -787,7 +787,7 @@ fn eval_method_inst(
             let sd = r.snapshot.as_ref().ok_or(VerifyError::Unimplemented(
                 "unfold of non-flat/abstract predicate",
             ))?;
-            let (snap_head, addr_fn) = (sd.snap, sd.addr_fn);
+            let (snap_head, addr_fn) = (call.resource, sd.addr_fn);
             let field_types = sd.field_types.clone();
             let cert = certs
                 .get(&call.resource)

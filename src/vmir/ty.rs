@@ -13,6 +13,12 @@ pub enum Type {
     /// type arguments. VMIR keeps types parametric (un-monomorphized); the
     /// verifier mints distinct monomorphic member ids per `(id, args)` instance.
     Domain(MemberId, Box<[Type]>),
+    /// The snapshot type of a predicate, identified by the predicate's own
+    /// Resource id (the snapshot ADT head). A single-variant ADT whose fields are
+    /// the predicate's footprint slot types (`Resource.snapshot.field_types`);
+    /// the verifier mints its constructor/projection ids on demand (see
+    /// `verify::mono`). No `@snap` declaration is emitted — this is derived.
+    Snap(MemberId),
     Addr(Box<Type>),
     /// A type parameter of the enclosing generic declaration, by 0-based index
     /// (e.g. `Generic(0)` is the `Some` field type of the generic `Option` ADT).
@@ -38,6 +44,7 @@ impl Display for Type {
                 write!(f, "d{}", id.0)?;
                 fmt_args(f, args, |a, f| write!(f, "{a}"))
             }
+            Type::Snap(id) => write!(f, "d{}@snap", id.0),
             Type::Addr(ty) => write!(f, "&{ty}"),
             Type::Generic(i) => write!(f, "?{i}"),
         }
@@ -51,6 +58,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Type> {
                 write!(f, "{}", self.interner.resolve(id))?;
                 fmt_args(f, args, |a, f| write!(f, "{}", self.with(a)))
             }
+            Type::Snap(id) => write!(f, "{}@snap", self.interner.resolve(id)),
             Type::Addr(ty) => write!(f, "&{}", self.with(ty.as_ref())),
             ty => write!(f, "{ty}"),
         }

@@ -87,8 +87,6 @@ pub(crate) struct Builder<'a> {
     decls: Vec<Option<vmir::Declaration>>,
     /// Maps Silver `Spur` names to VMIR `MemberId`s.
     pub name_map: HashMap<Spur, vmir::MemberId>,
-    /// Maps a predicate's `Spur` to its `@snap` Domain MemberId.
-    pub pred_snap: HashMap<Spur, vmir::MemberId>,
     /// Maps a predicate's `Spur` to its `@addr` Function MemberId.
     pub pred_addr: HashMap<Spur, vmir::MemberId>,
     /// Maps a field's `Spur` to its `@addr` Function MemberId.
@@ -112,7 +110,6 @@ impl<'a> Builder<'a> {
             vmir_interner: Rodeo::new(),
             decls: Vec::new(),
             name_map: HashMap::new(),
-            pred_snap: HashMap::new(),
             pred_addr: HashMap::new(),
             field_addr: HashMap::new(),
             method_requires: HashMap::new(),
@@ -232,19 +229,22 @@ impl<'a> Builder<'a> {
     }
 
     fn declare_predicate_accessors(&mut self, p: &typed::Predicate) {
-        let pred_name = self.interner.resolve(&p.name.0);
-        let snap_id = self.fresh_decl(&format!("{pred_name}@snap"));
-        self.set_decl(snap_id, vmir::Declaration::Domain(vmir::Domain {}));
+        let pred_name = self.interner.resolve(&p.name.0).to_owned();
+        // Reserve the predicate's Resource slot now (filled by `emit_predicate`)
+        // so its id can serve as the snapshot ADT head (`Type::Snap(pred_id)`) and
+        // be referenced by sibling predicates' footprints (self & mutual
+        // recursion).
+        let pred_id = self.fresh_decl(&pred_name);
+        self.name_map.insert(p.name.0, pred_id);
         let addr_id = self.fresh_decl(&format!("{pred_name}@addr"));
         // A predicate is an unbounded location returning its snapshot.
         let addr_loc = vmir::Location {
             params: p.params.iter().map(|p| lower_type(&p.ty)).collect(),
-            ret: vmir::Type::domain(snap_id),
+            ret: vmir::Type::Snap(pred_id),
             bound: vmir::Bound::Unbounded,
         };
         self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
 
-        self.pred_snap.insert(p.name.0, snap_id);
         self.pred_addr.insert(p.name.0, addr_id);
     }
 
@@ -269,9 +269,8 @@ impl<'a> Builder<'a> {
     }
 
     fn emit_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
-        let name = self.interner.resolve(&p.name.0).to_owned();
-        let pred_id = self.fresh_decl(&name);
-        self.name_map.insert(p.name.0, pred_id);
+        // The Resource slot was reserved in `declare_predicate_accessors`.
+        let pred_id = self.name_map[&p.name.0];
         let params: Vec<vmir::Type> = p.params.iter().map(|p| lower_type(&p.ty)).collect();
         // A concrete predicate body is self-framed (no precondition): params
         // occupy `Val::Temp(0..n)` and the spatial assertion accumulates onto an
@@ -304,20 +303,18 @@ impl<'a> Builder<'a> {
         );
 
         // A concrete predicate has a snapshot: a single-variant ADT (head = the
-        // `@snap` Domain) over the footprint slot values. The verifier mints its
-        // constructor/projection ids and reductions (see `verify::mono`); no
-        // accessor declarations are emitted here. Only abstract (bodyless)
-        // predicates remain snapshot-less.
+        // predicate's own id, i.e. `Type::Snap(pred_id)`) over the footprint slot
+        // values. The verifier mints its constructor/projection ids and reductions
+        // (see `verify::mono`); no accessor declarations are emitted here. Only
+        // abstract (bodyless) predicates remain snapshot-less.
         if let Some(body_exp) = &p.body
             && let Some(types) = self.footprint_types(body_exp)
         {
-            let snap_id = self.pred_snap[&p.name.0];
             let addr_id = self.pred_addr[&p.name.0];
             if let Some(vmir::Declaration::Resource(r)) = self.decls[usize::from(pred_id)].as_mut()
             {
                 r.snapshot = Some(vmir::Snapshot {
                     addr_fn: addr_id,
-                    snap: snap_id,
                     field_types: types,
                 });
             }
@@ -352,8 +349,8 @@ impl<'a> Builder<'a> {
                 // `Inner@snap`). Fold consumes the held `Inner(args)` chunk; the
                 // inner instance is never expanded here, so recursion is fine.
                 R::PredicateCall(call) => {
-                    let snap = *self.pred_snap.get(&call.name.0)?;
-                    Some(vec![vmir::Type::domain(snap)])
+                    let pred_id = *self.name_map.get(&call.name.0)?;
+                    Some(vec![vmir::Type::Snap(pred_id)])
                 }
             },
             S::Pure(_) => Some(vec![]),
@@ -547,20 +544,22 @@ method add(this: Ref, other: Ref) returns (res: Ref)
 "#;
         let p = run(input);
 
-        // Auto-emitted snap + addr for the predicate.
-        let snap_id = p.interner.get("number@snap").expect("missing number@snap");
-        assert!(matches!(p.decls[snap_id], vmir::Declaration::Domain(_)));
+        // No `@snap` decl is emitted; the snapshot type is the derived
+        // `Type::Snap(pred_id)`.
+        assert!(p.interner.get("number@snap").is_none());
 
+        let pred_id = p.interner.get("number").expect("missing number");
+
+        // Auto-emitted `@addr` for the predicate, returning its `Snap` type.
         let addr_id = p.interner.get("number@addr").expect("missing number@addr");
         let vmir::Declaration::Location(addr_loc) = &p.decls[addr_id] else {
             panic!("number@addr must be a Location");
         };
         assert_eq!(addr_loc.params, vec![vmir::Type::Ref]);
-        assert_eq!(addr_loc.ret, vmir::Type::domain(snap_id));
+        assert_eq!(addr_loc.ret, vmir::Type::Snap(pred_id));
         assert_eq!(addr_loc.bound, vmir::Bound::Unbounded);
 
         // Predicate itself is abstract.
-        let pred_id = p.interner.get("number").expect("missing number");
         let vmir::Declaration::Resource(pred) = &p.decls[pred_id] else {
             panic!("number must be a Resource");
         };

@@ -165,6 +165,7 @@ impl<'a> VerifyContext<'a> {
                     format!("{head}[{}]", inner.join(", "))
                 }
             }
+            Type::Snap(id) => format!("{}@snap", self.member_name(*id)),
             Type::Generic(i) => format!("?{i}"),
         }
     }

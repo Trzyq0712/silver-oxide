@@ -33,12 +33,11 @@ impl Display for Program {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for item in self.decls.iter_enumerated() {
-            // Hide the derived accessor declarations (`@addr`, `@snap` and the
-            // snapshot constructor/projections) — they are mechanically implied
-            // by the resource/predicate/field definition, so they only clutter
-            // the dump.
+            // Hide the derived `@addr` accessor declarations — mechanically
+            // implied by the resource/predicate/field definition, so they only
+            // clutter the dump. (`@snap` is no longer a decl; it is `Type::Snap`.)
             let name = self.interner.resolve(&item.0);
-            if name.contains("@addr") || name.contains("@snap") {
+            if name.contains("@addr") {
                 continue;
             }
             if !first {
