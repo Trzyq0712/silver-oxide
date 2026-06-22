@@ -32,7 +32,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Adt> {
             }
             match ctor.name {
                 Some(id) => write!(f, "{}(", self.interner.resolve(&id))?,
-                None => write!(f, "#{v}(")?,
+                None => write!(f, "_{v}(")?,
             }
             for (i, ty) in ctor.field_types.iter().enumerate() {
                 if i > 0 {
