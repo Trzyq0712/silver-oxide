@@ -90,7 +90,11 @@ impl Resource {
             }
         }
         Some(Snapshot::Concrete(Adt {
-            variants: vec![AdtVariant { field_types }],
+            // A snapshot's single constructor is synthetic — no source name.
+            variants: vec![AdtVariant {
+                name: None,
+                field_types,
+            }],
         }))
     }
 }

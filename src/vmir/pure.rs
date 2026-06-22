@@ -167,7 +167,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
             PureInst::AdtCons {
                 adt, variant, args, ..
             } => {
-                write!(f, "{}#{variant}(", self.interner.resolve(adt))?;
+                write!(f, "{}::#{variant}(", self.interner.resolve(adt))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -184,11 +184,11 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 ..
             } => write!(
                 f,
-                "{}#{variant}.{field}({base})",
+                "{}::#{variant}.{field}({base})",
                 self.interner.resolve(adt)
             ),
             PureInst::AdtTag { adt, base, .. } => {
-                write!(f, "tag[{}]({base})", self.interner.resolve(adt))
+                write!(f, "{}@tag({base})", self.interner.resolve(adt))
             }
         }
     }

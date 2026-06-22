@@ -1,5 +1,5 @@
-use crate::vmir::Type;
 use crate::vmir::display::VmirDisplay;
+use crate::vmir::{MemberId, Type};
 use std::fmt::{self, Display, Formatter};
 
 /// An algebraic data type: a list of variants (constructors), variant index =
@@ -11,11 +11,15 @@ pub struct Adt {
     pub variants: Vec<AdtVariant>,
 }
 
-/// One variant (constructor) of an [`Adt`]: just its field types, in field
-/// order. The constructor / projection / tag operations over it are the
-/// semantic `PureInst::{AdtCons,AdtProj,AdtTag}` nodes.
+/// One variant (constructor) of an [`Adt`]: an optional interned constructor
+/// name (kept from the source; only needs to be distinct within the ADT — `None`
+/// for synthetic ADTs like a predicate snapshot) plus its field types in order.
+/// The constructor / projection / tag operations over it are the semantic
+/// `PureInst::{AdtCons,AdtProj,AdtTag}` nodes; the verifier names its minted ids
+/// `Adt::Ctor` (`@` is reserved for builtin suffixes, e.g. `Adt@tag`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdtVariant {
+    pub name: Option<MemberId>,
     pub field_types: Vec<Type>,
 }
 
@@ -26,7 +30,10 @@ impl<'a> Display for VmirDisplay<'a, &'a Adt> {
             if v > 0 {
                 write!(f, " | ")?;
             }
-            write!(f, "#{v}(")?;
+            match ctor.name {
+                Some(id) => write!(f, "{}(", self.interner.resolve(&id))?,
+                None => write!(f, "#{v}(")?,
+            }
             for (i, ty) in ctor.field_types.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;

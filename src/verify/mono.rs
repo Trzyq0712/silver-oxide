@@ -44,6 +44,10 @@ pub struct Allocator {
     shapes: HashMap<MemberId, Vec<usize>>,
     /// Base display name per ADT head.
     head_names: HashMap<MemberId, String>,
+    /// Per ADT head, the source constructor name of each variant (`None` for a
+    /// synthetic variant — e.g. a snapshot's sole constructor). Drives minted-id
+    /// names: `Adt::Ctor` when named, `Adt#i` when anonymous.
+    variant_names: HashMap<MemberId, Vec<Option<String>>>,
     /// The builtin `Option` ADT id, if present.
     option_adt: Option<MemberId>,
 }
@@ -55,6 +59,13 @@ impl Allocator {
     pub fn new(program: &Program) -> Self {
         let mut shapes = HashMap::new();
         let mut head_names = HashMap::new();
+        let mut variant_names: HashMap<MemberId, Vec<Option<String>>> = HashMap::new();
+        let vname = |adt: &crate::vmir::Adt| -> Vec<Option<String>> {
+            adt.variants
+                .iter()
+                .map(|v| v.name.map(|n| program.interner.resolve(&n).to_string()))
+                .collect()
+        };
 
         // The builtin `Option` ADT (`vmir::Type::Option`): `Some(T)` (variant 0,
         // one field) and `None` (variant 1, no fields). It is not a program
@@ -64,6 +75,10 @@ impl Allocator {
         let option_head = MemberId(program.interner.len());
         shapes.insert(option_head, vec![1, 0]);
         head_names.insert(option_head, "Option".to_string());
+        variant_names.insert(
+            option_head,
+            vec![Some("Some".to_string()), Some("None".to_string())],
+        );
 
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Adt(adt) = decl {
@@ -72,6 +87,7 @@ impl Allocator {
                     adt.variants.iter().map(|v| v.field_types.len()).collect(),
                 );
                 head_names.insert(id, program.interner.resolve(&id).to_string());
+                variant_names.insert(id, vname(adt));
             }
         }
         for (id, decl) in program.decls.iter_enumerated() {
@@ -88,6 +104,7 @@ impl Allocator {
                     adt.variants.iter().map(|v| v.field_types.len()).collect(),
                 );
                 head_names.insert(id, format!("{}@snap", program.interner.resolve(&id)));
+                variant_names.insert(id, vname(&adt));
             }
         }
         Allocator {
@@ -101,6 +118,7 @@ impl Allocator {
             rules: Vec::new(),
             shapes,
             head_names,
+            variant_names,
             option_adt: Some(option_head),
         }
     }
@@ -117,6 +135,7 @@ impl Allocator {
             rules: Vec::new(),
             shapes: HashMap::new(),
             head_names: HashMap::new(),
+            variant_names: HashMap::new(),
             option_adt: None,
         }
     }
@@ -202,17 +221,30 @@ impl Allocator {
 
         let mut ctor_tags = HashMap::new();
         for (variant, &fields) in counts.iter().enumerate() {
-            let cons_id = self.mint(format!("{label}#{variant}"));
+            // `Adt::Ctor` for a named constructor, `Adt::#i` for an anonymous one.
+            let cons_label = match self.variant_name(adt, variant) {
+                Some(name) => format!("{label}::{name}"),
+                None => format!("{label}::#{variant}"),
+            };
+            let cons_id = self.mint(cons_label.clone());
             self.cons.insert((adt, args.to_vec(), variant), cons_id);
             ctor_tags.insert(cons_id, variant);
             for field in 0..fields {
-                let proj_id = self.mint(format!("{label}#{variant}.{field}"));
+                let proj_id = self.mint(format!("{cons_label}.{field}"));
                 self.proj
                     .insert((adt, args.to_vec(), variant, field), proj_id);
                 self.rules.push(proj_rule(proj_id, cons_id, field));
             }
         }
         self.rules.push(tag_rule(tag_id, ctor_tags));
+    }
+
+    /// The source constructor name of `adt`'s `variant`, if any.
+    fn variant_name(&self, adt: MemberId, variant: usize) -> Option<&str> {
+        self.variant_names
+            .get(&adt)
+            .and_then(|v| v.get(variant))
+            .and_then(|n| n.as_deref())
     }
 
     fn mint(&mut self, name: String) -> FuncId {

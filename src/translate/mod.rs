@@ -98,6 +98,10 @@ pub(crate) struct Builder<'a> {
     /// Maps a destructor's `Spur` to the semantic `(adt id, variant, field)` it
     /// projects — the operands of a `PureInst::AdtProj`.
     pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
+    /// Constructor names to intern (`(adt id, variant tag, name)`), applied in
+    /// `finalize` after every `fresh_decl` so interning a non-decl name never
+    /// breaks the decl/interner index invariant.
+    pending_ctor_names: Vec<(vmir::MemberId, usize, String)>,
 }
 
 impl<'a> Builder<'a> {
@@ -113,6 +117,7 @@ impl<'a> Builder<'a> {
             method_ensures: HashMap::new(),
             ctor_tag: HashMap::new(),
             dtor_sem: HashMap::new(),
+            pending_ctor_names: Vec::new(),
         }
     }
 
@@ -168,47 +173,55 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Pass 2: user functions and ADT constructors.
+        // Pass 2a: user functions (each gets a decl). Done before constructors so
+        // every `fresh_decl` precedes the constructor-name interning below (which
+        // advances the interner past `decls.len()` without a decl slot).
         for (spur, gmid) in &entries {
-            match &globals.signatures[*gmid] {
-                GlobalSignature::Function(sig) => {
-                    let name = interner.resolve(spur).to_string();
-                    let id = self.fresh_decl(&name);
-                    let params = sig.params.iter().map(lower_type).collect();
-                    let ret = lower_type(&sig.ret);
-                    self.set_decl(
-                        id,
-                        vmir::Declaration::Function(vmir::Function {
-                            params,
-                            ret,
-                            body: None,
-                        }),
-                    );
-                    self.name_map.insert(*spur, id);
-                }
-                GlobalSignature::AdtConstructor(sig) => {
-                    // No declaration is emitted for a constructor: it lowers to a
-                    // semantic `AdtCons` node, and the verifier mints its id.
-                    // Only the `(adt, tag)` mapping and the ADT's variant shape
-                    // are recorded.
-                    self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
-                    let adt_id = self.name_map[&sig.adt];
-                    let field_types: Vec<vmir::Type> = sig.params.iter().map(lower_type).collect();
-                    if let Some(vmir::Declaration::Adt(adt)) =
-                        self.decls[usize::from(adt_id)].as_mut()
-                    {
-                        if adt.variants.len() <= sig.tag {
-                            adt.variants.resize(
-                                sig.tag + 1,
-                                vmir::AdtVariant {
-                                    field_types: Vec::new(),
-                                },
-                            );
-                        }
-                        adt.variants[sig.tag] = vmir::AdtVariant { field_types };
+            if let GlobalSignature::Function(sig) = &globals.signatures[*gmid] {
+                let name = interner.resolve(spur).to_string();
+                let id = self.fresh_decl(&name);
+                let params = sig.params.iter().map(lower_type).collect();
+                let ret = lower_type(&sig.ret);
+                self.set_decl(
+                    id,
+                    vmir::Declaration::Function(vmir::Function {
+                        params,
+                        ret,
+                        body: None,
+                    }),
+                );
+                self.name_map.insert(*spur, id);
+            }
+        }
+
+        // Pass 2b: ADT constructors. No declaration is emitted (they lower to a
+        // semantic `AdtCons` node; the verifier mints the id). Record the
+        // `(adt, tag)` mapping and fill the ADT's variant shape. The constructor
+        // *name* is interned in `finalize` (after every `fresh_decl`, so it never
+        // perturbs the decl/interner index invariant) — see `pending_ctor_names`.
+        for (spur, gmid) in &entries {
+            if let GlobalSignature::AdtConstructor(sig) = &globals.signatures[*gmid] {
+                self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
+                let adt_id = self.name_map[&sig.adt];
+                let ctor_name = interner.resolve(spur).to_string();
+                let field_types: Vec<vmir::Type> = sig.params.iter().map(lower_type).collect();
+                if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut()
+                {
+                    if adt.variants.len() <= sig.tag {
+                        adt.variants.resize(
+                            sig.tag + 1,
+                            vmir::AdtVariant {
+                                name: None,
+                                field_types: Vec::new(),
+                            },
+                        );
                     }
+                    adt.variants[sig.tag] = vmir::AdtVariant {
+                        name: None,
+                        field_types,
+                    };
                 }
-                _ => {}
+                self.pending_ctor_names.push((adt_id, sig.tag, ctor_name));
             }
         }
 
@@ -394,7 +407,16 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn finalize(self) -> vmir::Program {
+    fn finalize(mut self) -> vmir::Program {
+        // Intern constructor names now — past every `fresh_decl`, so these
+        // non-decl interner entries don't perturb the decl index invariant — and
+        // attach them to their variants.
+        for (adt_id, tag, name) in std::mem::take(&mut self.pending_ctor_names) {
+            let ctor_id = self.vmir_interner.get_or_intern(&name);
+            if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
+                adt.variants[tag].name = Some(ctor_id);
+            }
+        }
         let decls: TiVec<vmir::MemberId, vmir::Declaration> = self
             .decls
             .into_iter()
