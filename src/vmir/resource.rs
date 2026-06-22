@@ -1,7 +1,7 @@
 use crate::vmir::display::VmirDisplay;
 use crate::vmir::{
-    Adt, AdtVariant, Bound, Declaration, Domain, HeapInst, HeapVal, Inst, InstKind, Location,
-    MemberId, Type, Val,
+    Adt, AdtVariant, Bound, Domain, HeapInst, HeapVal, Inst, InstKind, Location, MemberId, Type,
+    Val,
 };
 use std::fmt::{self, Display, Formatter};
 
@@ -50,9 +50,10 @@ impl Resource {
         }
     }
 
-    /// Derive this resource's snapshot type as a stand-alone declaration:
-    /// - a concrete predicate → an [`Adt`] with a single constructor over the
-    ///   ordered footprint slot types (the snapshot ADT);
+    /// Derive this resource's snapshot type (see [`Snapshot`]):
+    /// - a concrete predicate → a single-constructor [`Adt`] over the footprint
+    ///   slots, each typed `Option[T]` (a slot is present-or-absent — `fold` packs
+    ///   `present ? Some(v) : None`);
     /// - an abstract (bodyless) predicate → an opaque empty [`Domain`].
     ///
     /// `None` for a non self-framed resource (two-state; no foldable snapshot).
@@ -63,13 +64,13 @@ impl Resource {
     /// params occupy `Val::Temp(0..n)`, so a `Val -> Type` map is just the params
     /// followed by each `Pure`'s result type. Every footprint slot is a
     /// `HeapInst::Combine` whose `loc` is an address of type `Addr<T>`; the slot
-    /// type is `T`.
-    pub fn derive_snapshot(&self) -> Option<Declaration> {
+    /// type is `Option[T]`.
+    pub fn derive_snapshot(&self) -> Option<Snapshot> {
         if !self.is_self_framed() {
             return None;
         }
         let Some(body) = &self.body else {
-            return Some(Declaration::Domain(Domain {}));
+            return Some(Snapshot::Domain(Domain {}));
         };
         let mut val_types: Vec<Type> = self.params.clone();
         let mut field_types = Vec::new();
@@ -82,16 +83,26 @@ impl Resource {
                         Val::Literal(_) => None,
                     };
                     if let Some(Type::Addr(inner)) = ty {
-                        field_types.push((**inner).clone());
+                        field_types.push(Type::Option(inner.clone()));
                     }
                 }
                 _ => {}
             }
         }
-        Some(Declaration::Adt(Adt {
+        Some(Snapshot::Adt(Adt {
             variants: vec![AdtVariant { field_types }],
         }))
     }
+}
+
+/// The derived snapshot type of a resource (see [`Resource::derive_snapshot`]):
+/// a concrete predicate's is an [`Adt`] with a single constructor over the
+/// `Option`-wrapped footprint slot types; an abstract predicate's is an opaque
+/// empty [`Domain`]. Never stored in the IR.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Snapshot {
+    Adt(Adt),
+    Domain(Domain),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

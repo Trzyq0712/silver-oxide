@@ -19,6 +19,10 @@ pub enum Type {
     /// the verifier mints its constructor/projection ids on demand (see
     /// `verify::mono`). No `@snap` declaration is emitted — this is derived.
     Snap(MemberId),
+    /// `Option[T]` — a builtin parametric type (like `Seq[T]`/`Set[T]` later): a
+    /// domain with axiomatized functions. The verifier resolves it to its `Option`
+    /// ADT instance via the mono registry; it is never a user declaration.
+    Option(Box<Type>),
     Addr(Box<Type>),
     /// A type parameter of the enclosing generic declaration, by 0-based index
     /// (e.g. `Generic(0)` is the `Some` field type of the generic `Option` ADT).
@@ -30,6 +34,14 @@ impl Type {
     /// A domain/ADT type with no type arguments.
     pub fn domain(id: MemberId) -> Self {
         Type::Domain(id, Box::new([]))
+    }
+
+    /// The inner `T` of an `Option[T]`, or `None` for any other type.
+    pub fn option_inner(&self) -> Option<&Type> {
+        match self {
+            Type::Option(inner) => Some(inner),
+            _ => None,
+        }
     }
 }
 
@@ -45,6 +57,7 @@ impl Display for Type {
                 fmt_args(f, args, |a, f| write!(f, "{a}"))
             }
             Type::Snap(id) => write!(f, "d{}@snap", id.0),
+            Type::Option(ty) => write!(f, "Option[{ty}]"),
             Type::Addr(ty) => write!(f, "&{ty}"),
             Type::Generic(i) => write!(f, "?{i}"),
         }
@@ -59,6 +72,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Type> {
                 fmt_args(f, args, |a, f| write!(f, "{}", self.with(a)))
             }
             Type::Snap(id) => write!(f, "{}@snap", self.interner.resolve(id)),
+            Type::Option(ty) => write!(f, "Option[{}]", self.with(ty.as_ref())),
             Type::Addr(ty) => write!(f, "&{}", self.with(ty.as_ref())),
             ty => write!(f, "{ty}"),
         }

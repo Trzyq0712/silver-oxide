@@ -166,6 +166,7 @@ impl<'a> VerifyContext<'a> {
                 }
             }
             Type::Snap(id) => format!("{}@snap", self.member_name(*id)),
+            Type::Option(t) => format!("Option[{}]", self.type_name(t)),
             Type::Generic(i) => format!("?{i}"),
         }
     }
@@ -179,13 +180,11 @@ impl<'a> VerifyContext<'a> {
         present: egg::Id,
         value: egg::Id,
     ) -> egg::Id {
-        // `Option` is an ordinary generic ADT: `Some` is variant 0, `None`
-        // variant 1, monomorphized at `[elem]`.
-        let opt = self.alloc.option_adt();
-        let args = [elem];
-        let some_id = self.alloc.cons(opt, &args, 0);
-        let none_id = self.alloc.cons(opt, &args, 1);
-        let opt_ty = Type::Domain(opt, Box::new(args));
+        // `Option` is a builtin parametric type; request its instance through the
+        // allocator's dedicated `option_*` path (`Some` = variant 0, `None` = 1).
+        let some_id = self.alloc.option_some(elem.clone());
+        let none_id = self.alloc.option_none(elem.clone());
+        let opt_ty = self.alloc.option_type(elem);
         let some = self.add_func_app_id(some_id, opt_ty.clone(), Box::new([value]));
         let none = self.add_func_app_id(none_id, opt_ty, Box::new([]));
         self.add(Symbolic::Ite([present, some, none]))
@@ -195,9 +194,7 @@ impl<'a> VerifyContext<'a> {
     /// `opt = Some(v)` this reduces to `v`; on an opaque member it stays
     /// uninterpreted (correct — the value was never present).
     pub(crate) fn option_unwrap(&mut self, elem: Type, opt: egg::Id) -> egg::Id {
-        // `value` = field 0 of `Some` (variant 0) of `Option[elem]`.
-        let opt_adt = self.alloc.option_adt();
-        let value_id = self.alloc.proj(opt_adt, &[elem.clone()], 0, 0);
+        let value_id = self.alloc.option_value(elem.clone());
         self.add_func_app_id(value_id, elem, Box::new([opt]))
     }
 

@@ -721,11 +721,11 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let Some(vmir::Declaration::Adt(snap)) = r.derive_snapshot() else {
+            let Some(vmir::Snapshot::Adt(snap)) = r.derive_snapshot() else {
                 return Err(VerifyError::Unimplemented("fold of abstract predicate"));
             };
             let (snap_head, addr_fn) = (call.resource, call.resource);
-            let field_types = snap.variants[0].field_types.clone();
+            let field_types = snap.variants.into_iter().next().unwrap().field_types;
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -744,14 +744,18 @@ fn eval_method_inst(
             for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
                 let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
                 let p = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
+                // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
+                let elem = field_types[i]
+                    .option_inner()
+                    .unwrap_or(&field_types[i])
+                    .clone();
                 let v = base_h
                     .entries()
                     .find_map(|(k, c)| {
                         (ctx.egraph.find(k) == ctx.egraph.find(addr)).then(|| c.value)
                     })
-                    .unwrap_or_else(|| ctx.fresh_symbolic_value(field_types[i].clone()));
+                    .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone()));
                 out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
-                let elem = field_types[i].clone();
                 let present = ctx.perm_positive(bperm);
                 members.push(ctx.option_member(elem, present, v));
                 subst.insert(cert.egraph.find(c_val), v);
@@ -779,11 +783,11 @@ fn eval_method_inst(
             let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
                 return Err(VerifyError::DependencyFailed);
             };
-            let Some(vmir::Declaration::Adt(snap)) = r.derive_snapshot() else {
+            let Some(vmir::Snapshot::Adt(snap)) = r.derive_snapshot() else {
                 return Err(VerifyError::Unimplemented("unfold of abstract predicate"));
             };
             let (snap_head, addr_fn) = (call.resource, call.resource);
-            let field_types = snap.variants[0].field_types.clone();
+            let field_types = snap.variants.into_iter().next().unwrap().field_types;
             let cert = certs
                 .get(&call.resource)
                 .ok_or(VerifyError::DependencyFailed)?;
@@ -811,9 +815,14 @@ fn eval_method_inst(
                 // concrete `cons` (so repeated fold/unfold doesn't grow the
                 // snapshot tower), and leaves it uninterpreted for an opaque
                 // snapshot. `unwrap` then peels the `Option` to the field value.
-                let elem = field_types[i].clone();
+                // The snapshot's i-th field is `Option[T]`; the projection yields
+                // it, then `option_unwrap` peels to the inner `T`.
+                let elem = field_types[i]
+                    .option_inner()
+                    .unwrap_or(&field_types[i])
+                    .clone();
                 let proj_id = ctx.alloc.proj(snap_head, &[], 0, i);
-                let opt_ty = Type::Domain(ctx.alloc.option_adt(), Box::new([elem.clone()]));
+                let opt_ty = ctx.alloc.option_type(elem.clone());
                 let opt = ctx.add_func_app_id(proj_id, opt_ty, Box::new([s]));
                 let pv = ctx.option_unwrap(elem, opt);
                 let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));

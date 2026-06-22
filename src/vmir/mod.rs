@@ -24,7 +24,7 @@ pub use function::{Function, FunctionCall};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use location::{Bound, Location};
 pub use method::Method;
-pub use resource::{Precond, Resource, ResourceBody, ResourceCall};
+pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
 
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};

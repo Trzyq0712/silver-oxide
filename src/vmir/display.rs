@@ -4,7 +4,7 @@
 //! Per-type `Display` impls live next to their types; the inst-block
 //! walker lives in `vmir/inst.rs`.
 
-use crate::vmir::{Declaration, MemberId, Program};
+use crate::vmir::{Declaration, MemberId, Program, Snapshot};
 use lasso::Rodeo;
 use std::fmt::{self, Display, Formatter, Write};
 
@@ -51,21 +51,21 @@ impl Program {
             // (self-framed) resource: a concrete one is an `adt` with a single
             // constructor; an abstract one is an opaque empty `domain`.
             match r.derive_snapshot() {
-                Some(Declaration::Adt(adt)) => {
+                Some(Snapshot::Adt(adt)) => {
                     let _ = writeln!(
                         out,
                         "adt {name}@snap {}",
                         VmirDisplay::new(&adt, &self.interner)
                     );
                 }
-                Some(Declaration::Domain(domain)) => {
+                Some(Snapshot::Domain(domain)) => {
                     let _ = writeln!(
                         out,
                         "domain {name}@snap {}",
                         VmirDisplay::new(&domain, &self.interner)
                     );
                 }
-                _ => {}
+                None => {}
             }
         }
         out

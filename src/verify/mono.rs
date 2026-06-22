@@ -67,7 +67,7 @@ impl Allocator {
         }
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Resource(r) = decl
-                && let Some(Declaration::Adt(adt)) = r.derive_snapshot()
+                && let Some(crate::vmir::Snapshot::Adt(adt)) = r.derive_snapshot()
             {
                 // A concrete predicate's snapshot is a single-variant ADT over
                 // the footprint slots, headed by the predicate's own id
@@ -132,6 +132,35 @@ impl Allocator {
     /// The builtin `Option` ADT's declaration id.
     pub fn option_adt(&self) -> MemberId {
         self.option_adt.expect("Option prelude not injected")
+    }
+
+    // ---- Builtin `Option` resolution -------------------------------------
+    // `Option[T]` is a builtin parametric type (`vmir::Type::Option`). These are
+    // the dedicated way to request its monomorphic instance, rather than open-
+    // coding `cons`/`proj` against `option_adt()`. (Future `Seq`/`Set` follow the
+    // same shape.)
+
+    /// `Option[elem]` as a concrete (monomorphic) ADT type.
+    pub fn option_type(&self, elem: Type) -> Type {
+        Type::Domain(self.option_adt(), Box::new([elem]))
+    }
+
+    /// Constructor id of `Some` (variant 0) of `Option[elem]`.
+    pub fn option_some(&mut self, elem: Type) -> FuncId {
+        let opt = self.option_adt();
+        self.cons(opt, &[elem], 0)
+    }
+
+    /// Constructor id of `None` (variant 1) of `Option[elem]`.
+    pub fn option_none(&mut self, elem: Type) -> FuncId {
+        let opt = self.option_adt();
+        self.cons(opt, &[elem], 1)
+    }
+
+    /// Projection id recovering the `Some` payload of `Option[elem]`.
+    pub fn option_value(&mut self, elem: Type) -> FuncId {
+        let opt = self.option_adt();
+        self.proj(opt, &[elem], 0, 0)
     }
 
     /// The reduction rules minted so far, to inject into a context's runner.
