@@ -106,6 +106,130 @@ method client(x: Ref)
     );
 }
 
+#[test]
+fn branch_preserves_held_permission_through_both_arms() {
+    // `m` holds `acc(x.f)` and neither arm of the `if` touches it, so the
+    // permission must still be held at the merge to discharge the `ensures`.
+    // Exercises CFG linearization: per-block path conditions and the single
+    // linear heap threaded across both arms.
+    let input = r#"
+field f: Int
+
+method m(c: Bool, x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{
+    if (c) { } else { }
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn branch_establishing_resource_on_one_arm_only_fails() {
+    // `give` establishes `number(this)`, but it is only called on the `c` arm.
+    // On the `!c` arm the predicate is never produced, so the `ensures` cannot
+    // hold unconditionally — the per-arm permission gating must surface this as
+    // insufficient permission rather than (unsoundly) verifying.
+    let input = r#"
+predicate number(this: Ref)
+
+method give(this: Ref)
+    ensures number(this)
+
+method m(c: Bool, this: Ref)
+    ensures number(this)
+{
+    if (c) { give(this) } else { }
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
+        "expected InsufficientPermission, got {result:?}"
+    );
+}
+
+#[test]
+fn goto_three_way_join_is_not_a_diamond() {
+    // A merge reached three ways (`goto M` from each `if`, plus fall-through) is
+    // only constructible with `goto` — it is not a clean `c ∨ !c` diamond, so it
+    // exercises the materialized-OR reach fallback (`pc = <a ∨ (!a∧b) ∨ (!a∧!b)>`).
+    // No arm touches `x.f`, so the permission survives and `ensures` holds; the
+    // verifier assumes the (tautological) reach literal to discharge it.
+    let input = r#"
+field f: Int
+
+method m(a: Bool, b: Bool, x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{
+    if (a) { goto done }
+    if (b) { goto done }
+    label done
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn forward_goto_skips_dead_block() {
+    // The `exhale` between `goto skip` and `label skip` is unreachable, so the
+    // linearizer drops it (reachability filter) and the permission is retained.
+    let input = r#"
+field f: Int
+
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{
+    goto skip
+    exhale acc(x.f, 1/1)
+    label skip
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn crossing_non_planar_control_flow() {
+    // `X` and `Y` both branch on `b` but to *swapped* targets `P`/`Q` — a
+    // crossing (non-planar) CFG, only constructible with `goto`. The four edge
+    // conditions `a∧b`, `a∧!b`, `!a∧b`, `!a∧!b` are pairwise exclusive, so each
+    // join's two in-edges stay mutually exclusive (phi exhaustive) and the final
+    // merge's reach is the tautology of all four. Planarity is irrelevant: the
+    // linearizer only uses topological order and per-edge reach conditions.
+    let input = r#"
+field f: Int
+
+method m(a: Bool, b: Bool, x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{
+    if (a) { goto x_blk } else { goto y_blk }
+    label x_blk
+    if (b) { goto p_blk } else { goto q_blk }
+    label y_blk
+    if (b) { goto q_blk } else { goto p_blk }
+    label p_blk
+    goto end_blk
+    label q_blk
+    goto end_blk
+    label end_blk
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
 /// Verify the resource interned under `name`, panicking if it is missing or
 /// is not a `Resource`.
 fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
@@ -1378,5 +1502,41 @@ method m(x: Ref)
             Err(ref e) if matches!(e.root_cause(), VerifyError::InsufficientPermission)
         ),
         "unfolding Inner(x) after it was folded into Outer(x) must lack permission"
+    );
+}
+
+#[test]
+fn mutually_recursive_snapshots_verify() {
+    // `A` and `B` reference each other only through a predicate *location*
+    // (`acc(B(..))` / `acc(A(..))`), not fold/unfold — so neither is a
+    // verification dependency of the other. Their snapshots are mutually
+    // recursive (nominal, by id), which is allowed: both verify.
+    let input = r#"
+field f: Int
+field nxt: Ref
+predicate A(x: Ref) { acc(x.f, write) && acc(x.nxt, write) && (x.nxt != null ==> B(x.nxt)) }
+predicate B(x: Ref) { acc(x.f, write) && acc(x.nxt, write) && (x.nxt != null ==> A(x.nxt)) }
+"#;
+    let program = lower(input);
+    assert!(verify_named_resource(&program, "A").is_ok());
+    assert!(verify_named_resource(&program, "B").is_ok());
+}
+
+#[test]
+fn cyclic_unfolding_predicates_rejected() {
+    // `P` unfolds `Q` and `Q` unfolds `P`: each appears in the other's body in
+    // an *unfolding* context, so each is a verification dependency of the other
+    // → a cycle, rejected by `analyze` (unlike the mutual-snapshot case above).
+    let input = r#"
+predicate P(x: Ref) { acc(Q(x), write) && (unfolding acc(Q(x), write) in true) }
+predicate Q(x: Ref) { acc(P(x), write) && (unfolding acc(P(x), write) in true) }
+"#;
+    let program = lower(input);
+    assert!(
+        matches!(
+            crate::vmir::analyze(program),
+            Err(crate::vmir::AnalysisError::CircularDependency(_))
+        ),
+        "mutually-unfolding predicates should be a circular dependency"
     );
 }

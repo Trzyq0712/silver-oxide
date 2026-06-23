@@ -1156,6 +1156,12 @@ fn collect_labels(stmts: &[viper::Statement], labels: &mut HashSet<Spur>) {
             viper::Statement::Block(block) => {
                 collect_labels(&block.0, labels);
             }
+            viper::Statement::If(_, then_blk, else_blk) => {
+                collect_labels(&then_blk.0, labels);
+                if let Some(b) = else_blk {
+                    collect_labels(&b.0, labels);
+                }
+            }
             _ => {}
         }
     }
@@ -1216,7 +1222,24 @@ fn lower_statement(
         // the label are loop-related and out of scope (ignored).
         S::Label(decl, _invs) => Ok(typed::Statement::Label(decl.0.id())),
 
-        S::If(..) | S::While(..) | S::Goto(..) => Err(TypeError::Other(
+        // `if (c) { .. } else { .. }`: the condition is a pure Bool; both arms
+        // are lowered in the same (flat, method-level) scope. Control flow is
+        // resolved later by the CFG (`viper::cfg`).
+        S::If(cond, then_blk, else_blk) => {
+            let cond = ctx.typecheck_pure::<MethodBodyExt>(cond, &Type::Bool, None)?;
+            let then_s = lower_stmt_block(&mut then_blk.0, ctx)?;
+            let else_s = else_blk
+                .as_mut()
+                .map(|b| lower_stmt_block(&mut b.0, ctx))
+                .transpose()?;
+            Ok(typed::Statement::If(
+                cond,
+                typed::StmtBlock(then_s),
+                else_s.map(typed::StmtBlock),
+            ))
+        }
+        S::Goto(idn) => Ok(typed::Statement::Goto(idn.id())),
+        S::While(..) => Err(TypeError::Other(
             "statement not yet supported in initial scope".to_string(),
         )),
     }

@@ -71,6 +71,23 @@ impl Sink {
         r
     }
 
+    /// Run `f` with every literal of `conds` pushed as a `Branch` guard (the
+    /// reaching condition of a CFG block), popping them all afterwards. Used by
+    /// the method-body linearizer to lower a basic block under its path
+    /// condition. The pops run even when `f` returns `Err`.
+    pub(crate) fn with_conds<R>(&mut self, conds: &PathConds, f: impl FnOnce(&mut Self) -> R) -> R {
+        for (cond, pol) in &conds.conds {
+            self.pc.conds.push((cond.clone(), *pol));
+            self.pc_kinds.push(PcKind::Branch);
+        }
+        let r = f(self);
+        for _ in &conds.conds {
+            self.pc.conds.pop();
+            self.pc_kinds.pop();
+        }
+        r
+    }
+
     /// The currently-active **branch** path-condition literals (the ones that
     /// gate permissions); `Fact` entries are excluded.
     pub(crate) fn branch_conds(&self) -> Vec<(Val, Polarity)> {

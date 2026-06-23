@@ -225,7 +225,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
 /// literal `b` yields `b ? perm : none`; a negative literal (the else arm)
 /// yields `b ? none : perm` — flipped branches instead of a materialized `!b`.
 /// The empty path condition (top level) returns `perm` unchanged.
-fn gate_perm_by_pc(sink: &mut Sink, perm: Val) -> Val {
+pub(crate) fn gate_perm_by_pc(sink: &mut Sink, perm: Val) -> Val {
     let mut v = perm;
     // Only *branch* conditions gate permissions: a separating-conjunction
     // `Fact` is an assertion (abort if false), so its `acc` keeps the bare
@@ -236,6 +236,24 @@ fn gate_perm_by_pc(sink: &mut Sink, perm: Val) -> Val {
             Polarity::Negative => (none(), v),
         };
         v = sink.emit_pure(Type::Real, PureInst::Ternary(lit, then_, else_));
+    }
+    v
+}
+
+/// Gate a written *value* by the current branch path condition, keeping the
+/// prior value `old` on the dead side: each branch literal wraps the value in a
+/// `lit ? val : old` (positive) or `lit ? old : val` (negative). Used for a
+/// field assignment inside an `if` arm, where the heap is a single timeline (no
+/// heap ternary) so the *value* must carry the branch instead of the chunk. The
+/// empty top-level pc returns `val` unchanged.
+pub(crate) fn gate_value_by_pc(sink: &mut Sink, val: Val, old: Val, ty: Type) -> Val {
+    let mut v = val;
+    for (lit, pol) in sink.branch_conds().into_iter().rev() {
+        let (then_, else_) = match pol {
+            Polarity::Positive => (v, old.clone()),
+            Polarity::Negative => (old.clone(), v),
+        };
+        v = sink.emit_pure(ty.clone(), PureInst::Ternary(lit, then_, else_));
     }
     v
 }

@@ -621,4 +621,160 @@ method m(x: Int, y: Int)
             "Div inside the ternary then-branch must be guarded by a path condition"
         );
     }
+
+    #[test]
+    fn if_else_arms_carry_complementary_path_conditions() {
+        // Each arm's guarded instructions (the `assert`s) must run under the
+        // branch condition: `<c>` in the then-arm, `<!c>` in the else-arm.
+        let input = r#"
+method m(c: Bool, x: Int)
+{
+    if (c) { assert x == x } else { assert x == x }
+}
+"#;
+        let p = run(input);
+        let m_id = p.interner.get("m").expect("missing m");
+        let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+            panic!("m must be a Method");
+        };
+        // params: c = Temp(0), x = Temp(1); the branch cond is the bare param c.
+        let c = vmir::Val::Temp(0);
+        let asserts: Vec<&vmir::PathConds> = m
+            .insts
+            .iter()
+            .filter_map(|i| matches!(i.kind, vmir::InstKind::Assert(_)).then_some(&i.pc))
+            .collect();
+        assert_eq!(asserts.len(), 2, "one assert per arm");
+        assert!(
+            asserts
+                .iter()
+                .any(|pc| pc.conds == vec![(c.clone(), vmir::Polarity::Positive)]),
+            "then-arm assert must be guarded by <c>"
+        );
+        assert!(
+            asserts
+                .iter()
+                .any(|pc| pc.conds == vec![(c.clone(), vmir::Polarity::Negative)]),
+            "else-arm assert must be guarded by <!c>"
+        );
+    }
+
+    #[test]
+    fn structured_nesting_keeps_pcs_minimal() {
+        // Structured (reducible) nesting must never produce a pc fatter than the
+        // enclosing split: inside `if a { if b { .. } }` the guard is exactly the
+        // two real branch literals `<a, b>` (no materialized OR), and each merge
+        // returns to the dominator's pc — the final `ensures` exhale carries `<>`.
+        let input = r#"
+field f: Int
+
+method m(a: Bool, b: Bool, x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{
+    if (a) {
+        if (b) {
+            assert true
+        }
+    }
+}
+"#;
+        let p = run(input);
+        let m_id = p.interner.get("m").expect("missing m");
+        let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+            panic!("m must be a Method");
+        };
+        // params: a = Temp(0), b = Temp(1).
+        let assert = m
+            .insts
+            .iter()
+            .find(|i| matches!(i.kind, vmir::InstKind::Assert(_)))
+            .expect("inner assert");
+        assert_eq!(
+            assert.pc.conds,
+            vec![
+                (vmir::Val::Temp(0), vmir::Polarity::Positive),
+                (vmir::Val::Temp(1), vmir::Polarity::Positive),
+            ],
+            "nested guard must be the two real branch literals <a, b>, not a materialized OR"
+        );
+        let exhale = m
+            .insts
+            .iter()
+            .find(|i| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
+            .expect("ensures exhale");
+        assert!(
+            exhale.pc.conds.is_empty(),
+            "both merges return to the dominator pc; final exhale is <>, got {:?}",
+            exhale.pc
+        );
+    }
+
+    #[test]
+    fn exhaustive_three_way_join_minimizes_to_empty_pc() {
+        // A 3-way `goto` join whose reach is `a ∨ (!a∧b) ∨ (!a∧!b)` — a tautology.
+        // Cube minimization (`merge_cubes`) collapses it, so the post-merge
+        // `ensures` exhale must carry the trivial `<>`, not a materialized-OR
+        // literal: the permission stays ungated.
+        let input = r#"
+field f: Int
+
+method m(a: Bool, b: Bool, x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{
+    if (a) { goto done }
+    if (b) { goto done }
+    label done
+}
+"#;
+        let p = run(input);
+        let m_id = p.interner.get("m").expect("missing m");
+        let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+            panic!("m must be a Method");
+        };
+        let exhale = m
+            .insts
+            .iter()
+            .find(|i| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
+            .expect("ensures lowers to an exhale");
+        assert!(
+            exhale.pc.conds.is_empty(),
+            "exhaustive 3-way join must minimize to <>, got {:?}",
+            exhale.pc
+        );
+    }
+
+    #[test]
+    fn join_inserts_phi_for_divergent_variable() {
+        // `r` takes different values on the two arms, so the merge block must
+        // reconcile it with a phi `c ? a : b`; the merged value flows into the
+        // postcondition with the trivial `<>` path condition.
+        let input = r#"
+method m(c: Bool, a: Int, b: Int) returns (r: Int)
+{
+    if (c) { r := a } else { r := b }
+}
+"#;
+        let p = run(input);
+        let m_id = p.interner.get("m").expect("missing m");
+        let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+            panic!("m must be a Method");
+        };
+        // params: c=Temp(0), a=Temp(1), b=Temp(2); ret r=Temp(3).
+        let phi = m
+            .insts
+            .iter()
+            .find(|i| {
+                matches!(
+                    &i.kind,
+                    vmir::InstKind::Pure(_, vmir::PureInst::Ternary(c, t, e))
+                        if *c == vmir::Val::Temp(0)
+                            && *t == vmir::Val::Temp(1)
+                            && *e == vmir::Val::Temp(2)
+                )
+            })
+            .expect("merge must emit phi `c ? a : b`");
+        assert!(phi.pc.conds.is_empty(), "phi itself is unguarded");
+    }
 }

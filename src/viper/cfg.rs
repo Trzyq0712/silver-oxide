@@ -67,6 +67,55 @@ pub enum CfgError {
     UndefinedLabel(Spur),
 }
 
+/// Which outgoing edge of a predecessor reaches a block: an unconditional
+/// `goto`/fall-through, or the then/else arm of a `Branch` (the branch
+/// condition must hold / must not hold to take it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeSide {
+    Goto,
+    Then,
+    Else,
+}
+
+impl Cfg {
+    /// Blocks in topological (dependency) order — every block precedes its
+    /// successors. Infallible: the graph is acyclic by construction.
+    pub fn topo_order(&self) -> Vec<BlockId> {
+        let g = block_graph(&self.blocks);
+        toposort(&g, None).expect("CFG is acyclic by construction")
+    }
+
+    /// For each block, its predecessors paired with the edge that reaches it.
+    pub fn predecessors(&self) -> TiVec<BlockId, Vec<(BlockId, EdgeSide)>> {
+        let mut preds: TiVec<BlockId, Vec<(BlockId, EdgeSide)>> =
+            self.blocks.iter().map(|_| Vec::new()).collect();
+        for (id, blk) in self.blocks.iter_enumerated() {
+            match &blk.term {
+                Terminator::Goto(t) => preds[*t].push((id, EdgeSide::Goto)),
+                Terminator::Branch { then_, else_, .. } => {
+                    preds[*then_].push((id, EdgeSide::Then));
+                    preds[*else_].push((id, EdgeSide::Else));
+                }
+                Terminator::Return => {}
+            }
+        }
+        preds
+    }
+
+    /// The set of blocks reachable from the entry (the rest are dead code an
+    /// `if`/`goto` left behind and need not be lowered).
+    pub fn reachable(&self) -> HashSet<BlockId> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![self.entry];
+        while let Some(b) = stack.pop() {
+            if seen.insert(b) {
+                stack.extend(successors(&self.blocks[b].term));
+            }
+        }
+        seen
+    }
+}
+
 /// Build the basic-block CFG of a method body, rejecting loops (back-edge
 /// `goto`s) and `goto`s to undefined labels.
 pub fn build_cfg(body: &StmtBlock) -> Result<Cfg, CfgError> {
