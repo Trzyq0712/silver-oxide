@@ -60,7 +60,7 @@ pub(crate) fn lower_method(
     collect_var_types(&body.0, &mut var_types);
 
     // Inhale this method's own precondition into the linear heap that every
-    // block threads: `h := current + acc self@requires`.
+    // block threads: `h := current + acc self#requires`.
     let mut current_heap: HeapVal = HeapVal::Empty;
     if let Some(&req_id) = b.method_requires.get(&m.name.0) {
         current_heap = emit_resource_combine(
@@ -758,7 +758,7 @@ fn lower_method_call(
 
     let mut heap = current_heap;
 
-    // Exhale precondition (if present): `h := heap - acc m@requires(args)`
+    // Exhale precondition (if present): `h := heap - acc m#requires(args)`
     // (implicitly asserts the requires bool).
     if let Some(&req_id) = b.method_requires.get(&call.name.0) {
         heap = emit_resource_combine(b, sink, vmir::Sign::Sub, req_id, heap, args.clone());
@@ -772,7 +772,7 @@ fn lower_method_call(
         ret_vals.push(v);
     }
 
-    // Inhale postcondition (if present): `h := heap + acc m@ensures(args, rets)`
+    // Inhale postcondition (if present): `h := heap + acc m#ensures(args, rets)`
     // (implicitly assumes the ensures bool).
     if let Some(&ens_id) = b.method_ensures.get(&call.name.0) {
         let mut ens_args = args.clone();
@@ -788,8 +788,8 @@ fn lower_method_call(
 /// (`Sub`) its boolean. Returns the resulting heap.
 ///
 /// The ctx heap is supplied (`Some(base)`) only when the called resource has a
-/// precondition resource (two-state, e.g. `@ensures`); self-framed resources
-/// (`@requires`, predicates) are context-free (`None`). The verifier currently
+/// precondition resource (two-state, e.g. `#ensures`); self-framed resources
+/// (`#requires`, predicates) are context-free (`None`). The verifier currently
 /// ignores it, so it is bookkeeping until ctx heaps become live.
 fn emit_resource_combine(
     b: &Builder<'_>,

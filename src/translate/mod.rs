@@ -89,9 +89,9 @@ pub(crate) struct Builder<'a> {
     pub name_map: HashMap<Spur, vmir::MemberId>,
     /// Maps a field's `Spur` to its address-location MemberId (its bare name).
     pub field_addr: HashMap<Spur, vmir::MemberId>,
-    /// Maps a method's `Spur` to its `@requires` Resource MemberId (if any).
+    /// Maps a method's `Spur` to its `#requires` Resource MemberId (if any).
     pub method_requires: HashMap<Spur, vmir::MemberId>,
-    /// Maps a method's `Spur` to its `@ensures` Resource MemberId (if any).
+    /// Maps a method's `Spur` to its `#ensures` Resource MemberId (if any).
     pub method_ensures: HashMap<Spur, vmir::MemberId>,
     /// Maps a constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
@@ -132,7 +132,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Whether `id` is a resource with a precondition resource (two-state, e.g.
-    /// `@ensures`). Such calls carry a context heap; self-framed resources don't.
+    /// `#ensures`). Such calls carry a context heap; self-framed resources don't.
     pub(crate) fn is_ctx_resource(&self, id: vmir::MemberId) -> bool {
         matches!(
             self.decls.get(usize::from(id)),
@@ -314,14 +314,14 @@ impl<'a> Builder<'a> {
         }
 
         if let Some(requires) = &m.requires {
-            let req_id = self.fresh_decl(&format!("{name}@requires"));
+            let req_id = self.fresh_decl(&format!("{name}#requires"));
             self.method_requires.insert(m.name.0, req_id);
             let params: Vec<vmir::Type> = m.params.iter().map(|p| lower_type(&p.ty)).collect();
             let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
             for (i, p) in m.params.iter().enumerate() {
                 env.insert(p.name.0, vmir::Val::Temp(i));
             }
-            // `@requires` is self-framed: accumulate from an empty initial heap,
+            // `#requires` is self-framed: accumulate from an empty initial heap,
             // emitted heaps start at `HeapVal::Temp(0)`.
             let body = resource::lower_spatial_never(
                 self,
@@ -342,7 +342,7 @@ impl<'a> Builder<'a> {
         }
 
         if let Some(ensures) = &m.ensures {
-            let ens_id = self.fresh_decl(&format!("{name}@ensures"));
+            let ens_id = self.fresh_decl(&format!("{name}#ensures"));
             self.method_ensures.insert(m.name.0, ens_id);
             let mut params: Vec<vmir::Type> = m.params.iter().map(|p| lower_type(&p.ty)).collect();
             params.extend(m.rets.iter().map(|r| lower_type(&r.ty)));
@@ -353,7 +353,7 @@ impl<'a> Builder<'a> {
             for (i, r) in m.rets.iter().enumerate() {
                 env.insert(r.name.0, vmir::Val::Temp(m.params.len() + i));
             }
-            // m@ensures's precondition resource is m@requires (when present).
+            // m#ensures's precondition resource is m#requires (when present).
             // The ensures delta is produced-only: accumulate from `HeapVal::Empty`
             // so a resource named in both requires and ensures isn't counted
             // twice. When there *is* a precondition, `HeapVal::Temp(0)` is the
@@ -516,11 +516,11 @@ method add(this: Ref, other: Ref) returns (res: Ref)
 
         // Method contracts.
         for name in [
-            "assign@ensures",
-            "read@requires",
-            "read@ensures",
-            "add@requires",
-            "add@ensures",
+            "assign#ensures",
+            "read#requires",
+            "read#ensures",
+            "add#requires",
+            "add#ensures",
         ] {
             let id = p
                 .interner
@@ -532,14 +532,14 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             );
         }
         assert!(
-            p.interner.get("assign@requires").is_none(),
-            "assign has no precondition; @requires must not exist"
+            p.interner.get("assign#requires").is_none(),
+            "assign has no precondition; #requires must not exist"
         );
 
-        // The read@requires body must reference the predicate's address
+        // The read#requires body must reference the predicate's address
         // location (`Location(number_id, ..)` — the predicate's own id) and an
         // Acc on its result, NOT a ResourceCall on number.
-        let read_req_id = p.interner.get("read@requires").unwrap();
+        let read_req_id = p.interner.get("read#requires").unwrap();
         let vmir::Declaration::Resource(read_req) = &p.decls[read_req_id] else {
             unreachable!();
         };
@@ -555,12 +555,12 @@ method add(this: Ref, other: Ref) returns (res: Ref)
                 _ => {}
             }
         }
-        assert!(saw_addr_call, "read@requires must address number");
-        assert!(saw_acc, "read@requires must contain an acc");
+        assert!(saw_addr_call, "read#requires must address number");
+        assert!(saw_acc, "read#requires must contain an acc");
 
         // The `add` body's method contracts lower to resource inhale/exhale
-        // instructions: an `exhale` of `add@requires` (implicit assert) and an
-        // `inhale` of `add@ensures` (implicit assume). No standalone
+        // instructions: an `exhale` of `add#requires` (implicit assert) and an
+        // `inhale` of `add#ensures` (implicit assume). No standalone
         // Assert/Assume/ResourceCall remain.
         let add_id = p.interner.get("add").expect("missing add method");
         let vmir::Declaration::Method(add) = &p.decls[add_id] else {
@@ -600,9 +600,9 @@ method m(x: Int, y: Int)
 "#;
         let p = run(input);
 
-        let req_id = p.interner.get("m@requires").expect("missing m@requires");
+        let req_id = p.interner.get("m#requires").expect("missing m#requires");
         let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
-            panic!("m@requires must be a Resource");
+            panic!("m#requires must be a Resource");
         };
         let body = req.body.as_ref().unwrap();
 

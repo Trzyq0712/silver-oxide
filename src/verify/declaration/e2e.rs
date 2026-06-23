@@ -302,7 +302,7 @@ method m(x: Ref)
     requires acc(x.f, 1/1 - 2/1)
 "#;
     let program = lower(input);
-    let result = verify_named_resource(&program, "m@requires");
+    let result = verify_named_resource(&program, "m#requires");
     assert!(
         matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))),
         "expected SideCondition, got {result:?}"
@@ -318,7 +318,7 @@ method m(x: Ref)
     requires acc(x.f, 1/1)
 "#;
     let program = lower(input);
-    let result = verify_named_resource(&program, "m@requires");
+    let result = verify_named_resource(&program, "m#requires");
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
 
@@ -330,7 +330,7 @@ method m(x: Int)
     requires x / 0 == x
 "#;
     let program = lower(input);
-    let result = verify_named_resource(&program, "m@requires");
+    let result = verify_named_resource(&program, "m#requires");
     assert!(
         matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))),
         "expected SideCondition, got {result:?}"

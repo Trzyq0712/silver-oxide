@@ -21,10 +21,10 @@ pub struct Resource {
 /// A resource's precondition mode.
 ///
 /// - `SelfFramed`: one-state — the body reads only its own footprint. Predicates,
-///   `@requires`, and function preconditions. Snapshottable / foldable.
+///   `#requires`, and function preconditions. Snapshottable / foldable.
 /// - `Ctx(req, args)`: two-state — the body additionally reads a context heap
 ///   (`HeapVal::Temp(0)`), the delta of the precondition resource `req` applied
-///   to `args` (the caller-supplied pre-state). `@ensures`. Opaque-only; never
+///   to `args` (the caller-supplied pre-state). `#ensures`. Opaque-only; never
 ///   snapshotted or folded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Precond {
