@@ -72,6 +72,10 @@ fn static_rules() -> Vec<Rule> {
         // full permission `write` folds away)
         rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
         rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
+        // x == x => true   (reflexivity; also fires when congruence has already
+        // merged the two operands into one e-class, e.g. a return var copied from
+        // a param: `ensures r == a` after `r := a`).
+        rw!("eq-refl"; "(== ?x ?x)" => "true"),
         // (a == b) proven true  =>  a ≡ b   (congruence)
         rw!("eq-true-union"; "(== ?a ?b)" => {
             UnionEqArgs { a: var("?a"), b: var("?b") }

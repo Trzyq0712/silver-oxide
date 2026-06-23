@@ -230,6 +230,18 @@ method m(a: Bool, b: Bool, x: Ref)
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
 
+#[test]
+fn value_postcondition_reflexive_and_copied() {
+    // `ensures r == a` after `r := a` reduces to `a == a` — discharged by the
+    // `eq-refl` rule (also covers a copy chain `t := a; r := t` via congruence).
+    for body in ["r := a", "var t: Int := a  r := t"] {
+        let input = format!("method m(a: Int) returns (r: Int) ensures r == a {{ {body} }}");
+        let program = lower(&input);
+        let result = verify_named_method(&program, "m");
+        assert!(result.is_ok(), "body `{body}`: expected Ok, got {result:?}");
+    }
+}
+
 /// Verify the resource interned under `name`, panicking if it is missing or
 /// is not a `Resource`.
 fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
