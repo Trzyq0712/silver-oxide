@@ -219,8 +219,11 @@ pub enum Statement {
     Block(StmtBlock),
     Fold(PredicateWithPerm<MethodBodyExt>),
     Unfold(PredicateWithPerm<MethodBodyExt>),
-    /// Label marking a heap state for `old[L](...)` to refer back to.
+    /// Label marking a heap state for `old[L](...)` to refer back to; also a
+    /// jump target for `goto`.
     Label(Spur),
+    /// `goto L`: unconditional jump to the block labelled `L`.
+    Goto(Spur),
 }
 
 #[derive(Debug, Clone, PartialEq)]

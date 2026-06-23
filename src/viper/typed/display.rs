@@ -268,6 +268,7 @@ impl<'a> Display for Show<'a, &'a Statement> {
             Statement::Fold(p) => write!(f, "fold {}", self.with(p)),
             Statement::Unfold(p) => write!(f, "unfold {}", self.with(p)),
             Statement::Label(l) => write!(f, "label {}", self.interner.resolve(l)),
+            Statement::Goto(l) => write!(f, "goto {}", self.interner.resolve(l)),
         }
     }
 }

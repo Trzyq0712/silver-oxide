@@ -270,6 +270,9 @@ fn lower_stmt(
             labeled.insert(*l, current_heap);
             Ok(current_heap)
         }
+        // Control flow is linearized via the CFG (`viper::cfg`) before reaching
+        // straight-line lowering; a bare `goto` here is not yet wired.
+        S::Goto(_) => Err(TranslationError::Unsupported("goto statement")),
         // Inhale: add the assertion's heap delta to the current heap and assume
         // its boolean. Heap-dependent sub-expressions are evaluated against the
         // growing heap (`ReadHeap::Track`), so later conjuncts can observe the
