@@ -199,6 +199,33 @@ impl<'a> HeapCtx<'a> {
     }
 }
 
+/// Lower a predicate-with-perm (`P(args)` + permission) into a self-framed
+/// `ResourceCall` plus the lowered permission `Val`. Shared by `unfolding`
+/// expressions and method-body `fold`/`unfold` statements.
+pub(crate) fn lower_pred_call<Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink,
+    hctx: HeapCtx<'_>,
+    pwp: &typed::PredicateWithPerm<Ext>,
+) -> Result<(ResourceCall, Val), TranslationError> {
+    let pred_id = *b.name_map.get(&pwp.pred_call.name.0).ok_or_else(|| {
+        TranslationError::UnknownIdent(b.interner.resolve(&pwp.pred_call.name.0).to_string())
+    })?;
+    let mut args = Vec::with_capacity(pwp.pred_call.args.len());
+    for a in &pwp.pred_call.args {
+        args.push(lower(b, env, sink, hctx, a)?);
+    }
+    let perm = lower(b, env, sink, hctx, &pwp.perm)?;
+    // Predicates are self-framed (context-free): no ctx heap.
+    let call = ResourceCall {
+        resource: pred_id,
+        ctx_heap: None,
+        args,
+    };
+    Ok((call, perm))
+}
+
 pub(crate) fn lower<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -253,7 +280,24 @@ pub(crate) fn lower<Ext: PureExt>(
             let addr = crate::translate::resource::field_addr(b, sink, base, id.0)?;
             Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
         }
-        P::Unfolding(_, _) => Err(TranslationError::Unsupported("unfolding")),
+        P::Unfolding(pwp, body) => {
+            // `unfolding acc(P(args), perm) in body`: a *scoped* unfold. Emit a
+            // normal `Unfold`, evaluate `body` against the unfolded heap, then
+            // discard that heap — the surrounding expression keeps reading the
+            // original `hctx` (the unfolded heap temp is left unreferenced).
+            let (call, perm) = lower_pred_call(b, env, sink, hctx, pwp)?;
+            let h = sink.emit_heap_guarded(HeapInst::Unfold {
+                base: hctx.value,
+                call,
+                perm,
+            });
+            let inner = HeapCtx {
+                value: h,
+                perm: h,
+                old: hctx.old,
+            };
+            lower(b, env, sink, inner, body)
+        }
         P::FunctionCall(call) => {
             // Constructors and (heap-independent) user functions. Heap-dependent
             // functions are a later (purification) concern; pass an empty heap.

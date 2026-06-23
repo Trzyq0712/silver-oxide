@@ -370,22 +370,9 @@ fn lower_fold_unfold(
     pwp: &typed::PredicateWithPerm<typed::MethodBodyExt>,
     is_fold: bool,
 ) -> Result<HeapVal, TranslationError> {
-    let pred_id = *b.name_map.get(&pwp.pred_call.name.0).ok_or_else(|| {
-        TranslationError::UnknownIdent(b.interner.resolve(&pwp.pred_call.name.0).to_string())
-    })?;
     let old = pure_exp::OldHeaps { baseline, labeled };
     let hctx = pure_exp::HeapCtx::same_with_old(current_heap, &old);
-    let mut args = Vec::with_capacity(pwp.pred_call.args.len());
-    for a in &pwp.pred_call.args {
-        args.push(pure_exp::lower(b, env, sink, hctx, a)?);
-    }
-    let perm = pure_exp::lower(b, env, sink, hctx, &pwp.perm)?;
-    // Predicates are self-framed (context-free): no ctx heap.
-    let call = ResourceCall {
-        resource: pred_id,
-        ctx_heap: None,
-        args,
-    };
+    let (call, perm) = pure_exp::lower_pred_call(b, env, sink, hctx, pwp)?;
     let inst = if is_fold {
         HeapInst::Fold {
             base: current_heap,

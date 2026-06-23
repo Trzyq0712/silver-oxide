@@ -606,18 +606,24 @@ fn eval_heap_inst(
 }
 
 /// Evaluate one instruction of a resource body (well-formedness pass). Resource
-/// bodies currently emit only `Pure`/`Heap`; the effectful variants are not yet
-/// produced there (a follow-up enables inline `assume`).
+/// bodies emit `Pure`/`Heap`; `unfold` is the one heap op handled specially
+/// (shared with method bodies), the rest go through `eval_heap_inst`. The
+/// effectful variants (`Assume`/`Assert`/`Refute`) are not produced here.
 fn eval_resource_body_inst(
     ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
     state: &mut EvalState,
     inst: &Inst,
+    certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
             let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id);
         }
+        // `unfold` inside a resource body verifies identically to a method
+        // body (shared `eval_unfold`); only `Unfold` is emitted here.
+        InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -778,66 +784,7 @@ fn eval_method_inst(
         // `unfold`: inverse of fold — consume the predicate chunk, reproduce the
         // footprint (fields recovered by projecting the snapshot), assume the
         // body's pure facts.
-        InstKind::Heap(HeapInst::Unfold { base, call, perm }) => {
-            let base_h = get_heap(state, base);
-            let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
-                return Err(VerifyError::DependencyFailed);
-            };
-            let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
-                return Err(VerifyError::Unimplemented("unfold of abstract predicate"));
-            };
-            let (snap_head, addr_fn) = (call.resource, call.resource);
-            let field_types = snap.variants.into_iter().next().unwrap().field_types;
-            let cert = certs
-                .get(&call.resource)
-                .ok_or(VerifyError::DependencyFailed)?;
-            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            let perm_id = state.get_val(ctx, perm);
-            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-
-            let pred_addr = ctx.add_location(addr_fn, args.clone().into());
-            let a = ctx.egraph.find(pred_addr);
-            let s = base_h
-                .entries()
-                .find_map(|(k, c)| (ctx.egraph.find(k) == a).then(|| c.value))
-                .ok_or(VerifyError::InsufficientPermission)?;
-            let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
-
-            let mut values = Vec::with_capacity(cert.footprint.len());
-            // As in fold, grow `subst` with each recovered slot value so a
-            // value-dependent address (an inner predicate `P(this.next)`) resolves
-            // against the projected field value.
-            let mut subst = ctx.footprint_param_subst(cert, &args);
-            for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
-                let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
-                // `proj_i(s)` recovers the optional snapshot member; `reduce()`
-                // collapses it to the constructor's i-th member when `s` is a
-                // concrete `cons` (so repeated fold/unfold doesn't grow the
-                // snapshot tower), and leaves it uninterpreted for an opaque
-                // snapshot. `unwrap` then peels the `Option` to the field value.
-                // The snapshot's i-th field is `Option[T]`; the projection yields
-                // it, then `option_unwrap` peels to the inner `T`.
-                let elem = field_types[i]
-                    .option_inner()
-                    .unwrap_or(&field_types[i])
-                    .clone();
-                let proj_id = ctx.alloc.proj(snap_head, &[], 0, i);
-                let opt_ty = ctx.alloc.option_type(elem.clone());
-                let opt = ctx.add_func_app_id(proj_id, opt_ty, Box::new([s]));
-                let pv = ctx.option_unwrap(elem, opt);
-                let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
-                out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
-                subst.insert(cert.egraph.find(c_val), pv);
-                values.push(pv);
-            }
-            let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-            let true_ = ctx.true_();
-            ctx.egraph.union(bool_id, true_);
-            ctx.egraph.rebuild();
-            state.push_heap(out);
-            // Collapse any snapshot tower created by repeated fold/unfold.
-            ctx.reduce();
-        }
+        InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -874,6 +821,82 @@ fn eval_method_inst(
             }
         }
     }
+    Ok(())
+}
+
+/// Evaluate an `unfold`: consume the predicate chunk, reproduce the footprint
+/// (fields recovered by projecting the snapshot), assume the body's pure facts.
+/// Shared by method bodies and resource bodies; grafts the unfolded predicate's
+/// pre-verified certificate (so the predicate must be verified first — a
+/// self/mutual `unfolding` cycle is rejected upstream by `analyze`).
+fn eval_unfold(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    state: &mut EvalState,
+    inst: &Inst,
+    certs: &HashMap<MemberId, ResourceCertificate>,
+) -> Result<(), VerifyError> {
+    let InstKind::Heap(HeapInst::Unfold { base, call, perm }) = &inst.kind else {
+        unreachable!("eval_unfold called on a non-Unfold instruction");
+    };
+    let base_h = get_heap(state, base);
+    let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
+        return Err(VerifyError::DependencyFailed);
+    };
+    let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
+        return Err(VerifyError::Unimplemented("unfold of abstract predicate"));
+    };
+    let (snap_head, addr_fn) = (call.resource, call.resource);
+    let field_types = snap.variants.into_iter().next().unwrap().field_types;
+    let cert = certs
+        .get(&call.resource)
+        .ok_or(VerifyError::DependencyFailed)?;
+    let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
+    let perm_id = state.get_val(ctx, perm);
+    let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+
+    let pred_addr = ctx.add_location(addr_fn, args.clone().into());
+    let a = ctx.egraph.find(pred_addr);
+    let s = base_h
+        .entries()
+        .find_map(|(k, c)| (ctx.egraph.find(k) == a).then(|| c.value))
+        .ok_or(VerifyError::InsufficientPermission)?;
+    let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
+
+    let mut values = Vec::with_capacity(cert.footprint.len());
+    // As in fold, grow `subst` with each recovered slot value so a
+    // value-dependent address (an inner predicate `P(this.next)`) resolves
+    // against the projected field value.
+    let mut subst = ctx.footprint_param_subst(cert, &args);
+    for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
+        let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
+        // `proj_i(s)` recovers the optional snapshot member; `reduce()`
+        // collapses it to the constructor's i-th member when `s` is a
+        // concrete `cons` (so repeated fold/unfold doesn't grow the
+        // snapshot tower), and leaves it uninterpreted for an opaque
+        // snapshot. `unwrap` then peels the `Option` to the field value.
+        // The snapshot's i-th field is `Option[T]`; the projection yields
+        // it, then `option_unwrap` peels to the inner `T`.
+        let elem = field_types[i]
+            .option_inner()
+            .unwrap_or(&field_types[i])
+            .clone();
+        let proj_id = ctx.alloc.proj(snap_head, &[], 0, i);
+        let opt_ty = ctx.alloc.option_type(elem.clone());
+        let opt = ctx.add_func_app_id(proj_id, opt_ty, Box::new([s]));
+        let pv = ctx.option_unwrap(elem, opt);
+        let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
+        out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
+        subst.insert(cert.egraph.find(c_val), pv);
+        values.push(pv);
+    }
+    let bool_id = ctx.graft_pred_bool(cert, &args, &values);
+    let true_ = ctx.true_();
+    ctx.egraph.union(bool_id, true_);
+    ctx.egraph.rebuild();
+    state.push_heap(out);
+    // Collapse any snapshot tower created by repeated fold/unfold.
+    ctx.reduce();
     Ok(())
 }
 
@@ -957,6 +980,7 @@ pub fn verify_resource(
     program: &vmir::Program,
     resource_name: &str,
     resource: &Resource,
+    certs: &HashMap<MemberId, ResourceCertificate>,
     alloc: &mut crate::verify::mono::Allocator,
 ) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
@@ -1006,7 +1030,7 @@ pub fn verify_resource(
             }
         }
 
-        if let Err(err) = eval_resource_body_inst(&mut ctx, &mut state, inst) {
+        if let Err(err) = eval_resource_body_inst(&mut ctx, program, &mut state, inst, certs) {
             return Err(err.with_inst(inst_text));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);

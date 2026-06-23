@@ -117,7 +117,23 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
         panic!("{name} must be a Resource");
     };
     let mut alloc = crate::verify::mono::Allocator::new(program);
-    verify_resource(program, name, r, &mut alloc).map(|_| ())
+    // Build certificates for the *other* resources (dependency order ≈ decl
+    // order for these small fixtures), tolerating failures, so a body that
+    // unfolds another predicate can graft its certificate. The target itself is
+    // skipped so a deliberately-failing target still returns `Err`.
+    let mut certs = HashMap::new();
+    for (cid, decl) in program.decls.iter_enumerated() {
+        if cid == id {
+            continue;
+        }
+        if let vmir::Declaration::Resource(cr) = decl {
+            let cname = program.interner.resolve(&cid).to_string();
+            if let Ok(Some(cert)) = verify_resource(program, &cname, cr, &certs, &mut alloc) {
+                certs.insert(cid, cert);
+            }
+        }
+    }
+    verify_resource(program, name, r, &certs, &mut alloc).map(|_| ())
 }
 
 /// Build certificates for every resource in `program` (test helper). Shares the
@@ -131,7 +147,7 @@ fn build_certs(
         if let vmir::Declaration::Resource(r) = decl {
             let name = program.interner.resolve(&id).to_string();
             if let Some(cert) =
-                verify_resource(program, &name, r, alloc).expect("resource verifies")
+                verify_resource(program, &name, r, &certs, alloc).expect("resource verifies")
             {
                 certs.insert(id, cert);
             }
@@ -337,6 +353,88 @@ method m(x: Ref)
     assert!(
         verify_named_method(&program, "m").is_ok(),
         "fold/unfold round-trip should preserve x.f == 5"
+    );
+}
+
+#[test]
+fn unfolding_expression_reads_field() {
+    // `unfolding acc(Cell(x), write) in x.f` reads the field through a scoped
+    // unfold without a preceding statement `unfold` — the predicate stays
+    // folded afterwards (the unfolded heap is discarded).
+    let input = r#"
+field f: Int
+predicate Cell(x: Ref) { acc(x.f, write) }
+method m(x: Ref) returns (v: Int)
+  requires acc(x.f, write) && x.f == 5
+{
+  fold acc(Cell(x), write)
+  v := unfolding acc(Cell(x), write) in x.f
+  assert v == 5
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "unfolding expression should read x.f == 5 through a scoped unfold"
+    );
+}
+
+#[test]
+fn unfolding_in_predicate_body_unfolds_nested() {
+    // A predicate body holds a nested predicate and reads through it via
+    // `unfolding`, verified by the shared resource-body unfold path (the cert
+    // of the nested `Inner` is grafted).
+    let input = r#"
+field f: Int
+predicate Inner(x: Ref) { acc(x.f, write) }
+predicate Outer(x: Ref) {
+  acc(Inner(x), write) && (unfolding acc(Inner(x), write) in x.f) == 0
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_resource(&program, "Outer").is_ok(),
+        "Outer well-formedness should verify via nested unfold"
+    );
+}
+
+#[test]
+fn unfolding_in_predicate_body_without_holding_fails() {
+    // `unfolding Inner(x)` without holding `acc(Inner(x))` lacks permission.
+    let input = r#"
+field f: Int
+predicate Inner(x: Ref) { acc(x.f, write) }
+predicate Bad(x: Ref) { (unfolding acc(Inner(x), write) in x.f) == 0 }
+"#;
+    let program = lower(input);
+    assert!(
+        matches!(
+            verify_named_resource(&program, "Bad"),
+            Err(ref e) if matches!(e.root_cause(), VerifyError::InsufficientPermission)
+        ),
+        "unfolding a predicate that is not held should lack permission"
+    );
+}
+
+#[test]
+fn unfolding_recursive_predicate_in_resource_body() {
+    // A predicate body unfolds a *recursive* predicate one level by grafting
+    // the unfolded predicate's certificate (`List` is verified first).
+    let input = r#"
+field val: Int
+field next: Ref
+predicate List(this: Ref) {
+  acc(this.val, write) && acc(this.next, write) &&
+  (this.next != null ==> List(this.next))
+}
+predicate Head(this: Ref) {
+  acc(List(this), write) && (unfolding acc(List(this), write) in this.val) == 0
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_resource(&program, "Head").is_ok(),
+        "Head should verify by inlining List one level (cert-free)"
     );
 }
 

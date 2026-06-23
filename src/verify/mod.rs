@@ -39,7 +39,7 @@ pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<VerifyResult> {
         let name = program.interner.resolve(&id).to_string();
         let outcome = match &program.decls[id] {
             vmir::Declaration::Resource(r) => {
-                match declaration::verify_resource(program, &name, r, &mut alloc) {
+                match declaration::verify_resource(program, &name, r, &certs, &mut alloc) {
                     Ok(cert) => {
                         if let Some(cert) = cert {
                             certs.insert(id, cert);
