@@ -103,19 +103,20 @@ impl Snapshotter {
             }
         }
         for m in funcs {
-            // `Symbolic` renders a func app as `fn<id>(..)` (no type args) or
-            // `fn<id><T0, T1>(..)` (with the ground instantiation folded into the
-            // label). Resolve just the `fn<id>` token to the concept name, keeping
-            // any `<…>` type suffix. Anchoring on the trailing `(`/`<` keeps `fn1`
-            // from also rewriting `fn10`.
+            // `Symbolic` renders a func app as `fn<id>` (no type args) or
+            // `fn<id>[T0, T1]` (Viper-style square-bracket type args folded into
+            // the label). Resolve just the `fn<id>` token to the concept name,
+            // keeping any `[…]` type suffix. Anchor on the trailing label-quote
+            // `"` (no type args) or `[` (typed) so `fn1` doesn't also rewrite
+            // `fn10`.
             let name = escape(&ctx.func_name(m));
-            dot = dot.replace(&format!("fn{}(", m.0), &format!("{name}("));
-            dot = dot.replace(&format!("fn{}<", m.0), &format!("{name}<"));
+            dot = dot.replace(&format!("fn{}\"", m.0), &format!("{name}\""));
+            dot = dot.replace(&format!("fn{}[", m.0), &format!("{name}["));
         }
         for m in locs {
             dot = dot.replace(
-                &format!("loc{}(..)", m.0),
-                &format!("{}", escape(&ctx.loc_name(m))),
+                &format!("loc{}\"", m.0),
+                &format!("{}\"", escape(&ctx.loc_name(m))),
             );
         }
         // `Symbolic` renders a fresh value as `fresh<id>`; append its type from

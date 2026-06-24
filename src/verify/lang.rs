@@ -135,13 +135,14 @@ impl Display for Symbolic {
             // dot (it holds the interner).
             Symbolic::FuncApp(id, tys, _) => {
                 if tys.is_empty() {
-                    write!(f, "fn{}(..)", id.0)
+                    write!(f, "fn{}", id.0)
                 } else {
+                    // Viper spells type arguments with square brackets (`Box[Int]`).
                     let args: Vec<String> = tys.iter().map(|t| t.to_string()).collect();
-                    write!(f, "fn{}<{}>(..)", id.0, args.join(", "))
+                    write!(f, "fn{}[{}]", id.0, args.join(", "))
                 }
             }
-            Symbolic::Location(id, _) => write!(f, "loc{}(..)", id.0),
+            Symbolic::Location(id, _) => write!(f, "loc{}", id.0),
         }
     }
 }
