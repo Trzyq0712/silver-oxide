@@ -38,13 +38,13 @@ pub(crate) fn lower_method(
     let mut init_env: HashMap<Spur, Val> = HashMap::new();
     let mut param_vals: Vec<Val> = Vec::with_capacity(m.params.len());
     for p in &m.params {
-        let v = sink.emit_pure(lower_type(&p.ty), PureInst::Fresh);
+        let v = sink.emit_pure(b.lower_type(&p.ty), PureInst::Fresh);
         init_env.insert(p.name.0, v.clone());
         param_vals.push(v);
     }
     let mut ret_names: Vec<Spur> = Vec::with_capacity(m.rets.len());
     for r in &m.rets {
-        let v = sink.emit_pure(lower_type(&r.ty), PureInst::Fresh);
+        let v = sink.emit_pure(b.lower_type(&r.ty), PureInst::Fresh);
         init_env.insert(r.name.0, v);
         ret_names.push(r.name.0);
     }
@@ -52,12 +52,12 @@ pub(crate) fn lower_method(
     // Types of every method-scoped variable, needed to type phi nodes at joins.
     let mut var_types: HashMap<Spur, Type> = HashMap::new();
     for p in &m.params {
-        var_types.insert(p.name.0, lower_type(&p.ty));
+        var_types.insert(p.name.0, b.lower_type(&p.ty));
     }
     for r in &m.rets {
-        var_types.insert(r.name.0, lower_type(&r.ty));
+        var_types.insert(r.name.0, b.lower_type(&r.ty));
     }
-    collect_var_types(&body.0, &mut var_types);
+    collect_var_types(&b.name_map, &body.0, &mut var_types);
 
     // Inhale this method's own precondition into the linear heap that every
     // block threads: `h := current + acc self#requires`.
@@ -199,22 +199,26 @@ pub(crate) fn lower_method(
 /// Collect the VMIR type of every method-scoped `var` declaration (plus the
 /// already-seeded params/rets), recursing through `if`/block statements. Viper
 /// locals are method-scoped, so a single flat map suffices for phi typing.
-fn collect_var_types(stmts: &[typed::Statement], out: &mut HashMap<Spur, Type>) {
+fn collect_var_types(
+    names: &HashMap<Spur, vmir::MemberId>,
+    stmts: &[typed::Statement],
+    out: &mut HashMap<Spur, Type>,
+) {
     use typed::Statement as S;
     for s in stmts {
         match s {
             S::Var(idents, _) => {
                 for id in idents {
-                    out.insert(id.name.0, lower_type(&id.ty));
+                    out.insert(id.name.0, lower_type(names, &[], &id.ty));
                 }
             }
             S::If(_, then, els) => {
-                collect_var_types(&then.0, out);
+                collect_var_types(names, &then.0, out);
                 if let Some(e) = els {
-                    collect_var_types(&e.0, out);
+                    collect_var_types(names, &e.0, out);
                 }
             }
-            S::Block(inner) => collect_var_types(&inner.0, out),
+            S::Block(inner) => collect_var_types(names, &inner.0, out),
             _ => {}
         }
     }
@@ -435,7 +439,7 @@ fn lower_stmt(
     match stmt {
         S::Var(idents, None) => {
             for id in idents {
-                let ty = lower_type(&id.ty);
+                let ty = b.lower_type(&id.ty);
                 let v = sink.emit_pure(ty, PureInst::Fresh);
                 env.insert(id.name.0, v);
             }
@@ -461,7 +465,7 @@ fn lower_stmt(
         }
         S::Var(idents, Some(typed::AssignRhs::MethodCall(call))) => {
             let ret_names: Vec<Spur> = idents.iter().map(|i| i.name.0).collect();
-            let ret_types: Vec<vmir::Type> = idents.iter().map(|i| lower_type(&i.ty)).collect();
+            let ret_types: Vec<vmir::Type> = idents.iter().map(|i| b.lower_type(&i.ty)).collect();
             lower_method_call(
                 b,
                 env,
@@ -538,7 +542,7 @@ fn lower_stmt(
                     let val = if sink.branch_conds().is_empty() {
                         v
                     } else {
-                        let ty = lower_type(&pure.ty);
+                        let ty = b.lower_type(&pure.ty);
                         let old = sink.emit_pure_guarded(
                             ty.clone(),
                             PureInst::Deref(current_heap, addr.clone()),

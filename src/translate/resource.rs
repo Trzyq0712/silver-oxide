@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use lasso::Spur;
 
 use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PcKind, PureExt, Sink};
-use crate::translate::{Builder, TranslationError, lower_type};
+use crate::translate::{Builder, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{
     self, FALSE, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val, none,
@@ -408,7 +408,7 @@ pub(crate) fn field_addr(
         .resolve(fname)
         .and_then(|s| s.as_field().cloned())
         .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
-    let ret_ty = Type::Addr(Box::new(lower_type(&field_ty)));
+    let ret_ty = Type::Addr(Box::new(b.lower_type(&field_ty)));
     Ok(sink.emit_pure(ret_ty, PureInst::Location(addr_fn, vec![base])))
 }
 

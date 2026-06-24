@@ -251,7 +251,7 @@ pub(crate) fn lower<Ext: PureExt>(
     exp: &typed::TypedPureExp<Ext>,
 ) -> Result<Val, TranslationError> {
     use typed::PureExpKind as P;
-    let ty = lower_type(&exp.ty);
+    let ty = b.lower_type(&exp.ty);
     match &*exp.exp {
         P::Ident(id) => env
             .get(&id.0)
@@ -326,7 +326,7 @@ pub(crate) fn lower<Ext: PureExt>(
             // `FunctionCall` to the constructor's synthetic declaration.
             if let Some(&(adt_spur, variant)) = b.ctor_tag.get(&call.name.0) {
                 let adt = b.name_map[&adt_spur];
-                let type_args = adt_type_args(&exp.ty);
+                let type_args = adt_type_args(&b.name_map, &exp.ty);
                 return Ok(sink.emit_pure(
                     ty,
                     PureInst::AdtCons {
@@ -360,7 +360,7 @@ pub(crate) fn lower<Ext: PureExt>(
             let &(adt, variant, field) = b.dtor_sem.get(&field.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
             })?;
-            let type_args = adt_type_args(&base.ty);
+            let type_args = adt_type_args(&b.name_map, &base.ty);
             Ok(sink.emit_pure(
                 ty,
                 PureInst::AdtProj {
@@ -380,7 +380,7 @@ pub(crate) fn lower<Ext: PureExt>(
                 TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
-            let type_args = adt_type_args(&base.ty);
+            let type_args = adt_type_args(&b.name_map, &base.ty);
             let tag_call = sink.emit_pure(
                 vmir::Type::Int,
                 PureInst::AdtTag {
@@ -402,9 +402,12 @@ pub(crate) fn lower<Ext: PureExt>(
 /// The type arguments of an ADT-typed expression (`Domain(_, args)`), lowered;
 /// empty for a non-generic ADT. The monomorphization key carried on the
 /// semantic ADT nodes.
-fn adt_type_args(ty: &typed::Type) -> Vec<vmir::Type> {
+fn adt_type_args(
+    names: &std::collections::HashMap<Spur, vmir::MemberId>,
+    ty: &typed::Type,
+) -> Vec<vmir::Type> {
     match ty {
-        typed::Type::Domain(_, args) => args.iter().map(lower_type).collect(),
+        typed::Type::Domain(_, args) => args.iter().map(|a| lower_type(names, &[], a)).collect(),
         _ => Vec::new(),
     }
 }
@@ -489,8 +492,8 @@ fn lower_binary<Ext: PureExt>(
     }
     // Homogenize: a `Real`-result arithmetic op with an `Int` operand gets that
     // operand wrapped in `real(..)` so the e-graph operands share a type.
-    let lv = real_cast_if(sink, lv, &lower_type(&l.ty), &ty);
-    let rv = real_cast_if(sink, rv, &lower_type(&r.ty), &ty);
+    let lv = real_cast_if(sink, lv, &b.lower_type(&l.ty), &ty);
+    let rv = real_cast_if(sink, rv, &b.lower_type(&r.ty), &ty);
     Ok(match op {
         B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
         B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),

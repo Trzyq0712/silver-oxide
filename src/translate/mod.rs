@@ -140,6 +140,14 @@ impl<'a> Builder<'a> {
         )
     }
 
+    /// Lower a typed type in a concrete (non-generic) context, resolving
+    /// domain/ADT names through the VMIR name map. For ADT-declaration field
+    /// types (which may mention type parameters) call the free [`lower_type`]
+    /// with the owning ADT's parameter list instead.
+    pub(crate) fn lower_type(&self, ty: &typed::Type) -> vmir::Type {
+        lower_type(&self.name_map, &[], ty)
+    }
+
     fn set_decl(&mut self, id: vmir::MemberId, decl: vmir::Declaration) {
         let slot = &mut self.decls[usize::from(id)];
         debug_assert!(slot.is_none(), "decl slot filled twice");
@@ -180,8 +188,8 @@ impl<'a> Builder<'a> {
             if let GlobalSignature::Function(sig) = &globals.signatures[*gmid] {
                 let name = interner.resolve(spur).to_string();
                 let id = self.fresh_decl(&name);
-                let params = sig.params.iter().map(lower_type).collect();
-                let ret = lower_type(&sig.ret);
+                let params = sig.params.iter().map(|t| self.lower_type(t)).collect();
+                let ret = self.lower_type(&sig.ret);
                 self.set_decl(
                     id,
                     vmir::Declaration::Function(vmir::Function {
@@ -204,7 +212,18 @@ impl<'a> Builder<'a> {
                 self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
                 let adt_id = self.name_map[&sig.adt];
                 let ctor_name = interner.resolve(spur).to_string();
-                let field_types: Vec<vmir::Type> = sig.params.iter().map(lower_type).collect();
+                // Field types may mention the ADT's type parameters, so lower
+                // them against the owning ADT's parameter list (→ `Generic(i)`).
+                let adt_params = globals
+                    .resolve(sig.adt)
+                    .and_then(|s| s.as_adt())
+                    .map(|a| a.params.clone())
+                    .unwrap_or_default();
+                let field_types: Vec<vmir::Type> = sig
+                    .params
+                    .iter()
+                    .map(|t| lower_type(&self.name_map, &adt_params, t))
+                    .collect();
                 if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut()
                 {
                     if adt.variants.len() <= sig.tag {
@@ -262,7 +281,7 @@ impl<'a> Builder<'a> {
         // field's value type.
         let addr_loc = vmir::Location {
             params: vec![vmir::Type::Ref],
-            ret: lower_type(&f.0.ty),
+            ret: self.lower_type(&f.0.ty),
             bound: vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
         };
         self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
@@ -272,7 +291,7 @@ impl<'a> Builder<'a> {
     fn emit_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
         // The Resource slot was reserved in `declare_predicate_accessors`.
         let pred_id = self.name_map[&p.name.0];
-        let params: Vec<vmir::Type> = p.params.iter().map(|p| lower_type(&p.ty)).collect();
+        let params: Vec<vmir::Type> = p.params.iter().map(|p| self.lower_type(&p.ty)).collect();
         // A concrete predicate body is self-framed (no precondition): params
         // occupy `Val::Temp(0..n)` and the spatial assertion accumulates onto an
         // empty initial heap, so emitted heaps start at `HeapVal::Temp(0)`.
@@ -316,7 +335,7 @@ impl<'a> Builder<'a> {
         if let Some(requires) = &m.requires {
             let req_id = self.fresh_decl(&format!("{name}#requires"));
             self.method_requires.insert(m.name.0, req_id);
-            let params: Vec<vmir::Type> = m.params.iter().map(|p| lower_type(&p.ty)).collect();
+            let params: Vec<vmir::Type> = m.params.iter().map(|p| self.lower_type(&p.ty)).collect();
             let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
             for (i, p) in m.params.iter().enumerate() {
                 env.insert(p.name.0, vmir::Val::Temp(i));
@@ -344,8 +363,9 @@ impl<'a> Builder<'a> {
         if let Some(ensures) = &m.ensures {
             let ens_id = self.fresh_decl(&format!("{name}#ensures"));
             self.method_ensures.insert(m.name.0, ens_id);
-            let mut params: Vec<vmir::Type> = m.params.iter().map(|p| lower_type(&p.ty)).collect();
-            params.extend(m.rets.iter().map(|r| lower_type(&r.ty)));
+            let mut params: Vec<vmir::Type> =
+                m.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+            params.extend(m.rets.iter().map(|r| self.lower_type(&r.ty)));
             let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
             for (i, p) in m.params.iter().enumerate() {
                 env.insert(p.name.0, vmir::Val::Temp(i));
@@ -433,17 +453,45 @@ impl<'a> Builder<'a> {
     }
 }
 
-pub(crate) fn lower_type(ty: &typed::Type) -> vmir::Type {
+/// Lower a typed Silver type to a VMIR type.
+///
+/// `names` resolves a domain/ADT name `Spur` to its VMIR declaration id;
+/// `generics` is the enclosing generic declaration's type-parameter list (used
+/// to map a `Type::Generic` to its 0-based index). Both are empty in fully
+/// concrete contexts (most call sites go through [`Builder::lower_type`]).
+pub(crate) fn lower_type(
+    names: &HashMap<Spur, vmir::MemberId>,
+    generics: &[Spur],
+    ty: &typed::Type,
+) -> vmir::Type {
     match ty {
         typed::Type::Bool => vmir::Type::Bool,
         typed::Type::Int => vmir::Type::Int,
         typed::Type::Real => vmir::Type::Real,
         typed::Type::Ref => vmir::Type::Ref,
-        typed::Type::Generic(_) | typed::Type::Collection(_) | typed::Type::Domain(_, _) => {
-            // Not exercised by the target case. Use Ref as a placeholder; a
-            // future round will introduce proper VMIR domain/collection types.
-            vmir::Type::Ref
+        typed::Type::Generic(id) => {
+            let idx = generics
+                .iter()
+                .position(|p| *p == id.0)
+                .expect("generic type parameter not in the enclosing declaration's scope");
+            vmir::Type::Generic(idx)
         }
+        typed::Type::Domain(id, args) => match names.get(&id.0) {
+            // An ADT (or a modeled domain): keep the head + recurse on args so
+            // the monomorphization key `(head, args)` is faithful.
+            Some(&head) => {
+                let args = args
+                    .iter()
+                    .map(|a| lower_type(names, generics, a))
+                    .collect();
+                vmir::Type::Domain(head, args)
+            }
+            // A domain with no VMIR declaration (not yet modeled). Fall back to
+            // Ref, as before; ADTs are always present (declared in pass 1).
+            None => vmir::Type::Ref,
+        },
+        // TODO: Seq/Set — modeled as builtin parametric types like Option.
+        typed::Type::Collection(_) => vmir::Type::Ref,
     }
 }
 
@@ -780,5 +828,48 @@ method m(c: Bool, a: Int, b: Int) returns (r: Int)
             })
             .expect("merge must emit phi `c ? a : b`");
         assert!(phi.pc.conds.is_empty(), "phi itself is unguarded");
+    }
+
+    #[test]
+    fn lowers_generic_adt_type_parameters() {
+        // A generic ADT's declared field types keep their type parameters
+        // (`Generic(i)`) and nested ADT structure; a use at a concrete
+        // instantiation lowers to `Domain(head, [concrete args])` — never the
+        // erased `Ref` placeholder, so the monomorphization key is faithful.
+        let input = r#"
+adt List[T] {
+    Nil()
+    Cons(head: T, tail: List[T])
+}
+
+function len(l: List[Int]): Int
+"#;
+        let p = run(input);
+        let list_id = p.interner.get("List").expect("missing List");
+
+        let vmir::Declaration::Adt(adt) = &p.decls[list_id] else {
+            panic!("List must be an Adt");
+        };
+        // Variant 0 = `Nil()` (no fields); variant 1 = `Cons(?0, List[?0])`.
+        assert!(adt.variants[0].field_types.is_empty(), "Nil has no fields");
+        assert_eq!(
+            adt.variants[1].field_types,
+            vec![
+                vmir::Type::Generic(0),
+                vmir::Type::Domain(list_id, Box::new([vmir::Type::Generic(0)])),
+            ],
+            "Cons field types must be [?0, List[?0]], not erased to Ref"
+        );
+
+        // `len`'s parameter is `List[Int]` — a concrete monomorphization.
+        let len_id = p.interner.get("len").expect("missing len");
+        let vmir::Declaration::Function(func) = &p.decls[len_id] else {
+            panic!("len must be a Function");
+        };
+        assert_eq!(
+            func.params,
+            vec![vmir::Type::Domain(list_id, Box::new([vmir::Type::Int]))],
+            "len's param must lower to List[Int], not Ref"
+        );
     }
 }

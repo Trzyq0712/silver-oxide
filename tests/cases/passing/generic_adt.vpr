@@ -1,0 +1,22 @@
+// A user-written generic ADT, monomorphized at Int. Exercises generic-ADT
+// lowering: the declaration carries type parameters (`?0`) and use sites carry
+// the concrete monomorphization args (`Pair[Int]`).
+adt Pair[T] {
+    P(fst: T, snd: T)
+}
+
+// Construction round-trips structurally (congruence over identical AdtCons).
+method rebuild(p: Pair[Int]) returns (q: Pair[Int])
+    ensures q == P(p.fst, p.snd)
+{
+    q := P(p.fst, p.snd)
+}
+
+// Projection reduces against a known constructor (the verifier's mono proj
+// rule, minted per `(Pair, [Int])` instance).
+method project(a: Int, b: Int) returns (r: Int)
+    ensures r == a
+{
+    var p: Pair[Int] := P(a, b)
+    r := p.fst
+}
