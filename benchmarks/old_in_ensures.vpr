@@ -1,0 +1,6 @@
+// old(x.f) reads the pre-state; field untouched so x.f == old(x.f) holds.
+field f: Int
+method m(x: Ref) returns (r: Int)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1) && x.f == old(x.f)
+{ r := x.f }

@@ -1,0 +1,13 @@
+// Predicate permission carried across method calls; ensures produced-only.
+predicate number(this: Ref)
+method assign(this: Ref, value: Int) ensures number(this)
+method read(this: Ref) returns (val: Int) requires number(this) ensures number(this)
+method add(this: Ref, other: Ref) returns (res: Ref)
+    requires number(this) && number(other)
+    ensures number(this) && number(other) && number(res)
+{
+    var a: Int := read(this)
+    var b: Int := read(other)
+    var sum: Int := a + b
+    assign(res, sum)
+}

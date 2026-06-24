@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match pipeline::run_file_timed(Path::new(&file)) {
         Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
-        Ok((results, timings)) => {
+        Ok((results, timings, stats)) => {
             if results.is_empty() {
                 println!("[INFO] no method bodies to verify");
             } else {
@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             eprintln!("[TIMING]\n{timings}");
+            eprintln!("[STATS] {stats:?}");
         }
     }
 

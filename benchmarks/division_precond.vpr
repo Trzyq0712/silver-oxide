@@ -1,0 +1,5 @@
+// `#ensures` divides by x; safe only via the grafted precondition x != 0.
+method m(x: Int) returns (r: Int)
+    requires x != 0
+    ensures r == 100 / x
+{ r := 100 / x }

@@ -50,6 +50,9 @@ pub struct Allocator {
     variant_names: HashMap<MemberId, Vec<Option<String>>>,
     /// The builtin `Option` ADT id, if present.
     option_adt: Option<MemberId>,
+    /// Verifier cost metrics, accumulated across every unit of the run (the
+    /// allocator is the per-run shared state threaded into each `VerifyContext`).
+    pub(crate) stats: crate::verify::VerifyStats,
 }
 
 impl Allocator {
@@ -120,6 +123,7 @@ impl Allocator {
             head_names,
             variant_names,
             option_adt: Some(option_head),
+            stats: Default::default(),
         }
     }
 
@@ -137,7 +141,13 @@ impl Allocator {
             head_names: HashMap::new(),
             variant_names: HashMap::new(),
             option_adt: None,
+            stats: Default::default(),
         }
+    }
+
+    /// Consume the allocator, returning the accumulated verifier cost metrics.
+    pub(crate) fn into_stats(self) -> crate::verify::VerifyStats {
+        self.stats
     }
 
     /// Constructor id for variant `variant` of `adt[args]` (minting the instance

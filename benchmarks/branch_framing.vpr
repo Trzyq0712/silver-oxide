@@ -1,0 +1,6 @@
+// Permission carried through both arms of a branch (linear heap + pc gating).
+field f: Int
+method m(c: Bool, x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1)
+{ if (c) { } else { } }

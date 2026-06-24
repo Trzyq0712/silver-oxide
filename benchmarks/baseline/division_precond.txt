@@ -1,0 +1,10 @@
+saturations=3
+reduces=0
+sat_iterations=4
+egraph_nodes_peak=11
+egraph_classes_peak=10
+rule_applications=1
+prove_calls=2
+prove_tier3=0
+cert_grafts=3
+rule.eq-refl=1

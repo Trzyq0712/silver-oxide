@@ -7,9 +7,11 @@ mod heap;
 pub mod lang;
 mod mono;
 mod rewrite;
+mod stats;
 mod viz;
 
 pub use declaration::{VerifyError, verify_resource};
+pub use stats::VerifyStats;
 
 /// Result for one verification unit (method or resource): its name and whether
 /// verification succeeded.
@@ -20,6 +22,12 @@ pub type VerifyResult = (String, Result<(), VerifyError>);
 /// side conditions) ahead of the methods that use them; methods are then
 /// verified, reusing the resources' established proofs.
 pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<VerifyResult> {
+    verify_with_stats(analyzed).0
+}
+
+/// Like [`verify`], but also returns the aggregated [`VerifyStats`] (e-graph
+/// cost metrics) for the whole run — used by the performance regression tests.
+pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>, VerifyStats) {
     let program = &analyzed.program;
     let mut results = Vec::new();
     // Derive a linear order from the dependency graph; acyclicity was already
@@ -58,5 +66,6 @@ pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<VerifyResult> {
             results.push((name, outcome));
         }
     }
-    results
+    let stats = alloc.into_stats();
+    (results, stats)
 }

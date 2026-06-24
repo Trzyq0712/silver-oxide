@@ -224,6 +224,8 @@ impl<'a> VerifyContext<'a> {
             .collect();
         let egraph = std::mem::take(&mut self.egraph);
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        self.alloc.stats.saturations += 1;
+        self.alloc.stats.record_run(&runner.iterations);
         self.egraph = runner.egraph;
     }
 
@@ -240,6 +242,8 @@ impl<'a> VerifyContext<'a> {
             .collect();
         let egraph = std::mem::take(&mut self.egraph);
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
+        self.alloc.stats.reduces += 1;
+        self.alloc.stats.record_run(&runner.iterations);
         self.egraph = runner.egraph;
     }
 
@@ -293,6 +297,7 @@ impl<'a> VerifyContext<'a> {
         args: &[egg::Id],
         old_ctx: Option<&Heap>,
     ) -> (Heap, egg::Id) {
+        self.alloc.stats.cert_grafts += 1;
         let mut subst: HashMap<Id, Id> = HashMap::new();
         for (p, a) in cert.params.iter().zip(args) {
             subst.insert(cert.egraph.find(*p), *a);
@@ -441,6 +446,7 @@ impl<'a> VerifyContext<'a> {
         goal: egg::Id,
         pc_lits: &[(egg::Id, Polarity)],
     ) -> bool {
+        self.alloc.stats.prove_calls += 1;
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
 
@@ -480,6 +486,7 @@ impl<'a> VerifyContext<'a> {
                 }
             }
         }
+        self.alloc.stats.prove_tier3 += 1;
         let proven = if unsat_pc {
             true
         } else {
@@ -490,6 +497,7 @@ impl<'a> VerifyContext<'a> {
                 .cloned()
                 .collect();
             let runner = egg::Runner::default().with_egraph(probe).run(&rules);
+            self.alloc.stats.record_run(&runner.iterations);
             let probe = runner.egraph;
             probe.find(goal) == probe.find(true_p)
         };
