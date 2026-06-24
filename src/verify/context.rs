@@ -186,13 +186,15 @@ impl<'a> VerifyContext<'a> {
         present: egg::Id,
         value: egg::Id,
     ) -> egg::Id {
-        // `Option` is a builtin parametric type; request its instance through the
-        // allocator's dedicated `option_*` path (`Some` = variant 0, `None` = 1).
-        let some_id = self.alloc.option_some(elem.clone());
-        let none_id = self.alloc.option_none(elem.clone());
-        let opt_ty = self.alloc.option_type(elem);
-        let some = self.add_func_app_id(some_id, opt_ty.clone(), Box::new([value]));
-        let none = self.add_func_app_id(none_id, opt_ty, Box::new([]));
+        // `Option` is a builtin parametric type; one polymorphic id each for
+        // `Some`/`None` (variants 0/1). The element type is the application's ground
+        // type instantiation (carried in the operator identity, not a child).
+        let some_id = self.alloc.option_some();
+        let none_id = self.alloc.option_none();
+        let opt_ty = self.alloc.option_type(elem.clone());
+        let tys: Box<[Type]> = Box::new([elem]);
+        let some = self.add_func_app_id(some_id, tys.clone(), opt_ty.clone(), Box::new([value]));
+        let none = self.add_func_app_id(none_id, tys, opt_ty, Box::new([]));
         self.add(Symbolic::Ite([present, some, none]))
     }
 
@@ -200,8 +202,9 @@ impl<'a> VerifyContext<'a> {
     /// `opt = Some(v)` this reduces to `v`; on an opaque member it stays
     /// uninterpreted (correct — the value was never present).
     pub(crate) fn option_unwrap(&mut self, elem: Type, opt: egg::Id) -> egg::Id {
-        let value_id = self.alloc.option_value(elem.clone());
-        self.add_func_app_id(value_id, elem, Box::new([opt]))
+        let value_id = self.alloc.option_value();
+        let tys: Box<[Type]> = Box::new([elem.clone()]);
+        self.add_func_app_id(value_id, tys, elem, Box::new([opt]))
     }
 
     /// The boolean `0 < perm` (a permission is positive). Lifts a permission
@@ -262,28 +265,33 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Add a `FuncApp`, recording its return type in the side-oracle so the
-    /// viz can color the result (the node itself is type-free).
+    /// viz can color the result (the node itself is type-free). `type_args` is the
+    /// ground type instantiation (empty for a non-generic plain function).
     pub(crate) fn add_func_app(
         &mut self,
         fc: &FunctionCall,
+        type_args: Box<[Type]>,
         ret_ty: Type,
         args: Box<[egg::Id]>,
     ) -> egg::Id {
         // A plain function reuses its declaration's index as its `FuncId`.
-        self.add_func_app_id(FuncId(usize::from(fc.function)), ret_ty, args)
+        self.add_func_app_id(FuncId(usize::from(fc.function)), type_args, ret_ty, args)
     }
 
     /// Add a `FuncApp` over an already-allocated [`FuncId`] (a plain function,
     /// or an ADT constructor/projection/tag id from the allocator). Also used by
-    /// grafting, which carries the id verbatim.
+    /// grafting, which carries the id verbatim. `type_args` is the ground type
+    /// instantiation — part of the node's operator identity (discriminant), not a
+    /// child.
     pub(crate) fn add_func_app_id(
         &mut self,
         id: FuncId,
+        type_args: Box<[Type]>,
         ret_ty: Type,
         args: Box<[egg::Id]>,
     ) -> egg::Id {
         self.func_ret_types.entry(id).or_insert(ret_ty);
-        self.egraph.add(Symbolic::FuncApp(id, args))
+        self.egraph.add(Symbolic::FuncApp(id, type_args, args))
     }
 
     /// Graft a resource certificate into this (caller) e-graph, substituting the
@@ -582,13 +590,14 @@ fn transplant(
                 let x = transplant(caller, cert, *x, subst, memo);
                 caller.add(Symbolic::RealCast(x))
             }
-            Symbolic::FuncApp(m, fargs) => {
+            Symbolic::FuncApp(m, tys, fargs) => {
                 let fargs: Box<[Id]> = fargs
                     .iter()
                     .map(|a| transplant(caller, cert, *a, subst, memo))
                     .collect();
                 let ret = cert.func_ret_types.get(m).cloned().unwrap_or(Type::Int);
-                caller.add_func_app_id(*m, ret, fargs)
+                // The ground type instantiation has no e-class — copy it verbatim.
+                caller.add_func_app_id(*m, tys.clone(), ret, fargs)
             }
             Symbolic::Location(m, fargs) => {
                 let fargs: Box<[Id]> = fargs
@@ -640,7 +649,7 @@ pub(crate) fn infer_type(
             Symbolic::Lit(l) => Some(lit_type(l)),
             Symbolic::RealCast(_) => Some(Type::Real),
             Symbolic::Fresh(u) => fresh_types.get(u).cloned(),
-            Symbolic::FuncApp(f, _) => func_ret_types.get(f).cloned(),
+            Symbolic::FuncApp(f, _, _) => func_ret_types.get(f).cloned(),
             // Address types (`Addr<T>`) are reconstructed by `heap_acc` from the
             // location declaration, not here.
             Symbolic::Location(..) => None,

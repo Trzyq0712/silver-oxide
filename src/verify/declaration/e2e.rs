@@ -497,9 +497,10 @@ method m()
 
 #[test]
 fn generic_adt_two_monomorphizations() {
-    // A user-written generic ADT used at two element types. Each
-    // monomorphization (`Box[Int]`, `Box[Bool]`) gets its own verifier ids, so
-    // both projections reduce correctly and don't congruence-merge.
+    // A user-written generic ADT used at two element types. The e-graph is
+    // polymorphic: `Box[Int]` and `Box[Bool]` share one `mk` constructor id but
+    // carry distinct `Ty` type-arg children, so congruence keeps the two
+    // projections disjoint (`bi.v == 5`, `bb.v == true` never merge).
     let input = r#"
 adt Box[T] { mk(v: T) }
 method m()

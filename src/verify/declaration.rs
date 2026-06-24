@@ -227,7 +227,8 @@ fn eval_pure_inst(
         }
         PureInst::FunctionCall(_heap, fc) => {
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add_func_app(fc, ty.clone(), args.into())
+            // Plain Silver functions are not generic yet — empty type instantiation.
+            ctx.add_func_app(fc, Box::new([]), ty.clone(), args.into())
         }
         PureInst::Location(member, args) => {
             let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
@@ -239,20 +240,20 @@ fn eval_pure_inst(
             let addr = state.get_val(ctx, loc);
             heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
         }
-        // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted id
-        // (see `verify::mono`), monomorphized by the ADT's type arguments, over
-        // which the cons/proj/tag reductions fire. The constructor's type-args
-        // are its result type's; projection/tag over non-generic user ADTs use
-        // the empty argument tuple.
+        // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted **concept**
+        // id (one per `(head, variant[, field])`, see `verify::mono`); the ground
+        // `type_args` ride in the node's operator identity (the discriminant), so
+        // distinct instantiations never merge and the cons/proj/tag reductions fire
+        // per concept regardless of instantiation.
         PureInst::AdtCons {
             adt,
             type_args,
             variant,
             args,
         } => {
-            let cons = ctx.alloc.cons(*adt, type_args, *variant);
+            let cons = ctx.alloc.cons(*adt, *variant);
             let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add_func_app_id(cons, ty.clone(), args.into())
+            ctx.add_func_app_id(cons, type_args.clone().into(), ty.clone(), args.into())
         }
         PureInst::AdtProj {
             adt,
@@ -261,18 +262,18 @@ fn eval_pure_inst(
             field,
             base,
         } => {
-            let proj = ctx.alloc.proj(*adt, type_args, *variant, *field);
+            let proj = ctx.alloc.proj(*adt, *variant, *field);
             let base = state.get_val(ctx, base);
-            ctx.add_func_app_id(proj, ty.clone(), Box::new([base]))
+            ctx.add_func_app_id(proj, type_args.clone().into(), ty.clone(), Box::new([base]))
         }
         PureInst::AdtTag {
             adt,
             type_args,
             base,
         } => {
-            let tag = ctx.alloc.tag(*adt, type_args);
+            let tag = ctx.alloc.tag(*adt);
             let base = state.get_val(ctx, base);
-            ctx.add_func_app_id(tag, Type::Int, Box::new([base]))
+            ctx.add_func_app_id(tag, type_args.clone().into(), Type::Int, Box::new([base]))
         }
     }
 }
@@ -776,9 +777,10 @@ fn eval_method_inst(
             }
             // The snapshot is a single-variant ADT (head = the `@snap` Domain).
             let cons_args: Box<[egg::Id]> = members.into_iter().collect();
-            let snap_cons = ctx.alloc.cons(snap_head, &[], 0);
+            let snap_cons = ctx.alloc.cons(snap_head, 0);
             let snap_ty = Type::Snap(snap_head);
-            let snap = ctx.add_func_app_id(snap_cons, snap_ty, cons_args);
+            // Predicate snapshots are non-generic — empty type instantiation.
+            let snap = ctx.add_func_app_id(snap_cons, Box::new([]), snap_ty, cons_args);
             let pred_addr = ctx.add_location(addr_fn, args.into());
             let out = heap_union(ctx, &out, pred_addr, Chunk::new(perm_id, snap), &pc_lits);
             state.push_heap(out);
@@ -884,9 +886,9 @@ fn eval_unfold(
             .option_inner()
             .unwrap_or(&field_types[i])
             .clone();
-        let proj_id = ctx.alloc.proj(snap_head, &[], 0, i);
+        let proj_id = ctx.alloc.proj(snap_head, 0, i);
         let opt_ty = ctx.alloc.option_type(elem.clone());
-        let opt = ctx.add_func_app_id(proj_id, opt_ty, Box::new([s]));
+        let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([s]));
         let pv = ctx.option_unwrap(elem, opt);
         let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
         out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
@@ -1651,8 +1653,8 @@ mod tests {
 
         let a = ctx.add(Symbolic::Fresh(0));
         let b = ctx.add(Symbolic::Fresh(1));
-        let fa = ctx.add(Symbolic::FuncApp(f, Box::from([a])));
-        let fb = ctx.add(Symbolic::FuncApp(f, Box::from([b])));
+        let fa = ctx.add(Symbolic::FuncApp(f, Box::from([]), Box::from([a])));
+        let fb = ctx.add(Symbolic::FuncApp(f, Box::from([]), Box::from([b])));
         let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         ctx.egraph.union(eq, true_);

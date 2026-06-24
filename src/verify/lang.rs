@@ -3,11 +3,13 @@ use std::fmt::{Display, Formatter};
 
 use crate::vmir::BinOp;
 use crate::vmir::Literal;
+use crate::vmir::Type;
 
 /// A verifier-allocated function-application id in the e-graph. **Disconnected
 /// from VMIR `MemberId`**: the verifier assigns these (see `verify::mono`) — a
 /// plain function reuses its declaration's index, ADT constructor/projection/tag
-/// ops get freshly-minted indices per monomorphic instance.
+/// ops get one freshly-minted index per *concept* (polymorphic; the type
+/// instantiation rides in the `FuncApp` discriminant, not the id).
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FuncId(pub usize);
 
@@ -22,7 +24,16 @@ pub enum Symbolic {
     Lit(Literal),
     Binary(BinOp, [Id; 2]),
     Ite([Id; 3]),
-    FuncApp(FuncId, Box<[Id]>),
+    /// A function application `f[type_args](value_args)`. The e-graph is
+    /// **polymorphic**: one `FuncId` per concept, with the **ground** type
+    /// instantiation carried in the enode payload. It is *not* a child (ground
+    /// types never merge, so they want no e-class) and *not* in the discriminant
+    /// (which would fragment egg's `classes_by_op` op-index per instantiation).
+    /// Distinctness — `mk[Int]` ≠ `mk[Bool]` — comes from the enode's derived
+    /// `Eq`/`Hash` via egg's congruence `memo` (a `HashMap<L, Id>` keyed by the
+    /// full enode), so two instantiations never dedup/merge. `children()` returns
+    /// only the value args; the [`Discriminant`] is the concept `FuncId` alone.
+    FuncApp(FuncId, Box<[Type]>, Box<[Id]>),
     /// A heap-location application `f(args)` (an address). A distinct sort from
     /// `FuncApp` so function rewrites never touch it; congruence still gives
     /// `f(x) == f(y) ⟺ x == y`.
@@ -36,6 +47,11 @@ pub enum Discriminant {
     Lit(Literal),
     Binary(BinOp),
     Ite,
+    /// The concept id alone (no type instantiation). Keeping the type args out of
+    /// the discriminant means egg's `classes_by_op` indexes one bucket per concept
+    /// (not per instantiation), and `discriminant()` stays a cheap `Copy`.
+    /// Distinctness across instantiations does *not* rely on this — it comes from
+    /// the full-enode `Eq`/`Hash` in the congruence memo (see [`Symbolic::FuncApp`]).
     FuncApp(FuncId),
     Location(LocId),
     RealCast,
@@ -52,7 +68,7 @@ impl Language for Symbolic {
             S::Lit(l) => D::Lit(l.clone()),
             S::Binary(op, _) => D::Binary(*op),
             S::Ite(_) => D::Ite,
-            S::FuncApp(id, _) => D::FuncApp(*id),
+            S::FuncApp(id, _, _) => D::FuncApp(*id),
             S::Location(id, _) => D::Location(*id),
             S::RealCast(_) => D::RealCast,
         }
@@ -66,7 +82,12 @@ impl Language for Symbolic {
             (Binary(op1, _), Binary(op2, _)) => op1 == op2,
             (Ite(_), Ite(_)) => true,
             (RealCast(_), RealCast(_)) => true,
-            (FuncApp(id1, args1), FuncApp(id2, args2)) => id1 == id2 && args1.len() == args2.len(),
+            // Operator identity is the concept id + value arity, consistent with
+            // the type-blind discriminant. (Distinctness across instantiations is
+            // the memo's job via full-enode `Eq`, not `matches`.)
+            (FuncApp(id1, _, args1), FuncApp(id2, _, args2)) => {
+                id1 == id2 && args1.len() == args2.len()
+            }
             (Location(id1, args1), Location(id2, args2)) => {
                 id1 == id2 && args1.len() == args2.len()
             }
@@ -81,7 +102,9 @@ impl Language for Symbolic {
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_ref(id),
-            FuncApp(_, ids) | Location(_, ids) => ids,
+            // Type args live in the discriminant, not here — only value args.
+            FuncApp(_, _, ids) => ids,
+            Location(_, ids) => ids,
         }
     }
 
@@ -92,7 +115,8 @@ impl Language for Symbolic {
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_mut(id),
-            FuncApp(_, ids) | Location(_, ids) => ids,
+            FuncApp(_, _, ids) => ids,
+            Location(_, ids) => ids,
         }
     }
 }
@@ -105,9 +129,18 @@ impl Display for Symbolic {
             Symbolic::Binary(op, _) => write!(f, "{op}"),
             Symbolic::Ite(_) => write!(f, "ITE"),
             Symbolic::RealCast(_) => write!(f, "real"),
-            // Id-only label; the viz resolves member ids to source names when it
-            // renders the dot (it holds the interner).
-            Symbolic::FuncApp(id, _) => write!(f, "fn{}(..)", id.0),
+            // Id-only label, with the ground type instantiation folded in (so each
+            // instantiation is a distinct, self-describing node). The viz resolves
+            // the `fn{id}` token to the concept's source name when it renders the
+            // dot (it holds the interner).
+            Symbolic::FuncApp(id, tys, _) => {
+                if tys.is_empty() {
+                    write!(f, "fn{}(..)", id.0)
+                } else {
+                    let args: Vec<String> = tys.iter().map(|t| t.to_string()).collect();
+                    write!(f, "fn{}<{}>(..)", id.0, args.join(", "))
+                }
+            }
             Symbolic::Location(id, _) => write!(f, "loc{}(..)", id.0),
         }
     }

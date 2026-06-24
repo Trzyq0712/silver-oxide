@@ -1,21 +1,24 @@
 //! Verifier-side ADT id allocator.
 //!
 //! ADT operations (`PureInst::{AdtCons,AdtProj,AdtTag}` and predicate snapshots)
-//! are interpreted as `Symbolic::FuncApp`s over **verifier-minted** member ids,
+//! are interpreted as `Symbolic::FuncApp`s over **verifier-minted** function ids,
 //! distinct from any VMIR declaration id — so no synthetic `@tag`/`@dtor`/
 //! constructor declarations exist. Ids are allocated **lazily on first use** of a
-//! monomorphic instance `(adt, type-args)`; minting one mints its whole instance
-//! (tag + every constructor + every projection) and appends its reduction rules.
+//! **concept** `(adt-head)`; minting one mints its whole concept (tag + every
+//! constructor + every projection) and appends its reduction rules.
+//!
+//! The e-graph is **polymorphic**, not monomorphized: a generic op gets **one** id
+//! per concept, and its ground type arguments ride in the `FuncApp` operator
+//! identity (the discriminant, `Symbolic::FuncApp(FuncId, Box<[Type]>, _)`), not as
+//! children. Distinctness across instantiations (`Box[Int]` vs `Box[Bool]`) comes
+//! from the differing discriminant — not from per-instance ids, and with no type
+//! e-classes. The reductions are instantiation-agnostic (one per concept).
 //!
 //! The allocator is owned by `verify::verify` and threaded `&mut` through each
-//! (sequential) verification unit, so an instance gets the **same** id wherever
-//! it appears — required for a resource certificate's grafted nodes to
+//! (sequential) verification unit, so a concept gets the **same** id wherever it
+//! appears — required for a resource certificate's grafted nodes to
 //! congruence-match the caller (`transplant` carries the id verbatim). Contexts
 //! never run concurrently, so a plain `&mut` suffices (no interior mutability).
-//!
-//! Monomorphization is general: a non-generic ADT is the instance with empty
-//! type-args; a generic ADT (user-written, or the builtin `Option`) gets one
-//! instance per concrete type-argument tuple it is used at — discovered on use.
 
 use std::collections::HashMap;
 
@@ -26,15 +29,20 @@ use crate::vmir::{Declaration, MemberId, Program, Type};
 
 type Rule = egg::Rewrite<Symbolic, ConstFold>;
 
-/// Lazily allocates and names the verifier ids for monomorphic ADT
+/// Lazily allocates and names the verifier ids for polymorphic ADT
 /// constructors / projections / tags, and accumulates their reduction rules.
 pub struct Allocator {
     /// Next func id to mint (starts past every real declaration id, so a minted
     /// id never collides with a plain function reusing its declaration index).
     next: usize,
-    cons: HashMap<(MemberId, Vec<Type>, usize), FuncId>,
-    proj: HashMap<(MemberId, Vec<Type>, usize, usize), FuncId>,
-    tag: HashMap<(MemberId, Vec<Type>), FuncId>,
+    /// Keyed by **concept**, not by type instantiation: one id per `(head,
+    /// variant)` / `(head, variant, field)` / `head`. The e-graph is polymorphic —
+    /// the ground type args ride in the `FuncApp` discriminant, so a single id
+    /// serves every instantiation (distinctness comes from the differing
+    /// discriminant, not from per-instance ids or type e-classes).
+    cons: HashMap<(MemberId, usize), FuncId>,
+    proj: HashMap<(MemberId, usize, usize), FuncId>,
+    tag: HashMap<MemberId, FuncId>,
     /// Display names for minted ids (which are outside the interner).
     names: HashMap<FuncId, String>,
     rules: Vec<Rule>,
@@ -150,23 +158,24 @@ impl Allocator {
         self.stats
     }
 
-    /// Constructor id for variant `variant` of `adt[args]` (minting the instance
-    /// on first use).
-    pub fn cons(&mut self, adt: MemberId, args: &[Type], variant: usize) -> FuncId {
-        self.ensure(adt, args);
-        self.cons[&(adt, args.to_vec(), variant)]
+    /// Constructor id for variant `variant` of `adt` (minting the concept on first
+    /// use). Polymorphic — one id for every instantiation; the ground type args
+    /// ride in the `FuncApp` discriminant, never key the id.
+    pub fn cons(&mut self, adt: MemberId, variant: usize) -> FuncId {
+        self.ensure(adt);
+        self.cons[&(adt, variant)]
     }
 
-    /// Field-`field` projection id of variant `variant` of `adt[args]`.
-    pub fn proj(&mut self, adt: MemberId, args: &[Type], variant: usize, field: usize) -> FuncId {
-        self.ensure(adt, args);
-        self.proj[&(adt, args.to_vec(), variant, field)]
+    /// Field-`field` projection id of variant `variant` of `adt`.
+    pub fn proj(&mut self, adt: MemberId, variant: usize, field: usize) -> FuncId {
+        self.ensure(adt);
+        self.proj[&(adt, variant, field)]
     }
 
-    /// Discriminator-tag id of `adt[args]`.
-    pub fn tag(&mut self, adt: MemberId, args: &[Type]) -> FuncId {
-        self.ensure(adt, args);
-        self.tag[&(adt, args.to_vec())]
+    /// Discriminator-tag id of `adt`.
+    pub fn tag(&mut self, adt: MemberId) -> FuncId {
+        self.ensure(adt);
+        self.tag[&adt]
     }
 
     /// The builtin `Option` ADT's (synthetic) head id.
@@ -185,22 +194,22 @@ impl Allocator {
         Type::Option(Box::new(elem))
     }
 
-    /// Constructor id of `Some` (variant 0) of `Option[elem]`.
-    pub fn option_some(&mut self, elem: Type) -> FuncId {
+    /// Constructor id of `Some` (variant 0) of `Option`.
+    pub fn option_some(&mut self) -> FuncId {
         let opt = self.option_adt();
-        self.cons(opt, &[elem], 0)
+        self.cons(opt, 0)
     }
 
-    /// Constructor id of `None` (variant 1) of `Option[elem]`.
-    pub fn option_none(&mut self, elem: Type) -> FuncId {
+    /// Constructor id of `None` (variant 1) of `Option`.
+    pub fn option_none(&mut self) -> FuncId {
         let opt = self.option_adt();
-        self.cons(opt, &[elem], 1)
+        self.cons(opt, 1)
     }
 
-    /// Projection id recovering the `Some` payload of `Option[elem]`.
-    pub fn option_value(&mut self, elem: Type) -> FuncId {
+    /// Projection id recovering the `Some` payload of `Option`.
+    pub fn option_value(&mut self) -> FuncId {
         let opt = self.option_adt();
-        self.proj(opt, &[elem], 0, 0)
+        self.proj(opt, 0, 0)
     }
 
     /// The reduction rules minted so far, to inject into a context's runner.
@@ -213,10 +222,12 @@ impl Allocator {
         self.names.get(&f).map(String::as_str)
     }
 
-    /// Mint the instance `adt[args]` (tag + all constructors + all projections +
-    /// rules) if not already present.
-    fn ensure(&mut self, adt: MemberId, args: &[Type]) {
-        if self.tag.contains_key(&(adt, args.to_vec())) {
+    /// Mint the **concept** `adt` (tag + all constructors + all projections +
+    /// reduction rules) if not already present. One concept covers every
+    /// instantiation; the ground type args live in the `FuncApp` discriminant, so
+    /// the reductions are instantiation-agnostic.
+    fn ensure(&mut self, adt: MemberId) {
+        if self.tag.contains_key(&adt) {
             return;
         }
         let counts = self
@@ -224,10 +235,10 @@ impl Allocator {
             .get(&adt)
             .unwrap_or_else(|| panic!("unknown ADT head {}", adt.0))
             .clone();
-        let label = self.label(adt, args);
+        let label = self.label(adt);
 
         let tag_id = self.mint(format!("{label}@tag"));
-        self.tag.insert((adt, args.to_vec()), tag_id);
+        self.tag.insert(adt, tag_id);
 
         let mut ctor_tags = HashMap::new();
         for (variant, &fields) in counts.iter().enumerate() {
@@ -237,12 +248,11 @@ impl Allocator {
                 None => format!("{label}::#{variant}"),
             };
             let cons_id = self.mint(cons_label.clone());
-            self.cons.insert((adt, args.to_vec(), variant), cons_id);
+            self.cons.insert((adt, variant), cons_id);
             ctor_tags.insert(cons_id, variant);
             for field in 0..fields {
                 let proj_id = self.mint(format!("{cons_label}.{field}"));
-                self.proj
-                    .insert((adt, args.to_vec(), variant, field), proj_id);
+                self.proj.insert((adt, variant, field), proj_id);
                 self.rules.push(proj_rule(proj_id, cons_id, field));
             }
         }
@@ -264,18 +274,12 @@ impl Allocator {
         id
     }
 
-    /// A readable label for `adt[args]`, e.g. `Option` or `Box[Int]`.
-    fn label(&self, adt: MemberId, args: &[Type]) -> String {
-        let head = self
-            .head_names
+    /// A readable label for the head `adt`, e.g. `Option` or `Box`. One id now
+    /// serves every instantiation, so the label carries no type arguments.
+    fn label(&self, adt: MemberId) -> String {
+        self.head_names
             .get(&adt)
             .cloned()
-            .unwrap_or_else(|| format!("d{}", adt.0));
-        if args.is_empty() {
-            head
-        } else {
-            let inner: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
-            format!("{head}[{}]", inner.join(", "))
-        }
+            .unwrap_or_else(|| format!("d{}", adt.0))
     }
 }

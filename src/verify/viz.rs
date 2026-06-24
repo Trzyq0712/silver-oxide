@@ -89,7 +89,7 @@ impl Snapshotter {
         for class in ctx.egraph.classes() {
             for node in &class.nodes {
                 match node {
-                    Symbolic::FuncApp(m, _) => {
+                    Symbolic::FuncApp(m, _, _) => {
                         funcs.insert(*m);
                     }
                     Symbolic::Location(m, _) => {
@@ -103,10 +103,14 @@ impl Snapshotter {
             }
         }
         for m in funcs {
-            dot = dot.replace(
-                &format!("fn{}(..)", m.0),
-                &format!("{}", escape(&ctx.func_name(m))),
-            );
+            // `Symbolic` renders a func app as `fn<id>(..)` (no type args) or
+            // `fn<id><T0, T1>(..)` (with the ground instantiation folded into the
+            // label). Resolve just the `fn<id>` token to the concept name, keeping
+            // any `<…>` type suffix. Anchoring on the trailing `(`/`<` keeps `fn1`
+            // from also rewriting `fn10`.
+            let name = escape(&ctx.func_name(m));
+            dot = dot.replace(&format!("fn{}(", m.0), &format!("{name}("));
+            dot = dot.replace(&format!("fn{}<", m.0), &format!("{name}<"));
         }
         for m in locs {
             dot = dot.replace(
