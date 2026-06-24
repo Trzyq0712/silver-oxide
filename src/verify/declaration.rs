@@ -666,7 +666,10 @@ fn eval_resource_call(
         .map(|v| caller_state.get_val(ctx, v))
         .collect();
 
-    Ok(ctx.graft_certificate(cert, &args))
+    // A two-state resource carries a ctx (pre-state) heap; bind the cert's
+    // `old(...)` reads against it.
+    let old_ctx = call.ctx_heap.as_ref().map(|h| get_heap(caller_state, h));
+    Ok(ctx.graft_certificate(cert, &args, old_ctx.as_ref()))
 }
 
 fn eval_method_inst(
@@ -995,12 +998,27 @@ pub fn verify_resource(
         .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
         .collect();
     let mut state = EvalState::with_args(params.clone());
-    // A two-state (`Ctx`) resource reads a parametric context heap as
-    // `HeapVal::Temp(0)` (empty here; reads yield fresh symbolics), so pre-push
-    // it. A self-framed resource has no precondition: its initial heap is
+    // A two-state (`Ctx`) resource's context slot `HeapVal::Temp(0)` is its
+    // pre-state. Graft the precondition resource's certificate into it — both its
+    // heap delta (so `old(...)` reads are framed) and its boolean, *assumed* (so
+    // the precondition's facts, e.g. a nonzero divisor, are available to this
+    // body). A self-framed resource has no precondition: its initial heap is
     // `Empty` and its emitted heaps start at `Temp(0)`, so push nothing.
-    if !matches!(resource.precond, Precond::SelfFramed) {
-        state.push_heap(Heap::empty());
+    match &resource.precond {
+        Precond::SelfFramed => {}
+        Precond::Ctx(req_id, req_args) => {
+            let req_cert = certs.get(req_id).ok_or(VerifyError::DependencyFailed)?;
+            let arg_ids: Vec<egg::Id> = req_args
+                .iter()
+                .map(|v| state.get_val(&mut ctx, v))
+                .collect();
+            // The precondition is itself self-framed (no nested ctx / old-reads).
+            let (req_delta, req_bool) = ctx.graft_certificate(req_cert, &arg_ids, None);
+            state.push_heap(req_delta);
+            let true_ = ctx.true_();
+            ctx.egraph.union(req_bool, true_);
+            ctx.egraph.rebuild();
+        }
     }
 
     let mut snap = Snapshotter::from_env(resource_name);
@@ -1010,6 +1028,12 @@ pub fn verify_resource(
     // syntactic `acc` (location target), kept unmerged for the fold/unfold
     // snapshot layout (the merged `delta` below is for inhale/exhale).
     let mut footprint_ops: Vec<(Val, Val)> = Vec::new();
+
+    // For a two-state resource, a `Deref` against the ctx slot `HeapVal::Temp(0)`
+    // is an `old(...)` read; record `(addr, value)` so call sites can bind the
+    // value to the caller's pre-state (see `graft_certificate`).
+    let is_ctx = !matches!(resource.precond, Precond::SelfFramed);
+    let mut old_reads: Vec<(egg::Id, egg::Id)> = Vec::new();
 
     for inst in &body.insts {
         if let InstKind::Heap(HeapInst::Combine { loc, perm, .. }) = &inst.kind {
@@ -1032,6 +1056,11 @@ pub fn verify_resource(
 
         if let Err(err) = eval_resource_body_inst(&mut ctx, program, &mut state, inst, certs) {
             return Err(err.with_inst(inst_text));
+        }
+        if is_ctx && let InstKind::Pure(_, PureInst::Deref(HeapVal::Temp(0), loc)) = &inst.kind {
+            let addr = state.get_val(&mut ctx, loc);
+            let value = *state.vals.last().expect("Deref pushes a value");
+            old_reads.push((addr, value));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
         let heaps = display_heaps(&state, &inst.kind, heaps_before);
@@ -1072,6 +1101,10 @@ pub fn verify_resource(
     let bool_val = state.get_val(&mut ctx, &body.res.1);
     let bool_id = ctx.egraph.find(bool_val);
     let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
+    let old_reads: Vec<(egg::Id, egg::Id)> = old_reads
+        .into_iter()
+        .map(|(a, v)| (ctx.egraph.find(a), ctx.egraph.find(v)))
+        .collect();
 
     Ok(Some(ResourceCertificate {
         egraph: ctx.egraph.clone(),
@@ -1081,6 +1114,7 @@ pub fn verify_resource(
         delta,
         footprint,
         bool_id,
+        old_reads,
     }))
 }
 
@@ -1663,13 +1697,14 @@ mod tests {
             delta: vec![],
             footprint: vec![],
             bool_id: rctx.egraph.find(d_ne0),
+            old_reads: vec![],
         };
 
         // --- caller side: graft, then check `a != 0` is known true ---
         let mut cctx = fresh_ctx(&interner);
         let a = cctx.fresh_symbolic_value(Type::Int);
         // No `Assume` anywhere — the only knowledge injected is the graft.
-        let _ = cctx.graft_certificate(&cert, &[a]);
+        let _ = cctx.graft_certificate(&cert, &[a], None);
         cctx.egraph.rebuild();
 
         let a_ne0 = ne_zero(&mut cctx, a);

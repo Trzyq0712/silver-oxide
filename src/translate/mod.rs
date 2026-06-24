@@ -371,9 +371,12 @@ impl<'a> Builder<'a> {
                     vmir::Precond::Ctx(req_id, req_args)
                 })
                 .unwrap_or(vmir::Precond::SelfFramed);
-            let heap_base = match &precond {
-                vmir::Precond::Ctx(..) => 1,
-                vmir::Precond::SelfFramed => 0,
+            // Two-state (`Ctx`) ensures reserves `HeapVal::Temp(0)` as the ctx /
+            // pre-state slot (so emitted heaps start at 1); it is the heap that
+            // `old(...)` reads. Self-framed ensures has no pre-state.
+            let (heap_base, pre_state) = match &precond {
+                vmir::Precond::Ctx(..) => (1, Some(vmir::HeapVal::Temp(0))),
+                vmir::Precond::SelfFramed => (0, None),
             };
             let body = resource::lower_spatial_ensures(
                 self,
@@ -382,6 +385,7 @@ impl<'a> Builder<'a> {
                 params.len(),
                 vmir::HeapVal::Empty,
                 heap_base,
+                pre_state,
             )?;
             self.set_decl(
                 ens_id,

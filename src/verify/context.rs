@@ -37,6 +37,12 @@ pub(crate) struct ResourceCertificate {
     pub(crate) footprint: Vec<(Id, Id, Id)>,
     /// Result boolean e-class.
     pub(crate) bool_id: Id,
+    /// `old(...)` reads: `(addr, value)` e-classes (in cert id-space) of each
+    /// `Deref` against the ctx slot `HeapVal::Temp(0)`. At a graft site the
+    /// caller binds `value` to its concrete pre-state heap value at `addr`, so a
+    /// postcondition like `r == old(x.f)` connects to the real pre-value. Empty
+    /// for self-framed resources.
+    pub(crate) old_reads: Vec<(Id, Id)>,
 }
 
 pub(crate) struct VerifyContext<'a> {
@@ -285,6 +291,7 @@ impl<'a> VerifyContext<'a> {
         &mut self,
         cert: &ResourceCertificate,
         args: &[egg::Id],
+        old_ctx: Option<&Heap>,
     ) -> (Heap, egg::Id) {
         let mut subst: HashMap<Id, Id> = HashMap::new();
         for (p, a) in cert.params.iter().zip(args) {
@@ -299,6 +306,21 @@ impl<'a> VerifyContext<'a> {
             delta = delta.with_chunk(a, Chunk::new(p, v));
         }
         let bool_id = transplant(self, cert, cert.bool_id, &subst, &mut memo);
+        // Bind each `old(...)` read to the caller's concrete pre-state value at
+        // the (transplanted) address, so the cert's symbolic pre-value unifies
+        // with the real one.
+        if let Some(ctx_heap) = old_ctx {
+            for &(addr, value) in &cert.old_reads {
+                let a = transplant(self, cert, addr, &subst, &mut memo);
+                let v = transplant(self, cert, value, &subst, &mut memo);
+                let a_canon = self.egraph.find(a);
+                let caller_val = ctx_heap
+                    .entries()
+                    .find_map(|(k, c)| (self.egraph.find(k) == a_canon).then_some(c.value))
+                    .unwrap_or_else(|| self.fresh_symbolic_value(Type::Int));
+                self.egraph.union(v, caller_val);
+            }
+        }
         self.egraph.rebuild();
         (delta, bool_id)
     }

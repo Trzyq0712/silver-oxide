@@ -242,6 +242,72 @@ fn value_postcondition_reflexive_and_copied() {
     }
 }
 
+#[test]
+fn ensures_resource_uses_precondition_facts() {
+    // The `#ensures` resource body divides by `x`, which is only well-formed
+    // because the precondition `x != 0` is grafted into the ctx slot and assumed
+    // when the resource is verified self-contained. Without the `requires`, the
+    // same division must be rejected.
+    let with_req = r#"
+method m(x: Int) returns (r: Int)
+    requires x != 0
+    ensures r == 100 / x
+{ r := 100 / x }
+"#;
+    let program = lower(with_req);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "division in ensures should be safe given `requires x != 0`"
+    );
+
+    let without_req = r#"
+method m(x: Int) returns (r: Int)
+    ensures r == 100 / x
+{ r := 100 / x }
+"#;
+    let program = lower(without_req);
+    // Without a precondition the `#ensures` resource is self-framed and its
+    // division has no nonzero witness — it fails as a resource.
+    assert!(
+        matches!(
+            verify_named_resource(&program, "m#ensures"),
+            Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))
+        ),
+        "division in ensures must fail without a precondition framing the divisor"
+    );
+}
+
+#[test]
+fn old_in_ensures_reads_pre_state() {
+    // `old(x.f)` reads the method pre-state. Untouched field: `x.f == old(x.f)`
+    // holds. Mutated field: it must not.
+    let unchanged = r#"
+field f: Int
+method m(x: Ref) returns (r: Int)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1) && x.f == old(x.f)
+{ r := x.f }
+"#;
+    let program = lower(unchanged);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "untouched field equals its old value"
+    );
+
+    let mutated = r#"
+field f: Int
+method m(x: Ref)
+    requires acc(x.f, 1/1)
+    ensures acc(x.f, 1/1) && x.f == old(x.f)
+{ x.f := 7 }
+"#;
+    let program = lower(mutated);
+    assert!(
+        verify_named_method(&program, "m").is_err(),
+        "mutated field must not equal its old value"
+    );
+}
+
 /// Verify the resource interned under `name`, panicking if it is missing or
 /// is not a `Resource`.
 fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {

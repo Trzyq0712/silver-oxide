@@ -573,14 +573,39 @@ impl PureExt for ! {
 
 impl PureExt for typed::MethodEnsuresExt {
     fn lower_ext(
-        _b: &Builder<'_>,
-        _env: &HashMap<Spur, Val>,
-        _sink: &mut Sink,
-        _hctx: HeapCtx<'_>,
-        _ty: vmir::Type,
-        _ext: &Self,
+        b: &Builder<'_>,
+        env: &HashMap<Spur, Val>,
+        sink: &mut Sink,
+        hctx: HeapCtx<'_>,
+        ty: vmir::Type,
+        ext: &Self,
     ) -> Result<Val, TranslationError> {
-        Err(TranslationError::Unsupported("`old` in method ensures"))
+        let _ = ty;
+        match ext {
+            // old(e): re-read `e` against the method pre-state. For a two-state
+            // ensures that heap is the ctx slot (`HeapVal::Temp(0)`), supplied as
+            // the `old` baseline by `lower_spatial_ensures`. Ensures-`old` is
+            // always unlabeled (`old[L]` is a type error). A self-framed ensures
+            // has no pre-state (`hctx.old == None`): `old` there needs a
+            // `requires` to frame it.
+            typed::MethodEnsuresExt::Old(inner) => {
+                let old = hctx.old.ok_or(TranslationError::Unsupported(
+                    "`old` in method ensures needs a precondition framing it",
+                ))?;
+                let heap = old.baseline;
+                lower(
+                    b,
+                    env,
+                    sink,
+                    HeapCtx {
+                        value: heap,
+                        perm: heap,
+                        old: hctx.old,
+                    },
+                    inner,
+                )
+            }
+        }
     }
 }
 

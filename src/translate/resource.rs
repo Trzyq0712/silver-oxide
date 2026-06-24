@@ -82,15 +82,25 @@ pub(crate) fn lower_spatial_ensures(
     val_base: usize,
     initial_heap: HeapVal,
     heap_base: usize,
+    pre_state: Option<HeapVal>,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, heap_base);
+    // `old(e)` in the postcondition reads the method pre-state. For a two-state
+    // (`Ctx`) resource that heap is the caller-supplied ctx slot `HeapVal::Temp(0)`;
+    // bind it as the (unlabeled) `old` baseline. A self-framed ensures has no
+    // pre-state, so `old` is rejected at lowering (see `MethodEnsuresExt`).
+    let labeled: HashMap<Spur, HeapVal> = HashMap::new();
+    let old = pre_state.map(|baseline| OldHeaps {
+        baseline,
+        labeled: &labeled,
+    });
     let (h, bv) = lower_spatial(
         b,
         env,
         &mut sink,
         initial_heap,
         SpatialMode::Inhale,
-        None,
+        old.as_ref(),
         exp,
     )?;
     Ok(vmir::ResourceBody {
