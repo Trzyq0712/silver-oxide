@@ -4,7 +4,7 @@ use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
         context::{ResourceCertificate, VerifyContext},
-        heap::{Chunk, Heap},
+        heap::{Chunk, Heap, LocationKind},
         lang::{FuncId, Symbolic},
         viz::Snapshotter,
     },
@@ -77,6 +77,10 @@ impl VerifyError {
 
 struct EvalState {
     vals: Vec<egg::Id>,
+    /// The VMIR `Type` of each `vals` entry, kept in lockstep. The location kind
+    /// of an address operand is read straight from here (`loc_kind`) — no e-graph
+    /// inference. Params seed the initial slots; every `Pure` inst pushes its type.
+    val_types: Vec<Type>,
     heaps: Vec<Heap>,
 }
 
@@ -84,13 +88,16 @@ impl EvalState {
     fn new() -> Self {
         Self {
             vals: Vec::new(),
+            val_types: Vec::new(),
             heaps: Vec::new(),
         }
     }
 
-    fn with_args(args: Vec<egg::Id>) -> Self {
+    fn with_args(args: Vec<egg::Id>, arg_types: Vec<Type>) -> Self {
+        debug_assert_eq!(args.len(), arg_types.len());
         Self {
             vals: args,
+            val_types: arg_types,
             heaps: Vec::new(),
         }
     }
@@ -102,8 +109,18 @@ impl EvalState {
         }
     }
 
-    fn push_val(&mut self, id: egg::Id) {
+    /// The location kind of an address operand, from its tracked VMIR type. A
+    /// non-`Temp` or non-`Addr`-typed operand has no kind (`None`).
+    fn loc_kind(&self, val: &Val) -> Option<LocationKind> {
+        match val {
+            Val::Temp(n) => LocationKind::from_addr_type(&self.val_types[*n]),
+            Val::Literal(_) => None,
+        }
+    }
+
+    fn push_val(&mut self, id: egg::Id, ty: Type) {
         self.vals.push(id);
+        self.val_types.push(ty);
     }
     fn push_heap(&mut self, heap: Heap) {
         self.heaps.push(heap);
@@ -188,8 +205,9 @@ fn check_deref_permission(
     loc: &Val,
 ) -> Result<(), VerifyError> {
     let addr = state.get_val(ctx, loc);
-    let perm = get_heap(state, heap)
-        .perm_at(addr)
+    let perm = state
+        .loc_kind(loc)
+        .and_then(|k| get_heap(state, heap).perm_at(&k, addr))
         .unwrap_or_else(|| zero_real(ctx));
     let zero = zero_real(ctx);
     let positive = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, perm]));
@@ -227,7 +245,9 @@ fn eval_pure_inst(
         PureInst::Deref(hv, loc) => {
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
-            heap.value_at(addr)
+            state
+                .loc_kind(loc)
+                .and_then(|k| heap.value_at(&k, addr))
                 .unwrap_or_else(|| ctx.fresh_symbolic_value(ty.clone()))
         }
         PureInst::FunctionCall(_heap, fc) => {
@@ -239,7 +259,10 @@ fn eval_pure_inst(
         PureInst::Perm(hv, loc) => {
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
-            heap.perm_at(addr).unwrap_or_else(|| zero_real(ctx))
+            state
+                .loc_kind(loc)
+                .and_then(|k| heap.perm_at(&k, addr))
+                .unwrap_or_else(|| zero_real(ctx))
         }
         // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted **concept**
         // id (one per `(head, variant[, field])`, see `verify::mono`); the ground
@@ -282,20 +305,13 @@ fn eval_pure_inst(
 fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalState) -> Heap {
     let addr = state.get_val(ctx, loc);
     let perm = state.get_val(ctx, perm);
-    // The held value's type is the `T` in the location's `Addr<T>` type (the
-    // `@addr` function's return type) — e.g. a field's type, or a predicate's
-    // `@snap`. Fall back to `Int` if the location type can't be inferred.
-    let value_ty = crate::verify::context::infer_type(
-        &ctx.egraph,
-        &ctx.fresh_types,
-        &ctx.func_ret_types,
-        addr,
-        &mut HashMap::new(),
-    )
-    .and_then(|t| t.addr_value().cloned())
-    .unwrap_or(Type::Int);
-    let value = ctx.fresh_symbolic_value(value_ty);
-    Heap::empty().with_chunk(addr, Chunk::new(perm, value))
+    // The location kind (group + held value type + bound) comes straight from the
+    // address operand's VMIR `Type::Addr` — no e-graph inference.
+    let kind = state
+        .loc_kind(loc)
+        .expect("acc location must be Addr-typed");
+    let value = ctx.fresh_symbolic_value(kind.value.clone());
+    Heap::empty().with_chunk(&kind, Chunk::new(addr, perm, value))
 }
 
 /// Merge two fractional chunks at the same address. Decouples the operational
@@ -312,6 +328,7 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalStat
 /// `==>`, so these desugar to `Lt(0, p)` and `Ite` forms.
 fn merge_chunks(
     ctx: &mut VerifyContext<'_>,
+    addr: egg::Id,
     p0: egg::Id,
     v0: egg::Id,
     p1: egg::Id,
@@ -338,7 +355,7 @@ fn merge_chunks(
     let imp = ctx.implication(eq, antecedents);
     ctx.egraph.union(imp, true_);
 
-    Chunk::new(perm, value)
+    Chunk::new(addr, perm, value)
 }
 
 /// A location chunk extracted from a heap for the location axioms: its
@@ -366,21 +383,11 @@ fn pred_addr_type(program: &vmir::Program, pred_id: MemberId) -> Type {
 /// `@addr` application — its value-arg e-classes (used by the non-aliasing axiom).
 fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     let mut out = Vec::new();
-    for (addr, chunk) in h.entries() {
-        let canon = ctx.egraph.find(addr);
-        let ty = crate::verify::context::infer_type(
-            &ctx.egraph,
-            &ctx.fresh_types,
-            &ctx.func_ret_types,
-            canon,
-            &mut HashMap::new(),
-        );
-        let Some(Type::Addr { group, bound, .. }) = ty else {
-            continue;
-        };
-        // The value args of the direct address application — the `FuncApp` whose
-        // function returns an `Addr` type. Absent for a computed address (no such
-        // node) → no non-aliasing for it.
+    for (kind, chunk) in h.entries() {
+        // group/bound come straight from the chunk's location kind (VMIR-sourced) —
+        // no inference. The value args for non-aliasing are read from the address
+        // application node; absent for a computed address (no such node).
+        let canon = ctx.egraph.find(chunk.addr);
         let args = ctx.egraph[canon]
             .nodes
             .iter()
@@ -395,8 +402,8 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
             .unwrap_or_default();
         out.push(LocationChunk {
             perm: chunk.perm,
-            group,
-            bound,
+            group: kind.group,
+            bound: kind.bound.clone(),
             args,
         });
     }
@@ -483,49 +490,56 @@ fn conj_args_eq(
     acc
 }
 
-/// Heap addition for a single location chunk.
+/// Heap addition for a single location chunk of kind `kind`.
 fn heap_union(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
-    addr: egg::Id,
+    kind: &LocationKind,
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Heap {
     let mut out = h1.clone();
-    let addr = ctx.egraph.find(addr);
+    let addr = ctx.egraph.find(chunk2.addr);
+    // Find any congruent chunk already in this group (canonical-address match).
     let existing = out
-        .entries()
-        .find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
+        .chunks_of(kind)
+        .iter()
+        .find(|c| ctx.egraph.find(c.addr) == addr)
+        .cloned();
     if let Some(existing) = existing {
+        // Replace the existing chunk in place (keep its stored address key).
         let merged = merge_chunks(
             ctx,
+            existing.addr,
             existing.perm,
             existing.value,
             chunk2.perm,
             chunk2.value,
             pc_lits,
         );
-        out = out.with_chunk(addr, merged);
+        out = out.with_chunk(kind, merged);
     } else {
-        out = out.with_chunk(addr, chunk2);
+        out = out.with_chunk(kind, chunk2);
     }
     assume_location_axioms(ctx, &out);
     out
 }
 
-/// Heap subtraction for a single location chunk.
+/// Heap subtraction for a single location chunk of kind `kind`.
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
-    addr: egg::Id,
+    kind: &LocationKind,
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
     let mut out = h1.clone();
-    let addr = ctx.egraph.find(addr);
+    let addr = ctx.egraph.find(chunk2.addr);
     let existing = out
-        .entries()
-        .find_map(|(k, c)| (ctx.egraph.find(k) == addr).then(|| c.clone()));
+        .chunks_of(kind)
+        .iter()
+        .find(|c| ctx.egraph.find(c.addr) == addr)
+        .cloned();
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
         // conditional footprint slot whose guard is false — a nested predicate
@@ -555,14 +569,9 @@ fn heap_subtract(
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
     let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [remainder, zero]));
     if ctx.prove_under_pc(eq, pc_lits) {
-        // Find the actual key used in `out` to remove it
-        let key = out
-            .entries()
-            .find_map(|(k, _)| (ctx.egraph.find(k) == addr).then(|| k))
-            .unwrap();
-        out = out.without_chunk(key);
+        out = out.without_chunk(kind, existing.addr);
     } else {
-        out = out.with_chunk(addr, Chunk::new(remainder, existing.value));
+        out = out.with_chunk(kind, Chunk::new(existing.addr, remainder, existing.value));
     }
     Ok(out)
 }
@@ -590,10 +599,11 @@ fn eval_heap_inst(
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
-            let (addr, ch) = chunk.entries().next().unwrap();
+            let (kind, ch) = chunk.entries().next().unwrap();
+            let (kind, ch) = (kind.clone(), ch.clone());
             match sign {
-                Sign::Add => Ok(heap_union(ctx, &base_h, addr, ch.clone(), &pc_lits)),
-                Sign::Sub => heap_subtract(ctx, &base_h, addr, ch.clone(), &pc_lits),
+                Sign::Add => Ok(heap_union(ctx, &base_h, &kind, ch, &pc_lits)),
+                Sign::Sub => heap_subtract(ctx, &base_h, &kind, ch, &pc_lits),
             }
         }
         // Resource inhale/exhale need the program + certificates; method-only.
@@ -611,7 +621,8 @@ fn eval_heap_inst(
             let h = get_heap(state, heap);
             let addr = state.get_val(ctx, loc);
             let new_val = state.get_val(ctx, val);
-            let perm = h.perm_at(addr).unwrap_or_else(|| zero_real(ctx));
+            let kind = state.loc_kind(loc).expect("assign location must be Addr-typed");
+            let perm = h.perm_at(&kind, addr).unwrap_or_else(|| zero_real(ctx));
             // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc.
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
@@ -626,7 +637,7 @@ fn eval_heap_inst(
             if !ctx.prove_under_pc(goal, &pc_lits) {
                 return Err(VerifyError::InsufficientPermission);
             }
-            Ok(h.with_chunk(addr, Chunk::new(perm, new_val)))
+            Ok(h.with_chunk(&kind, Chunk::new(addr, perm, new_val)))
         }
     }
 }
@@ -645,7 +656,7 @@ fn eval_resource_body_inst(
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
             let id = eval_pure_inst(ctx, state, ty, pi);
-            state.push_val(id);
+            state.push_val(id, ty.clone());
         }
         // `unfold` inside a resource body verifies identically to a method
         // body (shared `eval_unfold`); only `Unfold` is emitted here.
@@ -708,7 +719,7 @@ fn eval_method_inst(
     match &inst.kind {
         InstKind::Pure(ty, pi) => {
             let id = eval_pure_inst(ctx, state, ty, pi);
-            state.push_val(id);
+            state.push_val(id, ty.clone());
         }
         // `base inhale <resource>(args) perm`: graft the resource's certificate,
         // scale its delta by `perm`, union against `base`, and **assume** the
@@ -729,8 +740,8 @@ fn eval_method_inst(
                 .collect();
             let out = if is_inhale {
                 let mut h = base_h.clone();
-                for (addr, ch) in scaled.entries() {
-                    h = heap_union(ctx, &h, addr, ch.clone(), &pc_lits);
+                for (kind, ch) in scaled.entries() {
+                    h = heap_union(ctx, &h, kind, ch.clone(), &pc_lits);
                 }
                 let true_ = ctx.true_();
                 ctx.egraph.union(bool_id, true_);
@@ -738,8 +749,8 @@ fn eval_method_inst(
                 h
             } else {
                 let mut h = base_h.clone();
-                for (addr, ch) in scaled.entries() {
-                    h = heap_subtract(ctx, &h, addr, ch.clone(), &pc_lits)?;
+                for (kind, ch) in scaled.entries() {
+                    h = heap_subtract(ctx, &h, kind, ch.clone(), &pc_lits)?;
                 }
                 if !ctx.prove_under_pc(bool_id, &pc_lits) {
                     return Err(VerifyError::AssertionFailed);
@@ -776,8 +787,8 @@ fn eval_method_inst(
             // inner predicate `P(this.next)`) resolves against the actual field
             // value read for an earlier slot.
             let mut subst = ctx.footprint_param_subst(cert, &args);
-            for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
-                let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
+            for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
+                let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
                 let p = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
                 // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
                 let elem = field_types[i]
@@ -786,14 +797,14 @@ fn eval_method_inst(
                     .clone();
                 let v = base_h
                     .entries()
-                    .find_map(|(k, c)| {
-                        (ctx.egraph.find(k) == ctx.egraph.find(addr)).then(|| c.value)
+                    .find_map(|(_, c)| {
+                        (ctx.egraph.find(c.addr) == ctx.egraph.find(addr)).then(|| c.value)
                     })
                     .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone()));
-                out = heap_subtract(ctx, &out, addr, Chunk::new(p, v), &pc_lits)?;
+                out = heap_subtract(ctx, &out, kind, Chunk::new(addr, p, v), &pc_lits)?;
                 let present = ctx.perm_positive(bperm);
                 members.push(ctx.option_member(elem, present, v));
-                subst.insert(cert.egraph.find(c_val), v);
+                subst.insert(cert.egraph.find(*c_val), v);
                 values.push(v);
             }
             let bool_id = ctx.graft_pred_bool(cert, &args, &values);
@@ -807,6 +818,8 @@ fn eval_method_inst(
             // Predicate snapshots are non-generic — empty type instantiation.
             let snap = ctx.add_func_app_id(snap_cons, Box::new([]), snap_ty, cons_args);
             let addr_ty = pred_addr_type(program, addr_fn);
+            let pred_kind =
+                LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
             // The predicate's address is an ordinary call to its address function
             // (the predicate's own id); the `Addr` type is the recorded return type.
             let pred_addr = ctx.add_func_app_id(
@@ -815,7 +828,13 @@ fn eval_method_inst(
                 addr_ty,
                 args.into(),
             );
-            let out = heap_union(ctx, &out, pred_addr, Chunk::new(perm_id, snap), &pc_lits);
+            let out = heap_union(
+                ctx,
+                &out,
+                &pred_kind,
+                Chunk::new(pred_addr, perm_id, snap),
+                &pc_lits,
+            );
             state.push_heap(out);
             ctx.reduce();
         }
@@ -894,6 +913,7 @@ fn eval_unfold(
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
     let addr_ty = pred_addr_type(program, addr_fn);
+    let pred_kind = LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
     // The predicate's address is an ordinary call to its address function (the
     // predicate's own id); the `Addr` type is the recorded return type.
     let pred_addr = ctx.add_func_app_id(
@@ -905,17 +925,23 @@ fn eval_unfold(
     let a = ctx.egraph.find(pred_addr);
     let s = base_h
         .entries()
-        .find_map(|(k, c)| (ctx.egraph.find(k) == a).then(|| c.value))
+        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then(|| c.value))
         .ok_or(VerifyError::InsufficientPermission)?;
-    let mut out = heap_subtract(ctx, &base_h, pred_addr, Chunk::new(perm_id, s), &pc_lits)?;
+    let mut out = heap_subtract(
+        ctx,
+        &base_h,
+        &pred_kind,
+        Chunk::new(pred_addr, perm_id, s),
+        &pc_lits,
+    )?;
 
     let mut values = Vec::with_capacity(cert.footprint.len());
     // As in fold, grow `subst` with each recovered slot value so a
     // value-dependent address (an inner predicate `P(this.next)`) resolves
     // against the projected field value.
     let mut subst = ctx.footprint_param_subst(cert, &args);
-    for (i, (c_addr, c_perm, c_val)) in cert.footprint.iter().copied().enumerate() {
-        let (addr, bperm) = ctx.graft_footprint_slot(cert, c_addr, c_perm, &subst);
+    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
+        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
         // `proj_i(s)` recovers the optional snapshot member; `reduce()`
         // collapses it to the constructor's i-th member when `s` is a
         // concrete `cons` (so repeated fold/unfold doesn't grow the
@@ -932,8 +958,8 @@ fn eval_unfold(
         let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([s]));
         let pv = ctx.option_unwrap(elem, opt);
         let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
-        out = heap_union(ctx, &out, addr, Chunk::new(need, pv), &pc_lits);
-        subst.insert(cert.egraph.find(c_val), pv);
+        out = heap_union(ctx, &out, kind, Chunk::new(addr, need, pv), &pc_lits);
+        subst.insert(cert.egraph.find(*c_val), pv);
         values.push(pv);
     }
     let bool_id = ctx.graft_pred_bool(cert, &args, &values);
@@ -951,9 +977,11 @@ fn eval_unfold(
 /// rewrite folds the multiply away.
 fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Heap {
     let mut out = Heap::empty();
-    for (addr, chunk) in h.entries() {
+    let entries: Vec<(LocationKind, Chunk)> =
+        h.entries().map(|(k, c)| (k.clone(), c.clone())).collect();
+    for (kind, chunk) in entries {
         let perm = ctx.add(Symbolic::Binary(BinOp::Mult, [scale, chunk.perm]));
-        out = out.with_chunk(addr, Chunk::new(perm, chunk.value));
+        out = out.with_chunk(&kind, Chunk::new(chunk.addr, perm, chunk.value));
     }
     out
 }
@@ -1020,7 +1048,7 @@ pub fn verify_resource(
         .iter()
         .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
         .collect();
-    let mut state = EvalState::with_args(params.clone());
+    let mut state = EvalState::with_args(params.clone(), resource.params.clone());
     // A two-state (`Ctx`) resource's context slot `HeapVal::Temp(0)` is its
     // pre-state. Graft the precondition resource's certificate into it — both its
     // heap delta (so `old(...)` reads are framed) and its boolean, *assumed* (so
@@ -1100,31 +1128,37 @@ pub fn verify_resource(
     // result roots (canonicalized) for grafting at call sites.
     ctx.saturate();
     let delta_heap = get_heap(&state, &body.res.0);
-    let delta: Vec<(egg::Id, egg::Id, egg::Id)> = delta_heap
+    // Each delta chunk keeps its `LocationKind` (VMIR-sourced) so grafting regroups
+    // without inference.
+    let delta: Vec<(LocationKind, egg::Id, egg::Id, egg::Id)> = delta_heap
         .entries()
-        .map(|(addr, chunk)| {
+        .map(|(kind, chunk)| {
             (
-                ctx.egraph.find(addr),
+                kind.clone(),
+                ctx.egraph.find(chunk.addr),
                 ctx.egraph.find(chunk.perm),
                 ctx.egraph.find(chunk.value),
             )
         })
         .collect();
-    // Unmerged, program-ordered footprint: each acc's `(addr, perm)` with the
+    // Unmerged, program-ordered footprint: each acc's `(kind, addr, perm)` with the
     // *merged* chunk value at that address (so aliased slots stay separate yet
     // share their value). Drives the fold/unfold snapshot layout.
-    let footprint: Vec<(egg::Id, egg::Id, egg::Id)> = footprint_ops
+    let footprint: Vec<(LocationKind, egg::Id, egg::Id, egg::Id)> = footprint_ops
         .iter()
         .map(|(loc, perm)| {
+            let kind = state
+                .loc_kind(loc)
+                .expect("footprint location must be Addr-typed");
             let addr = state.get_val(&mut ctx, loc);
             let addr = ctx.egraph.find(addr);
             let perm = state.get_val(&mut ctx, perm);
             let perm = ctx.egraph.find(perm);
             let value = delta_heap
-                .chunk(addr)
-                .map(|c| ctx.egraph.find(c.value))
+                .entries()
+                .find_map(|(_, c)| (ctx.egraph.find(c.addr) == addr).then(|| ctx.egraph.find(c.value)))
                 .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
-            (addr, perm, value)
+            (kind, addr, perm, value)
         })
         .collect();
     let bool_val = state.get_val(&mut ctx, &body.res.1);
@@ -1216,6 +1250,17 @@ mod tests {
         ))))
     }
 
+    /// An **unbounded** test location kind — like a predicate, it triggers no
+    /// bound/non-aliasing axioms, so the merge/subtract unit tests exercise the
+    /// chunk accounting in isolation (as the old non-`Addr` test addresses did).
+    fn test_kind() -> LocationKind {
+        LocationKind {
+            group: <lasso::Spur as lasso::Key>::try_from_usize(0).unwrap(),
+            value: Type::Int,
+            bound: Bound::Unbounded,
+        }
+    }
+
     // A multi-arg bounded location (not Viper-reachable; only via direct VMIR):
     // two chunks of the same location whose perms sum > bound, with all args
     // forced equal, must contradict (the conjunction of arg-equalities collapses
@@ -1241,12 +1286,13 @@ mod tests {
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
         let a0 = ctx.add_func_app_id(addr_fn, Box::new([]), addr_ty.clone(), Box::new([x0, y0]));
-        let a1 = ctx.add_func_app_id(addr_fn, Box::new([]), addr_ty, Box::new([x1, y1]));
+        let a1 = ctx.add_func_app_id(addr_fn, Box::new([]), addr_ty.clone(), Box::new([x1, y1]));
+        let k = LocationKind::from_addr_type(&addr_ty).unwrap();
         let (v0, v1) = (ctx.add(Symbolic::Fresh(4)), ctx.add(Symbolic::Fresh(5)));
         let (p0, p1) = (real(&mut ctx, 3, 4), real(&mut ctx, 1, 2)); // sum 5/4 > 1
         let heap = Heap::empty()
-            .with_chunk(a0, Chunk::new(p0, v0))
-            .with_chunk(a1, Chunk::new(p1, v1));
+            .with_chunk(&k, Chunk::new(a0, p0, v0))
+            .with_chunk(&k, Chunk::new(a1, p1, v1));
 
         // Assume both argument pairs are equal: x0==x1, y0==y1.
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
@@ -1276,14 +1322,14 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
         let v2 = ctx.add(Symbolic::Fresh(3));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let merged = heap_union(&mut ctx, &h1, b, Chunk::new(p2, v2), &[]);
+        let merged = heap_union(&mut ctx, &h1, &test_kind(), Chunk::new(b, p2, v2), &[]);
 
         let canon = ctx.egraph.find(a);
-        let chunk = merged.chunk(canon).expect("merged chunk missing");
+        let chunk = merged.chunk(&test_kind(), canon).expect("merged chunk missing");
 
         let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p1, p2]));
         ctx.saturate();
@@ -1305,10 +1351,10 @@ mod tests {
         let v0 = ctx.add(Symbolic::Fresh(1));
         let v1 = ctx.add(Symbolic::Fresh(2));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[]);
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p0, v0));
+        let merged = heap_union(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v1), &[]);
         let chunk = merged
-            .chunk(ctx.egraph.find(a))
+            .chunk(&test_kind(), ctx.egraph.find(a))
             .expect("merged chunk missing");
         ctx.saturate();
 
@@ -1328,10 +1374,10 @@ mod tests {
         let v0 = ctx.add(Symbolic::Fresh(1));
         let v1 = ctx.add(Symbolic::Fresh(2));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
-        let merged = heap_union(&mut ctx, &h1, a, Chunk::new(p1, v1), &[]);
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p0, v0));
+        let merged = heap_union(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v1), &[]);
         let chunk = merged
-            .chunk(ctx.egraph.find(a))
+            .chunk(&test_kind(), ctx.egraph.find(a))
             .expect("merged chunk missing");
         ctx.saturate();
 
@@ -1352,16 +1398,16 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
         let false_lit = ctx.add(Symbolic::Lit(Literal::Bool(false)));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p0, v0));
         let merged = heap_union(
             &mut ctx,
             &h1,
-            a,
-            Chunk::new(p1, v1),
+            &test_kind(),
+            Chunk::new(a, p1, v1),
             &[(false_lit, Polarity::Positive)],
         );
         let chunk = merged
-            .chunk(ctx.egraph.find(a))
+            .chunk(&test_kind(), ctx.egraph.find(a))
             .expect("merged chunk missing");
         ctx.saturate();
 
@@ -1384,16 +1430,16 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
         let true_lit = ctx.add(Symbolic::Lit(Literal::Bool(true)));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p0, v0));
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p0, v0));
         let merged = heap_union(
             &mut ctx,
             &h1,
-            a,
-            Chunk::new(p1, v1),
+            &test_kind(),
+            Chunk::new(a, p1, v1),
             &[(true_lit, Polarity::Positive)],
         );
         let _chunk = merged
-            .chunk(ctx.egraph.find(a))
+            .chunk(&test_kind(), ctx.egraph.find(a))
             .expect("merged chunk missing");
         ctx.saturate();
 
@@ -1476,9 +1522,9 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(3));
         let v2 = ctx.add(Symbolic::Fresh(4));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p_have, v1));
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p_have, v1));
         // Symbolic perms → `have >= take` not provable by equality saturation.
-        let err = heap_subtract(&mut ctx, &h1, a, Chunk::new(p_take, v2), &[])
+        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p_take, v2), &[])
             .err()
             .expect("symbolic-perm exhale must fail without a proof");
         assert!(matches!(
@@ -1499,15 +1545,15 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
         let v2 = ctx.add(Symbolic::Fresh(3));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p2, v1));
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p2, v1));
         ctx.egraph.union(a, b);
         ctx.egraph.rebuild();
 
-        let result = heap_subtract(&mut ctx, &h1, b, Chunk::new(p1, v2), &[])
+        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(b, p1, v2), &[])
             .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
-        let chunk = result.chunk(canon).expect("result chunk missing");
+        let chunk = result.chunk(&test_kind(), canon).expect("result chunk missing");
         let expected_perm = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         ctx.egraph.rebuild();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
@@ -1524,13 +1570,13 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
         let v2 = ctx.add(Symbolic::Fresh(3));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let result = heap_subtract(&mut ctx, &h1, a, Chunk::new(p1, v2), &[])
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
+        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v2), &[])
             .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         assert!(
-            result.chunk(canon).is_none(),
+            result.chunk(&test_kind(), canon).is_none(),
             "zero-perm chunk must be dropped"
         );
     }
@@ -1546,8 +1592,8 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
         let v2 = ctx.add(Symbolic::Fresh(3));
 
-        let h1 = Heap::empty().with_chunk(a, Chunk::new(p1, v1));
-        let err = heap_subtract(&mut ctx, &h1, a, Chunk::new(p2, v2), &[])
+        let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
+        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p2, v2), &[])
             .err()
             .expect("over-consumption must fail");
         assert!(matches!(
@@ -1567,7 +1613,7 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty();
-        let err = heap_subtract(&mut ctx, &h1, a, Chunk::new(p1, v1), &[])
+        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v1), &[])
             .err()
             .expect("subtract from empty must fail");
         assert!(matches!(

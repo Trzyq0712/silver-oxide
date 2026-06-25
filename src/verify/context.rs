@@ -5,7 +5,7 @@ use egg::{EGraph, Id};
 use crate::{
     verify::{
         analysis::ConstFold,
-        heap::{Chunk, Heap},
+        heap::{Chunk, Heap, LocationKind},
         lang::{FuncId, Symbolic},
         mono::Allocator,
         rewrite,
@@ -25,16 +25,17 @@ pub(crate) struct ResourceCertificate {
     pub(crate) func_ret_types: HashMap<FuncId, Type>,
     /// Formal-param e-classes, in order (the call's args substitute these).
     pub(crate) params: Vec<Id>,
-    /// Result heap-delta chunks as `(addr, perm, value)` e-classes — the
-    /// **merged** (accounting) view, chunks keyed by congruent address with
-    /// perms summed. Used by inhale/exhale grafting (`graft_certificate`).
-    pub(crate) delta: Vec<(Id, Id, Id)>,
-    /// **Unmerged, program-ordered** footprint: one `(addr, perm, value)` per
-    /// syntactic `acc`, in body order. Aliased accs (same address) stay
+    /// Result heap-delta chunks as `(kind, addr, perm, value)` — the **merged**
+    /// (accounting) view, chunks keyed by congruent address with perms summed.
+    /// The `LocationKind` is captured at build (VMIR-sourced) so grafting groups
+    /// them without inference. Used by inhale/exhale grafting (`graft_certificate`).
+    pub(crate) delta: Vec<(LocationKind, Id, Id, Id)>,
+    /// **Unmerged, program-ordered** footprint: one `(kind, addr, perm, value)`
+    /// per syntactic `acc`, in body order. Aliased accs (same address) stay
     /// separate, so the snapshot keeps one member per acc; `value` is the merged
     /// chunk value at that address, so aliased slots share it. Used by
     /// fold/unfold (the snapshot layout).
-    pub(crate) footprint: Vec<(Id, Id, Id)>,
+    pub(crate) footprint: Vec<(LocationKind, Id, Id, Id)>,
     /// Result boolean e-class.
     pub(crate) bool_id: Id,
     /// `old(...)` reads: `(addr, value)` e-classes (in cert id-space) of each
@@ -287,11 +288,11 @@ impl<'a> VerifyContext<'a> {
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let mut delta = Heap::empty();
-        for &(addr, perm, value) in &cert.delta {
-            let a = transplant(self, cert, addr, &subst, &mut memo);
-            let p = transplant(self, cert, perm, &subst, &mut memo);
-            let v = transplant(self, cert, value, &subst, &mut memo);
-            delta = delta.with_chunk(a, Chunk::new(p, v));
+        for (kind, addr, perm, value) in &cert.delta {
+            let a = transplant(self, cert, *addr, &subst, &mut memo);
+            let p = transplant(self, cert, *perm, &subst, &mut memo);
+            let v = transplant(self, cert, *value, &subst, &mut memo);
+            delta = delta.with_chunk(kind, Chunk::new(a, p, v));
         }
         let bool_id = transplant(self, cert, cert.bool_id, &subst, &mut memo);
         // Bind each `old(...)` read to the caller's concrete pre-state value at
@@ -304,7 +305,7 @@ impl<'a> VerifyContext<'a> {
                 let a_canon = self.egraph.find(a);
                 let caller_val = ctx_heap
                     .entries()
-                    .find_map(|(k, c)| (self.egraph.find(k) == a_canon).then_some(c.value))
+                    .find_map(|(_, c)| (self.egraph.find(c.addr) == a_canon).then_some(c.value))
                     .unwrap_or_else(|| self.fresh_symbolic_value(Type::Int));
                 self.egraph.union(v, caller_val);
             }
@@ -366,7 +367,8 @@ impl<'a> VerifyContext<'a> {
         // Aliased slots share their cert value, and the caller supplies the same
         // (per-location) value for each, so the inserts agree.
         for (slot, &v) in cert.footprint.iter().zip(values) {
-            subst.insert(cert.egraph.find(slot.2), v);
+            // `slot.3` is the footprint value e-class (`(kind, addr, perm, value)`).
+            subst.insert(cert.egraph.find(slot.3), v);
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let b = transplant(self, cert, cert.bool_id, &subst, &mut memo);
