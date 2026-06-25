@@ -1,16 +1,16 @@
 use crate::vmir::display::VmirDisplay;
 use crate::vmir::{
-    Adt, AdtVariant, Bound, Domain, HeapInst, HeapVal, Inst, InstKind, Location, MemberId, Type,
+    Adt, AdtVariant, Bound, Domain, Function, HeapInst, HeapVal, Inst, InstKind, MemberId, Type,
     Val,
 };
 use std::fmt::{self, Display, Formatter};
 
 /// A reusable unit of proof.
 ///
-/// A resource computes a heap delta and a boolean condition. Its address
-/// location and snapshot type are not stored — they are mechanically implied by
-/// the definition and derived on demand (see [`Resource::derive_location`] and
-/// [`Resource::derive_snapshot`]).
+/// A resource computes a heap delta and a boolean condition. Its address function
+/// and snapshot type are not stored — they are mechanically implied by the
+/// definition and derived on demand (the `@addr` function via
+/// [`Resource::derive_location`]; the snapshot via [`Resource::derive_snapshot`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub params: Vec<Type>,
@@ -39,14 +39,16 @@ impl Resource {
         matches!(self.precond, Precond::SelfFramed)
     }
 
-    /// Derive this resource's address location: `params -> Addr<Snap(id)>`,
-    /// unbounded. `id` is the resource's own `MemberId` (its address `LocId` and
-    /// `Type::Snap` head). Not emitted as a declaration — synthesized on demand.
-    pub fn derive_location(&self, id: MemberId) -> Location {
-        Location {
+    /// This resource's `@addr` **function**: `params -> &[group] Snap(id) @ *`.
+    /// The address is a generic-`ADDR` application; all location metadata (group
+    /// tag, snapshot value, unbounded permission) rides in the return type.
+    /// Derived on demand — not emitted as a declaration. `group` is the predicate's
+    /// interned group tag (`Program.groups`).
+    pub fn derive_location(&self, id: MemberId, group: lasso::Spur) -> Function {
+        Function {
             params: self.params.clone(),
-            ret: Type::Snap(id),
-            bound: Bound::Unbounded,
+            ret: Type::addr(group, Type::Snap(id), Bound::Unbounded),
+            body: None,
         }
     }
 
@@ -82,8 +84,8 @@ impl Resource {
                         Val::Temp(n) => val_types.get(*n),
                         Val::Literal(_) => None,
                     };
-                    if let Some(Type::Addr(inner)) = ty {
-                        field_types.push(Type::Option(inner.clone()));
+                    if let Some(Type::Addr { value, .. }) = ty {
+                        field_types.push(Type::Option(value.clone()));
                     }
                 }
                 _ => {}

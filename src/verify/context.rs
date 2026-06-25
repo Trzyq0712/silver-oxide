@@ -6,13 +6,13 @@ use crate::{
     verify::{
         analysis::ConstFold,
         heap::{Chunk, Heap},
-        lang::{FuncId, LocId, Symbolic},
+        lang::{FuncId, Symbolic},
         mono::Allocator,
         rewrite,
     },
-    vmir::{BinOp, Bound, FunctionCall, Literal, MemberId, Polarity, Type},
+    vmir::{BinOp, FunctionCall, Literal, MemberId, Polarity, Type},
 };
-use lasso::Rodeo;
+use lasso::{Rodeo, Spur};
 
 /// A resource's well-formedness proof, kept for **reuse at call sites**: the
 /// saturated proof e-graph (carrying every proven merge) plus the root
@@ -55,6 +55,8 @@ pub(crate) struct VerifyContext<'a> {
     static_reduce: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
     pub(crate) interner: &'a Rodeo<MemberId>,
+    /// Location group tags (`Type::Addr.group`), for display resolution.
+    pub(crate) groups: &'a Rodeo<Spur>,
     /// Shared verifier id allocator (minted ADT cons/proj/tag ids + their rules).
     /// Owned by `verify::verify`, threaded `&mut` through each unit so ids stay
     /// consistent across certificate grafts.
@@ -65,26 +67,13 @@ pub(crate) struct VerifyContext<'a> {
     /// needed — the visualization reads them directly to reconstruct types.
     pub(crate) fresh_types: HashMap<u32, Type>,
     pub(crate) func_ret_types: HashMap<FuncId, Type>,
-    /// Location declarations by member id (the heap-address functions). A chunk
-    /// whose address is a `Symbolic::Location(m, _)` is bounded/non-aliased per
-    /// `locations[m]`.
-    pub(crate) locations: HashMap<MemberId, LocationInfo>,
-}
-
-/// Verifier-side view of a `Declaration::Location`.
-#[derive(Debug, Clone)]
-pub(crate) struct LocationInfo {
-    pub(crate) bound: Bound,
-    /// Held value type `T` (the location value is `Addr<T>`).
-    pub(crate) ret: Type,
-    pub(crate) arity: usize,
 }
 
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
         interner: &'a Rodeo<MemberId>,
+        groups: &'a Rodeo<Spur>,
         alloc: &'a mut Allocator,
-        locations: HashMap<MemberId, LocationInfo>,
     ) -> Self {
         Self {
             egraph: egg::EGraph::default(),
@@ -92,24 +81,11 @@ impl<'a> VerifyContext<'a> {
             static_reduce: rewrite::reduce_rules(),
             fresh_counter: 0,
             interner,
+            groups,
             alloc,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
-            locations,
         }
-    }
-
-    /// Add a location application `f(args)` (an address of type `Addr<ret>`),
-    /// recording its result type in the side-oracle for type inference.
-    pub(crate) fn add_location(&mut self, member: MemberId, args: Box<[egg::Id]>) -> egg::Id {
-        // A location reuses its declaration's index as its `LocId`.
-        self.add_location_id(LocId(usize::from(member)), args)
-    }
-
-    /// Add a `Location` over an already-allocated [`LocId`] (used by grafting,
-    /// which carries the id verbatim).
-    pub(crate) fn add_location_id(&mut self, id: LocId, args: Box<[egg::Id]>) -> egg::Id {
-        self.egraph.add(Symbolic::Location(id, args))
     }
 
     /// Whether the e-graph has reached a contradiction (some e-class merged
@@ -143,15 +119,6 @@ impl<'a> VerifyContext<'a> {
         }
     }
 
-    /// Display name for an e-graph location id (always a real location decl).
-    pub(crate) fn loc_name(&self, l: LocId) -> String {
-        if l.0 < self.interner.len() {
-            self.interner.resolve(&MemberId::from(l.0)).to_string()
-        } else {
-            format!("loc{}", l.0)
-        }
-    }
-
     /// Render a VMIR type using [`Self::member_name`] for `Domain` heads, so
     /// verifier-synthesised types (e.g. `Option[Int]`) print without panicking
     /// on the interner.
@@ -161,7 +128,15 @@ impl<'a> VerifyContext<'a> {
             Type::Bool => "Bool".to_string(),
             Type::Real => "Real".to_string(),
             Type::Ref => "Ref".to_string(),
-            Type::Addr(t) => format!("&{}", self.type_name(t)),
+            Type::Addr {
+                group,
+                value,
+                bound,
+            } => format!(
+                "&[{}] {} @ {bound}",
+                self.groups.resolve(group),
+                self.type_name(value)
+            ),
             Type::Domain(id, args) => {
                 let head = self.member_name(*id);
                 if args.is_empty() {
@@ -599,13 +574,6 @@ fn transplant(
                 // The ground type instantiation has no e-class — copy it verbatim.
                 caller.add_func_app_id(*m, tys.clone(), ret, fargs)
             }
-            Symbolic::Location(m, fargs) => {
-                let fargs: Box<[Id]> = fargs
-                    .iter()
-                    .map(|a| transplant(caller, cert, *a, subst, memo))
-                    .collect();
-                caller.add_location_id(*m, fargs)
-            }
         };
         built.push(b);
     }
@@ -649,10 +617,9 @@ pub(crate) fn infer_type(
             Symbolic::Lit(l) => Some(lit_type(l)),
             Symbolic::RealCast(_) => Some(Type::Real),
             Symbolic::Fresh(u) => fresh_types.get(u).cloned(),
+            // Addresses are ordinary func apps: a field/predicate address function
+            // records its `Addr{..}` return type in `func_ret_types` like any other.
             Symbolic::FuncApp(f, _, _) => func_ret_types.get(f).cloned(),
-            // Address types (`Addr<T>`) are reconstructed by `heap_acc` from the
-            // location declaration, not here.
-            Symbolic::Location(..) => None,
             Symbolic::Binary(op, [l, _]) => match op {
                 BinOp::Eq | BinOp::Lt => Some(Type::Bool),
                 _ => infer_type(egraph, fresh_types, func_ret_types, *l, memo),

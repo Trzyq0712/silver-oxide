@@ -4,7 +4,6 @@ mod domain;
 mod function;
 mod heap;
 mod inst;
-mod location;
 mod method;
 mod pure;
 mod resource;
@@ -22,9 +21,9 @@ pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::Domain;
 pub use function::{Function, FunctionCall};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
-pub use location::{Bound, Location};
 pub use method::Method;
 pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
+pub use ty::Bound;
 
 use derive_more::{From, Into};
 use lasso::{Key, Rodeo};
@@ -47,13 +46,15 @@ unsafe impl Key for MemberId {
 pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
     pub interner: Rodeo<MemberId>,
+    /// Location **group** tags (`Type::Addr.group`), interned separately from the
+    /// declaration interner — a group is just a name, never a declaration.
+    pub groups: Rodeo<lasso::Spur>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Declaration {
     Domain(Domain),
     Function(Function),
-    Location(Location),
     Method(Method),
     Resource(Resource),
     Adt(Adt),

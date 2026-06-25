@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
-        context::{LocationInfo, ResourceCertificate, VerifyContext},
+        context::{ResourceCertificate, VerifyContext},
         heap::{Chunk, Heap},
-        lang::Symbolic,
+        lang::{FuncId, Symbolic},
         viz::Snapshotter,
     },
     vmir::{
@@ -114,13 +114,18 @@ impl EvalState {
 fn format_inst(
     inst: &Inst,
     interner: &lasso::Rodeo<MemberId>,
+    groups: &lasso::Rodeo<lasso::Spur>,
     val_base: usize,
     heap_base: usize,
 ) -> String {
-    VmirDisplay::new((val_base, heap_base, std::slice::from_ref(inst)), interner)
-        .to_string()
-        .trim()
-        .to_string()
+    VmirDisplay::new(
+        (val_base, heap_base, std::slice::from_ref(inst)),
+        interner,
+        groups,
+    )
+    .to_string()
+    .trim()
+    .to_string()
 }
 
 /// Heap-fetch is monomorphic — `HeapVal` carries no ctx-heap variant. The
@@ -230,10 +235,6 @@ fn eval_pure_inst(
             // Plain Silver functions are not generic yet — empty type instantiation.
             ctx.add_func_app(fc, Box::new([]), ty.clone(), args.into())
         }
-        PureInst::Location(member, args) => {
-            let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add_location(*member, args.into())
-        }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {
             let heap = get_heap(state, hv);
@@ -291,10 +292,7 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalStat
         addr,
         &mut HashMap::new(),
     )
-    .and_then(|t| match t {
-        Type::Addr(inner) => Some(*inner),
-        _ => None,
-    })
+    .and_then(|t| t.addr_value().cloned())
     .unwrap_or(Type::Int);
     let value = ctx.fresh_symbolic_value(value_ty);
     Heap::empty().with_chunk(addr, Chunk::new(perm, value))
@@ -344,36 +342,63 @@ fn merge_chunks(
 }
 
 /// A location chunk extracted from a heap for the location axioms: its
-/// permission, the location member, its argument e-classes, and its bound.
+/// permission, the location group tag, its argument e-classes, and its bound.
 struct LocationChunk {
     perm: egg::Id,
-    member: MemberId,
+    group: lasso::Spur,
     args: Vec<egg::Id>,
     bound: Bound,
 }
 
-/// Extract the location chunks of `h`: for each chunk whose canonical address
-/// holds a `Symbolic::Location(m, args)` with `m` a known location, record its
-/// perm, member, args, and bound.
+/// A predicate's address type `&[name] Snap(id) @ *` — the group is the
+/// predicate's interned tag (`Program.groups`), value its snapshot, unbounded.
+fn pred_addr_type(program: &vmir::Program, pred_id: MemberId) -> Type {
+    let group = program
+        .groups
+        .get(program.interner.resolve(&pred_id))
+        .expect("predicate group tag not registered");
+    Type::addr(group, Type::Snap(pred_id), Bound::Unbounded)
+}
+
+/// Extract the location chunks of `h`: for each chunk whose canonical address has
+/// an `Addr{group,bound,..}` type (recovered by `infer_type`, so **computed**
+/// addresses count too), record its perm, group, bound, and — for a direct
+/// `@addr` application — its value-arg e-classes (used by the non-aliasing axiom).
 fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     let mut out = Vec::new();
     for (addr, chunk) in h.entries() {
         let canon = ctx.egraph.find(addr);
-        let found = ctx.egraph[canon].nodes.iter().find_map(|n| match n {
-            Symbolic::Location(l, args) => {
-                let m = MemberId::from(l.0);
-                ctx.locations.contains_key(&m).then(|| (m, args.to_vec()))
-            }
-            _ => None,
+        let ty = crate::verify::context::infer_type(
+            &ctx.egraph,
+            &ctx.fresh_types,
+            &ctx.func_ret_types,
+            canon,
+            &mut HashMap::new(),
+        );
+        let Some(Type::Addr { group, bound, .. }) = ty else {
+            continue;
+        };
+        // The value args of the direct address application — the `FuncApp` whose
+        // function returns an `Addr` type. Absent for a computed address (no such
+        // node) → no non-aliasing for it.
+        let args = ctx.egraph[canon]
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                Symbolic::FuncApp(f, _, args)
+                    if matches!(ctx.func_ret_types.get(f), Some(Type::Addr { .. })) =>
+                {
+                    Some(args.to_vec())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        out.push(LocationChunk {
+            perm: chunk.perm,
+            group,
+            bound,
+            args,
         });
-        if let Some((member, args)) = found {
-            out.push(LocationChunk {
-                perm: chunk.perm,
-                member,
-                bound: ctx.locations[&member].bound.clone(),
-                args,
-            });
-        }
     }
     out
 }
@@ -414,7 +439,7 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     // Non-aliasing: same bounded location, perms sum > bound ⇒ args differ.
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
-            if chunks[i].member != chunks[j].member {
+            if chunks[i].group != chunks[j].group {
                 continue;
             }
             let Bound::Bounded(b) = &chunks[i].bound else {
@@ -781,7 +806,15 @@ fn eval_method_inst(
             let snap_ty = Type::Snap(snap_head);
             // Predicate snapshots are non-generic — empty type instantiation.
             let snap = ctx.add_func_app_id(snap_cons, Box::new([]), snap_ty, cons_args);
-            let pred_addr = ctx.add_location(addr_fn, args.into());
+            let addr_ty = pred_addr_type(program, addr_fn);
+            // The predicate's address is an ordinary call to its address function
+            // (the predicate's own id); the `Addr` type is the recorded return type.
+            let pred_addr = ctx.add_func_app_id(
+                FuncId(usize::from(addr_fn)),
+                Box::new([]),
+                addr_ty,
+                args.into(),
+            );
             let out = heap_union(ctx, &out, pred_addr, Chunk::new(perm_id, snap), &pc_lits);
             state.push_heap(out);
             ctx.reduce();
@@ -860,7 +893,15 @@ fn eval_unfold(
     let perm_id = state.get_val(ctx, perm);
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-    let pred_addr = ctx.add_location(addr_fn, args.clone().into());
+    let addr_ty = pred_addr_type(program, addr_fn);
+    // The predicate's address is an ordinary call to its address function (the
+    // predicate's own id); the `Addr` type is the recorded return type.
+    let pred_addr = ctx.add_func_app_id(
+        FuncId(usize::from(addr_fn)),
+        Box::new([]),
+        addr_ty,
+        args.clone().into(),
+    );
     let a = ctx.egraph.find(pred_addr);
     let s = base_h
         .entries()
@@ -917,32 +958,6 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
     out
 }
 
-/// Index the program's location signatures for the verifier: the emitted
-/// `Location` decls (fields) plus the derived address location of every
-/// `Resource` (a predicate's address `LocId` is the predicate's own id; the
-/// signature comes from `Resource::derive_location`, not a decl).
-fn build_locations(program: &vmir::Program) -> HashMap<MemberId, LocationInfo> {
-    program
-        .decls
-        .iter_enumerated()
-        .filter_map(|(id, d)| {
-            let loc = match d {
-                Declaration::Location(loc) => loc.clone(),
-                Declaration::Resource(r) => r.derive_location(id),
-                _ => return None,
-            };
-            Some((
-                id,
-                LocationInfo {
-                    bound: loc.bound,
-                    ret: loc.ret,
-                    arity: loc.params.len(),
-                },
-            ))
-        })
-        .collect()
-}
-
 pub fn verify_method(
     program: &vmir::Program,
     method_name: &str,
@@ -950,7 +965,7 @@ pub fn verify_method(
     certs: &HashMap<MemberId, ResourceCertificate>,
     alloc: &mut crate::verify::mono::Allocator,
 ) -> Result<(), VerifyError> {
-    let mut ctx = VerifyContext::new(&program.interner, alloc, build_locations(program));
+    let mut ctx = VerifyContext::new(&program.interner, &program.groups, alloc);
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -958,7 +973,13 @@ pub fn verify_method(
     for inst in &method.insts {
         let vals_before = state.vals.len();
         let heaps_before = state.heaps.len();
-        let inst_text = format_inst(inst, &program.interner, vals_before, heaps_before);
+        let inst_text = format_inst(
+            inst,
+            &program.interner,
+            &program.groups,
+            vals_before,
+            heaps_before,
+        );
         if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
             let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
             if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
@@ -993,7 +1014,7 @@ pub fn verify_resource(
         return Ok(None);
     };
 
-    let mut ctx = VerifyContext::new(&program.interner, alloc, build_locations(program));
+    let mut ctx = VerifyContext::new(&program.interner, &program.groups, alloc);
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1043,7 +1064,13 @@ pub fn verify_resource(
         }
         let vals_before = state.vals.len();
         let heaps_before = state.heaps.len();
-        let inst_text = format_inst(inst, &program.interner, vals_before, heaps_before);
+        let inst_text = format_inst(
+            inst,
+            &program.interner,
+            &program.groups,
+            vals_before,
+            heaps_before,
+        );
         let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
         if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
             if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
@@ -1175,9 +1202,11 @@ mod tests {
     use crate::verify::lang::Symbolic;
 
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        // Leak a `'static` empty allocator so the returned context can borrow it.
+        // Leak a `'static` empty allocator + group interner so the returned context
+        // can borrow them.
         let alloc: &'static mut _ = Box::leak(Box::new(crate::verify::mono::Allocator::empty()));
-        VerifyContext::new(interner, alloc, Default::default())
+        let groups: &'static _ = Box::leak(Box::new(lasso::Rodeo::<lasso::Spur>::new()));
+        VerifyContext::new(interner, groups, alloc)
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1193,23 +1222,26 @@ mod tests {
     // to false against the assumed-true equalities).
     #[test]
     fn multiarg_location_nonaliasing_all_args_equal_is_inconsistent() {
-        let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
-        let g = interner.get_or_intern("g");
-        let locations = std::collections::HashMap::from([(
-            g,
-            LocationInfo {
-                bound: Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
-                ret: Type::Int,
-                arity: 2,
-            },
-        )]);
+        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let mut groups = lasso::Rodeo::<lasso::Spur>::new();
+        let g = groups.get_or_intern("g");
         let mut alloc = crate::verify::mono::Allocator::empty();
-        let mut ctx = VerifyContext::new(&interner, &mut alloc, locations);
+        let mut ctx = VerifyContext::new(&interner, &groups, &mut alloc);
 
+        // A 2-arg bounded address group `g` of held type `Int`, cap `1/1`. The
+        // address is an ordinary `FuncApp` to the group's address function
+        // (`FuncId(0)` here); its `Addr{..}` return type is recorded in
+        // `func_ret_types` (recovered by `location_chunks`).
+        let addr_ty = Type::addr(
+            g,
+            Type::Int,
+            Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
+        );
+        let addr_fn = FuncId(0);
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
-        let a0 = ctx.add_location(g, Box::new([x0, y0]));
-        let a1 = ctx.add_location(g, Box::new([x1, y1]));
+        let a0 = ctx.add_func_app_id(addr_fn, Box::new([]), addr_ty.clone(), Box::new([x0, y0]));
+        let a1 = ctx.add_func_app_id(addr_fn, Box::new([]), addr_ty, Box::new([x1, y1]));
         let (v0, v1) = (ctx.add(Symbolic::Fresh(4)), ctx.add(Symbolic::Fresh(5)));
         let (p0, p1) = (real(&mut ctx, 3, 4), real(&mut ctx, 1, 2)); // sum 5/4 > 1
         let heap = Heap::empty()

@@ -82,13 +82,15 @@ pub(crate) struct Builder<'a> {
     pub globals: &'a Globals,
     /// VMIR name interner. MemberIds are positions in `decls`.
     vmir_interner: Rodeo<vmir::MemberId>,
+    /// Location **group** tags (`Type::Addr.group`) — field/predicate names
+    /// interned here, NOT as declarations. Resolvable at verify time via
+    /// `Program.groups`.
+    groups: Rodeo<lasso::Spur>,
     /// Declarations indexed by MemberId. Empty `None` slots are filled in
     /// later phases.
     decls: Vec<Option<vmir::Declaration>>,
     /// Maps Silver `Spur` names to VMIR `MemberId`s.
     pub name_map: HashMap<Spur, vmir::MemberId>,
-    /// Maps a field's `Spur` to its address-location MemberId (its bare name).
-    pub field_addr: HashMap<Spur, vmir::MemberId>,
     /// Maps a method's `Spur` to its `#requires` Resource MemberId (if any).
     pub method_requires: HashMap<Spur, vmir::MemberId>,
     /// Maps a method's `Spur` to its `#ensures` Resource MemberId (if any).
@@ -110,9 +112,9 @@ impl<'a> Builder<'a> {
             interner,
             globals,
             vmir_interner: Rodeo::new(),
+            groups: Rodeo::new(),
             decls: Vec::new(),
             name_map: HashMap::new(),
-            field_addr: HashMap::new(),
             method_requires: HashMap::new(),
             method_ensures: HashMap::new(),
             ctor_tag: HashMap::new(),
@@ -266,26 +268,44 @@ impl<'a> Builder<'a> {
         // on demand (`Resource::derive_location`/`derive_snapshot`) — not emitted.
         let pred_id = self.fresh_decl(&pred_name);
         self.name_map.insert(p.name.0, pred_id);
+        // Register the predicate's location group tag (its address is grouped by
+        // the predicate name, not by `pred_id`).
+        self.groups.get_or_intern(&pred_name);
     }
 
     fn declare_field_accessor(&mut self, f: &typed::Field) {
-        // A field's address function carries the field's *original* name (no
-        // `@addr` suffix). The field name has exactly one VMIR meaning — its
-        // `Ref -> Addr<T>` accessor — so the bare name is canonical. The `@`
-        // suffixes (`@addr`, `@snap`, …) are reserved for *generated* implicit
-        // members that sit alongside a user-named resource (e.g. a predicate's
-        // `P@addr` / `P@snap`).
+        // A field's address is the result of an ordinary function `Ref -> Addr<T>`
+        // (no bespoke location instruction or declaration). Register the location
+        // **group** tag (addresses are grouped by field name), then emit the
+        // address function as a normal `Declaration::Function`; `field_addr` calls
+        // it like any function.
         let field_name = self.interner.resolve(&f.0.name.0).to_owned();
-        let addr_id = self.fresh_decl(&field_name);
-        // A field is a location bounded by full permission `1/1`, returning the
-        // field's value type.
-        let addr_loc = vmir::Location {
-            params: vec![vmir::Type::Ref],
-            ret: self.lower_type(&f.0.ty),
-            bound: vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
-        };
-        self.set_decl(addr_id, vmir::Declaration::Location(addr_loc));
-        self.field_addr.insert(f.0.name.0, addr_id);
+        self.groups.get_or_intern(&field_name);
+        let field_id = self.fresh_decl(&field_name);
+        // The field's address type: group = the field's tag, value = the field
+        // type, bound = full permission `1/1`.
+        let group = self.group_tag(f.0.name.0);
+        let value = self.lower_type(&f.0.ty);
+        let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
+        let ret = vmir::Type::addr(group, value, bound);
+        self.set_decl(
+            field_id,
+            vmir::Declaration::Function(vmir::Function {
+                params: vec![vmir::Type::Ref],
+                ret,
+                body: None,
+            }),
+        );
+        self.name_map.insert(f.0.name.0, field_id);
+    }
+
+    /// The interned group tag for a field/predicate source name (registered during
+    /// the declare phase).
+    pub fn group_tag(&self, name: Spur) -> lasso::Spur {
+        let s = self.interner.resolve(&name);
+        self.groups
+            .get(s)
+            .unwrap_or_else(|| panic!("group tag `{s}` not registered"))
     }
 
     fn emit_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
@@ -449,6 +469,7 @@ impl<'a> Builder<'a> {
         vmir::Program {
             decls,
             interner: self.vmir_interner,
+            groups: self.groups,
         }
     }
 }
@@ -556,10 +577,13 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             pred.body.is_none(),
             "abstract predicate must have body=None"
         );
-        let addr_loc = pred.derive_location(pred_id);
-        assert_eq!(addr_loc.params, vec![vmir::Type::Ref]);
-        assert_eq!(addr_loc.ret, vmir::Type::Snap(pred_id));
-        assert_eq!(addr_loc.bound, vmir::Bound::Unbounded);
+        let group = p.groups.get("number").expect("predicate group tag");
+        let addr_fn = pred.derive_location(pred_id, group);
+        assert_eq!(addr_fn.params, vec![vmir::Type::Ref]);
+        assert_eq!(
+            addr_fn.ret,
+            vmir::Type::addr(group, vmir::Type::Snap(pred_id), vmir::Bound::Unbounded)
+        );
         // Abstract predicate (no body) derives an opaque empty Domain snapshot.
         assert!(matches!(
             pred.derive_snapshot(),
@@ -598,9 +622,15 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         let body = read_req.body.as_ref().unwrap();
         let mut saw_addr_call = false;
         let mut saw_acc = false;
+        let number_group = p.groups.get("number").expect("number group tag");
         for inst in &body.insts {
             match &inst.kind {
-                vmir::InstKind::Pure(_, vmir::PureInst::Location(m, _)) if *m == pred_id => {
+                // An address is an ordinary call to the predicate's address
+                // function (its own id), result type grouped under `number`.
+                vmir::InstKind::Pure(
+                    vmir::Type::Addr { group, .. },
+                    vmir::PureInst::FunctionCall(None, fc),
+                ) if *group == number_group && fc.function == pred_id => {
                     saw_addr_call = true;
                 }
                 vmir::InstKind::Heap(vmir::HeapInst::Combine { .. }) => saw_acc = true,

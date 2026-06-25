@@ -84,16 +84,12 @@ impl Snapshotter {
         // nodes with their type — both live in the viz/context oracles, so the
         // e-graph itself need not carry them.
         let mut funcs: HashSet<crate::verify::lang::FuncId> = HashSet::new();
-        let mut locs: HashSet<crate::verify::lang::LocId> = HashSet::new();
         let mut fresh: HashSet<u32> = HashSet::new();
         for class in ctx.egraph.classes() {
             for node in &class.nodes {
                 match node {
                     Symbolic::FuncApp(m, _, _) => {
                         funcs.insert(*m);
-                    }
-                    Symbolic::Location(m, _) => {
-                        locs.insert(*m);
                     }
                     Symbolic::Fresh(u) => {
                         fresh.insert(*u);
@@ -112,12 +108,6 @@ impl Snapshotter {
             let name = escape(&ctx.func_name(m));
             dot = dot.replace(&format!("fn{}\"", m.0), &format!("{name}\""));
             dot = dot.replace(&format!("fn{}[", m.0), &format!("{name}["));
-        }
-        for m in locs {
-            dot = dot.replace(
-                &format!("loc{}\"", m.0),
-                &format!("{}\"", escape(&ctx.loc_name(m))),
-            );
         }
         // `Symbolic` renders a fresh value as `fresh<id>`; append its type from
         // the `fresh_types` oracle. Match the trailing `"` so `fresh1` doesn't

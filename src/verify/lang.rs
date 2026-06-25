@@ -13,11 +13,6 @@ use crate::vmir::Type;
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FuncId(pub usize);
 
-/// A verifier-allocated heap-location (address) id in the e-graph. Like
-/// [`FuncId`] but a distinct sort so function rewrites never touch addresses.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LocId(pub usize);
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
     Fresh(u32),
@@ -33,11 +28,12 @@ pub enum Symbolic {
     /// `Eq`/`Hash` via egg's congruence `memo` (a `HashMap<L, Id>` keyed by the
     /// full enode), so two instantiations never dedup/merge. `children()` returns
     /// only the value args; the [`Discriminant`] is the concept `FuncId` alone.
+    /// Addresses are ordinary function applications too: a field/predicate's
+    /// address function (its own `FuncId`) over its args, with the rich
+    /// `Type::Addr{group,value,bound}` as its return type (recorded in
+    /// `func_ret_types` and recoverable by `infer_type`). No dedicated location
+    /// sort or sentinel id. (No rewrite rule matches an address `FuncId`.)
     FuncApp(FuncId, Box<[Type]>, Box<[Id]>),
-    /// A heap-location application `f(args)` (an address). A distinct sort from
-    /// `FuncApp` so function rewrites never touch it; congruence still gives
-    /// `f(x) == f(y) ⟺ x == y`.
-    Location(LocId, Box<[Id]>),
     RealCast(Id),
 }
 
@@ -53,7 +49,6 @@ pub enum Discriminant {
     /// Distinctness across instantiations does *not* rely on this — it comes from
     /// the full-enode `Eq`/`Hash` in the congruence memo (see [`Symbolic::FuncApp`]).
     FuncApp(FuncId),
-    Location(LocId),
     RealCast,
 }
 
@@ -69,7 +64,6 @@ impl Language for Symbolic {
             S::Binary(op, _) => D::Binary(*op),
             S::Ite(_) => D::Ite,
             S::FuncApp(id, _, _) => D::FuncApp(*id),
-            S::Location(id, _) => D::Location(*id),
             S::RealCast(_) => D::RealCast,
         }
     }
@@ -88,9 +82,6 @@ impl Language for Symbolic {
             (FuncApp(id1, _, args1), FuncApp(id2, _, args2)) => {
                 id1 == id2 && args1.len() == args2.len()
             }
-            (Location(id1, args1), Location(id2, args2)) => {
-                id1 == id2 && args1.len() == args2.len()
-            }
             _ => false,
         }
     }
@@ -102,9 +93,8 @@ impl Language for Symbolic {
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_ref(id),
-            // Type args live in the discriminant, not here — only value args.
+            // Type args are in the payload, not children — only value args.
             FuncApp(_, _, ids) => ids,
-            Location(_, ids) => ids,
         }
     }
 
@@ -116,7 +106,6 @@ impl Language for Symbolic {
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_mut(id),
             FuncApp(_, _, ids) => ids,
-            Location(_, ids) => ids,
         }
     }
 }
@@ -142,7 +131,6 @@ impl Display for Symbolic {
                     write!(f, "fn{}[{}]", id.0, args.join(", "))
                 }
             }
-            Symbolic::Location(id, _) => write!(f, "loc{}", id.0),
         }
     }
 }

@@ -10,6 +10,7 @@ use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
     Declaration, HeapInst, InstKind, MemberId, Method, Precond, Program, PureInst, ResourceBody,
+    Type,
 };
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
@@ -153,23 +154,24 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
         }
         Declaration::Method(m) => method_deps(m, out),
         // Leaf declarations: nothing to depend on.
-        Declaration::Function(_)
-        | Declaration::Location(_)
-        | Declaration::Domain(_)
-        | Declaration::Adt(_) => {}
+        Declaration::Function(_) | Declaration::Domain(_) | Declaration::Adt(_) => {}
     }
 }
 
 fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
     // Resource bodies reference members through `FunctionCall`s and the
-    // resource of a `ResourceCall`/fold/unfold. A `PureInst::Location` is NOT a
-    // dependency: forming an address needs no certificate, and a predicate's
-    // address `LocId` is the predicate's own id, so treating it as a dependency
-    // would make a recursive predicate (`acc(P(this.next))` in `P`'s body) a
-    // self-cycle.
+    // resource of a `ResourceCall`/fold/unfold. An **address-typed** `FunctionCall`
+    // (result `Type::Addr`) is NOT a dependency: forming an address needs no
+    // certificate, and a predicate's address function is the predicate's own id,
+    // so treating it as a dependency would make a recursive predicate
+    // (`acc(P(this.next))` in `P`'s body) a self-cycle.
     for inst in &body.insts {
         match &inst.kind {
-            InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
+            InstKind::Pure(ty, PureInst::FunctionCall(_, fc))
+                if !matches!(ty, Type::Addr { .. }) =>
+            {
+                out.push(fc.function)
+            }
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
                 out.push(call.resource)
             }
@@ -184,7 +186,13 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
 fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
     for inst in &m.insts {
         match &inst.kind {
-            InstKind::Pure(_, PureInst::FunctionCall(_, fc)) => out.push(fc.function),
+            // Address-typed `FunctionCall`s are not dependencies (see
+            // `resource_body_deps`).
+            InstKind::Pure(ty, PureInst::FunctionCall(_, fc))
+                if !matches!(ty, Type::Addr { .. }) =>
+            {
+                out.push(fc.function)
+            }
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
                 out.push(call.resource)
             }
@@ -242,6 +250,7 @@ mod tests {
         Program {
             decls: TiVec::from(decls),
             interner,
+            groups: Rodeo::new(),
         }
     }
 

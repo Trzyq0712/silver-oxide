@@ -1,5 +1,6 @@
 use crate::vmir::MemberId;
 use crate::vmir::display::VmirDisplay;
+use lasso::{Key, Spur};
 use std::fmt::{self, Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -23,11 +24,32 @@ pub enum Type {
     /// domain with axiomatized functions. The verifier resolves it to its `Option`
     /// ADT instance via the mono registry; it is never a user declaration.
     Option(Box<Type>),
-    Addr(Box<Type>),
+    /// A heap address `&[group] value @ bound` — the type of a location. Self-
+    /// describing: it carries the **held value type** `value`, the permission
+    /// **bound** (`Bounded(1/1)` for fields, `Unbounded` for predicates), and a
+    /// **grouping tag** `group` (an interned `Spur` in `Program.groups`, *not* a
+    /// declaration) that distinguishes e.g. two `Int` fields and scopes
+    /// non-aliasing. Because all of this lives in the type (not a side table keyed
+    /// by a syntactic node), addresses can be **computed over** and still recover
+    /// their metadata.
+    Addr {
+        group: Spur,
+        value: Box<Type>,
+        bound: Bound,
+    },
     /// A type parameter of the enclosing generic declaration, by 0-based index
     /// (e.g. `Generic(0)` is the `Some` field type of the generic `Option` ADT).
     /// Substituted by the type arguments at monomorphization.
     Generic(usize),
+}
+
+/// Permission bound of a heap location (cap on total permission per cell).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Bound {
+    /// At most this much total permission per cell (a real literal).
+    Bounded(num::BigRational),
+    /// No bound (predicates).
+    Unbounded,
 }
 
 impl Type {
@@ -36,10 +58,27 @@ impl Type {
         Type::Domain(id, Box::new([]))
     }
 
+    /// An address type holding `value`, grouped under `group`, capped at `bound`.
+    pub fn addr(group: Spur, value: Type, bound: Bound) -> Self {
+        Type::Addr {
+            group,
+            value: Box::new(value),
+            bound,
+        }
+    }
+
     /// The inner `T` of an `Option[T]`, or `None` for any other type.
     pub fn option_inner(&self) -> Option<&Type> {
         match self {
             Type::Option(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// The held value type `T` of an address `&[g] T @ b`, else `None`.
+    pub fn addr_value(&self) -> Option<&Type> {
+        match self {
+            Type::Addr { value, .. } => Some(value),
             _ => None,
         }
     }
@@ -58,8 +97,22 @@ impl Display for Type {
             }
             Type::Snap(id) => write!(f, "d{}@snap", id.0),
             Type::Option(ty) => write!(f, "Option[{ty}]"),
-            Type::Addr(ty) => write!(f, "&{ty}"),
+            Type::Addr {
+                group,
+                value,
+                bound,
+            } => write!(f, "&[g{}] {value} @ {bound}", group.into_usize()),
             Type::Generic(i) => write!(f, "?{i}"),
+        }
+    }
+}
+
+impl Display for Bound {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Match the permission-literal rendering (`1/1`, never reduced).
+            Bound::Bounded(p) => write!(f, "{}/{}", p.numer(), p.denom()),
+            Bound::Unbounded => write!(f, "*"),
         }
     }
 }
@@ -73,7 +126,16 @@ impl<'a> Display for VmirDisplay<'a, &'a Type> {
             }
             Type::Snap(id) => write!(f, "{}@snap", self.interner.resolve(id)),
             Type::Option(ty) => write!(f, "Option[{}]", self.with(ty.as_ref())),
-            Type::Addr(ty) => write!(f, "&{}", self.with(ty.as_ref())),
+            Type::Addr {
+                group,
+                value,
+                bound,
+            } => write!(
+                f,
+                "&[{}] {} @ {bound}",
+                self.groups.resolve(group),
+                self.with(value.as_ref())
+            ),
             ty => write!(f, "{ty}"),
         }
     }

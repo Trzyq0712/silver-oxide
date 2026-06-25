@@ -311,8 +311,21 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             for a in &call.args {
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
-            let ret_ty = Type::Addr(Box::new(Type::Snap(pred_id)));
-            Ok(sink.emit_pure(ret_ty, PureInst::Location(pred_id, args)))
+            // The predicate's address type: group = its interned tag, value = its
+            // snapshot, unbounded permission cap. The address is an ordinary call
+            // to the predicate's address function (its own id).
+            let group = b.group_tag(call.name.0);
+            let ret_ty = Type::addr(group, Type::Snap(pred_id), vmir::Bound::Unbounded);
+            Ok(sink.emit_pure(
+                ret_ty,
+                PureInst::FunctionCall(
+                    None,
+                    vmir::FunctionCall {
+                        function: pred_id,
+                        args,
+                    },
+                ),
+            ))
         }
     }
 }
@@ -399,17 +412,32 @@ pub(crate) fn field_addr(
     base: Val,
     fname: Spur,
 ) -> Result<Val, TranslationError> {
-    let &addr_fn = b
-        .field_addr
-        .get(&fname)
-        .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
     let field_ty = b
         .globals
         .resolve(fname)
         .and_then(|s| s.as_field().cloned())
         .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
-    let ret_ty = Type::Addr(Box::new(b.lower_type(&field_ty)));
-    Ok(sink.emit_pure(ret_ty, PureInst::Location(addr_fn, vec![base])))
+    // The field's address type: group = the field's interned tag, value = the
+    // field type, bound = full permission `1/1`.
+    let group = b.group_tag(fname);
+    let value = b.lower_type(&field_ty);
+    let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
+    let ret_ty = Type::addr(group, value, bound);
+    // The field's address is an ordinary call to its address function (declared by
+    // `declare_field_accessor` under the field's bare name).
+    let field_id = *b.name_map.get(&fname).ok_or_else(|| {
+        TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string())
+    })?;
+    Ok(sink.emit_pure(
+        ret_ty,
+        PureInst::FunctionCall(
+            None,
+            vmir::FunctionCall {
+                function: field_id,
+                args: vec![base],
+            },
+        ),
+    ))
 }
 
 /// Lower `acc(base.fname, perm)` to its `(loc, perm)`: the field's `@addr`
