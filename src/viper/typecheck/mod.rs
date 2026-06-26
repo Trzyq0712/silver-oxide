@@ -1390,6 +1390,46 @@ fn typecheck_field(field: &viper::Field) -> typed::Declaration {
     }))
 }
 
+/// Convert a parsed ADT into its typed declaration. Variant field types are
+/// lowered directly (parsed types already carry `Generic`); anonymous fields are
+/// rejected — the read-only interner cannot mint a destructor name for them.
+fn typecheck_adt(adt: &viper::Adt) -> Result<typed::Declaration, TypeError> {
+    let mut variants = Vec::with_capacity(adt.variants.len());
+    for v in &adt.variants {
+        let mut params = Vec::with_capacity(v.fields.len());
+        for field in &v.fields {
+            let idn = field.idn().ok_or_else(|| {
+                TypeError::Other("anonymous ADT variant field is unsupported".to_string())
+            })?;
+            params.push(TypedIdent {
+                name: Ident(idn.0.id()),
+                ty: Type::from(field.ty()),
+            });
+        }
+        variants.push(typed::AdtVariant {
+            name: Ident(v.name.0.id()),
+            params,
+        });
+    }
+    Ok(typed::Declaration::Adt(typed::Adt {
+        name: Ident(adt.name.0.id()),
+        type_params: adt.params.iter().map(|p| Ident(p.0.id())).collect(),
+        variants,
+    }))
+}
+
+/// A domain function as a bodyless typed `Function` (signature only).
+fn domain_function_to_typed(df: &viper::DomainFunction) -> typed::Function {
+    typed::Function {
+        name: Ident(df.signature.name.0.id()),
+        params: collect_params(&df.signature.args),
+        ret: Type::from(df.signature.ret[0].ty()),
+        requires: None,
+        ensures: None,
+        body: None,
+    }
+}
+
 fn collect_params(args: &[viper::ArgOrType]) -> Vec<TypedIdent> {
     args.iter()
         .filter_map(|p| {
@@ -1551,6 +1591,22 @@ pub fn typecheck_program(
     let mut decls = Vec::new();
     let mut errors = Vec::new();
 
+    // Domain functions/axioms are separate `DomainElement` decls; gather the
+    // functions per owning domain so each `Domain` can carry them. Axioms are
+    // deferred (nothing consumes them yet).
+    let mut domain_fns: std::collections::HashMap<lasso::Spur, Vec<typed::Function>> =
+        std::collections::HashMap::new();
+    for decl in &program.0 {
+        if let viper::Declaration::DomainElement(de) = decl
+            && let viper::DomainElementKind::Function(df) = &de.kind
+        {
+            domain_fns
+                .entry(de.domain.id())
+                .or_default()
+                .push(domain_function_to_typed(df));
+        }
+    }
+
     for decl in &mut program.0 {
         let result = match decl {
             viper::Declaration::Field(field) => Ok(Some(typecheck_field(field))),
@@ -1562,6 +1618,18 @@ pub fn typecheck_program(
             }
             viper::Declaration::Method(method) => {
                 typecheck_method(method, globals, &interner).map(Some)
+            }
+            viper::Declaration::Adt(adt) => typecheck_adt(adt).map(Some),
+            viper::Declaration::Domain(domain) => {
+                let functions = domain_fns.remove(&domain.name.0.id()).unwrap_or_default();
+                Ok(Some(typed::Declaration::Domain(typed::Domain {
+                    name: Ident(domain.name.0.id()),
+                    type_params: domain.params.iter().map(|p| Ident(p.0.id())).collect(),
+                    functions,
+                    // TODO: typecheck domain axioms into `TypedPureExp` once a
+                    // consumer (verify) needs them.
+                    axioms: Vec::new(),
+                })))
             }
             _ => Ok(None),
         };
