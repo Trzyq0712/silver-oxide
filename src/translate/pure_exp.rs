@@ -178,6 +178,28 @@ pub(crate) fn lower<Ext: PureExt>(
                 ),
             ))
         }
+        // A dedicated constructor node (typecheck-classified) lowers to the
+        // semantic `AdtCons`, like the constructor branch of `FunctionCall`.
+        P::AdtConstructor(call) => {
+            let mut args = Vec::with_capacity(call.args.len());
+            for a in &call.args {
+                args.push(lower(b, env, sink, hctx, a)?);
+            }
+            let &(adt_spur, variant) = b.adt.ctor_tag.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
+            let adt = b.name_map[&adt_spur];
+            let type_args = adt_type_args(&b.name_map, &exp.ty);
+            Ok(sink.emit_pure(
+                ty,
+                PureInst::AdtCons {
+                    adt,
+                    type_args,
+                    variant,
+                    args,
+                },
+            ))
+        }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
         P::AdtDestructor(base, field) => {

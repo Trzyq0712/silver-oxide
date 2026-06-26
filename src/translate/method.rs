@@ -63,7 +63,7 @@ pub(crate) fn lower_method(
     // Inhale this method's own precondition into the linear heap that every
     // block threads: `h := current + acc self#requires`.
     let mut current_heap: HeapVal = HeapVal::Empty;
-    if let Some(&req_id) = b.method_requires.get(&m.name.0) {
+    if let Some(req_id) = b.method_requires(m.name.0) {
         current_heap = emit_resource_combine(
             b,
             &mut sink,
@@ -165,7 +165,7 @@ pub(crate) fn lower_method(
                 // At each exit, exhale the postcondition gated by this block's
                 // pc against the final values of the return variables.
                 Terminator::Return => {
-                    if let Some(&ens_id) = b.method_ensures.get(&m.name.0) {
+                    if let Some(ens_id) = b.method_ensures(m.name.0) {
                         let mut ens_args = param_vals.clone();
                         for name in &ret_names {
                             ens_args.push(env.get(name).cloned().expect("return var bound"));
@@ -575,7 +575,7 @@ fn lower_method_call(
 
     // Exhale precondition (if present): `h := heap - acc m#requires(args)`
     // (implicitly asserts the requires bool).
-    if let Some(&req_id) = b.method_requires.get(&call.name.0) {
+    if let Some(req_id) = b.method_requires(call.name.0) {
         // `#requires` is self-framed; ctx source is unused.
         heap = emit_resource_combine(b, sink, vmir::Sign::Sub, req_id, heap, args.clone(), heap);
     }
@@ -590,7 +590,7 @@ fn lower_method_call(
 
     // Inhale postcondition (if present): `h := heap + acc m#ensures(args, rets)`
     // (implicitly assumes the ensures bool).
-    if let Some(&ens_id) = b.method_ensures.get(&call.name.0) {
+    if let Some(ens_id) = b.method_ensures(call.name.0) {
         let mut ens_args = args.clone();
         ens_args.extend(ret_vals.iter().cloned());
         // The callee's `old(...)` reads its pre-state = the caller's heap at the

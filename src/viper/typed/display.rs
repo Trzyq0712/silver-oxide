@@ -113,6 +113,10 @@ impl<'a> Display for Show<'a, &'a Declaration> {
             Declaration::Predicate(d) => write!(f, "{}", self.with(d)),
             Declaration::Method(d) => write!(f, "{}", self.with(d)),
             Declaration::Field(d) => write!(f, "{}", self.with(d)),
+            // ADT/Domain decls are not yet consumed by translation; a minimal
+            // header keeps the typed dump total.
+            Declaration::Adt(d) => write!(f, "adt {}", self.name(d.name)),
+            Declaration::Domain(d) => write!(f, "domain {}", self.name(d.name)),
         }
     }
 }
@@ -430,7 +434,9 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
         PureExpKind::Unfolding(p, e) => {
             write!(f, "unfolding {} in {}", show.with(p), show.with(e))
         }
-        PureExpKind::FunctionCall(call) => write!(f, "{}", show.with(call)),
+        PureExpKind::FunctionCall(call) | PureExpKind::AdtConstructor(call) => {
+            write!(f, "{}", show.with(call))
+        }
         PureExpKind::Field(e, field) => write!(f, "{}.{}", show.with(e), show.name(*field)),
         PureExpKind::LetIn { binder, value, exp } => write!(
             f,

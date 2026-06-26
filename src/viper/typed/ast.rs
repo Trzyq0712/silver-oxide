@@ -128,7 +128,6 @@ pub enum PureExpKind<Ext> {
     },
     /// Evaluates `exp` under the temporary unfolding of the predicate.
     Unfolding(PredicateWithPerm<Ext>, TypedPureExp<Ext>),
-    FunctionCall(Call<Ext>),
     /// Heap field access: `e.f` where `f` is a Silver `field` declaration.
     Field(TypedPureExp<Ext>, Ident),
     LetIn {
@@ -137,6 +136,8 @@ pub enum PureExpKind<Ext> {
         exp: TypedPureExp<Ext>,
     },
     Ascribe(TypedPureExp<Ext>, Type),
+    FunctionCall(Call<Ext>),
+    AdtConstructor(Call<Ext>),
     /// A pure projection from an ADT/Domain.
     AdtDestructor(TypedPureExp<Ext>, Ident),
     /// A variant check on an ADT (e.g., `e.isCons(list)`).
@@ -260,6 +261,35 @@ pub enum Declaration {
     Predicate(Predicate),
     Method(Method),
     Field(Field),
+    Adt(Adt),
+    Domain(Domain),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Domain {
+    pub name: Ident,
+    pub type_params: Vec<Ident>,
+    pub functions: Vec<Function>,
+    pub axioms: Vec<Axiom>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Axiom {
+    pub name: Option<Ident>,
+    pub exp: TypedPureExp<!>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Adt {
+    pub name: Ident,
+    pub type_params: Vec<Ident>,
+    pub variants: Vec<AdtVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdtVariant {
+    pub name: Ident,
+    pub params: Vec<TypedIdent>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

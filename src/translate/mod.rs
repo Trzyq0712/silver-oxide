@@ -36,22 +36,6 @@ pub fn translate(
     Ok(builder.finalize())
 }
 
-/// The VMIR program under construction: the declaration slots plus the name
-/// interners that index them.
-#[derive(Default)]
-struct Arena {
-    /// Cheap string repr for member/constructor names. Keys are independent of
-    /// `MemberId` — names are mapped to ids via `names`.
-    interner: Rodeo,
-    /// Each declaration's name, parallel to `decls` (→ `Program.names`).
-    names: Vec<Spur>,
-    /// Location **group** tags (`Type::Addr.group`) — field/predicate names,
-    /// resolvable at verify time via `Program.groups`.
-    groups: Rodeo<lasso::Spur>,
-    /// Declarations indexed by `MemberId`. `None` slots are filled in `define`.
-    decls: Vec<Option<vmir::Declaration>>,
-}
-
 /// ADT shape metadata recorded in `declare`, consumed when lowering `AdtCons` /
 /// `AdtProj` / `AdtTag` use sites.
 #[derive(Default)]
@@ -62,18 +46,32 @@ pub(crate) struct AdtInfo {
     pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
 }
 
+/// A method's contract resource ids (`#requires` / `#ensures`), absent when the
+/// method omits that clause.
+#[derive(Default)]
+pub(crate) struct MethodContracts {
+    pub requires: Option<vmir::MemberId>,
+    pub ensures: Option<vmir::MemberId>,
+}
+
 /// Mid-translation state.
 pub(crate) struct Builder<'a> {
     pub interner: &'a Interner,
     pub globals: &'a Globals,
-    /// The program being assembled.
-    arena: Arena,
+    /// Cheap string repr for member/constructor names. Keys are independent of
+    /// `MemberId` — names are mapped to ids via `decl_names`.
+    vmir_interner: Rodeo,
+    /// Each declaration's name, parallel to `decls` (→ `Program.names`).
+    decl_names: Vec<Spur>,
+    /// Location **group** tags (`Type::Addr.group`) — field/predicate names,
+    /// resolvable at verify time via `Program.groups`.
+    groups: Rodeo<Spur>,
+    /// Declarations indexed by `MemberId`. `None` slots are filled in `define`.
+    decls: Vec<Option<vmir::Declaration>>,
     /// Silver `Spur` names to VMIR `MemberId`s.
     pub name_map: HashMap<Spur, vmir::MemberId>,
-    /// A method's `Spur` to its `#requires` Resource MemberId (if any).
-    pub method_requires: HashMap<Spur, vmir::MemberId>,
-    /// A method's `Spur` to its `#ensures` Resource MemberId (if any).
-    pub method_ensures: HashMap<Spur, vmir::MemberId>,
+    /// A method's `Spur` to its contract resource ids.
+    pub contracts: HashMap<Spur, MethodContracts>,
     /// ADT constructor/destructor metadata.
     pub adt: AdtInfo,
 }
@@ -83,22 +81,32 @@ impl<'a> Builder<'a> {
         Self {
             interner,
             globals,
-            arena: Arena::default(),
+            vmir_interner: Rodeo::new(),
+            decl_names: Vec::new(),
+            groups: Rodeo::new(),
+            decls: Vec::new(),
             name_map: HashMap::new(),
-            method_requires: HashMap::new(),
-            method_ensures: HashMap::new(),
+            contracts: HashMap::new(),
             adt: AdtInfo::default(),
         }
+    }
+
+    /// The `#requires` contract resource of method `m`, if it has one.
+    pub(crate) fn method_requires(&self, m: Spur) -> Option<vmir::MemberId> {
+        self.contracts.get(&m).and_then(|c| c.requires)
+    }
+
+    /// The `#ensures` contract resource of method `m`, if it has one.
+    pub(crate) fn method_ensures(&self, m: Spur) -> Option<vmir::MemberId> {
+        self.contracts.get(&m).and_then(|c| c.ensures)
     }
 
     /// Reserve a `Declaration` slot (filled via `set_decl`), recording its name.
     /// `MemberId` is just the slot index; the interner key is unrelated.
     fn fresh_decl(&mut self, name: &str) -> vmir::MemberId {
-        let id = vmir::MemberId(self.arena.decls.len());
-        self.arena
-            .names
-            .push(self.arena.interner.get_or_intern(name));
-        self.arena.decls.push(None);
+        let id = vmir::MemberId(self.decls.len());
+        self.decl_names.push(self.vmir_interner.get_or_intern(name));
+        self.decls.push(None);
         id
     }
 
@@ -111,7 +119,12 @@ impl<'a> Builder<'a> {
             match decl {
                 typed::Declaration::Predicate(p) => self.declare_predicate_accessors(p),
                 typed::Declaration::Field(f) => self.declare_field_accessor(f),
-                typed::Declaration::Function(_) | typed::Declaration::Method(_) => {}
+                // ADTs/Domains are still declared from `globals` below (not yet
+                // consumed from the typed decls); functions/methods come later.
+                typed::Declaration::Adt(_)
+                | typed::Declaration::Domain(_)
+                | typed::Declaration::Function(_)
+                | typed::Declaration::Method(_) => {}
             }
         }
         // ADTs/functions live in `globals`, not the typed decls.
@@ -153,7 +166,7 @@ impl<'a> Builder<'a> {
     /// `#ensures`). Such calls carry a context heap; self-framed resources don't.
     pub(crate) fn is_ctx_resource(&self, id: vmir::MemberId) -> bool {
         matches!(
-            self.arena.decls.get(usize::from(id)),
+            self.decls.get(usize::from(id)),
             Some(Some(vmir::Declaration::Resource(r))) if !matches!(r.precond, vmir::Precond::SelfFramed)
         )
     }
@@ -166,7 +179,7 @@ impl<'a> Builder<'a> {
     }
 
     fn set_decl(&mut self, id: vmir::MemberId, decl: vmir::Declaration) {
-        let slot = &mut self.arena.decls[usize::from(id)];
+        let slot = &mut self.decls[usize::from(id)];
         debug_assert!(slot.is_none(), "decl slot filled twice");
         *slot = Some(decl);
     }
@@ -223,7 +236,7 @@ impl<'a> Builder<'a> {
             if let GlobalSignature::AdtConstructor(sig) = &globals.signatures[*gmid] {
                 self.adt.ctor_tag.insert(*spur, (sig.adt, sig.tag));
                 let adt_id = self.name_map[&sig.adt];
-                let ctor_name = self.arena.interner.get_or_intern(interner.resolve(spur));
+                let ctor_name = self.vmir_interner.get_or_intern(interner.resolve(spur));
                 // Field types may mention the ADT's type parameters, so lower
                 // them against the owning ADT's parameter list (→ `Generic(i)`).
                 let adt_params = globals
@@ -236,8 +249,7 @@ impl<'a> Builder<'a> {
                     .iter()
                     .map(|t| lower_type(&self.name_map, &adt_params, t))
                     .collect();
-                if let Some(vmir::Declaration::Adt(adt)) =
-                    self.arena.decls[usize::from(adt_id)].as_mut()
+                if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut()
                 {
                     if adt.variants.len() <= sig.tag {
                         adt.variants.resize(
@@ -276,14 +288,14 @@ impl<'a> Builder<'a> {
         let pred_id = self.fresh_decl(&pred_name);
         self.name_map.insert(p.name.0, pred_id);
         // Its address is grouped by the predicate name, not by `pred_id`.
-        self.arena.groups.get_or_intern(&pred_name);
+        self.groups.get_or_intern(&pred_name);
     }
 
     fn declare_field_accessor(&mut self, f: &typed::Field) {
         // A field's address is an ordinary function `Ref -> Addr<T>` (group = field
         // name, value = field type, bound = full permission `1/1`).
         let field_name = self.interner.resolve(&f.0.name.0).to_owned();
-        self.arena.groups.get_or_intern(&field_name);
+        self.groups.get_or_intern(&field_name);
         let field_id = self.fresh_decl(&field_name);
         let group = self.group_tag(f.0.name.0);
         let value = self.lower_type(&f.0.ty);
@@ -302,10 +314,9 @@ impl<'a> Builder<'a> {
 
     /// The interned group tag for a field/predicate name (registered in the
     /// declare phase).
-    pub fn group_tag(&self, name: Spur) -> lasso::Spur {
+    pub fn group_tag(&self, name: Spur) -> Spur {
         let s = self.interner.resolve(&name);
-        self.arena
-            .groups
+        self.groups
             .get(s)
             .unwrap_or_else(|| panic!("group tag `{s}` not registered"))
     }
@@ -352,19 +363,21 @@ impl<'a> Builder<'a> {
             let method_id = self.fresh_decl(&name);
             self.name_map.insert(m.name.0, method_id);
         }
+        let mut contracts = MethodContracts::default();
         if m.requires.is_some() {
-            let req_id = self.fresh_decl(&format!("{name}#requires"));
-            self.method_requires.insert(m.name.0, req_id);
+            contracts.requires = Some(self.fresh_decl(&format!("{name}#requires")));
         }
         if m.ensures.is_some() {
-            let ens_id = self.fresh_decl(&format!("{name}#ensures"));
-            self.method_ensures.insert(m.name.0, ens_id);
+            contracts.ensures = Some(self.fresh_decl(&format!("{name}#ensures")));
         }
+        self.contracts.insert(m.name.0, contracts);
     }
 
     fn define_method_contracts(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
         if let Some(requires) = &m.requires {
-            let req_id = self.method_requires[&m.name.0];
+            let req_id = self
+                .method_requires(m.name.0)
+                .expect("declared in declare_method");
             let params: Vec<vmir::Type> = m.params.iter().map(|p| self.lower_type(&p.ty)).collect();
             let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
             for (i, p) in m.params.iter().enumerate() {
@@ -390,7 +403,9 @@ impl<'a> Builder<'a> {
         }
 
         if let Some(ensures) = &m.ensures {
-            let ens_id = self.method_ensures[&m.name.0];
+            let ens_id = self
+                .method_ensures(m.name.0)
+                .expect("declared in declare_method");
             let mut params: Vec<vmir::Type> =
                 m.params.iter().map(|p| self.lower_type(&p.ty)).collect();
             params.extend(m.rets.iter().map(|r| self.lower_type(&r.ty)));
@@ -405,9 +420,7 @@ impl<'a> Builder<'a> {
             // accumulates from `Empty` so a resource in both contracts isn't
             // double-counted.
             let precond = self
-                .method_requires
-                .get(&m.name.0)
-                .copied()
+                .method_requires(m.name.0)
                 .map(|req_id| {
                     let req_args: Vec<vmir::Val> =
                         (0..m.params.len()).map(vmir::Val::Temp).collect();
@@ -456,16 +469,15 @@ impl<'a> Builder<'a> {
 
     fn finalize(self) -> vmir::Program {
         let decls: TiVec<vmir::MemberId, vmir::Declaration> = self
-            .arena
             .decls
             .into_iter()
             .map(|o| o.expect("declaration slot left empty"))
             .collect();
         vmir::Program {
             decls,
-            names: self.arena.names.into(),
-            interner: self.arena.interner,
-            groups: self.arena.groups,
+            names: self.decl_names.into(),
+            interner: self.vmir_interner,
+            groups: self.groups,
         }
     }
 }
