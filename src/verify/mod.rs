@@ -44,7 +44,7 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // certificate grafts (see `verify::mono`). Threaded `&mut` into each unit.
     let mut alloc = mono::Allocator::new(program);
     for id in order {
-        let name = program.interner.resolve(&id).to_string();
+        let name = program.name(id).to_string();
         let outcome = match &program.decls[id] {
             vmir::Declaration::Resource(r) => {
                 match declaration::verify_resource(program, &name, r, &certs, &mut alloc) {

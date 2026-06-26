@@ -89,7 +89,11 @@ impl Heap {
     /// Insert `chunk` into `kind`'s group, replacing any chunk already at the
     /// same `addr` (preserving today's one-chunk-per-address semantics).
     pub fn with_chunk(&self, kind: &LocationKind, chunk: Chunk) -> Self {
-        let mut v: Vec<Chunk> = self.groups.get(kind).map(|r| r.to_vec()).unwrap_or_default();
+        let mut v: Vec<Chunk> = self
+            .groups
+            .get(kind)
+            .map(|r| r.to_vec())
+            .unwrap_or_default();
         match v.iter_mut().find(|c| c.addr == chunk.addr) {
             Some(slot) => *slot = chunk,
             None => v.push(chunk),

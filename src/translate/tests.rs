@@ -46,10 +46,10 @@ method add(this: Ref, other: Ref) returns (res: Ref)
 
     // No `@snap`/`@addr` decls are emitted; the snapshot type and address
     // location are derived from the predicate's own id.
-    assert!(p.interner.get("number@snap").is_none());
-    assert!(p.interner.get("number@addr").is_none());
+    assert!(p.id("number@snap").is_none());
+    assert!(p.id("number@addr").is_none());
 
-    let pred_id = p.interner.get("number").expect("missing number");
+    let pred_id = p.id("number").expect("missing number");
 
     // Predicate itself is abstract; its address location is derived.
     let vmir::Declaration::Resource(pred) = &p.decls[pred_id] else {
@@ -81,8 +81,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         "add#ensures",
     ] {
         let id = p
-            .interner
-            .get(name)
+            .id(name)
             .unwrap_or_else(|| panic!("missing resource {name}"));
         assert!(
             matches!(&p.decls[id], vmir::Declaration::Resource(r) if r.body.is_some()),
@@ -90,14 +89,14 @@ method add(this: Ref, other: Ref) returns (res: Ref)
         );
     }
     assert!(
-        p.interner.get("assign#requires").is_none(),
+        p.id("assign#requires").is_none(),
         "assign has no precondition; #requires must not exist"
     );
 
     // The read#requires body must reference the predicate's address
     // location (`Location(number_id, ..)` — the predicate's own id) and an
     // Acc on its result, NOT a ResourceCall on number.
-    let read_req_id = p.interner.get("read#requires").unwrap();
+    let read_req_id = p.id("read#requires").unwrap();
     let vmir::Declaration::Resource(read_req) = &p.decls[read_req_id] else {
         unreachable!();
     };
@@ -126,7 +125,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
     // instructions: an `exhale` of `add#requires` (implicit assert) and an
     // `inhale` of `add#ensures` (implicit assume). No standalone
     // Assert/Assume/ResourceCall remain.
-    let add_id = p.interner.get("add").expect("missing add method");
+    let add_id = p.id("add").expect("missing add method");
     let vmir::Declaration::Method(add) = &p.decls[add_id] else {
         panic!("add must be a Method");
     };
@@ -164,7 +163,7 @@ method m(x: Int, y: Int)
 "#;
     let p = run(input);
 
-    let req_id = p.interner.get("m#requires").expect("missing m#requires");
+    let req_id = p.id("m#requires").expect("missing m#requires");
     let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
         panic!("m#requires must be a Resource");
     };
@@ -197,7 +196,7 @@ method m(c: Bool, x: Int)
 }
 "#;
     let p = run(input);
-    let m_id = p.interner.get("m").expect("missing m");
+    let m_id = p.id("m").expect("missing m");
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
@@ -244,7 +243,7 @@ method m(a: Bool, b: Bool, x: Ref)
 }
 "#;
     let p = run(input);
-    let m_id = p.interner.get("m").expect("missing m");
+    let m_id = p.id("m").expect("missing m");
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
@@ -293,7 +292,7 @@ method m(a: Bool, b: Bool, x: Ref)
 }
 "#;
     let p = run(input);
-    let m_id = p.interner.get("m").expect("missing m");
+    let m_id = p.id("m").expect("missing m");
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
@@ -321,7 +320,7 @@ method m(c: Bool, a: Int, b: Int) returns (r: Int)
 }
 "#;
     let p = run(input);
-    let m_id = p.interner.get("m").expect("missing m");
+    let m_id = p.id("m").expect("missing m");
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
@@ -357,7 +356,7 @@ adt List[T] {
 function len(l: List[Int]): Int
 "#;
     let p = run(input);
-    let list_id = p.interner.get("List").expect("missing List");
+    let list_id = p.id("List").expect("missing List");
 
     let vmir::Declaration::Adt(adt) = &p.decls[list_id] else {
         panic!("List must be an Adt");
@@ -374,7 +373,7 @@ function len(l: List[Int]): Int
     );
 
     // `len`'s parameter is `List[Int]` — a concrete monomorphization.
-    let len_id = p.interner.get("len").expect("missing len");
+    let len_id = p.id("len").expect("missing len");
     let vmir::Declaration::Function(func) = &p.decls[len_id] else {
         panic!("len must be a Function");
     };

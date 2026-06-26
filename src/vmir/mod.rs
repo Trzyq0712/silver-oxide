@@ -26,29 +26,43 @@ pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
 pub use ty::Bound;
 
 use derive_more::{From, Into};
-use lasso::{Key, Rodeo};
+use lasso::{Rodeo, Spur};
 use typed_index_collections::TiVec;
 
+/// A dense index into [`Program::decls`]. Purely positional — it is **not** an
+/// interner key; names are resolved through [`Program::name`].
 #[derive(Debug, From, Into, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct MemberId(pub usize);
-
-unsafe impl Key for MemberId {
-    fn into_usize(self) -> usize {
-        self.0
-    }
-
-    fn try_from_usize(int: usize) -> Option<Self> {
-        Some(Self(int))
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
-    pub interner: Rodeo<MemberId>,
-    /// Location **group** tags (`Type::Addr.group`), interned separately from the
-    /// declaration interner — a group is just a name, never a declaration.
-    pub groups: Rodeo<lasso::Spur>,
+    /// Each member's name, for display/debug. VMIR proper references members by
+    /// `MemberId`, never by name.
+    pub names: TiVec<MemberId, Spur>,
+    /// Cheap string repr for member (and constructor) names. Its `Spur` keys are
+    /// independent of `MemberId`.
+    pub interner: Rodeo,
+    /// Location **group** tags (`Type::Addr.group`), interned separately — a group
+    /// is just a name, never a declaration.
+    pub groups: Rodeo<Spur>,
+}
+
+impl Program {
+    /// The display name of a member.
+    pub fn name(&self, id: MemberId) -> &str {
+        self.interner.resolve(&self.names[id])
+    }
+
+    /// The member with the given name, if any. A linear scan — for tests/debug
+    /// only; VMIR proper never looks a member up by string.
+    pub fn id(&self, name: &str) -> Option<MemberId> {
+        let s = self.interner.get(name)?;
+        self.names
+            .iter_enumerated()
+            .find(|(_, n)| **n == s)
+            .map(|(id, _)| id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

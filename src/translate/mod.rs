@@ -74,8 +74,11 @@ pub fn translate(
 pub(crate) struct Builder<'a> {
     pub interner: &'a Interner,
     pub globals: &'a Globals,
-    /// VMIR name interner. MemberIds are positions in `decls`.
-    vmir_interner: Rodeo<vmir::MemberId>,
+    /// Cheap string repr for member/constructor names. Keys are independent of
+    /// `MemberId` — names are mapped to ids via `decl_names`.
+    vmir_interner: Rodeo,
+    /// Each declaration's name, parallel to `decls` (→ `Program.names`).
+    decl_names: Vec<Spur>,
     /// Location **group** tags (`Type::Addr.group`) — field/predicate names,
     /// resolvable at verify time via `Program.groups`.
     groups: Rodeo<lasso::Spur>,
@@ -91,9 +94,6 @@ pub(crate) struct Builder<'a> {
     pub ctor_tag: HashMap<Spur, (Spur, usize)>,
     /// A destructor's `Spur` to the `(adt id, variant, field)` it projects.
     pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
-    /// Constructor names to intern in `finalize` — after every `fresh_decl`, so
-    /// interning a non-decl name never breaks the decl/interner index invariant.
-    pending_ctor_names: Vec<(vmir::MemberId, usize, String)>,
 }
 
 impl<'a> Builder<'a> {
@@ -102,6 +102,7 @@ impl<'a> Builder<'a> {
             interner,
             globals,
             vmir_interner: Rodeo::new(),
+            decl_names: Vec::new(),
             groups: Rodeo::new(),
             decls: Vec::new(),
             name_map: HashMap::new(),
@@ -109,15 +110,14 @@ impl<'a> Builder<'a> {
             method_ensures: HashMap::new(),
             ctor_tag: HashMap::new(),
             dtor_sem: HashMap::new(),
-            pending_ctor_names: Vec::new(),
         }
     }
 
-    /// Intern a fresh name and reserve a `Declaration` slot for it (filled via
-    /// `set_decl`). Relies on `get_or_intern` assigning ids in increasing order.
+    /// Reserve a `Declaration` slot (filled via `set_decl`), recording its name.
+    /// `MemberId` is just the slot index; the interner key is unrelated.
     fn fresh_decl(&mut self, name: &str) -> vmir::MemberId {
-        let id = self.vmir_interner.get_or_intern(name);
-        debug_assert_eq!(usize::from(id), self.decls.len());
+        let id = vmir::MemberId(self.decls.len());
+        self.decl_names.push(self.vmir_interner.get_or_intern(name));
         self.decls.push(None);
         id
     }
@@ -190,13 +190,14 @@ impl<'a> Builder<'a> {
         }
 
         // Pass 2b: ADT constructors — no decl (they lower to a semantic `AdtCons`
-        // node). Record the `(adt, tag)` mapping and fill the ADT's variant shape;
-        // the name is interned in `finalize`.
+        // node). Record the `(adt, tag)` mapping and fill the ADT's variant shape.
+        // A constructor name is not a declaration, so it is interned for display
+        // only (its `Spur` is unrelated to any `MemberId`).
         for (spur, gmid) in &entries {
             if let GlobalSignature::AdtConstructor(sig) = &globals.signatures[*gmid] {
                 self.ctor_tag.insert(*spur, (sig.adt, sig.tag));
                 let adt_id = self.name_map[&sig.adt];
-                let ctor_name = interner.resolve(spur).to_string();
+                let ctor_name = self.vmir_interner.get_or_intern(interner.resolve(spur));
                 // Field types may mention the ADT's type parameters, so lower
                 // them against the owning ADT's parameter list (→ `Generic(i)`).
                 let adt_params = globals
@@ -221,11 +222,10 @@ impl<'a> Builder<'a> {
                         );
                     }
                     adt.variants[sig.tag] = vmir::AdtVariant {
-                        name: None,
+                        name: Some(ctor_name),
                         field_types,
                     };
                 }
-                self.pending_ctor_names.push((adt_id, sig.tag, ctor_name));
             }
         }
 
@@ -415,15 +415,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn finalize(mut self) -> vmir::Program {
-        // Intern constructor names now — past every `fresh_decl`, so these non-decl
-        // entries don't perturb the decl index invariant — and attach to variants.
-        for (adt_id, tag, name) in std::mem::take(&mut self.pending_ctor_names) {
-            let ctor_id = self.vmir_interner.get_or_intern(&name);
-            if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut() {
-                adt.variants[tag].name = Some(ctor_id);
-            }
-        }
+    fn finalize(self) -> vmir::Program {
         let decls: TiVec<vmir::MemberId, vmir::Declaration> = self
             .decls
             .into_iter()
@@ -431,6 +423,7 @@ impl<'a> Builder<'a> {
             .collect();
         vmir::Program {
             decls,
+            names: self.decl_names.into(),
             interner: self.vmir_interner,
             groups: self.groups,
         }

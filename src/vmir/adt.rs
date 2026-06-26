@@ -1,5 +1,6 @@
+use crate::vmir::Type;
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{MemberId, Type};
+use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
 
 /// An algebraic data type: a list of variants (constructors), variant index =
@@ -11,15 +12,15 @@ pub struct Adt {
     pub variants: Vec<AdtVariant>,
 }
 
-/// One variant (constructor) of an [`Adt`]: an optional interned constructor
-/// name (kept from the source; only needs to be distinct within the ADT — `None`
-/// for synthetic ADTs like a predicate snapshot) plus its field types in order.
-/// The constructor / projection / tag operations over it are the semantic
-/// `PureInst::{AdtCons,AdtProj,AdtTag}` nodes; the verifier names its minted ids
-/// `Adt::Ctor` (`@` is reserved for builtin suffixes, e.g. `Adt@tag`).
+/// One variant (constructor) of an [`Adt`]: an optional interned constructor name
+/// (kept from the source for display; only needs to be distinct within the ADT —
+/// `None` for synthetic ADTs like a predicate snapshot) plus its field types in
+/// order. A constructor is not a declaration, so its name is an interner `Spur`,
+/// not a `MemberId`. The constructor / projection / tag operations over it are the
+/// semantic `PureInst::{AdtCons,AdtProj,AdtTag}` nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdtVariant {
-    pub name: Option<MemberId>,
+    pub name: Option<Spur>,
     pub field_types: Vec<Type>,
 }
 

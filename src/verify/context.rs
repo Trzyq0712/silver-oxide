@@ -13,6 +13,7 @@ use crate::{
     vmir::{BinOp, FunctionCall, Literal, MemberId, Polarity, Type},
 };
 use lasso::{Rodeo, Spur};
+use typed_index_collections::TiVec;
 
 /// A resource's well-formedness proof, kept for **reuse at call sites**: the
 /// saturated proof e-graph (carrying every proven merge) plus the root
@@ -55,7 +56,10 @@ pub(crate) struct VerifyContext<'a> {
     /// normalize (collapse snapshot towers) without a full saturation.
     static_reduce: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
-    pub(crate) interner: &'a Rodeo<MemberId>,
+    /// Cheap string repr for member/constructor names.
+    pub(crate) interner: &'a Rodeo,
+    /// Member names indexed by `MemberId` (for `member_name`/`func_name`).
+    pub(crate) names: &'a TiVec<MemberId, Spur>,
     /// Location group tags (`Type::Addr.group`), for display resolution.
     pub(crate) groups: &'a Rodeo<Spur>,
     /// Shared verifier id allocator (minted ADT cons/proj/tag ids + their rules).
@@ -72,7 +76,8 @@ pub(crate) struct VerifyContext<'a> {
 
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
-        interner: &'a Rodeo<MemberId>,
+        interner: &'a Rodeo,
+        names: &'a TiVec<MemberId, Spur>,
         groups: &'a Rodeo<Spur>,
         alloc: &'a mut Allocator,
     ) -> Self {
@@ -82,6 +87,7 @@ impl<'a> VerifyContext<'a> {
             static_reduce: rewrite::reduce_rules(),
             fresh_counter: 0,
             interner,
+            names,
             groups,
             alloc,
             fresh_types: HashMap::new(),
@@ -100,8 +106,8 @@ impl<'a> VerifyContext<'a> {
     /// Display name for a member id. Registry-minted ids (outside the interner)
     /// resolve via the registry's name table.
     pub(crate) fn member_name(&self, m: MemberId) -> String {
-        if usize::from(m) < self.interner.len() {
-            self.interner.resolve(&m).to_string()
+        if usize::from(m) < self.names.len() {
+            self.interner.resolve(&self.names[m]).to_string()
         } else {
             format!("d{}", m.0)
         }
@@ -110,8 +116,10 @@ impl<'a> VerifyContext<'a> {
     /// Display name for an e-graph function id: a real declaration index resolves
     /// via the interner; an allocator-minted id via its name table.
     pub(crate) fn func_name(&self, f: FuncId) -> String {
-        if f.0 < self.interner.len() {
-            self.interner.resolve(&MemberId::from(f.0)).to_string()
+        if f.0 < self.names.len() {
+            self.interner
+                .resolve(&self.names[MemberId::from(f.0)])
+                .to_string()
         } else {
             self.alloc
                 .name(f)

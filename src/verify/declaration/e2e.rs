@@ -312,8 +312,7 @@ method m(x: Ref)
 /// is not a `Resource`.
 fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
     let id = program
-        .interner
-        .get(name)
+        .id(name)
         .unwrap_or_else(|| panic!("missing resource {name}"));
     let vmir::Declaration::Resource(r) = &program.decls[id] else {
         panic!("{name} must be a Resource");
@@ -329,7 +328,7 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
             continue;
         }
         if let vmir::Declaration::Resource(cr) = decl {
-            let cname = program.interner.resolve(&cid).to_string();
+            let cname = program.name(cid).to_string();
             if let Ok(Some(cert)) = verify_resource(program, &cname, cr, &certs, &mut alloc) {
                 certs.insert(cid, cert);
             }
@@ -347,7 +346,7 @@ fn build_certs(
     let mut certs = HashMap::new();
     for (id, decl) in program.decls.iter_enumerated() {
         if let vmir::Declaration::Resource(r) = decl {
-            let name = program.interner.resolve(&id).to_string();
+            let name = program.name(id).to_string();
             if let Some(cert) =
                 verify_resource(program, &name, r, &certs, alloc).expect("resource verifies")
             {
@@ -406,8 +405,7 @@ method m(x: Int)
 /// Verify the method `name`, panicking if missing or not a `Method`.
 fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
     let id = program
-        .interner
-        .get(name)
+        .id(name)
         .unwrap_or_else(|| panic!("missing method {name}"));
     let vmir::Declaration::Method(m) = &program.decls[id] else {
         panic!("{name} must be a Method");

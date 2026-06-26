@@ -7,21 +7,31 @@
 use crate::vmir::{Declaration, MemberId, Program, Snapshot};
 use lasso::{Rodeo, Spur};
 use std::fmt::{self, Display, Formatter, Write};
+use typed_index_collections::TiVec;
 
 /// Helper wrapper for interner-aware VMIR formatting. Fields are
 /// `pub(super)` so sibling modules can implement `Display` impls on
 /// `VmirDisplay<&MyType>`.
 pub struct VmirDisplay<'a, T> {
     pub(super) item: T,
-    pub(super) interner: &'a Rodeo<MemberId>,
+    /// Member names, indexed by `MemberId` (for [`Self::member`]).
+    pub(super) names: &'a TiVec<MemberId, Spur>,
+    /// Cheap string repr for member/constructor names.
+    pub(super) interner: &'a Rodeo,
     /// Location-group tags (`Type::Addr.group`), for resolving group names.
     pub(super) groups: &'a Rodeo<Spur>,
 }
 
 impl<'a, T> VmirDisplay<'a, T> {
-    pub fn new(item: T, interner: &'a Rodeo<MemberId>, groups: &'a Rodeo<Spur>) -> Self {
+    pub fn new(
+        item: T,
+        names: &'a TiVec<MemberId, Spur>,
+        interner: &'a Rodeo,
+        groups: &'a Rodeo<Spur>,
+    ) -> Self {
         Self {
             item,
+            names,
             interner,
             groups,
         }
@@ -30,9 +40,15 @@ impl<'a, T> VmirDisplay<'a, T> {
     pub fn with<U>(&self, item: U) -> VmirDisplay<'a, U> {
         VmirDisplay {
             item,
+            names: self.names,
             interner: self.interner,
             groups: self.groups,
         }
+    }
+
+    /// The display name of a member id.
+    pub(super) fn member(&self, id: MemberId) -> &'a str {
+        self.interner.resolve(&self.names[id])
     }
 }
 
@@ -46,7 +62,7 @@ impl Program {
             let Declaration::Resource(r) = decl else {
                 continue;
             };
-            let name = self.interner.resolve(&id);
+            let name = self.name(id);
             // The derived `@addr` accessor function (`params -> &[name] Snap @ *`).
             // Every predicate registers its group tag in `declare_predicate_accessors`.
             let group = self.groups.get(name).expect("predicate group tag");
@@ -54,7 +70,7 @@ impl Program {
             let _ = writeln!(
                 out,
                 "function {name}@addr{}",
-                VmirDisplay::new(&loc, &self.interner, &self.groups)
+                VmirDisplay::new(&loc, &self.names, &self.interner, &self.groups)
             );
             // The derived snapshot type, printed by kind for every snapshottable
             // (self-framed) resource: a concrete one is an `adt` with a single
@@ -64,14 +80,14 @@ impl Program {
                     let _ = writeln!(
                         out,
                         "adt {name}@snap {}",
-                        VmirDisplay::new(&adt, &self.interner, &self.groups)
+                        VmirDisplay::new(&adt, &self.names, &self.interner, &self.groups)
                     );
                 }
                 Some(Snapshot::Abstract(domain)) => {
                     let _ = writeln!(
                         out,
                         "domain {name}@snap {}",
-                        VmirDisplay::new(&domain, &self.interner, &self.groups)
+                        VmirDisplay::new(&domain, &self.names, &self.interner, &self.groups)
                     );
                 }
                 None => {}
@@ -96,7 +112,7 @@ impl Display for Program {
             write!(
                 f,
                 "{}",
-                VmirDisplay::new(item, &self.interner, &self.groups)
+                VmirDisplay::new(item, &self.names, &self.interner, &self.groups)
             )?;
         }
         Ok(())
@@ -106,7 +122,7 @@ impl Display for Program {
 impl<'a> Display for VmirDisplay<'a, (MemberId, &'a Declaration)> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let (id, decl) = self.item;
-        let name = self.interner.resolve(&id);
+        let name = self.member(id);
         match decl {
             Declaration::Domain(domain) => write!(f, "domain {name} {}", self.with(domain)),
             Declaration::Function(function) => write!(f, "function {name}{}", self.with(function)),

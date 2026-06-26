@@ -121,10 +121,10 @@ impl<'a> Display for VmirDisplay<'a, &'a Type> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             Type::Domain(id, args) => {
-                write!(f, "{}", self.interner.resolve(id))?;
+                write!(f, "{}", self.member(*id))?;
                 fmt_args(f, args, |a, f| write!(f, "{}", self.with(a)))
             }
-            Type::Snap(id) => write!(f, "{}@snap", self.interner.resolve(id)),
+            Type::Snap(id) => write!(f, "{}@snap", self.member(*id)),
             Type::Option(ty) => write!(f, "Option[{}]", self.with(ty.as_ref())),
             Type::Addr {
                 group,

@@ -136,7 +136,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
             PureInst::FunctionCall(heap, call) => {
-                write!(f, "{}(", self.interner.resolve(&call.function))?;
+                write!(f, "{}(", self.member(call.function))?;
                 for (i, arg) in call.args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -154,7 +154,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
             PureInst::AdtCons {
                 adt, variant, args, ..
             } => {
-                write!(f, "{}::#{variant}(", self.interner.resolve(adt))?;
+                write!(f, "{}::#{variant}(", self.member(*adt))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -169,13 +169,9 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 field,
                 base,
                 ..
-            } => write!(
-                f,
-                "{}::#{variant}.{field}({base})",
-                self.interner.resolve(adt)
-            ),
+            } => write!(f, "{}::#{variant}.{field}({base})", self.member(*adt)),
             PureInst::AdtTag { adt, base, .. } => {
-                write!(f, "{}@tag({base})", self.interner.resolve(adt))
+                write!(f, "{}@tag({base})", self.member(*adt))
             }
         }
     }

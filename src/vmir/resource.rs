@@ -154,7 +154,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
                 let heap_base = match &self.item.precond {
                     Precond::SelfFramed => 0usize,
                     Precond::Ctx(req_id, req_args) => {
-                        write!(f, "[{}(", self.interner.resolve(req_id))?;
+                        write!(f, "[{}(", self.member(*req_id))?;
                         for (i, arg) in req_args.iter().enumerate() {
                             if i > 0 {
                                 write!(f, ", ")?;

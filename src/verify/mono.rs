@@ -83,7 +83,7 @@ impl Allocator {
         // declaration, so it gets a synthetic head id one past the last decl; its
         // values are typed `Type::Option`, never `Type::Domain(option_head, …)`,
         // so the head id is only ever a mono key (never resolved via the interner).
-        let option_head = MemberId(program.interner.len());
+        let option_head = MemberId(program.decls.len());
         shapes.insert(option_head, vec![1, 0]);
         head_names.insert(option_head, "Option".to_string());
         variant_names.insert(
@@ -97,7 +97,7 @@ impl Allocator {
                     id,
                     adt.variants.iter().map(|v| v.field_types.len()).collect(),
                 );
-                head_names.insert(id, program.interner.resolve(&id).to_string());
+                head_names.insert(id, program.name(id).to_string());
                 variant_names.insert(id, vname(adt));
             }
         }
@@ -114,14 +114,14 @@ impl Allocator {
                     id,
                     adt.variants.iter().map(|v| v.field_types.len()).collect(),
                 );
-                head_names.insert(id, format!("{}@snap", program.interner.resolve(&id)));
+                head_names.insert(id, format!("{}@snap", program.name(id)));
                 variant_names.insert(id, vname(&adt));
             }
         }
         Allocator {
             // Mint func ids past the synthetic `Option` head, so neither a plain
             // function (which reuses its decl index) nor the head id collides.
-            next: program.interner.len() + 1,
+            next: program.decls.len() + 1,
             cons: HashMap::new(),
             proj: HashMap::new(),
             tag: HashMap::new(),

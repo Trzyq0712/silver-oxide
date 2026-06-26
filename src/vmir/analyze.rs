@@ -100,9 +100,7 @@ fn dump_callgraph(graph: &DepGraph, program: &Program) {
         return;
     }
     let edge_attr = |_, _| String::new();
-    let node_attr = |_, (id, _): (MemberId, &MemberId)| {
-        format!("label = \"{}\"", program.interner.resolve(&id))
-    };
+    let node_attr = |_, (id, _): (MemberId, &MemberId)| format!("label = \"{}\"", program.name(id));
     let dot = Dot::with_attr_getters(
         graph,
         &[Config::EdgeNoLabel, Config::NodeNoLabel],
@@ -125,7 +123,7 @@ fn cycle_error(program: &Program, graph: &DepGraph) -> AnalysisError {
         let cyclic = scc.len() > 1 || graph.contains_edge(scc[0], scc[0]);
         if cyclic {
             for id in scc {
-                names.push(program.interner.resolve(&id).to_string());
+                names.push(program.name(id).to_string());
             }
         }
     }
@@ -243,12 +241,11 @@ mod tests {
     }
 
     fn program(names: &[&str], decls: Vec<Declaration>) -> Program {
-        let mut interner: Rodeo<MemberId> = Rodeo::new();
-        for name in names {
-            interner.get_or_intern(name);
-        }
+        let mut interner = Rodeo::new();
+        let name_ids = names.iter().map(|n| interner.get_or_intern(n)).collect();
         Program {
             decls: TiVec::from(decls),
+            names: name_ids,
             interner,
             groups: Rodeo::new(),
         }

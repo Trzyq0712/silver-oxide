@@ -96,7 +96,7 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         // Render `name(arg, ...)` for a resource call.
         let call_head = |f: &mut Formatter<'_>, call: &ResourceCall| -> fmt::Result {
-            write!(f, "{}(", self.interner.resolve(&call.resource))?;
+            write!(f, "{}(", self.member(call.resource))?;
             for (i, arg) in call.args.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;

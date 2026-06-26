@@ -130,13 +130,15 @@ impl EvalState {
 /// Render a single instruction (method or resource body) for error context.
 fn format_inst(
     inst: &Inst,
-    interner: &lasso::Rodeo<MemberId>,
+    names: &typed_index_collections::TiVec<MemberId, lasso::Spur>,
+    interner: &lasso::Rodeo,
     groups: &lasso::Rodeo<lasso::Spur>,
     val_base: usize,
     heap_base: usize,
 ) -> String {
     VmirDisplay::new(
         (val_base, heap_base, std::slice::from_ref(inst)),
+        names,
         interner,
         groups,
     )
@@ -372,7 +374,7 @@ struct LocationChunk {
 fn pred_addr_type(program: &vmir::Program, pred_id: MemberId) -> Type {
     let group = program
         .groups
-        .get(program.interner.resolve(&pred_id))
+        .get(program.name(pred_id))
         .expect("predicate group tag not registered");
     Type::addr(group, Type::Snap(pred_id), Bound::Unbounded)
 }
@@ -621,7 +623,9 @@ fn eval_heap_inst(
             let h = get_heap(state, heap);
             let addr = state.get_val(ctx, loc);
             let new_val = state.get_val(ctx, val);
-            let kind = state.loc_kind(loc).expect("assign location must be Addr-typed");
+            let kind = state
+                .loc_kind(loc)
+                .expect("assign location must be Addr-typed");
             let perm = h.perm_at(&kind, addr).unwrap_or_else(|| zero_real(ctx));
             // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc.
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
@@ -818,8 +822,7 @@ fn eval_method_inst(
             // Predicate snapshots are non-generic — empty type instantiation.
             let snap = ctx.add_func_app_id(snap_cons, Box::new([]), snap_ty, cons_args);
             let addr_ty = pred_addr_type(program, addr_fn);
-            let pred_kind =
-                LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
+            let pred_kind = LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
             // The predicate's address is an ordinary call to its address function
             // (the predicate's own id); the `Addr` type is the recorded return type.
             let pred_addr = ctx.add_func_app_id(
@@ -993,7 +996,7 @@ pub fn verify_method(
     certs: &HashMap<MemberId, ResourceCertificate>,
     alloc: &mut crate::verify::mono::Allocator,
 ) -> Result<(), VerifyError> {
-    let mut ctx = VerifyContext::new(&program.interner, &program.groups, alloc);
+    let mut ctx = VerifyContext::new(&program.interner, &program.names, &program.groups, alloc);
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -1003,6 +1006,7 @@ pub fn verify_method(
         let heaps_before = state.heaps.len();
         let inst_text = format_inst(
             inst,
+            &program.names,
             &program.interner,
             &program.groups,
             vals_before,
@@ -1042,7 +1046,7 @@ pub fn verify_resource(
         return Ok(None);
     };
 
-    let mut ctx = VerifyContext::new(&program.interner, &program.groups, alloc);
+    let mut ctx = VerifyContext::new(&program.interner, &program.names, &program.groups, alloc);
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1094,6 +1098,7 @@ pub fn verify_resource(
         let heaps_before = state.heaps.len();
         let inst_text = format_inst(
             inst,
+            &program.names,
             &program.interner,
             &program.groups,
             vals_before,
@@ -1156,7 +1161,9 @@ pub fn verify_resource(
             let perm = ctx.egraph.find(perm);
             let value = delta_heap
                 .entries()
-                .find_map(|(_, c)| (ctx.egraph.find(c.addr) == addr).then(|| ctx.egraph.find(c.value)))
+                .find_map(|(_, c)| {
+                    (ctx.egraph.find(c.addr) == addr).then(|| ctx.egraph.find(c.value))
+                })
                 .unwrap_or_else(|| ctx.fresh_symbolic_value(Type::Int));
             (kind, addr, perm, value)
         })
@@ -1235,12 +1242,16 @@ mod tests {
     use super::*;
     use crate::verify::lang::Symbolic;
 
-    fn fresh_ctx<'a>(interner: &'a lasso::Rodeo<vmir::MemberId>) -> VerifyContext<'a> {
-        // Leak a `'static` empty allocator + group interner so the returned context
-        // can borrow them.
+    fn fresh_ctx<'a>(interner: &'a lasso::Rodeo) -> VerifyContext<'a> {
+        // Leak a `'static` empty allocator, names table, and group interner so the
+        // returned context can borrow them.
         let alloc: &'static mut _ = Box::leak(Box::new(crate::verify::mono::Allocator::empty()));
+        let names: &'static _ = Box::leak(Box::new(typed_index_collections::TiVec::<
+            vmir::MemberId,
+            lasso::Spur,
+        >::new()));
         let groups: &'static _ = Box::leak(Box::new(lasso::Rodeo::<lasso::Spur>::new()));
-        VerifyContext::new(interner, groups, alloc)
+        VerifyContext::new(interner, names, groups, alloc)
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1267,11 +1278,12 @@ mod tests {
     // to false against the assumed-true equalities).
     #[test]
     fn multiarg_location_nonaliasing_all_args_equal_is_inconsistent() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
+        let names = typed_index_collections::TiVec::<vmir::MemberId, lasso::Spur>::new();
         let mut groups = lasso::Rodeo::<lasso::Spur>::new();
         let g = groups.get_or_intern("g");
         let mut alloc = crate::verify::mono::Allocator::empty();
-        let mut ctx = VerifyContext::new(&interner, &groups, &mut alloc);
+        let mut ctx = VerifyContext::new(&interner, &names, &groups, &mut alloc);
 
         // A 2-arg bounded address group `g` of held type `Int`, cap `1/1`. The
         // address is an ordinary `FuncApp` to the group's address function
@@ -1312,7 +1324,7 @@ mod tests {
 
     #[test]
     fn heap_union_merges_egg_equivalent_addresses() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1329,7 +1341,9 @@ mod tests {
         let merged = heap_union(&mut ctx, &h1, &test_kind(), Chunk::new(b, p2, v2), &[]);
 
         let canon = ctx.egraph.find(a);
-        let chunk = merged.chunk(&test_kind(), canon).expect("merged chunk missing");
+        let chunk = merged
+            .chunk(&test_kind(), canon)
+            .expect("merged chunk missing");
 
         let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p1, p2]));
         ctx.saturate();
@@ -1342,7 +1356,7 @@ mod tests {
 
     #[test]
     fn merge_zero_fraction_picks_active_value() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1365,7 +1379,7 @@ mod tests {
 
     #[test]
     fn merge_both_active_fuses_values() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1388,7 +1402,7 @@ mod tests {
 
     #[test]
     fn merge_under_false_pc_blocks_fusion() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1420,7 +1434,7 @@ mod tests {
 
     #[test]
     fn merge_under_true_pc_allows_fusion() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1449,7 +1463,7 @@ mod tests {
 
     #[test]
     fn prove_under_empty_pc_proves_known_goal() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let g = ctx.add(Symbolic::Fresh(0));
@@ -1463,7 +1477,7 @@ mod tests {
 
     #[test]
     fn prove_unknown_goal_fails() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         // A free boolean never driven to `true` is not provable.
@@ -1473,7 +1487,7 @@ mod tests {
 
     #[test]
     fn prove_under_false_pc_is_vacuous() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         // Unprovable goal, but the path is unsatisfiable (`false`).
@@ -1489,7 +1503,7 @@ mod tests {
 
     #[test]
     fn prove_commits_conditional_implication() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let c = ctx.add(Symbolic::Fresh(0));
@@ -1513,7 +1527,7 @@ mod tests {
 
     #[test]
     fn subtract_symbolic_perm_fails_without_proof() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1535,7 +1549,7 @@ mod tests {
 
     #[test]
     fn heap_subtract_canonical_match() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1553,7 +1567,9 @@ mod tests {
             .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
-        let chunk = result.chunk(&test_kind(), canon).expect("result chunk missing");
+        let chunk = result
+            .chunk(&test_kind(), canon)
+            .expect("result chunk missing");
         let expected_perm = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         ctx.egraph.rebuild();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
@@ -1562,7 +1578,7 @@ mod tests {
 
     #[test]
     fn heap_subtract_exact_match_drops_chunk() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1583,7 +1599,7 @@ mod tests {
 
     #[test]
     fn heap_subtract_over_consume_fails() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1604,7 +1620,7 @@ mod tests {
 
     #[test]
     fn heap_subtract_missing_addr_fails() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1624,7 +1640,7 @@ mod tests {
 
     #[test]
     fn const_fold_folds_subtraction() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
@@ -1637,7 +1653,7 @@ mod tests {
 
     #[test]
     fn const_fold_folds_ternary() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let cond = ctx.add(Symbolic::Lit(Literal::Bool(true)));
@@ -1653,7 +1669,7 @@ mod tests {
 
     #[test]
     fn rewrite_ite_false_picks_else() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let cond = ctx.add(Symbolic::Lit(Literal::Bool(false)));
@@ -1668,7 +1684,7 @@ mod tests {
 
     #[test]
     fn rewrite_add_zero_int() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let x = ctx.add(Symbolic::Fresh(0));
@@ -1681,7 +1697,7 @@ mod tests {
 
     #[test]
     fn rewrite_add_zero_real_commuted() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let x = ctx.add(Symbolic::Fresh(0));
@@ -1695,7 +1711,7 @@ mod tests {
 
     #[test]
     fn eq_true_unions_args() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1711,7 +1727,7 @@ mod tests {
 
     #[test]
     fn eq_unknown_does_not_union() {
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1725,8 +1741,8 @@ mod tests {
 
     #[test]
     fn eq_true_propagates_through_congruence() {
-        let mut interner = lasso::Rodeo::<vmir::MemberId>::new();
-        let f = crate::verify::lang::FuncId(usize::from(interner.get_or_intern("f")));
+        let mut interner = lasso::Rodeo::new();
+        let f = crate::verify::lang::FuncId(lasso::Key::into_usize(interner.get_or_intern("f")));
         let mut ctx = fresh_ctx(&interner);
 
         let a = ctx.add(Symbolic::Fresh(0));
@@ -1759,7 +1775,7 @@ mod tests {
         // with `true`). Grafting the certificate into a caller (param `d` → arg
         // `a`) transfers that fact: the caller then knows `a != 0` *without
         // assuming any boolean* — the knowledge comes from the merge alone.
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
 
         // --- resource side: learn `d != 0` ---
         let mut rctx = fresh_ctx(&interner);
@@ -1800,7 +1816,7 @@ mod tests {
     #[test]
     fn realcast_folds_int_to_real() {
         // real(2) const-folds to the Real literal 2.
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
         let two = ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(2))));
         let cast = ctx.add(Symbolic::RealCast(two));
@@ -1812,7 +1828,7 @@ mod tests {
     #[test]
     fn rewrite_and_true_collapses() {
         // b && true  =  ite(b, true, false)  =>  b
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
         let b = ctx.add(Symbolic::Fresh(0));
         let t = ctx.add(Symbolic::Lit(Literal::Bool(true)));
@@ -1825,7 +1841,7 @@ mod tests {
     #[test]
     fn rewrite_and_self_collapses() {
         // b && b  =  ite(b, b, false)  =>  b
-        let interner = lasso::Rodeo::<vmir::MemberId>::new();
+        let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
         let b = ctx.add(Symbolic::Fresh(0));
         let f = ctx.add(Symbolic::Lit(Literal::Bool(false)));
