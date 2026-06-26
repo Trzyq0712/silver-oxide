@@ -95,7 +95,7 @@ impl Constructable for ViperTcType {
 /// arguments are imposed separately as `rusttyc` children (see
 /// `ConstraintCtx::impose_type`); a bare `Generic` has no top-level variant
 /// (it is bound to a fresh type variable), so it maps to `Top`.
-pub fn type_to_tc(ty: &Type) -> ViperTcType {
+pub fn type_to_tc<G>(ty: &Type<G>) -> ViperTcType {
     match ty {
         Type::Bool => ViperTcType::Bool,
         Type::Int => ViperTcType::Int,

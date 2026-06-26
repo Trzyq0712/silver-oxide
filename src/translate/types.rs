@@ -4,19 +4,20 @@ use std::collections::HashMap;
 
 use lasso::Spur;
 
-use crate::viper::typed;
+use crate::viper::typed::{self, TypeParam};
 use crate::vmir;
 
 /// Lower a typed Silver type to a VMIR type.
 ///
 /// `names` resolves a domain/ADT name `Spur` to its VMIR declaration id;
 /// `generics` is the enclosing generic declaration's type-parameter list (used
-/// to map a `Type::Generic` to its 0-based index). Both are empty in fully
-/// concrete contexts (most call sites go through [`super::Builder::lower_type`]).
-pub(crate) fn lower_type(
+/// to map a `Type::Generic` to its 0-based index). For a ground type
+/// (`Type<!>`, e.g. via [`super::Builder::lower_type`]) the `Generic` arm is
+/// unreachable and `generics` is empty.
+pub(crate) fn lower_type<G: TypeParam>(
     names: &HashMap<Spur, vmir::MemberId>,
     generics: &[Spur],
-    ty: &typed::Type,
+    ty: &typed::Type<G>,
 ) -> vmir::Type {
     match ty {
         typed::Type::Bool => vmir::Type::Bool,
@@ -26,7 +27,7 @@ pub(crate) fn lower_type(
         typed::Type::Generic(id) => {
             let idx = generics
                 .iter()
-                .position(|p| *p == id.0)
+                .position(|p| *p == id.param())
                 .expect("generic type parameter not in the enclosing declaration's scope");
             vmir::Type::Generic(idx)
         }
