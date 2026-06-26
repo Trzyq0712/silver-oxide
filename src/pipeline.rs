@@ -105,13 +105,13 @@ pub fn run_file_timed(
 
     let typed = phase!(
         "typecheck",
-        typecheck_program(&mut program, &interner, &globals)
+        typecheck_program(&mut program, interner, &globals)
             .map_err(|e| PipelineError::Typecheck(format!("{e:?}")))?
     );
 
     let vmir = phase!(
         "translate",
-        translate::translate(&typed, &interner, &globals)
+        translate::translate(&typed, &globals)
             .map_err(|e| PipelineError::Translate(format!("{e:?}")))?
     );
 

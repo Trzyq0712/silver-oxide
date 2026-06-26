@@ -1,7 +1,13 @@
 use lasso::Spur;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Program(pub Vec<Declaration>);
+use crate::viper::Interner;
+
+#[derive(Debug, PartialEq)]
+pub struct Program {
+    pub decls: Vec<Declaration>,
+    /// The symbol alphabet every `Spur` in this program resolves through.
+    pub interner: Interner,
+}
 
 /// A resolved identifier string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

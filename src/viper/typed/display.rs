@@ -96,7 +96,7 @@ impl ShowExt for MethodBodyExt {
 
 impl<'a> Display for Show<'a, &'a Program> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for (i, decl) in self.item.0.iter().enumerate() {
+        for (i, decl) in self.item.decls.iter().enumerate() {
             if i > 0 {
                 writeln!(f)?;
             }

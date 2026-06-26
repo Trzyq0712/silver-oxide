@@ -1537,9 +1537,11 @@ fn typecheck_method(
 // 12. Entry point
 // ==========================================
 
+/// Type-check `program`, consuming `interner` into the returned typed program
+/// (every `Spur` it holds resolves through that interner).
 pub fn typecheck_program(
     program: &mut viper::Program,
-    interner: &Interner,
+    interner: Interner,
     globals: &Globals,
 ) -> Result<typed::Program, Vec<TypeError>> {
     let mut decls = Vec::new();
@@ -1549,13 +1551,13 @@ pub fn typecheck_program(
         let result = match decl {
             viper::Declaration::Field(field) => Ok(Some(typecheck_field(field))),
             viper::Declaration::Predicate(pred) => {
-                typecheck_predicate(pred, globals, interner).map(Some)
+                typecheck_predicate(pred, globals, &interner).map(Some)
             }
             viper::Declaration::Function(func) => {
-                typecheck_function(func, globals, interner).map(Some)
+                typecheck_function(func, globals, &interner).map(Some)
             }
             viper::Declaration::Method(method) => {
-                typecheck_method(method, globals, interner).map(Some)
+                typecheck_method(method, globals, &interner).map(Some)
             }
             _ => Ok(None),
         };
@@ -1568,7 +1570,7 @@ pub fn typecheck_program(
     }
 
     if errors.is_empty() {
-        Ok(typed::Program(decls))
+        Ok(typed::Program { decls, interner })
     } else {
         Err(errors)
     }
@@ -1596,7 +1598,7 @@ mod tests {
         let globals = globals_collector.finalize().expect("globals error");
         disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
         inline_macros(&mut program, &interner).expect("macro inline failed");
-        typecheck_program(&mut program, &interner, &globals)
+        typecheck_program(&mut program, interner, &globals)
     }
 
     #[test]
@@ -1729,7 +1731,7 @@ method m(x: Ref)
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         let prog = result.unwrap();
         let method = prog
-            .0
+            .decls
             .iter()
             .find_map(|d| {
                 if let typed::Declaration::Method(m) = d {

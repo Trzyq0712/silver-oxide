@@ -20,10 +20,10 @@ fn lower(input: &str) -> vmir::Program {
     let globals = gc.finalize().expect("globals");
     disambiguate(&mut program, &interner, &globals).expect("disambiguation");
     inline_macros(&mut program, &interner).expect("macros");
-    let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck");
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck");
     // `Option` is a verifier builtin (the mono allocator registers it), not a
     // program declaration — nothing to inject here.
-    translate::translate(&typed, &interner, &globals).expect("translate")
+    translate::translate(&typed, &globals).expect("translate")
 }
 
 #[test]
@@ -1281,9 +1281,9 @@ method m(x: Ref)
     let globals = gc.finalize().expect("globals");
     disambiguate(&mut program, &interner, &globals).expect("disambiguation");
     inline_macros(&mut program, &interner).expect("macros");
-    let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck");
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck");
     assert!(
-        translate::translate(&typed, &interner, &globals).is_err(),
+        translate::translate(&typed, &globals).is_err(),
         "old[L] before label L must fail translation"
     );
 }

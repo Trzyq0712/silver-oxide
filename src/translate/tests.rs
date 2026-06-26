@@ -16,8 +16,8 @@ fn run(input: &str) -> vmir::Program {
     let globals = globals_collector.finalize().expect("globals error");
     disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
     inline_macros(&mut program, &interner).expect("macro inlining failed");
-    let typed = typecheck_program(&mut program, &interner, &globals).expect("typecheck failed");
-    translate(&typed, &interner, &globals).expect("translation failed")
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck failed");
+    translate(&typed, &globals).expect("translation failed")
 }
 
 #[test]

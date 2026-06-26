@@ -30,10 +30,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
     inline_macros(&mut program, &interner).expect("macro inlining failed");
 
-    match typecheck_program(&mut program, &interner, &globals) {
+    match typecheck_program(&mut program, interner, &globals) {
         Ok(typed) => {
             eprintln!("typecheck OK");
-            println!("{}", show(&typed, &interner));
+            println!("{}", show(&typed, &typed.interner));
         }
         Err(errors) => {
             eprintln!("typecheck FAILED with {} error(s):", errors.len());

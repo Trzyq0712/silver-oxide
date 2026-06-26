@@ -36,11 +36,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
     inline_macros(&mut program, &interner).expect("macro inlining failed");
 
-    let typed = typecheck_program(&mut program, &interner, &globals)
+    let typed = typecheck_program(&mut program, interner, &globals)
         .map_err(|e| format!("typecheck failed: {e:?}"))?;
 
-    let vmir = translate::translate(&typed, &interner, &globals)
-        .map_err(|e| format!("translation failed: {e:?}"))?;
+    let vmir =
+        translate::translate(&typed, &globals).map_err(|e| format!("translation failed: {e:?}"))?;
 
     println!("{}", vmir);
     if derived {

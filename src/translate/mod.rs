@@ -21,14 +21,13 @@ pub use errors::TranslationError;
 /// Build a `vmir::Program` from a typed `typed::Program`.
 pub fn translate(
     program: &typed::Program,
-    interner: &Interner,
     globals: &Globals,
 ) -> Result<vmir::Program, Vec<TranslationError>> {
-    let mut builder = Builder::new(interner, globals);
+    let mut builder = Builder::new(&program.interner, globals);
     let mut errors = Vec::new();
 
     // Phase A: predicate + field address accessors.
-    for decl in &program.0 {
+    for decl in &program.decls {
         match decl {
             typed::Declaration::Predicate(p) => builder.declare_predicate_accessors(p),
             typed::Declaration::Field(f) => builder.declare_field_accessor(f),
@@ -40,7 +39,7 @@ pub fn translate(
     builder.declare_adts_and_functions();
 
     // Phase B1: Resource declarations (predicates + method contracts).
-    for decl in &program.0 {
+    for decl in &program.decls {
         match decl {
             typed::Declaration::Predicate(p) => {
                 if let Err(e) = builder.emit_predicate(p) {
@@ -57,7 +56,7 @@ pub fn translate(
     }
 
     // Phase B2: method bodies.
-    for decl in &program.0 {
+    for decl in &program.decls {
         if let typed::Declaration::Method(m) = decl
             && let Err(e) = builder.emit_method_body(m)
         {
