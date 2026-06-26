@@ -3,18 +3,19 @@
 //! blocks are walked in topological order, each lowered under its reaching path
 //! condition, with phi (`ite`) nodes at joins and a single linear heap.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use lasso::Spur;
 use typed_index_collections::TiVec;
 
-use crate::translate::pure_exp::{self, Sink};
-use crate::translate::resource::{self, SpatialMode};
-use crate::translate::{Builder, TranslationError, lower_type};
+use crate::translate::reach::{and_val, block_reach, build_entry_env, not_val};
+use crate::translate::sink::Sink;
+use crate::translate::spatial::{self, SpatialMode};
+use crate::translate::{Builder, TranslationError, lower_type, pure_exp, resource};
 use crate::viper::cfg::{self, BlockId, EdgeSide, Terminator};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, HeapInst, HeapVal, PathConds, Polarity, PureInst, ResourceCall, TRUE, Type, Val,
+    self, HeapInst, HeapVal, PathConds, Polarity, PureInst, ResourceCall, TRUE, Type, Val,
 };
 
 pub(crate) fn lower_method(
@@ -26,7 +27,7 @@ pub(crate) fn lower_method(
     // in topological order, each lowered under its reaching path condition, with
     // phi (`ite`) nodes reconciling variables at joins. The heap is *not* phi'd —
     // it threads linearly through the walk, off-path contributions gated to 0
-    // permission (see `gate_perm_by_pc`).
+    // permission (see `Sink::gate_perm`).
     let cfg = cfg::build_cfg(body).map_err(|_| {
         TranslationError::Unsupported("method control flow (loop or undefined label)")
     })?;
@@ -224,208 +225,6 @@ fn collect_var_types(
     }
 }
 
-/// `!v`, constant-folded over `true`/`false`.
-fn not_val(sink: &mut Sink, v: Val) -> Val {
-    if v == TRUE {
-        FALSE
-    } else if v == FALSE {
-        TRUE
-    } else {
-        sink.emit_pure(Type::Bool, PureInst::Ternary(v, FALSE, TRUE))
-    }
-}
-
-/// `a && b` as `a ? b : false`, constant-folded.
-fn and_val(sink: &mut Sink, a: Val, b: Val) -> Val {
-    if a == TRUE {
-        b
-    } else if b == TRUE {
-        a
-    } else if a == FALSE || b == FALSE {
-        FALSE
-    } else {
-        sink.emit_pure(Type::Bool, PureInst::Ternary(a, b, FALSE))
-    }
-}
-
-/// `a || b` as `a ? true : b`, constant-folded.
-fn or_val(sink: &mut Sink, a: Val, b: Val) -> Val {
-    if a == FALSE {
-        b
-    } else if b == FALSE {
-        a
-    } else if a == TRUE || b == TRUE {
-        TRUE
-    } else {
-        sink.emit_pure(Type::Bool, PureInst::Ternary(a, TRUE, b))
-    }
-}
-
-/// Materialize a path condition into a single boolean `Val` (conjunction of its
-/// literals; `true` for the empty pc).
-fn reach_val_of(sink: &mut Sink, pc: &PathConds) -> Val {
-    let mut acc = TRUE;
-    for (v, pol) in &pc.conds {
-        let lit = match pol {
-            Polarity::Positive => v.clone(),
-            Polarity::Negative => not_val(sink, v.clone()),
-        };
-        acc = and_val(sink, acc, lit);
-    }
-    acc
-}
-
-/// The reaching condition of a block, as a `(pc, reach_val)` pair, from its
-/// incoming `(pred, edge_val, edge_pc)` edges. The reach is the `OR` of the edge
-/// path conditions (cubes); [`merge_cubes`] minimizes them by adjacency
-/// (`P∧x ∨ P∧!x ⇒ P`). If they collapse to one cube it becomes the conjunctive
-/// pc (a diamond → its prefix; a full `n`-way split → `<>`); otherwise the
-/// residual cubes are OR'd into a single materialized reach literal. Always
-/// exactly the block's reach condition, hence sound.
-fn block_reach(sink: &mut Sink, edges: &[(BlockId, Val, PathConds)]) -> (PathConds, Val) {
-    if edges.is_empty() {
-        // Unreachable (filtered out before lowering); keep it fully gated.
-        return (
-            PathConds {
-                conds: vec![(FALSE, Polarity::Positive)],
-            },
-            FALSE,
-        );
-    }
-    if let [(_, ev, epc)] = edges {
-        return (epc.clone(), ev.clone());
-    }
-
-    let mut cubes: Vec<PathConds> = Vec::new();
-    for (_, _, epc) in edges {
-        if !cubes.contains(epc) {
-            cubes.push(epc.clone());
-        }
-    }
-    merge_cubes(&mut cubes);
-
-    if let [only] = cubes.as_slice() {
-        let pc = only.clone();
-        let rv = reach_val_of(sink, &pc);
-        return (pc, rv);
-    }
-    let mut rv = FALSE;
-    for cube in &cubes {
-        let cv = reach_val_of(sink, cube);
-        rv = or_val(sink, rv, cv);
-    }
-    (
-        PathConds {
-            conds: vec![(rv.clone(), Polarity::Positive)],
-        },
-        rv,
-    )
-}
-
-/// Boolean cube minimization: while two cubes are *adjacent* (identical literals
-/// except one variable at opposite polarity), replace the pair with the shared
-/// sub-cube. Value-preserving (`P∧x ∨ P∧!x = P`), so the disjunction is unchanged
-/// — it just shrinks. Only equal-length cubes merge, so the innermost differing
-/// literal collapses first and cascades outward, giving the LIFO/innermost-first
-/// reduction a structured nest (or a goto split re-covering a subcube) expects.
-fn merge_cubes(cubes: &mut Vec<PathConds>) {
-    loop {
-        let mut found = None;
-        'search: for i in 0..cubes.len() {
-            for j in (i + 1)..cubes.len() {
-                if let Some(m) = merge_adjacent(&cubes[i], &cubes[j]) {
-                    found = Some((i, j, m));
-                    break 'search;
-                }
-            }
-        }
-        let Some((i, j, m)) = found else { break };
-        cubes.remove(j); // j > i, so remove it first to keep index `i` valid
-        cubes.remove(i);
-        if !cubes.contains(&m) {
-            cubes.push(m);
-        }
-    }
-}
-
-/// Two cubes merge iff they share every literal except exactly one variable that
-/// appears with opposite polarity; the result drops that variable.
-fn merge_adjacent(a: &PathConds, b: &PathConds) -> Option<PathConds> {
-    if a.conds.len() != b.conds.len() {
-        return None;
-    }
-    let a_only: Vec<(Val, Polarity)> = a
-        .conds
-        .iter()
-        .filter(|l| !b.conds.contains(l))
-        .cloned()
-        .collect();
-    let b_only: Vec<(Val, Polarity)> = b
-        .conds
-        .iter()
-        .filter(|l| !a.conds.contains(l))
-        .cloned()
-        .collect();
-    if a_only.len() != 1 || b_only.len() != 1 {
-        return None;
-    }
-    let (va, pa) = &a_only[0];
-    let (vb, pb) = &b_only[0];
-    if va != vb || pa == pb {
-        return None;
-    }
-    let conds = a
-        .conds
-        .iter()
-        .filter(|(v, p)| !(v == va && p == pa))
-        .cloned()
-        .collect();
-    Some(PathConds { conds })
-}
-
-/// Build a block's entry environment by phi-merging its predecessors' exit
-/// environments. A single predecessor inherits directly; multiple predecessors
-/// reconcile each variable with a nested `ite` over the edge conditions (the
-/// last arm unguarded, since the edges are exhaustive). Variables that agree
-/// across all predecessors pass through unchanged.
-fn build_entry_env(
-    sink: &mut Sink,
-    edges: &[(BlockId, Val)],
-    exit_env: &HashMap<BlockId, HashMap<Spur, Val>>,
-    var_types: &HashMap<Spur, Type>,
-) -> HashMap<Spur, Val> {
-    if let [(p, _)] = edges {
-        return exit_env.get(p).cloned().unwrap_or_default();
-    }
-    let mut names: HashSet<Spur> = HashSet::new();
-    for (p, _) in edges {
-        if let Some(e) = exit_env.get(p) {
-            names.extend(e.keys().copied());
-        }
-    }
-    let mut out: HashMap<Spur, Val> = HashMap::new();
-    for name in names {
-        let entries: Vec<(Val, Val)> = edges
-            .iter()
-            .filter_map(|(p, ev)| exit_env.get(p)?.get(&name).map(|v| (ev.clone(), v.clone())))
-            .collect();
-        let Some((_, first)) = entries.first() else {
-            continue;
-        };
-        if entries.iter().all(|(_, v)| v == first) {
-            out.insert(name, first.clone());
-            continue;
-        }
-        let ty = var_types.get(&name).cloned().unwrap_or(Type::Int);
-        let mut acc = entries.last().unwrap().1.clone();
-        for (ev, v) in entries[..entries.len() - 1].iter().rev() {
-            acc = sink.emit_pure(ty.clone(), PureInst::Ternary(ev.clone(), v.clone(), acc));
-        }
-        out.insert(name, acc);
-    }
-    out
-}
-
 fn lower_stmt(
     b: &Builder<'_>,
     env: &mut HashMap<Spur, Val>,
@@ -547,7 +346,7 @@ fn lower_stmt(
                             ty.clone(),
                             PureInst::Deref(current_heap, addr.clone()),
                         );
-                        resource::gate_value_by_pc(sink, v, old, ty)
+                        sink.gate_value(v, old, ty)
                     };
                     Ok(sink.emit_heap_guarded(HeapInst::Assign(
                         current_heap,
@@ -589,7 +388,7 @@ fn lower_stmt(
                 labeled: &*labeled,
             };
             if let Some(v) =
-                resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
+                spatial::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
                 sink.emit_assert(v);
             }
@@ -601,7 +400,7 @@ fn lower_stmt(
                 labeled: &*labeled,
             };
             if let Some(v) =
-                resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
+                spatial::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
                 sink.emit_refute(v);
             }
@@ -613,7 +412,7 @@ fn lower_stmt(
                 labeled: &*labeled,
             };
             if let Some(v) =
-                resource::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
+                spatial::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
                 sink.emit_assume(v);
             }
@@ -636,7 +435,7 @@ fn lower_stmt(
                 baseline,
                 labeled: &*labeled,
             };
-            let (h_out, bv) = resource::lower_spatial(
+            let (h_out, bv) = spatial::lower_spatial(
                 b,
                 env,
                 sink,
@@ -663,7 +462,7 @@ fn lower_stmt(
                 baseline,
                 labeled: &*labeled,
             };
-            let (h_out, bv) = resource::lower_spatial(
+            let (h_out, bv) = spatial::lower_spatial(
                 b,
                 env,
                 sink,
@@ -701,7 +500,7 @@ fn lower_new(
             let mut heap = current_heap;
             for f in fields {
                 let (loc, perm) = resource::field_acc(b, sink, v.clone(), f.0, vmir::write())?;
-                let perm = resource::gate_perm_by_pc(sink, perm);
+                let perm = sink.gate_perm(perm);
                 heap = sink.emit_heap(HeapInst::Combine {
                     base: heap,
                     sign: vmir::Sign::Add,
@@ -731,7 +530,7 @@ fn lower_fold_unfold(
     let old = pure_exp::OldHeaps { baseline, labeled };
     let hctx = pure_exp::HeapCtx::same_with_old(current_heap, &old);
     let (call, perm) = pure_exp::lower_pred_call(b, env, sink, hctx, pwp)?;
-    let perm = resource::gate_perm_by_pc(sink, perm);
+    let perm = sink.gate_perm(perm);
     let inst = if is_fold {
         HeapInst::Fold {
             base: current_heap,
@@ -833,7 +632,7 @@ fn emit_resource_combine(
     // Gate the permission by the current branch path condition so a contract
     // inhaled/exhaled inside an `if` arm contributes nothing on the other path
     // (the empty top-level pc leaves `write` unchanged).
-    let perm = resource::gate_perm_by_pc(sink, vmir::write());
+    let perm = sink.gate_perm(vmir::write());
     sink.emit_resource_combine(
         base,
         sign,
