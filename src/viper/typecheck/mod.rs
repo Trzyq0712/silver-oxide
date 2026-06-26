@@ -1390,10 +1390,35 @@ fn typecheck_field(field: &viper::Field) -> typed::Declaration {
     }))
 }
 
+/// Lower a parsed type, resolving a bare `Domain(p, [])` whose head is one of
+/// `type_params` to `Generic(p)` (the parser emits every named type as a
+/// `Domain`, so a type-parameter use arrives erased). Used for ADT variant field
+/// types, which may mention the owning ADT's parameters.
+fn type_with_generics(ty: &viper::Type, type_params: &[lasso::Spur]) -> Type {
+    use crate::viper::parsed::ast::Type as P;
+    match ty {
+        P::Bool => Type::Bool,
+        P::Int => Type::Int,
+        P::Real => Type::Real,
+        P::Ref => Type::Ref,
+        P::Generic(id) => Type::Generic(Ident(id.id())),
+        P::Domain(id, args) if args.is_empty() && type_params.contains(&id.id()) => {
+            Type::Generic(Ident(id.id()))
+        }
+        P::Domain(id, args) => Type::Domain(
+            Ident(id.id()),
+            args.iter()
+                .map(|a| type_with_generics(a, type_params))
+                .collect(),
+        ),
+    }
+}
+
 /// Convert a parsed ADT into its typed declaration. Variant field types are
-/// lowered directly (parsed types already carry `Generic`); anonymous fields are
+/// lowered with the ADT's type parameters in scope; anonymous fields are
 /// rejected — the read-only interner cannot mint a destructor name for them.
 fn typecheck_adt(adt: &viper::Adt) -> Result<typed::Declaration, TypeError> {
+    let type_params: Vec<lasso::Spur> = adt.params.iter().map(|p| p.0.id()).collect();
     let mut variants = Vec::with_capacity(adt.variants.len());
     for v in &adt.variants {
         let mut params = Vec::with_capacity(v.fields.len());
@@ -1403,7 +1428,7 @@ fn typecheck_adt(adt: &viper::Adt) -> Result<typed::Declaration, TypeError> {
             })?;
             params.push(TypedIdent {
                 name: Ident(idn.0.id()),
-                ty: Type::from(field.ty()),
+                ty: type_with_generics(field.ty(), &type_params),
             });
         }
         variants.push(typed::AdtVariant {

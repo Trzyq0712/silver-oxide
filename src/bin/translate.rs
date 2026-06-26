@@ -39,8 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let typed = typecheck_program(&mut program, interner, &globals)
         .map_err(|e| format!("typecheck failed: {e:?}"))?;
 
-    let vmir =
-        translate::translate(&typed, &globals).map_err(|e| format!("translation failed: {e:?}"))?;
+    let vmir = translate::translate(&typed).map_err(|e| format!("translation failed: {e:?}"))?;
 
     println!("{}", vmir);
     if derived {

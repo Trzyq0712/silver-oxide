@@ -4,7 +4,7 @@ use lasso::{Rodeo, Spur};
 use std::collections::HashMap;
 use typed_index_collections::TiVec;
 
-use crate::viper::{GlobalSignature, Globals, Interner, typed};
+use crate::viper::{Interner, typed};
 use crate::vmir;
 
 pub mod errors;
@@ -23,11 +23,8 @@ pub use errors::TranslationError;
 /// Two phases: `declare` reserves a slot and records metadata for every member
 /// (so any member can reference any other), then `define` fills each slot with
 /// its body.
-pub fn translate(
-    program: &typed::Program,
-    globals: &Globals,
-) -> Result<vmir::Program, Vec<TranslationError>> {
-    let mut builder = Builder::new(&program.interner, globals);
+pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<TranslationError>> {
+    let mut builder = Builder::new(&program.interner);
     builder.declare(&program.decls);
     let errors = builder.define(&program.decls);
     if !errors.is_empty() {
@@ -57,7 +54,6 @@ pub(crate) struct MethodContracts {
 /// Mid-translation state.
 pub(crate) struct Builder<'a> {
     pub interner: &'a Interner,
-    pub globals: &'a Globals,
     /// Cheap string repr for member/constructor names. Keys are independent of
     /// `MemberId` — names are mapped to ids via `decl_names`.
     vmir_interner: Rodeo,
@@ -70,6 +66,8 @@ pub(crate) struct Builder<'a> {
     decls: Vec<Option<vmir::Declaration>>,
     /// Silver `Spur` names to VMIR `MemberId`s.
     pub name_map: HashMap<Spur, vmir::MemberId>,
+    /// A field's `Spur` to its lowered value type (for `field@addr`'s `Addr<T>`).
+    pub field_types: HashMap<Spur, vmir::Type>,
     /// A method's `Spur` to its contract resource ids.
     pub contracts: HashMap<Spur, MethodContracts>,
     /// ADT constructor/destructor metadata.
@@ -77,15 +75,15 @@ pub(crate) struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(interner: &'a Interner, globals: &'a Globals) -> Self {
+    fn new(interner: &'a Interner) -> Self {
         Self {
             interner,
-            globals,
             vmir_interner: Rodeo::new(),
             decl_names: Vec::new(),
             groups: Rodeo::new(),
             decls: Vec::new(),
             name_map: HashMap::new(),
+            field_types: HashMap::new(),
             contracts: HashMap::new(),
             adt: AdtInfo::default(),
         }
@@ -119,16 +117,15 @@ impl<'a> Builder<'a> {
             match decl {
                 typed::Declaration::Predicate(p) => self.declare_predicate_accessors(p),
                 typed::Declaration::Field(f) => self.declare_field_accessor(f),
-                // ADTs/Domains are still declared from `globals` below (not yet
-                // consumed from the typed decls); functions/methods come later.
+                // ADTs/Domains/functions are handled by `declare_adts_and_functions`;
+                // methods by `declare_method`.
                 typed::Declaration::Adt(_)
                 | typed::Declaration::Domain(_)
                 | typed::Declaration::Function(_)
                 | typed::Declaration::Method(_) => {}
             }
         }
-        // ADTs/functions live in `globals`, not the typed decls.
-        self.declare_adts_and_functions();
+        self.declare_adts_and_functions(decls);
         for decl in decls {
             if let typed::Declaration::Method(m) = decl {
                 self.declare_method(m);
@@ -184,20 +181,16 @@ impl<'a> Builder<'a> {
         *slot = Some(decl);
     }
 
-    /// Declare a stub `Adt` per ADT, a decl per user function, and record
-    /// constructor/destructor metadata. ADTs are declared first so a constructor
-    /// can register against its ADT's id.
-    fn declare_adts_and_functions(&mut self) {
-        let globals = self.globals;
-        let interner = self.interner;
-        // Deterministic order: by Silver declaration order (global MemberId).
-        let mut entries: Vec<_> = globals.symbol_table.iter().map(|(s, m)| (*s, *m)).collect();
-        entries.sort_by_key(|(_, m)| usize::from(*m));
-
-        // Pass 1: ADTs (the verifier mints its own ids and reductions).
-        for (spur, gmid) in &entries {
-            if let GlobalSignature::Adt(_) = &globals.signatures[*gmid] {
-                let name = interner.resolve(spur).to_string();
+    /// Declare a stub `Adt` per ADT, a decl per user/domain function, and record
+    /// constructor/destructor metadata — all from the typed declarations. ADT
+    /// stubs are reserved first so a variant field type or constructor can
+    /// reference any ADT by id.
+    fn declare_adts_and_functions(&mut self, decls: &[typed::Declaration]) {
+        // Pass 1: reserve a stub `Adt` per ADT (the verifier mints its own ids
+        // and reductions from the variant shapes filled in pass 3).
+        for decl in decls {
+            if let typed::Declaration::Adt(adt) = decl {
+                let name = self.interner.resolve(&adt.name.0).to_string();
                 let adt_id = self.fresh_decl(&name);
                 self.set_decl(
                     adt_id,
@@ -205,79 +198,71 @@ impl<'a> Builder<'a> {
                         variants: Vec::new(),
                     }),
                 );
-                self.name_map.insert(*spur, adt_id);
+                self.name_map.insert(adt.name.0, adt_id);
             }
         }
 
-        // Pass 2a: user functions.
-        for (spur, gmid) in &entries {
-            if let GlobalSignature::Function(sig) = &globals.signatures[*gmid] {
-                let name = interner.resolve(spur).to_string();
-                let id = self.fresh_decl(&name);
-                let params = sig.params.iter().map(|t| self.lower_type(t)).collect();
-                let ret = self.lower_type(&sig.ret);
-                self.set_decl(
-                    id,
-                    vmir::Declaration::Function(vmir::Function {
-                        params,
-                        ret,
-                        body: None,
-                    }),
-                );
-                self.name_map.insert(*spur, id);
-            }
+        // Pass 2: user functions (top-level + domain functions).
+        for func in decls.iter().flat_map(decl_functions) {
+            let name = self.interner.resolve(&func.name.0).to_string();
+            let id = self.fresh_decl(&name);
+            let params = func.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+            let ret = self.lower_type(&func.ret);
+            self.set_decl(
+                id,
+                vmir::Declaration::Function(vmir::Function {
+                    params,
+                    ret,
+                    body: None,
+                }),
+            );
+            self.name_map.insert(func.name.0, id);
         }
 
-        // Pass 2b: ADT constructors — no decl (they lower to a semantic `AdtCons`
-        // node). Record the `(adt, tag)` mapping and fill the ADT's variant shape.
-        // A constructor name is not a declaration, so it is interned for display
-        // only (its `Spur` is unrelated to any `MemberId`).
-        for (spur, gmid) in &entries {
-            if let GlobalSignature::AdtConstructor(sig) = &globals.signatures[*gmid] {
-                self.adt.ctor_tag.insert(*spur, (sig.adt, sig.tag));
-                let adt_id = self.name_map[&sig.adt];
-                let ctor_name = self.vmir_interner.get_or_intern(interner.resolve(spur));
-                // Field types may mention the ADT's type parameters, so lower
-                // them against the owning ADT's parameter list (→ `Generic(i)`).
-                let adt_params = globals
-                    .resolve(sig.adt)
-                    .and_then(|s| s.as_adt())
-                    .map(|a| a.params.clone())
-                    .unwrap_or_default();
-                let field_types: Vec<vmir::Type> = sig
-                    .params
-                    .iter()
-                    .map(|t| lower_type(&self.name_map, &adt_params, t))
-                    .collect();
-                if let Some(vmir::Declaration::Adt(adt)) = self.decls[usize::from(adt_id)].as_mut()
-                {
-                    if adt.variants.len() <= sig.tag {
-                        adt.variants.resize(
-                            sig.tag + 1,
-                            vmir::AdtVariant {
-                                name: None,
-                                field_types: Vec::new(),
-                            },
-                        );
-                    }
-                    adt.variants[sig.tag] = vmir::AdtVariant {
-                        name: Some(ctor_name),
-                        field_types,
-                    };
+        // Pass 3: fill each ADT's variant shape and record constructor/destructor
+        // metadata. Needs every ADT id from pass 1 (field types reference them).
+        for decl in decls {
+            if let typed::Declaration::Adt(adt) = decl {
+                self.declare_adt_variants(adt);
+            }
+        }
+    }
+
+    /// Fill `adt`'s variant shapes and record its constructor (`ctor_tag`) and
+    /// destructor (`dtor_sem`) metadata. A constructor/destructor is not a
+    /// declaration: the constructor name is interned for display only, and a
+    /// destructor maps a field name to its `(adt, variant, field)` projection.
+    fn declare_adt_variants(&mut self, adt: &typed::Adt) {
+        let adt_id = self.name_map[&adt.name.0];
+        // Variant field types may mention the ADT's type parameters (→ `Generic`).
+        let type_params: Vec<Spur> = adt.type_params.iter().map(|i| i.0).collect();
+        for (tag, v) in adt.variants.iter().enumerate() {
+            self.adt.ctor_tag.insert(v.name.0, (adt.name.0, tag));
+            let ctor_str = self.interner.resolve(&v.name.0).to_string();
+            let ctor_name = self.vmir_interner.get_or_intern(&ctor_str);
+            let field_types: Vec<vmir::Type> = v
+                .params
+                .iter()
+                .map(|p| lower_type(&self.name_map, &type_params, &p.ty))
+                .collect();
+            for (field, p) in v.params.iter().enumerate() {
+                self.adt.dtor_sem.insert(p.name.0, (adt_id, tag, field));
+            }
+            if let Some(vmir::Declaration::Adt(a)) = self.decls[usize::from(adt_id)].as_mut() {
+                if a.variants.len() <= tag {
+                    a.variants.resize(
+                        tag + 1,
+                        vmir::AdtVariant {
+                            name: None,
+                            field_types: Vec::new(),
+                        },
+                    );
                 }
+                a.variants[tag] = vmir::AdtVariant {
+                    name: Some(ctor_name),
+                    field_types,
+                };
             }
-        }
-
-        // Pass 3: destructor semantics `(adt, variant, field)` for `AdtProj` use
-        // sites (no accessor decls — the verifier mints projection ids).
-        let mut dtors: Vec<_> = globals.dtor_by_name.iter().collect();
-        dtors.sort_by_key(|(s, _)| interner.resolve(s).to_string());
-        for (dtor_spur, info) in dtors {
-            let adt_id = self.name_map[&info.adt];
-            let variant = self.adt.ctor_tag[&info.ctor].1;
-            self.adt
-                .dtor_sem
-                .insert(*dtor_spur, (adt_id, variant, info.index));
         }
     }
 
@@ -299,6 +284,7 @@ impl<'a> Builder<'a> {
         let field_id = self.fresh_decl(&field_name);
         let group = self.group_tag(f.0.name.0);
         let value = self.lower_type(&f.0.ty);
+        self.field_types.insert(f.0.name.0, value.clone());
         let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
         let ret = vmir::Type::addr(group, value, bound);
         self.set_decl(
@@ -479,6 +465,16 @@ impl<'a> Builder<'a> {
             interner: self.vmir_interner,
             groups: self.groups,
         }
+    }
+}
+
+/// The functions a declaration contributes to the global function namespace: a
+/// top-level function itself, or each of a domain's functions.
+fn decl_functions(decl: &typed::Declaration) -> &[typed::Function] {
+    match decl {
+        typed::Declaration::Function(f) => std::slice::from_ref(f),
+        typed::Declaration::Domain(d) => &d.functions,
+        _ => &[],
     }
 }
 

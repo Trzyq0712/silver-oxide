@@ -67,15 +67,13 @@ pub(crate) fn field_addr(
     base: Val,
     fname: Spur,
 ) -> Result<Val, TranslationError> {
-    let field_ty = b
-        .globals
-        .resolve(fname)
-        .and_then(|s| s.as_field().cloned())
-        .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
     // The field's address type: group = the field's interned tag, value = the
-    // field type, bound = full permission `1/1`.
+    // field's (already lowered) value type, bound = full permission `1/1`.
     let group = b.group_tag(fname);
-    let value = b.lower_type(&field_ty);
+    let value =
+        b.field_types.get(&fname).cloned().ok_or_else(|| {
+            TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string())
+        })?;
     let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
     let ret_ty = Type::addr(group, value, bound);
     // The field's address is an ordinary call to its address function (declared by

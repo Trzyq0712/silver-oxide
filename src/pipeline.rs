@@ -111,8 +111,7 @@ pub fn run_file_timed(
 
     let vmir = phase!(
         "translate",
-        translate::translate(&typed, &globals)
-            .map_err(|e| PipelineError::Translate(format!("{e:?}")))?
+        translate::translate(&typed).map_err(|e| PipelineError::Translate(format!("{e:?}")))?
     );
 
     let analyzed = phase!(
