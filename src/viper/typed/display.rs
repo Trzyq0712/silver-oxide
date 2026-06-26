@@ -434,7 +434,9 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
         PureExpKind::Unfolding(p, e) => {
             write!(f, "unfolding {} in {}", show.with(p), show.with(e))
         }
-        PureExpKind::FunctionCall(call) | PureExpKind::AdtConstructor(call) => {
+        PureExpKind::FunctionCall(call)
+        | PureExpKind::DomainFunctionCall(_, call)
+        | PureExpKind::AdtConstructor(_, call) => {
             write!(f, "{}", show.with(call))
         }
         PureExpKind::Field(e, field) => write!(f, "{}.{}", show.with(e), show.name(*field)),
@@ -446,8 +448,10 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
             show.with(exp)
         ),
         PureExpKind::Ascribe(e, ty) => write!(f, "{}: {}", show.with(e), show.with(ty)),
-        PureExpKind::AdtDestructor(e, field) => write!(f, "{}.{}", show.with(e), show.name(*field)),
-        PureExpKind::AdtDiscriminator(e, variant) => {
+        PureExpKind::AdtDestructor(_, e, field) => {
+            write!(f, "{}.{}", show.with(e), show.name(*field))
+        }
+        PureExpKind::AdtDiscriminator(_, e, variant) => {
             write!(f, "{}.is{}", show.with(e), show.name(*variant))
         }
         PureExpKind::Ext(ext) => ext.fmt_ext(f, show.interner),

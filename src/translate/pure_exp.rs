@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use lasso::Spur;
 
 use crate::translate::sink::{PcKind, Sink};
-use crate::translate::{Builder, TranslationError, lower_type};
+use crate::translate::{Builder, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{
     self, FALSE, HeapInst, HeapVal, Literal, Polarity, PureInst, ResourceCall, TRUE, Val,
@@ -142,10 +142,12 @@ pub(crate) fn lower<Ext: PureExt>(
             };
             lower(b, env, sink, inner, body)
         }
-        P::FunctionCall(call) => {
-            // A (heap-independent) user function. Heap-dependent functions are a
-            // later (purification) concern; pass an empty heap. Constructors arrive
-            // as the dedicated `AdtConstructor` node, not here.
+        // A (heap-independent) top-level user function; domain functions arrive
+        // here too for now (they are not yet distinguished). Heap-dependent
+        // functions are a later (purification) concern; pass an empty heap.
+        // TODO: thread a `DomainFunctionCall`'s `inst.type_args` once VMIR
+        // function calls carry a monomorphization key.
+        P::FunctionCall(call) | P::DomainFunctionCall(_, call) => {
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(lower(b, env, sink, hctx, a)?);
@@ -164,9 +166,9 @@ pub(crate) fn lower<Ext: PureExt>(
                 ),
             ))
         }
-        // A dedicated constructor node (typecheck-classified) lowers to the
-        // semantic `AdtCons`, like the constructor branch of `FunctionCall`.
-        P::AdtConstructor(call) => {
+        // A constructor lowers to the semantic `AdtCons`; its type arguments are
+        // the instantiation carried by the node, the variant tag from `ctor_tag`.
+        P::AdtConstructor(inst, call) => {
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(lower(b, env, sink, hctx, a)?);
@@ -175,7 +177,7 @@ pub(crate) fn lower<Ext: PureExt>(
                 TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
-            let type_args = adt_type_args(&b.name_map, &exp.ty);
+            let type_args = inst.type_args.iter().map(|t| b.lower_type(t)).collect();
             Ok(sink.emit_pure(
                 ty,
                 PureInst::AdtCons {
@@ -188,14 +190,14 @@ pub(crate) fn lower<Ext: PureExt>(
         }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
-        P::AdtDestructor(base, field) => {
+        P::AdtDestructor(inst, base, field) => {
             // `e.f` ⇒ `AdtProj{adt, variant, field}(e)`. The verifier's
             // projection reduction folds it when `e` is a known constructor.
             let base_v = lower(b, env, sink, hctx, base)?;
             let &(adt, variant, field) = b.adt.dtor_sem.get(&field.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
             })?;
-            let type_args = adt_type_args(&b.name_map, &base.ty);
+            let type_args = inst.type_args.iter().map(|t| b.lower_type(t)).collect();
             Ok(sink.emit_pure(
                 ty,
                 PureInst::AdtProj {
@@ -207,7 +209,7 @@ pub(crate) fn lower<Ext: PureExt>(
                 },
             ))
         }
-        P::AdtDiscriminator(base, variant) => {
+        P::AdtDiscriminator(inst, base, variant) => {
             // `e.is<Ctor>` ⇒ `AdtTag{adt}(e) == tag_index`. The verifier's tag
             // reduction folds this to a literal when `e` is a known constructor.
             let base_v = lower(b, env, sink, hctx, base)?;
@@ -215,7 +217,7 @@ pub(crate) fn lower<Ext: PureExt>(
                 TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
-            let type_args = adt_type_args(&b.name_map, &base.ty);
+            let type_args = inst.type_args.iter().map(|t| b.lower_type(t)).collect();
             let tag_call = sink.emit_pure(
                 vmir::Type::Int,
                 PureInst::AdtTag {
@@ -231,19 +233,6 @@ pub(crate) fn lower<Ext: PureExt>(
             ))
         }
         P::Ext(ext) => Ext::lower_ext(b, env, sink, hctx, ty, ext),
-    }
-}
-
-/// The type arguments of an ADT-typed expression (`Domain(_, args)`), lowered;
-/// empty for a non-generic ADT. The monomorphization key carried on the
-/// semantic ADT nodes.
-fn adt_type_args(
-    names: &std::collections::HashMap<Spur, vmir::MemberId>,
-    ty: &typed::Type,
-) -> Vec<vmir::Type> {
-    match ty {
-        typed::Type::Domain(_, args) => args.iter().map(|a| lower_type(names, &[], a)).collect(),
-        _ => Vec::new(),
     }
 }
 
