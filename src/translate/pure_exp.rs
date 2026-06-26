@@ -151,7 +151,7 @@ pub(crate) fn lower<Ext: PureExt>(
             }
             // An ADT constructor lowers to the semantic `AdtCons` node, not a
             // `FunctionCall` to the constructor's synthetic declaration.
-            if let Some(&(adt_spur, variant)) = b.ctor_tag.get(&call.name.0) {
+            if let Some(&(adt_spur, variant)) = b.adt.ctor_tag.get(&call.name.0) {
                 let adt = b.name_map[&adt_spur];
                 let type_args = adt_type_args(&b.name_map, &exp.ty);
                 return Ok(sink.emit_pure(
@@ -184,7 +184,7 @@ pub(crate) fn lower<Ext: PureExt>(
             // `e.f` ⇒ `AdtProj{adt, variant, field}(e)`. The verifier's
             // projection reduction folds it when `e` is a known constructor.
             let base_v = lower(b, env, sink, hctx, base)?;
-            let &(adt, variant, field) = b.dtor_sem.get(&field.0).ok_or_else(|| {
+            let &(adt, variant, field) = b.adt.dtor_sem.get(&field.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
             })?;
             let type_args = adt_type_args(&b.name_map, &base.ty);
@@ -203,7 +203,7 @@ pub(crate) fn lower<Ext: PureExt>(
             // `e.is<Ctor>` ⇒ `AdtTag{adt}(e) == tag_index`. The verifier's tag
             // reduction folds this to a literal when `e` is a known constructor.
             let base_v = lower(b, env, sink, hctx, base)?;
-            let &(adt_spur, tag) = b.ctor_tag.get(&variant.0).ok_or_else(|| {
+            let &(adt_spur, tag) = b.adt.ctor_tag.get(&variant.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
