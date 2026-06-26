@@ -143,26 +143,12 @@ pub(crate) fn lower<Ext: PureExt>(
             lower(b, env, sink, inner, body)
         }
         P::FunctionCall(call) => {
-            // Constructors and (heap-independent) user functions. Heap-dependent
-            // functions are a later (purification) concern; pass an empty heap.
+            // A (heap-independent) user function. Heap-dependent functions are a
+            // later (purification) concern; pass an empty heap. Constructors arrive
+            // as the dedicated `AdtConstructor` node, not here.
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(lower(b, env, sink, hctx, a)?);
-            }
-            // An ADT constructor lowers to the semantic `AdtCons` node, not a
-            // `FunctionCall` to the constructor's synthetic declaration.
-            if let Some(&(adt_spur, variant)) = b.adt.ctor_tag.get(&call.name.0) {
-                let adt = b.name_map[&adt_spur];
-                let type_args = adt_type_args(&b.name_map, &exp.ty);
-                return Ok(sink.emit_pure(
-                    ty,
-                    PureInst::AdtCons {
-                        adt,
-                        type_args,
-                        variant,
-                        args,
-                    },
-                ));
             }
             let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())

@@ -982,15 +982,19 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
             ExpCallKind::Predicate => Err(TypeError::PredicateInPureContext(
                 self.env.interner.resolve(&call_name).to_string(),
             )),
-            ExpCallKind::Function | ExpCallKind::AdtConstructor => {
+            kind @ (ExpCallKind::Function | ExpCallKind::AdtConstructor) => {
                 let mut args = Vec::with_capacity(call.args.len());
                 for arg in call.args.iter() {
                     args.push(self.lower_pure::<Ext>(arg)?);
                 }
-                Ok(PureExpKind::FunctionCall(Call {
+                let call = Call {
                     name: Ident(call_name),
                     args,
-                }))
+                };
+                Ok(match kind {
+                    ExpCallKind::AdtConstructor => PureExpKind::AdtConstructor(call),
+                    _ => PureExpKind::FunctionCall(call),
+                })
             }
             ExpCallKind::Macro => Err(TypeError::Other(
                 "macro in expression (should have been inlined)".to_string(),
