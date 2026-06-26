@@ -19,51 +19,17 @@ mod types;
 pub use errors::TranslationError;
 
 /// Build a `vmir::Program` from a typed `typed::Program`.
+///
+/// Two phases: `declare` reserves a slot and records metadata for every member
+/// (so any member can reference any other), then `define` fills each slot with
+/// its body.
 pub fn translate(
     program: &typed::Program,
     globals: &Globals,
 ) -> Result<vmir::Program, Vec<TranslationError>> {
     let mut builder = Builder::new(&program.interner, globals);
-    let mut errors = Vec::new();
-
-    // Phase A: predicate + field address accessors.
-    for decl in &program.decls {
-        match decl {
-            typed::Declaration::Predicate(p) => builder.declare_predicate_accessors(p),
-            typed::Declaration::Field(f) => builder.declare_field_accessor(f),
-            typed::Declaration::Function(_) | typed::Declaration::Method(_) => {}
-        }
-    }
-
-    // Phase A2: ADTs, constructors, and user functions (so calls resolve later).
-    builder.declare_adts_and_functions();
-
-    // Phase B1: Resource declarations (predicates + method contracts).
-    for decl in &program.decls {
-        match decl {
-            typed::Declaration::Predicate(p) => {
-                if let Err(e) = builder.emit_predicate(p) {
-                    errors.push(e);
-                }
-            }
-            typed::Declaration::Method(m) => {
-                if let Err(e) = builder.emit_method_contracts(m) {
-                    errors.push(e);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Phase B2: method bodies.
-    for decl in &program.decls {
-        if let typed::Declaration::Method(m) = decl
-            && let Err(e) = builder.emit_method_body(m)
-        {
-            errors.push(e);
-        }
-    }
-
+    builder.declare(&program.decls);
+    let errors = builder.define(&program.decls);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -120,6 +86,53 @@ impl<'a> Builder<'a> {
         self.decl_names.push(self.vmir_interner.get_or_intern(name));
         self.decls.push(None);
         id
+    }
+
+    /// Reserve a slot and record metadata for every member — predicates, fields,
+    /// ADTs (+ constructors/destructors), user functions, and methods (+ their
+    /// `#requires`/`#ensures` contracts). No bodies; ids are assigned so any
+    /// member can reference any other in `define`.
+    fn declare(&mut self, decls: &[typed::Declaration]) {
+        for decl in decls {
+            match decl {
+                typed::Declaration::Predicate(p) => self.declare_predicate_accessors(p),
+                typed::Declaration::Field(f) => self.declare_field_accessor(f),
+                typed::Declaration::Function(_) | typed::Declaration::Method(_) => {}
+            }
+        }
+        // ADTs/functions live in `globals`, not the typed decls.
+        self.declare_adts_and_functions();
+        for decl in decls {
+            if let typed::Declaration::Method(m) = decl {
+                self.declare_method(m);
+            }
+        }
+    }
+
+    /// Fill every reserved slot with its body, collecting per-member errors.
+    /// Contract resources are defined before method bodies: a method body inhales
+    /// /exhales its callees' contracts and inspects their `precond`
+    /// ([`Self::is_ctx_resource`]), which must already be set.
+    fn define(&mut self, decls: &[typed::Declaration]) -> Vec<TranslationError> {
+        let mut errors = Vec::new();
+        for decl in decls {
+            let r = match decl {
+                typed::Declaration::Predicate(p) => self.define_predicate(p),
+                typed::Declaration::Method(m) => self.define_method_contracts(m),
+                _ => Ok(()),
+            };
+            if let Err(e) = r {
+                errors.push(e);
+            }
+        }
+        for decl in decls {
+            if let typed::Declaration::Method(m) = decl
+                && let Err(e) = self.define_method_body(m)
+            {
+                errors.push(e);
+            }
+        }
+        errors
     }
 
     /// Whether `id` is a two-state resource (has a precondition resource, e.g.
@@ -281,7 +294,7 @@ impl<'a> Builder<'a> {
             .unwrap_or_else(|| panic!("group tag `{s}` not registered"))
     }
 
-    fn emit_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
+    fn define_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
         let pred_id = self.name_map[&p.name.0];
         let params: Vec<vmir::Type> = p.params.iter().map(|p| self.lower_type(&p.ty)).collect();
         // Self-framed: params occupy `Val::Temp(0..n)`, heaps accumulate from
@@ -314,17 +327,28 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn emit_method_contracts(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
+    /// Reserve slots for a method and its contract resources (filled by
+    /// [`Self::define_method_contracts`] / [`Self::define_method_body`]). A method
+    /// gets a slot only if it has a body.
+    fn declare_method(&mut self, m: &typed::Method) {
         let name = self.interner.resolve(&m.name.0).to_owned();
-        // A method gets a name slot only if it has a body (Phase B2 fills the decl).
         if m.body.is_some() {
             let method_id = self.fresh_decl(&name);
             self.name_map.insert(m.name.0, method_id);
         }
-
-        if let Some(requires) = &m.requires {
+        if m.requires.is_some() {
             let req_id = self.fresh_decl(&format!("{name}#requires"));
             self.method_requires.insert(m.name.0, req_id);
+        }
+        if m.ensures.is_some() {
+            let ens_id = self.fresh_decl(&format!("{name}#ensures"));
+            self.method_ensures.insert(m.name.0, ens_id);
+        }
+    }
+
+    fn define_method_contracts(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
+        if let Some(requires) = &m.requires {
+            let req_id = self.method_requires[&m.name.0];
             let params: Vec<vmir::Type> = m.params.iter().map(|p| self.lower_type(&p.ty)).collect();
             let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
             for (i, p) in m.params.iter().enumerate() {
@@ -350,8 +374,7 @@ impl<'a> Builder<'a> {
         }
 
         if let Some(ensures) = &m.ensures {
-            let ens_id = self.fresh_decl(&format!("{name}#ensures"));
-            self.method_ensures.insert(m.name.0, ens_id);
+            let ens_id = self.method_ensures[&m.name.0];
             let mut params: Vec<vmir::Type> =
                 m.params.iter().map(|p| self.lower_type(&p.ty)).collect();
             params.extend(m.rets.iter().map(|r| self.lower_type(&r.ty)));
@@ -404,7 +427,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn emit_method_body(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
+    fn define_method_body(&mut self, m: &typed::Method) -> Result<(), TranslationError> {
         let Some(body) = &m.body else { return Ok(()) };
         let method_id = *self
             .name_map
