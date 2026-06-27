@@ -55,7 +55,7 @@ impl SpatialMode {
 pub(crate) fn lower_spatial_never(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
-    exp: &typed::SpatialExp<!>,
+    exp: &typed::SpatialExp<typed::HeapExt>,
     val_base: usize,
     initial_heap: HeapVal,
     heap_base: usize,

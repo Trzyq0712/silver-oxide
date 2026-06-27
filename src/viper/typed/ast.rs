@@ -113,8 +113,10 @@ pub struct Call<Ext> {
     pub args: Vec<TypedPureExp<Ext>>,
 }
 
-/// The variants of a purely mathematical/logical expression.
-/// The `Ext` generic dictates which context-specific nodes are allowed.
+/// The **heap-free** core expression variants — exactly those legal in a domain
+/// axiom. Heap-dependent constructs (`e.f`, `unfolding`, calls to Silver
+/// `function`s, `old`/`perm`/`result`) are supplied per context through `Ext`
+/// (see [`HeapNode`]), so `PureExpKind<!>` is provably heap-free.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PureExpKind<Ext> {
     Ident(Ident),
@@ -126,28 +128,36 @@ pub enum PureExpKind<Ext> {
         then: TypedPureExp<Ext>,
         else_: TypedPureExp<Ext>,
     },
-    /// Evaluates `exp` under the temporary unfolding of the predicate.
-    Unfolding(PredicateWithPerm<Ext>, TypedPureExp<Ext>),
-    /// Heap field access: `e.f` where `f` is a Silver `field` declaration.
-    Field(TypedPureExp<Ext>, Ident),
     LetIn {
         binder: Ident,
         value: TypedPureExp<Ext>,
         exp: TypedPureExp<Ext>,
     },
     Ascribe(TypedPureExp<Ext>, Type),
-    /// Call to a top-level function
-    FunctionCall(Call<Ext>),
-    /// Call to a domain function
+    /// Call to a domain function (pure).
     DomainFunctionCall(DomainInstantiation, Call<Ext>),
-    /// Constructor call of an ADT variant
+    /// Constructor call of an ADT variant.
     AdtConstructor(DomainInstantiation, Call<Ext>),
     /// A projection from an ADT.
     AdtDestructor(DomainInstantiation, TypedPureExp<Ext>, Ident),
     /// A variant check on an ADT (e.g., `e.isCons(list)`).
     AdtDiscriminator(DomainInstantiation, TypedPureExp<Ext>, Ident),
-    /// The context-specific extension (e.g., `old`, `perm`, `result`).
+    /// The context-specific extension — heap nodes (`Ext::Heap`), `old`, `perm`,
+    /// `result`. Uninhabited (`!`) in a pure context, so none are constructible.
     Ext(Ext),
+}
+
+/// The heap-reading expression constructs, shared by every heap-bearing context
+/// (`Ext`): a field dereference, a Silver `function` call, and `unfolding`. A
+/// pure context omits these by construction (its `Ext` has no `Heap` variant).
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeapNode<Ext> {
+    /// Heap field access: `e.f` where `f` is a Silver `field` declaration.
+    Field(TypedPureExp<Ext>, Ident),
+    /// Call to a (heap-dependent) Silver `function`.
+    FunctionCall(Call<Ext>),
+    /// Evaluates the inner expression under a temporary unfolding of the predicate.
+    Unfolding(PredicateWithPerm<Ext>, TypedPureExp<Ext>),
 }
 
 /// A generic ADT/domain at a concrete instantiation — the monomorphization key.
@@ -198,22 +208,34 @@ pub struct PredicateWithPerm<PureExt> {
     pub perm: TypedPureExp<PureExt>,
 }
 
-/// Extensions allowed *only* in pure function postconditions.
+/// Heap access with **no** state extension: predicate bodies, function
+/// preconditions and bodies, method preconditions. (`old`/`perm`/`result` are
+/// not available here.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeapExt {
+    Heap(HeapNode<HeapExt>),
+}
+
+/// Extensions allowed in function postconditions: heap access + `result`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuncEnsuresExt {
+    Heap(HeapNode<FuncEnsuresExt>),
     Result,
     Old(TypedPureExp<FuncEnsuresExt>),
 }
 
-/// Extensions allowed *only* in method postconditions.
+/// Extensions allowed in method postconditions: heap access + `old`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MethodEnsuresExt {
+    Heap(HeapNode<MethodEnsuresExt>),
     Old(TypedPureExp<MethodEnsuresExt>),
 }
 
-/// Extensions allowed *only* in imperative method bodies.
+/// Extensions allowed in imperative method bodies: heap access + labelled `old`
+/// + `perm`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MethodBodyExt {
+    Heap(HeapNode<MethodBodyExt>),
     Old(Option<Spur>, TypedPureExp<MethodBodyExt>),
     Perm(ResourceExp<MethodBodyExt>),
 }
@@ -315,9 +337,9 @@ pub struct Function {
     pub name: Ident,
     pub params: Vec<TypedIdent>,
     pub ret: Type,
-    pub requires: Option<SpatialExp<!>>,
+    pub requires: Option<SpatialExp<HeapExt>>,
     pub ensures: Option<TypedPureExp<FuncEnsuresExt>>,
-    pub body: Option<TypedPureExp<!>>,
+    pub body: Option<TypedPureExp<HeapExt>>,
 }
 
 /// An imperative sub-routine that can mutate the heap.
@@ -326,7 +348,7 @@ pub struct Method {
     pub name: Ident,
     pub params: Vec<TypedIdent>,
     pub rets: Vec<TypedIdent>,
-    pub requires: Option<SpatialExp<!>>,
+    pub requires: Option<SpatialExp<HeapExt>>,
     pub ensures: Option<SpatialExp<MethodEnsuresExt>>,
     pub body: Option<StmtBlock>,
 }
@@ -336,5 +358,5 @@ pub struct Method {
 pub struct Predicate {
     pub name: Ident,
     pub params: Vec<TypedIdent>,
-    pub body: Option<SpatialExp<!>>,
+    pub body: Option<SpatialExp<HeapExt>>,
 }

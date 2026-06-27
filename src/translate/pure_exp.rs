@@ -119,53 +119,10 @@ pub(crate) fn lower<Ext: PureExt>(
             })?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
-        P::Field(base, id) => {
-            let base = lower(b, env, sink, hctx, base)?;
-            let addr = crate::translate::resource::field_addr(b, sink, base, id.0)?;
-            Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
-        }
-        P::Unfolding(pwp, body) => {
-            // `unfolding acc(P(args), perm) in body`: a *scoped* unfold. Emit a
-            // normal `Unfold`, evaluate `body` against the unfolded heap, then
-            // discard that heap — the surrounding expression keeps reading the
-            // original `hctx` (the unfolded heap temp is left unreferenced).
-            let (call, perm) = lower_pred_call(b, env, sink, hctx, pwp)?;
-            let h = sink.emit_heap_guarded(HeapInst::Unfold {
-                base: hctx.value,
-                call,
-                perm,
-            });
-            let inner = HeapCtx {
-                value: h,
-                perm: h,
-                old: hctx.old,
-            };
-            lower(b, env, sink, inner, body)
-        }
-        // A (heap-independent) top-level user function; domain functions arrive
-        // here too for now (they are not yet distinguished). Heap-dependent
-        // functions are a later (purification) concern; pass an empty heap.
-        // TODO: thread a `DomainFunctionCall`'s `inst.type_args` once VMIR
-        // function calls carry a monomorphization key.
-        P::FunctionCall(call) | P::DomainFunctionCall(_, call) => {
-            let mut args = Vec::with_capacity(call.args.len());
-            for a in &call.args {
-                args.push(lower(b, env, sink, hctx, a)?);
-            }
-            let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
-                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
-            })?;
-            Ok(sink.emit_pure(
-                ty,
-                PureInst::FunctionCall(
-                    None,
-                    vmir::FunctionCall {
-                        function: func,
-                        args,
-                    },
-                ),
-            ))
-        }
+        // A domain function call (pure). Lowered as an ordinary VMIR function
+        // application. TODO: thread `inst.type_args` once VMIR function calls
+        // carry a monomorphization key.
+        P::DomainFunctionCall(_, call) => lower_func_app(b, env, sink, hctx, ty, call),
         // A constructor lowers to the semantic `AdtCons`; its type arguments are
         // the instantiation carried by the node, the variant tag from `ctor_tag`.
         P::AdtConstructor(inst, call) => {
@@ -374,6 +331,74 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
 /// Per-context lowering of pure-expression extensions (`old`, `result`,
 /// `perm`, etc.). `hctx` carries the value/perm heaps; `ty` is the expression's
 /// result type.
+/// Lower a function application (domain function, or a heap `function`) to a
+/// VMIR `FunctionCall`. Heap-dependence is a later (purification) concern; the
+/// context heap is left empty.
+fn lower_func_app<Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink,
+    hctx: HeapCtx<'_>,
+    ty: vmir::Type,
+    call: &typed::Call<Ext>,
+) -> Result<Val, TranslationError> {
+    let mut args = Vec::with_capacity(call.args.len());
+    for a in &call.args {
+        args.push(lower(b, env, sink, hctx, a)?);
+    }
+    let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
+        TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+    })?;
+    Ok(sink.emit_pure(
+        ty,
+        PureInst::FunctionCall(
+            None,
+            vmir::FunctionCall {
+                function: func,
+                args,
+            },
+        ),
+    ))
+}
+
+/// Lower a heap-reading node (`e.f`, a `function` call, `unfolding`). Shared by
+/// every heap-bearing context's `lower_ext`.
+pub(crate) fn lower_heap_node<Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink,
+    hctx: HeapCtx<'_>,
+    ty: vmir::Type,
+    node: &typed::HeapNode<Ext>,
+) -> Result<Val, TranslationError> {
+    use typed::HeapNode as H;
+    match node {
+        H::Field(base, id) => {
+            let base = lower(b, env, sink, hctx, base)?;
+            let addr = crate::translate::resource::field_addr(b, sink, base, id.0)?;
+            Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
+        }
+        H::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
+        H::Unfolding(pwp, body) => {
+            // `unfolding acc(P(args), perm) in body`: a scoped unfold. Emit an
+            // `Unfold`, evaluate `body` against the unfolded heap, then discard it
+            // (the surrounding expression keeps reading the original `hctx`).
+            let (call, perm) = lower_pred_call(b, env, sink, hctx, pwp)?;
+            let h = sink.emit_heap_guarded(HeapInst::Unfold {
+                base: hctx.value,
+                call,
+                perm,
+            });
+            let inner = HeapCtx {
+                value: h,
+                perm: h,
+                old: hctx.old,
+            };
+            lower(b, env, sink, inner, body)
+        }
+    }
+}
+
 pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
     fn lower_ext(
         b: &Builder<'_>,
@@ -398,6 +423,21 @@ impl PureExt for ! {
     }
 }
 
+impl PureExt for typed::HeapExt {
+    fn lower_ext(
+        b: &Builder<'_>,
+        env: &HashMap<Spur, Val>,
+        sink: &mut Sink,
+        hctx: HeapCtx<'_>,
+        ty: vmir::Type,
+        ext: &Self,
+    ) -> Result<Val, TranslationError> {
+        match ext {
+            typed::HeapExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
+        }
+    }
+}
+
 impl PureExt for typed::MethodEnsuresExt {
     fn lower_ext(
         b: &Builder<'_>,
@@ -407,8 +447,8 @@ impl PureExt for typed::MethodEnsuresExt {
         ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError> {
-        let _ = ty;
         match ext {
+            typed::MethodEnsuresExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
             // old(e): re-read `e` against the method pre-state. For a two-state
             // ensures that heap is the ctx slot (`HeapVal::Temp(0)`), supplied as
             // the `old` baseline by `lower_spatial_ensures`. Ensures-`old` is
@@ -446,6 +486,7 @@ impl PureExt for typed::MethodBodyExt {
         ext: &Self,
     ) -> Result<Val, TranslationError> {
         match ext {
+            typed::MethodBodyExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
             // old(e) / old[L](e): re-read `e` against an earlier heap. Unlabeled
             // → the post-requires-inhale baseline; labeled → the heap captured
             // at `label L`. The `old` context is carried along so nested `old`s

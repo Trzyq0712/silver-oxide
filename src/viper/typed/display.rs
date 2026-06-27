@@ -11,10 +11,10 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::viper::interner::Interner;
 use crate::viper::typed::{
-    AssignLhs, AssignRhs, BinOp, Call, Declaration, Field, FuncEnsuresExt, Function, Ident,
-    Literal, Method, MethodBodyExt, MethodEnsuresExt, Predicate, PredicateWithPerm, Program,
-    PureExpKind, ResourceExp, ResourceExpKind, SpatialExp, SpatialExpKind, StarOrFields, Statement,
-    StmtBlock, Type, TypedIdent, TypedPureExp, UnOp,
+    AssignLhs, AssignRhs, BinOp, Call, Declaration, Field, FuncEnsuresExt, Function, HeapExt,
+    HeapNode, Ident, Literal, Method, MethodBodyExt, MethodEnsuresExt, Predicate,
+    PredicateWithPerm, Program, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp,
+    SpatialExpKind, StarOrFields, Statement, StmtBlock, Type, TypedIdent, TypedPureExp, UnOp,
 };
 
 /// Interner-aware formatting wrapper.
@@ -58,9 +58,45 @@ impl ShowExt for ! {
     }
 }
 
+/// Render a heap node (`e.f` / `function(..)` / `unfolding .. in ..`).
+fn fmt_heap_node<Ext: ShowExt>(
+    node: &HeapNode<Ext>,
+    f: &mut Formatter<'_>,
+    interner: &Interner,
+) -> fmt::Result {
+    match node {
+        HeapNode::Field(e, field) => {
+            write!(
+                f,
+                "{}.{}",
+                Show::new(e, interner),
+                interner.resolve(&field.0)
+            )
+        }
+        HeapNode::FunctionCall(call) => write!(f, "{}", Show::new(call, interner)),
+        HeapNode::Unfolding(p, e) => {
+            write!(
+                f,
+                "unfolding {} in {}",
+                Show::new(p, interner),
+                Show::new(e, interner)
+            )
+        }
+    }
+}
+
+impl ShowExt for HeapExt {
+    fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
+        match self {
+            HeapExt::Heap(node) => fmt_heap_node(node, f, interner),
+        }
+    }
+}
+
 impl ShowExt for FuncEnsuresExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
+            FuncEnsuresExt::Heap(node) => fmt_heap_node(node, f, interner),
             FuncEnsuresExt::Result => write!(f, "result"),
             FuncEnsuresExt::Old(e) => write!(f, "old({})", Show::new(e, interner)),
         }
@@ -70,6 +106,7 @@ impl ShowExt for FuncEnsuresExt {
 impl ShowExt for MethodEnsuresExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
+            MethodEnsuresExt::Heap(node) => fmt_heap_node(node, f, interner),
             MethodEnsuresExt::Old(e) => write!(f, "old({})", Show::new(e, interner)),
         }
     }
@@ -78,6 +115,7 @@ impl ShowExt for MethodEnsuresExt {
 impl ShowExt for MethodBodyExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
+            MethodBodyExt::Heap(node) => fmt_heap_node(node, f, interner),
             MethodBodyExt::Old(None, e) => write!(f, "old({})", Show::new(e, interner)),
             MethodBodyExt::Old(Some(label), e) => {
                 write!(
@@ -346,6 +384,7 @@ macro_rules! impl_spatial_display {
 }
 
 impl_spatial_display!(!);
+impl_spatial_display!(HeapExt);
 impl_spatial_display!(FuncEnsuresExt);
 impl_spatial_display!(MethodEnsuresExt);
 impl_spatial_display!(MethodBodyExt);
@@ -431,15 +470,9 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
                 show.with(else_)
             )
         }
-        PureExpKind::Unfolding(p, e) => {
-            write!(f, "unfolding {} in {}", show.with(p), show.with(e))
-        }
-        PureExpKind::FunctionCall(call)
-        | PureExpKind::DomainFunctionCall(_, call)
-        | PureExpKind::AdtConstructor(_, call) => {
+        PureExpKind::DomainFunctionCall(_, call) | PureExpKind::AdtConstructor(_, call) => {
             write!(f, "{}", show.with(call))
         }
-        PureExpKind::Field(e, field) => write!(f, "{}.{}", show.with(e), show.name(*field)),
         PureExpKind::LetIn { binder, value, exp } => write!(
             f,
             "let {} := {} in {}",

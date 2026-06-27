@@ -12,6 +12,9 @@ pub enum TypeError {
     UndefinedVariable(String),
     PredicateInPureContext(String),
     PermissionInPureContext,
+    /// A heap-reading construct (`e.f`, a `function` call, `unfolding`) used in a
+    /// pure context (e.g. a domain axiom).
+    HeapInPureContext,
     WrongArgCount {
         name: String,
         expected: usize,
@@ -57,6 +60,9 @@ impl std::fmt::Display for TypeError {
                 write!(f, "Predicate `{name}` used in pure expression context")
             }
             TypeError::PermissionInPureContext => write!(f, "`perm` not allowed here"),
+            TypeError::HeapInPureContext => {
+                write!(f, "heap-dependent expression not allowed in a pure context")
+            }
             TypeError::WrongArgCount {
                 name,
                 expected,

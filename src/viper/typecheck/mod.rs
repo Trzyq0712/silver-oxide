@@ -193,6 +193,9 @@ trait PureExt: Sized {
     ) -> Result<Self, TypeError>;
     fn lower_result() -> Result<Self, TypeError>;
     fn lower_perm(resource: ResourceExp<Self>) -> Result<Self, TypeError>;
+    /// Lift a heap-reading construct (`e.f`, `function` call, `unfolding`) into
+    /// this context's extension. A pure context (`!`) rejects it.
+    fn lower_heap(node: typed::HeapNode<Self>) -> Result<Self, TypeError>;
 }
 
 impl PureExt for ! {
@@ -209,6 +212,31 @@ impl PureExt for ! {
     }
     fn lower_perm(_resource: ResourceExp<!>) -> Result<!, TypeError> {
         Err(TypeError::PermissionInPureContext)
+    }
+    fn lower_heap(_node: typed::HeapNode<!>) -> Result<!, TypeError> {
+        Err(TypeError::HeapInPureContext)
+    }
+}
+
+/// Heap context with no state extension (predicate bodies, function pre/body,
+/// method pre): heap nodes allowed, `old`/`perm`/`result` rejected.
+impl PureExt for typed::HeapExt {
+    fn lower_old(
+        _label: Option<Spur>,
+        _inner: TypedPureExp<typed::HeapExt>,
+        _known_labels: &HashSet<Spur>,
+        _interner: &Interner,
+    ) -> Result<typed::HeapExt, TypeError> {
+        Err(TypeError::IllegalOldUsage)
+    }
+    fn lower_result() -> Result<typed::HeapExt, TypeError> {
+        Err(TypeError::IllegalResultUsage)
+    }
+    fn lower_perm(_resource: ResourceExp<typed::HeapExt>) -> Result<typed::HeapExt, TypeError> {
+        Err(TypeError::PermissionInPureContext)
+    }
+    fn lower_heap(node: typed::HeapNode<typed::HeapExt>) -> Result<typed::HeapExt, TypeError> {
+        Ok(typed::HeapExt::Heap(node))
     }
 }
 
@@ -230,6 +258,9 @@ impl PureExt for FuncEnsuresExt {
     fn lower_perm(_resource: ResourceExp<FuncEnsuresExt>) -> Result<FuncEnsuresExt, TypeError> {
         Err(TypeError::PermissionInPureContext)
     }
+    fn lower_heap(node: typed::HeapNode<FuncEnsuresExt>) -> Result<FuncEnsuresExt, TypeError> {
+        Ok(FuncEnsuresExt::Heap(node))
+    }
 }
 
 impl PureExt for MethodEnsuresExt {
@@ -249,6 +280,9 @@ impl PureExt for MethodEnsuresExt {
     }
     fn lower_perm(_resource: ResourceExp<MethodEnsuresExt>) -> Result<MethodEnsuresExt, TypeError> {
         Err(TypeError::PermissionInPureContext)
+    }
+    fn lower_heap(node: typed::HeapNode<MethodEnsuresExt>) -> Result<MethodEnsuresExt, TypeError> {
+        Ok(MethodEnsuresExt::Heap(node))
     }
 }
 
@@ -273,6 +307,9 @@ impl PureExt for MethodBodyExt {
     }
     fn lower_perm(resource: ResourceExp<MethodBodyExt>) -> Result<MethodBodyExt, TypeError> {
         Ok(MethodBodyExt::Perm(resource))
+    }
+    fn lower_heap(node: typed::HeapNode<MethodBodyExt>) -> Result<MethodBodyExt, TypeError> {
+        Ok(MethodBodyExt::Heap(node))
     }
 }
 
@@ -912,7 +949,8 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
 
             ExpKind::Field(base, field_name) => {
                 let base_exp = self.lower_pure::<Ext>(base)?;
-                Ok(PureExpKind::Field(base_exp, Ident(field_name.id())))
+                let node = typed::HeapNode::Field(base_exp, Ident(field_name.id()));
+                Ok(PureExpKind::Ext(Ext::lower_heap(node)?))
             }
 
             ExpKind::HeapUpdate(viper::HeapUpdateOp::Unfold, acc_exp, body) => {
@@ -925,10 +963,9 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                     }
                 };
                 let body_exp = self.lower_pure::<Ext>(body)?;
-                Ok(PureExpKind::Unfolding(
-                    PredicateWithPerm { pred_call, perm },
-                    body_exp,
-                ))
+                let node =
+                    typed::HeapNode::Unfolding(PredicateWithPerm { pred_call, perm }, body_exp);
+                Ok(PureExpKind::Ext(Ext::lower_heap(node)?))
             }
 
             ExpKind::AdtDestructor(base, field) => {
@@ -1013,15 +1050,18 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                     name: Ident(call_name),
                     args,
                 };
-                Ok(match kind {
-                    // A constructor's instantiation is its result type. Domain
-                    // function calls are currently indistinguishable from
-                    // top-level function calls, so both lower to `FunctionCall`.
+                match kind {
+                    // A constructor's instantiation is its result type (pure node).
                     ExpCallKind::AdtConstructor => {
-                        PureExpKind::AdtConstructor(self.domain_inst_of(exp)?, call)
+                        Ok(PureExpKind::AdtConstructor(self.domain_inst_of(exp)?, call))
                     }
-                    _ => PureExpKind::FunctionCall(call),
-                })
+                    // A Silver `function` call is heap-dependent — supplied via the
+                    // context's `Ext` (rejected in a pure context). Domain function
+                    // calls are not yet distinguished, so they land here too.
+                    _ => Ok(PureExpKind::Ext(Ext::lower_heap(
+                        typed::HeapNode::FunctionCall(call),
+                    )?)),
+                }
             }
             ExpCallKind::Macro => Err(TypeError::Other(
                 "macro in expression (should have been inlined)".to_string(),
@@ -1516,7 +1556,7 @@ fn typecheck_predicate(
     let body = pred
         .body
         .as_mut()
-        .map(|b| ctx.typecheck_spatial::<!>(&mut b.0))
+        .map(|b| ctx.typecheck_spatial::<typed::HeapExt>(&mut b.0))
         .transpose()?;
 
     Ok(typed::Declaration::Predicate(typed::Predicate {
@@ -1548,13 +1588,13 @@ fn typecheck_function(
     let mut ctx = LocalEnv::new(globals, interner);
     add_arg_locals(&mut ctx, &func.signature.args)?;
 
-    let requires = combine_spatial::<!>(&mut func.contract.precondition, &ctx)?;
+    let requires = combine_spatial::<typed::HeapExt>(&mut func.contract.precondition, &ctx)?;
 
     // Body cannot mention `result` (only postconditions can): pass None.
     let body = func
         .body
         .as_mut()
-        .map(|b| ctx.typecheck_pure::<!>(&mut b.0, &ret_ty, None))
+        .map(|b| ctx.typecheck_pure::<typed::HeapExt>(&mut b.0, &ret_ty, None))
         .transpose()?;
 
     // Postconditions enable `result`, typed as the return type.
@@ -1606,7 +1646,7 @@ fn typecheck_method(
 
     add_arg_locals(&mut ctx, &method.signature.args)?;
 
-    let requires = combine_spatial::<!>(&mut method.contract.precondition, &ctx)?;
+    let requires = combine_spatial::<typed::HeapExt>(&mut method.contract.precondition, &ctx)?;
 
     add_arg_locals(&mut ctx, &method.signature.ret)?;
 
