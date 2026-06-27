@@ -8,8 +8,8 @@ use crate::viper::{
     interner::Interner,
     typed::{
         self, BinOp, Call, FuncEnsuresExt, Ident, Literal, MethodBodyExt, MethodEnsuresExt,
-        PolyType, PredicateWithPerm, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp,
-        SpatialExpKind, Type, TypeParam, TypedIdent, TypedPureExp, UnOp,
+        PredicateWithPerm, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp, SpatialExpKind,
+        Type, TypedIdent, TypedPureExp, UnOp,
     },
 };
 
@@ -286,7 +286,7 @@ fn lower_ident(ident: &viper::Ident) -> Ident {
 
 /// Collect the distinct `Generic` type-parameter names occurring in `ty`
 /// (recursing into `Domain` type arguments), preserving first-seen order.
-fn collect_generics(ty: &PolyType, acc: &mut Vec<Spur>) {
+fn collect_generics(ty: &Type, acc: &mut Vec<Spur>) {
     match ty {
         Type::Generic(id) => {
             if !acc.contains(&id.0) {
@@ -624,10 +624,10 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
     /// type-variable key, so e.g. `Some(value: T): Option[T]` unifies `T` with
     /// the argument and propagates it to the result. A non-generic context
     /// passes an empty `subst`.
-    fn impose_type<G: TypeParam>(
+    fn impose_type(
         &mut self,
         key: TcKey,
-        ty: &Type<G>,
+        ty: &Type,
         subst: &HashMap<Spur, TcKey>,
     ) -> Result<(), TypeError> {
         match ty {
@@ -639,12 +639,9 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 .tc
                 .impose(key.concretizes_explicit(ViperTcType::Real))?,
             Type::Ref => self.tc.impose(key.concretizes_explicit(ViperTcType::Ref))?,
-            // Unreachable for a ground `Type<!>`; a poly signature resolves the
-            // parameter through `subst`.
             Type::Generic(id) => {
-                let name = id.param();
-                let var = subst.get(&name).copied().ok_or_else(|| {
-                    TypeError::UnboundTypeParam(self.env.interner.resolve(&name).to_string())
+                let var = subst.get(&id.0).copied().ok_or_else(|| {
+                    TypeError::UnboundTypeParam(self.env.interner.resolve(&id.0).to_string())
                 })?;
                 if var != key {
                     self.tc.impose(key.equate_with(var))?;
@@ -667,7 +664,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
 
     /// Instantiate the free type parameters of a callee signature: a fresh
     /// type-variable key per distinct `Generic` name occurring in `tys`.
-    fn instantiate_generics(&mut self, tys: &[PolyType]) -> HashMap<Spur, TcKey> {
+    fn instantiate_generics(&mut self, tys: &[Type]) -> HashMap<Spur, TcKey> {
         let mut names = Vec::new();
         for ty in tys {
             collect_generics(ty, &mut names);
@@ -798,7 +795,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 found: call.args.len(),
             });
         }
-        let expected_params: Vec<PolyType> = sig.params.clone();
+        let expected_params: Vec<Type> = sig.params.clone();
         for (arg, expected) in call.args.iter_mut().zip(expected_params.iter()) {
             let arg_key = self.constrain_pure(arg)?;
             self.impose_type(arg_key, expected, &HashMap::new())?;
@@ -888,7 +885,7 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
 
             ExpKind::Ascribe(inner, ascribed_ty) => {
                 let inner_exp = self.lower_pure::<Ext>(inner)?;
-                Ok(PureExpKind::Ascribe(inner_exp, ground_type(ascribed_ty)?))
+                Ok(PureExpKind::Ascribe(inner_exp, Type::from(ascribed_ty)))
             }
 
             ExpKind::UnOp(op, inner) => self.lower_unop::<Ext>(op, inner),
@@ -1219,7 +1216,7 @@ fn lower_statement(
         S::Var(decls, init) => {
             let mut typed_decls = Vec::with_capacity(decls.len());
             for d in decls.iter() {
-                let ty = ground_type(&d.ty)?;
+                let ty = Type::from(&d.ty);
                 ctx.add_local(d.idn.0.id(), ty.clone())?;
                 typed_decls.push(TypedIdent {
                     name: Ident(d.idn.0.id()),
@@ -1297,9 +1294,8 @@ fn lower_assign_lhs_typed(
                 .globals
                 .resolve(field_id)
                 .and_then(|s| s.as_field())
-                .ok_or_else(|| TypeError::Other("undefined field".to_string()))?
-                .ground()
-                .ok_or_else(|| TypeError::Other("field has a generic type".to_string()))?;
+                .cloned()
+                .ok_or_else(|| TypeError::Other("undefined field".to_string()))?;
             let base_exp = ctx.typecheck_pure::<MethodBodyExt>(base, &Type::Ref, None)?;
             Ok((typed::AssignLhs::Field(base_exp, Ident(field_id)), field_ty))
         }
@@ -1379,9 +1375,7 @@ fn lower_rhs_against_lhs(
             }
             // Each LHS type must match the corresponding return type from the signature.
             for (i, lhs_ty) in lhs_types.iter().enumerate() {
-                let ret_ty = sig.rets[i].ground().ok_or_else(|| {
-                    TypeError::Other("method return has a generic type".to_string())
-                })?;
+                let ret_ty = sig.rets[i].clone();
                 if *lhs_ty != ret_ty {
                     return Err(TypeError::Other(format!(
                         "return {} of `{}`: expected {:?}, found {:?}",
@@ -1395,10 +1389,7 @@ fn lower_rhs_against_lhs(
             // Each arg is constrained by the corresponding parameter type from the signature.
             let mut lowered_args = Vec::with_capacity(call.args.len());
             for (arg, param_ty) in call.args.iter_mut().zip(sig.params.iter()) {
-                let param_ty = param_ty.ground().ok_or_else(|| {
-                    TypeError::Other("method parameter has a generic type".to_string())
-                })?;
-                lowered_args.push(ctx.typecheck_pure::<MethodBodyExt>(arg, &param_ty, None)?);
+                lowered_args.push(ctx.typecheck_pure::<MethodBodyExt>(arg, param_ty, None)?);
             }
             Ok(typed::AssignRhs::MethodCall(Call {
                 name: Ident(call_name),
@@ -1419,27 +1410,18 @@ fn lower_stmt_block(
 // 11. Declaration-level functions
 // ==========================================
 
-/// Lower a parsed type to a **ground** typed type, erroring if it mentions a
-/// type parameter (`Generic`) — which is legal only inside an ADT/domain
-/// declaration body, not in a field/param/local.
-fn ground_type(ty: &viper::Type) -> Result<Type, TypeError> {
-    PolyType::from(ty).ground().ok_or_else(|| {
-        TypeError::Other("type parameter outside an ADT/domain declaration".to_string())
-    })
-}
-
-fn typecheck_field(field: &viper::Field) -> Result<typed::Declaration, TypeError> {
-    Ok(typed::Declaration::Field(typed::Field(TypedIdent {
+fn typecheck_field(field: &viper::Field) -> typed::Declaration {
+    typed::Declaration::Field(typed::Field(TypedIdent {
         name: Ident(field.0.idn.0.id()),
-        ty: ground_type(&field.0.ty)?,
-    })))
+        ty: Type::from(&field.0.ty),
+    }))
 }
 
 /// Lower a parsed type, resolving a bare `Domain(p, [])` whose head is one of
 /// `type_params` to `Generic(p)` (the parser emits every named type as a
 /// `Domain`, so a type-parameter use arrives erased). Used for ADT variant field
 /// types, which may mention the owning ADT's parameters.
-fn type_with_generics(ty: &viper::Type, type_params: &[lasso::Spur]) -> PolyType {
+fn type_with_generics(ty: &viper::Type, type_params: &[lasso::Spur]) -> Type {
     use crate::viper::parsed::ast::Type as P;
     match ty {
         P::Bool => Type::Bool,
@@ -1488,39 +1470,24 @@ fn typecheck_adt(adt: &viper::Adt) -> Result<typed::Declaration, TypeError> {
     }))
 }
 
-/// A domain function as a bodyless typed `Function` schema (signature only).
-/// Param/return types stay poly (a domain function may range over the domain's
-/// type parameters); they are not generic-resolved here (deferred, like axioms).
-fn domain_function_to_typed(df: &viper::DomainFunction) -> typed::Function<Ident> {
-    let params = df
-        .signature
-        .args
-        .iter()
-        .filter_map(|p| {
-            p.idn().map(|idn| TypedIdent {
-                name: Ident(idn.0.id()),
-                ty: PolyType::from(p.ty()),
-            })
-        })
-        .collect();
+/// A domain function as a bodyless typed `Function` (signature only).
+fn domain_function_to_typed(df: &viper::DomainFunction) -> typed::Function {
     typed::Function {
         name: Ident(df.signature.name.0.id()),
-        params,
-        ret: PolyType::from(df.signature.ret[0].ty()),
+        params: collect_params(&df.signature.args),
+        ret: Type::from(df.signature.ret[0].ty()),
         requires: None,
         ensures: None,
         body: None,
     }
 }
 
-fn collect_params(args: &[viper::ArgOrType]) -> Result<Vec<TypedIdent>, TypeError> {
+fn collect_params(args: &[viper::ArgOrType]) -> Vec<TypedIdent> {
     args.iter()
         .filter_map(|p| {
-            p.idn().map(|idn| {
-                Ok(TypedIdent {
-                    name: Ident(idn.0.id()),
-                    ty: ground_type(p.ty())?,
-                })
+            p.idn().map(|idn| TypedIdent {
+                name: Ident(idn.0.id()),
+                ty: Type::from(p.ty()),
             })
         })
         .collect()
@@ -1529,7 +1496,7 @@ fn collect_params(args: &[viper::ArgOrType]) -> Result<Vec<TypedIdent>, TypeErro
 fn add_arg_locals(ctx: &mut LocalEnv, args: &[viper::ArgOrType]) -> Result<(), TypeError> {
     for arg in args {
         if let viper::ArgOrType::Arg(decl) = arg {
-            ctx.add_local(decl.idn.0.id(), ground_type(&decl.ty)?)?;
+            ctx.add_local(decl.idn.0.id(), Type::from(&decl.ty))?;
         }
     }
     Ok(())
@@ -1541,7 +1508,7 @@ fn typecheck_predicate(
     interner: &Interner,
 ) -> Result<typed::Declaration, TypeError> {
     let name = Ident(pred.signature.name.0.id());
-    let params = collect_params(&pred.signature.args)?;
+    let params = collect_params(&pred.signature.args);
 
     let mut ctx = LocalEnv::new(globals, interner);
     add_arg_locals(&mut ctx, &pred.signature.args)?;
@@ -1566,19 +1533,17 @@ fn typecheck_function(
 ) -> Result<typed::Declaration, TypeError> {
     let func_spur = func.signature.name.0.id();
     let name = Ident(func_spur);
-    let params = collect_params(&func.signature.args)?;
+    let params = collect_params(&func.signature.args);
     let ret_ty = globals
         .resolve(func_spur)
         .and_then(|s| s.as_function())
+        .map(|sig| sig.ret.clone())
         .ok_or_else(|| {
             TypeError::Other(format!(
                 "internal: function `{}` not in globals",
                 interner.resolve(&func_spur)
             ))
-        })?
-        .ret
-        .ground()
-        .ok_or_else(|| TypeError::Other("function return has a generic type".to_string()))?;
+        })?;
 
     let mut ctx = LocalEnv::new(globals, interner);
     add_arg_locals(&mut ctx, &func.signature.args)?;
@@ -1629,8 +1594,8 @@ fn typecheck_method(
     interner: &Interner,
 ) -> Result<typed::Declaration, TypeError> {
     let name = Ident(method.signature.name.0.id());
-    let params = collect_params(&method.signature.args)?;
-    let rets = collect_params(&method.signature.ret)?;
+    let params = collect_params(&method.signature.args);
+    let rets = collect_params(&method.signature.ret);
 
     let mut ctx = LocalEnv::new(globals, interner);
 
@@ -1681,7 +1646,7 @@ pub fn typecheck_program(
     // Domain functions/axioms are separate `DomainElement` decls; gather the
     // functions per owning domain so each `Domain` can carry them. Axioms are
     // deferred (nothing consumes them yet).
-    let mut domain_fns: std::collections::HashMap<lasso::Spur, Vec<typed::Function<Ident>>> =
+    let mut domain_fns: std::collections::HashMap<lasso::Spur, Vec<typed::Function>> =
         std::collections::HashMap::new();
     for decl in &program.0 {
         if let viper::Declaration::DomainElement(de) = decl
@@ -1696,7 +1661,7 @@ pub fn typecheck_program(
 
     for decl in &mut program.0 {
         let result = match decl {
-            viper::Declaration::Field(field) => typecheck_field(field).map(Some),
+            viper::Declaration::Field(field) => Ok(Some(typecheck_field(field))),
             viper::Declaration::Predicate(pred) => {
                 typecheck_predicate(pred, globals, &interner).map(Some)
             }

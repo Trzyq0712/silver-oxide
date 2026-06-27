@@ -202,20 +202,21 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Pass 2a: top-level user functions (ground signatures).
-        for decl in decls {
-            if let typed::Declaration::Function(func) = decl {
-                self.declare_function(func, &[]);
-            }
-        }
-        // Pass 2b: domain functions — schemas over their domain's type parameters.
-        for decl in decls {
-            if let typed::Declaration::Domain(domain) = decl {
-                let generics: Vec<Spur> = domain.type_params.iter().map(|i| i.0).collect();
-                for func in &domain.functions {
-                    self.declare_function(func, &generics);
-                }
-            }
+        // Pass 2: user functions (top-level + domain functions).
+        for func in decls.iter().flat_map(decl_functions) {
+            let name = self.interner.resolve(&func.name.0).to_string();
+            let id = self.fresh_decl(&name);
+            let params = func.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+            let ret = self.lower_type(&func.ret);
+            self.set_decl(
+                id,
+                vmir::Declaration::Function(vmir::Function {
+                    params,
+                    ret,
+                    body: None,
+                }),
+            );
+            self.name_map.insert(func.name.0, id);
         }
 
         // Pass 3: fill each ADT's variant shape and record constructor/destructor
@@ -225,33 +226,6 @@ impl<'a> Builder<'a> {
                 self.declare_adt_variants(adt);
             }
         }
-    }
-
-    /// Declare a VMIR `Function` from a typed function signature, lowering its
-    /// param/return types against `generics` (empty for a ground top-level
-    /// function; the domain's type parameters for a domain function).
-    fn declare_function<G: typed::TypeParam>(
-        &mut self,
-        func: &typed::Function<G>,
-        generics: &[Spur],
-    ) {
-        let name = self.interner.resolve(&func.name.0).to_string();
-        let id = self.fresh_decl(&name);
-        let params = func
-            .params
-            .iter()
-            .map(|p| lower_type(&self.name_map, generics, &p.ty))
-            .collect();
-        let ret = lower_type(&self.name_map, generics, &func.ret);
-        self.set_decl(
-            id,
-            vmir::Declaration::Function(vmir::Function {
-                params,
-                ret,
-                body: None,
-            }),
-        );
-        self.name_map.insert(func.name.0, id);
     }
 
     /// Fill `adt`'s variant shapes and record its constructor (`ctor_tag`) and
@@ -491,6 +465,16 @@ impl<'a> Builder<'a> {
             interner: self.vmir_interner,
             groups: self.groups,
         }
+    }
+}
+
+/// The functions a declaration contributes to the global function namespace: a
+/// top-level function itself, or each of a domain's functions.
+fn decl_functions(decl: &typed::Declaration) -> &[typed::Function] {
+    match decl {
+        typed::Declaration::Function(f) => std::slice::from_ref(f),
+        typed::Declaration::Domain(d) => &d.functions,
+        _ => &[],
     }
 }
 

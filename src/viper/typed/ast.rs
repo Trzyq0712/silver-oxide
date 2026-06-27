@@ -13,94 +13,33 @@ pub struct Program {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ident(pub Spur);
 
-/// The type-parameter slot of a [`Type`]. Ground types use the uninhabited `!`
-/// (no type parameters can appear); schema types inside an ADT/domain
-/// declaration use [`Ident`] (a parameter reference).
-pub trait TypeParam: Clone + std::fmt::Debug + PartialEq {
-    /// The referenced parameter's name. Unreachable for the ground (`!`) slot.
-    fn param(&self) -> Spur;
-}
-
-impl TypeParam for ! {
-    fn param(&self) -> Spur {
-        match *self {}
-    }
-}
-
-impl TypeParam for Ident {
-    fn param(&self) -> Spur {
-        self.0
-    }
-}
-
 /// An identifier bundled with its explicit type (e.g., `x: Int`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypedIdent<G = !> {
+pub struct TypedIdent {
     pub name: Ident,
-    pub ty: Type<G>,
+    pub ty: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum BuiltinCollection<G = !> {
-    Seq(Box<Type<G>>),
-    Set(Box<Type<G>>),
-    MultiSet(Box<Type<G>>),
-    Map(Box<Type<G>>, Box<Type<G>>),
+pub enum BuiltinCollection {
+    Seq(Box<Type>),
+    Set(Box<Type>),
+    MultiSet(Box<Type>),
+    Map(Box<Type>, Box<Type>),
 }
 
-/// A Silver type. `G` is the type-parameter slot: `Type` (= `Type<!>`) is a
-/// **ground** type — `Generic(!)` is uninhabited, so it provably has no type
-/// parameters — while [`PolyType`] (`Type<Ident>`) is the **schema** form used
-/// only inside ADT/domain declarations.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Type<G = !> {
+pub enum Type {
     Bool,
     Int,
     Real,
     Ref,
-    Generic(G),
-    Collection(BuiltinCollection<G>),
-    Domain(Ident, Vec<Type<G>>),
+    Generic(Ident),
+    Collection(BuiltinCollection),
+    Domain(Ident, Vec<Type>),
 }
 
-/// A type that may reference type parameters — legal only inside ADT/domain
-/// declarations.
-pub type PolyType = Type<Ident>;
-
-impl BuiltinCollection<Ident> {
-    fn ground(&self) -> Option<BuiltinCollection> {
-        Some(match self {
-            BuiltinCollection::Seq(t) => BuiltinCollection::Seq(Box::new(t.ground()?)),
-            BuiltinCollection::Set(t) => BuiltinCollection::Set(Box::new(t.ground()?)),
-            BuiltinCollection::MultiSet(t) => BuiltinCollection::MultiSet(Box::new(t.ground()?)),
-            BuiltinCollection::Map(k, v) => {
-                BuiltinCollection::Map(Box::new(k.ground()?), Box::new(v.ground()?))
-            }
-        })
-    }
-}
-
-impl PolyType {
-    /// The ground form of this type, or `None` if it mentions a type parameter
-    /// (`Generic`). The fallible boundary that enforces "no free type parameters
-    /// outside an ADT/domain declaration".
-    pub fn ground(&self) -> Option<Type> {
-        Some(match self {
-            Type::Bool => Type::Bool,
-            Type::Int => Type::Int,
-            Type::Real => Type::Real,
-            Type::Ref => Type::Ref,
-            Type::Generic(_) => return None,
-            Type::Collection(c) => Type::Collection(c.ground()?),
-            Type::Domain(id, args) => Type::Domain(
-                *id,
-                args.iter().map(PolyType::ground).collect::<Option<_>>()?,
-            ),
-        })
-    }
-}
-
-impl From<&crate::viper::parsed::ast::Type> for PolyType {
+impl From<&crate::viper::parsed::ast::Type> for Type {
     fn from(t: &crate::viper::parsed::ast::Type) -> Self {
         use crate::viper::parsed::ast::Type as A;
         match t {
@@ -344,8 +283,7 @@ pub enum Declaration {
 pub struct Domain {
     pub name: Ident,
     pub type_params: Vec<Ident>,
-    /// Domain functions are schemas over `type_params` — hence `Function<Ident>`.
-    pub functions: Vec<Function<Ident>>,
+    pub functions: Vec<Function>,
     pub axioms: Vec<Axiom>,
 }
 
@@ -365,23 +303,18 @@ pub struct Adt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdtVariant {
     pub name: Ident,
-    /// Field types are schemas over the ADT's `type_params` — hence the
-    /// `Ident` slot.
-    pub params: Vec<TypedIdent<Ident>>,
+    pub params: Vec<TypedIdent>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field(pub TypedIdent);
 
-/// A purely mathematical function that cannot mutate state. `G` is the type slot
-/// of the signature: a top-level Silver function is ground (`Function<!>`), a
-/// domain function is a schema (`Function<Ident>`). Domain functions are
-/// uninterpreted, so their contract/body fields are always `None`.
+/// A purely mathematical function that cannot mutate state.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Function<G = !> {
+pub struct Function {
     pub name: Ident,
-    pub params: Vec<TypedIdent<G>>,
-    pub ret: Type<G>,
+    pub params: Vec<TypedIdent>,
+    pub ret: Type,
     pub requires: Option<SpatialExp<!>>,
     pub ensures: Option<TypedPureExp<FuncEnsuresExt>>,
     pub body: Option<TypedPureExp<!>>,

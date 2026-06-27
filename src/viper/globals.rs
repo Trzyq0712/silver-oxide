@@ -7,10 +7,7 @@ use lasso::Spur;
 use nonmax::NonMaxU32;
 use typed_index_collections::TiVec;
 
-use crate::viper::{IdnDecl, interner::Interner, walk::AstWalker};
-// Signatures are schemas: they may mention type parameters, so they use the
-// poly form of the type throughout.
-use crate::viper::typed::PolyType as Type;
+use crate::viper::{IdnDecl, interner::Interner, typed::Type, walk::AstWalker};
 
 /// Rewrite references to a bound type parameter into `Type::Generic`. The parser
 /// emits every named type as `Type::Domain(name, args)`, so a type-parameter use

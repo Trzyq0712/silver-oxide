@@ -145,8 +145,7 @@ impl<'a> Display for Show<'a, &'a Type> {
             Type::Int => write!(f, "Int"),
             Type::Real => write!(f, "Real"),
             Type::Ref => write!(f, "Ref"),
-            // Ground `Type<!>` has no type parameters.
-            Type::Generic(id) => match *id {},
+            Type::Generic(id) => write!(f, "{}", self.name(*id)),
             Type::Collection(_) => write!(f, "<collection>"),
             Type::Domain(id, _) => write!(f, "{}", self.name(*id)),
         }
