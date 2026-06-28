@@ -945,7 +945,7 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                 exp: self.lower_pure::<Ext>(body)?,
             }),
 
-            ExpKind::Call(call) => self.lower_call::<Ext>(exp, call),
+            ExpKind::Call(call) => self.lower_call::<Ext>(call),
 
             ExpKind::Field(base, field_name) => {
                 let base_exp = self.lower_pure::<Ext>(base)?;
@@ -969,23 +969,13 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
             }
 
             ExpKind::AdtDestructor(base, field) => {
-                let inst = self.domain_inst_of(base)?;
                 let base_exp = self.lower_pure::<Ext>(base)?;
-                Ok(PureExpKind::AdtDestructor(
-                    inst,
-                    base_exp,
-                    Ident(field.id()),
-                ))
+                Ok(PureExpKind::AdtDestructor(base_exp, Ident(field.id())))
             }
 
             ExpKind::AdtDiscriminator(base, variant) => {
-                let inst = self.domain_inst_of(base)?;
                 let base_exp = self.lower_pure::<Ext>(base)?;
-                Ok(PureExpKind::AdtDiscriminator(
-                    inst,
-                    base_exp,
-                    Ident(variant.id()),
-                ))
+                Ok(PureExpKind::AdtDiscriminator(base_exp, Ident(variant.id())))
             }
 
             // Quantifiers emitted as bool constant (proper typed support later).
@@ -1019,20 +1009,8 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
         }
     }
 
-    /// The ADT/domain instantiation of `exp`'s resolved type — its head and type
-    /// arguments. Errors if the type is not an ADT/domain (`Domain`).
-    fn domain_inst_of(&self, exp: &viper::Exp) -> Result<typed::DomainInstantiation, TypeError> {
-        match self.resolved_ty(exp)? {
-            Type::Domain(name, type_args) => Ok(typed::DomainInstantiation { name, type_args }),
-            other => Err(TypeError::Other(format!(
-                "expected an ADT/domain-typed expression, got {other:?}"
-            ))),
-        }
-    }
-
     fn lower_call<Ext: PureExt>(
         &self,
-        exp: &viper::Exp,
         call: &viper::Call<viper::ExpCallKind>,
     ) -> Result<PureExpKind<Ext>, TypeError> {
         use viper::ExpCallKind;
@@ -1051,10 +1029,7 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                     args,
                 };
                 match kind {
-                    // A constructor's instantiation is its result type (pure node).
-                    ExpCallKind::AdtConstructor => {
-                        Ok(PureExpKind::AdtConstructor(self.domain_inst_of(exp)?, call))
-                    }
+                    ExpCallKind::AdtConstructor => Ok(PureExpKind::AdtConstructor(call)),
                     // A Silver `function` call is heap-dependent — supplied via the
                     // context's `Ext` (rejected in a pure context). Domain function
                     // calls are not yet distinguished, so they land here too.

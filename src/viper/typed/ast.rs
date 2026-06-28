@@ -135,13 +135,13 @@ pub enum PureExpKind<Ext> {
     },
     Ascribe(TypedPureExp<Ext>, Type),
     /// Call to a domain function (pure).
-    DomainFunctionCall(DomainInstantiation, Call<Ext>),
+    DomainFunctionCall(Call<Ext>),
     /// Constructor call of an ADT variant.
-    AdtConstructor(DomainInstantiation, Call<Ext>),
+    AdtConstructor(Call<Ext>),
     /// A projection from an ADT.
-    AdtDestructor(DomainInstantiation, TypedPureExp<Ext>, Ident),
+    AdtDestructor(TypedPureExp<Ext>, Ident),
     /// A variant check on an ADT (e.g., `e.isCons(list)`).
-    AdtDiscriminator(DomainInstantiation, TypedPureExp<Ext>, Ident),
+    AdtDiscriminator(TypedPureExp<Ext>, Ident),
     /// The context-specific extension — heap nodes (`Ext::Heap`), `old`, `perm`,
     /// `result`. Uninhabited (`!`) in a pure context, so none are constructible.
     Ext(Ext),
@@ -158,16 +158,6 @@ pub enum HeapNode<Ext> {
     FunctionCall(Call<Ext>),
     /// Evaluates the inner expression under a temporary unfolding of the predicate.
     Unfolding(PredicateWithPerm<Ext>, TypedPureExp<Ext>),
-}
-
-/// A generic ADT/domain at a concrete instantiation — the monomorphization key.
-/// `name` is the **head** declaration (the ADT/domain), distinct from the
-/// `Call.name`/`Ident` that names the variant, field, or function at the use
-/// site. The pre-lowering twin of `vmir::Type::Domain(MemberId, Vec<Type>)`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DomainInstantiation {
-    pub name: Ident,
-    pub type_args: Vec<Type>,
 }
 
 /// An expression that asserts or transfers heap resources.

@@ -120,12 +120,12 @@ pub(crate) fn lower<Ext: PureExt>(
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
         // A domain function call (pure). Lowered as an ordinary VMIR function
-        // application. TODO: thread `inst.type_args` once VMIR function calls
-        // carry a monomorphization key.
-        P::DomainFunctionCall(_, call) => lower_func_app(b, env, sink, hctx, ty, call),
+        // application. TODO: thread the used type vars once VMIR function calls
+        // carry a monomorphization key (Part 2).
+        P::DomainFunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
         // A constructor lowers to the semantic `AdtCons`; its type arguments are
-        // the instantiation carried by the node, the variant tag from `ctor_tag`.
-        P::AdtConstructor(inst, call) => {
+        // its result type (`exp.ty`), the variant tag from `ctor_tag`.
+        P::AdtConstructor(call) => {
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(lower(b, env, sink, hctx, a)?);
@@ -134,7 +134,7 @@ pub(crate) fn lower<Ext: PureExt>(
                 TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
-            let type_args = inst.type_args.iter().map(|t| b.lower_type(t)).collect();
+            let type_args = adt_type_args(b, &exp.ty);
             Ok(sink.emit_pure(
                 ty,
                 PureInst::AdtCons {
@@ -147,14 +147,15 @@ pub(crate) fn lower<Ext: PureExt>(
         }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
         P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
-        P::AdtDestructor(inst, base, field) => {
+        P::AdtDestructor(base, field) => {
             // `e.f` ⇒ `AdtProj{adt, variant, field}(e)`. The verifier's
             // projection reduction folds it when `e` is a known constructor.
+            // Type args come from the scrutinee's type (`base.ty`).
+            let type_args = adt_type_args(b, &base.ty);
             let base_v = lower(b, env, sink, hctx, base)?;
             let &(adt, variant, field) = b.adt.dtor_sem.get(&field.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
             })?;
-            let type_args = inst.type_args.iter().map(|t| b.lower_type(t)).collect();
             Ok(sink.emit_pure(
                 ty,
                 PureInst::AdtProj {
@@ -166,15 +167,16 @@ pub(crate) fn lower<Ext: PureExt>(
                 },
             ))
         }
-        P::AdtDiscriminator(inst, base, variant) => {
+        P::AdtDiscriminator(base, variant) => {
             // `e.is<Ctor>` ⇒ `AdtTag{adt}(e) == tag_index`. The verifier's tag
             // reduction folds this to a literal when `e` is a known constructor.
+            // Type args come from the scrutinee's type (`base.ty`).
+            let type_args = adt_type_args(b, &base.ty);
             let base_v = lower(b, env, sink, hctx, base)?;
             let &(adt_spur, tag) = b.adt.ctor_tag.get(&variant.0).ok_or_else(|| {
                 TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
             })?;
             let adt = b.name_map[&adt_spur];
-            let type_args = inst.type_args.iter().map(|t| b.lower_type(t)).collect();
             let tag_call = sink.emit_pure(
                 vmir::Type::Int,
                 PureInst::AdtTag {
@@ -190,6 +192,16 @@ pub(crate) fn lower<Ext: PureExt>(
             ))
         }
         P::Ext(ext) => Ext::lower_ext(b, env, sink, hctx, ty, ext),
+    }
+}
+
+/// The type arguments of an ADT/domain-typed expression — its head's type
+/// parameters at this use site. `Domain(_, args)` → lower each; any other type
+/// (a non-generic / non-ADT result) → empty.
+fn adt_type_args(b: &Builder<'_>, ty: &typed::Type) -> Vec<vmir::Type> {
+    match ty {
+        typed::Type::Domain(_, args) => args.iter().map(|t| b.lower_type(t)).collect(),
+        _ => Vec::new(),
     }
 }
 

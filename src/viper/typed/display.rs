@@ -470,7 +470,7 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
                 show.with(else_)
             )
         }
-        PureExpKind::DomainFunctionCall(_, call) | PureExpKind::AdtConstructor(_, call) => {
+        PureExpKind::DomainFunctionCall(call) | PureExpKind::AdtConstructor(call) => {
             write!(f, "{}", show.with(call))
         }
         PureExpKind::LetIn { binder, value, exp } => write!(
@@ -481,10 +481,10 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
             show.with(exp)
         ),
         PureExpKind::Ascribe(e, ty) => write!(f, "{}: {}", show.with(e), show.with(ty)),
-        PureExpKind::AdtDestructor(_, e, field) => {
+        PureExpKind::AdtDestructor(e, field) => {
             write!(f, "{}.{}", show.with(e), show.name(*field))
         }
-        PureExpKind::AdtDiscriminator(_, e, variant) => {
+        PureExpKind::AdtDiscriminator(e, variant) => {
             write!(f, "{}.is{}", show.with(e), show.name(*variant))
         }
         PureExpKind::Ext(ext) => ext.fmt_ext(f, show.interner),
