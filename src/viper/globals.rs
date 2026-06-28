@@ -92,6 +92,7 @@ pub enum GlobalKind {
     Field,
     Predicate,
     Function,
+    DomainFunction,
     Method,
     Domain,
     Adt,
@@ -106,6 +107,7 @@ impl fmt::Display for GlobalKind {
             Self::Field => "field",
             Self::Predicate => "predicate",
             Self::Function => "function",
+            Self::DomainFunction => "domain function",
             Self::Method => "method",
             Self::Domain => "domain",
             Self::Adt => "ADT",
@@ -122,6 +124,7 @@ pub enum GlobalSignature {
     Field(Type),
     Predicate(PredicateSig),
     Function(FunctionSig),
+    DomainFunction(FunctionSig),
     Method(MethodSig),
     Domain(DomainSig),
     Adt(AdtSig),
@@ -136,6 +139,7 @@ impl GlobalSignature {
             Self::Field(_) => GlobalKind::Field,
             Self::Predicate(_) => GlobalKind::Predicate,
             Self::Function(_) => GlobalKind::Function,
+            Self::DomainFunction(_) => GlobalKind::DomainFunction,
             Self::Method(_) => GlobalKind::Method,
             Self::Domain(_) => GlobalKind::Domain,
             Self::Adt(_) => GlobalKind::Adt,
@@ -477,17 +481,30 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
         );
     }
 
-    fn walk_domain_function(&mut self, func: &'ast super::DomainFunction) {
+    fn walk_domain_element(&mut self, elem: &'ast super::DomainElement) {
+        let func = match &elem.kind {
+            super::DomainElementKind::Function(func) => func,
+            // Axioms are not top-level globals.
+            super::DomainElementKind::Axiom(_) => return,
+        };
+        // The owning domain (registered before its elements) supplies the bound
+        // type parameters, so generic arg/return types lower to `Generic`.
+        let type_params: HashSet<Spur> = self
+            .symbol_table
+            .get(&elem.domain.id())
+            .and_then(|mid| self.signatures[*mid].as_domain())
+            .map(|s| s.params.iter().copied().collect())
+            .unwrap_or_default();
         let sig = FunctionSig {
             params: func
                 .signature
                 .args
                 .iter()
-                .map(|p| Type::from(p.ty()))
+                .map(|p| genericize(Type::from(p.ty()), &type_params))
                 .collect(),
-            ret: Type::from(func.signature.ret[0].ty()),
+            ret: genericize(Type::from(func.signature.ret[0].ty()), &type_params),
         };
-        self.register(&func.signature.name, GlobalSignature::Function(sig));
+        self.register(&func.signature.name, GlobalSignature::DomainFunction(sig));
     }
 
     fn walk_define(&mut self, define: &'ast super::Define) {

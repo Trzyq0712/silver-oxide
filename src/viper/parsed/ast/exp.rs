@@ -84,6 +84,7 @@ pub enum ExpKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExpCallKind {
     Function,
+    DomainFunction,
     Predicate,
     AdtConstructor,
     Macro,

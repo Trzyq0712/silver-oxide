@@ -114,6 +114,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                     // EXPRESSION CONTEXT
                     // Let `walk_mut_exp_call` handle specific kind resolution and arguments!
                     GlobalKind::Function
+                    | GlobalKind::DomainFunction
                     | GlobalKind::Predicate
                     | GlobalKind::ExpMacro
                     | GlobalKind::AdtConstructor => {
@@ -162,6 +163,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
             match sym.kind() {
                 // EXPRESSION CONTEXT: Valid callable targets
                 GlobalKind::Function => call.kind = Some(ExpCallKind::Function),
+                GlobalKind::DomainFunction => call.kind = Some(ExpCallKind::DomainFunction),
                 GlobalKind::Predicate => call.kind = Some(ExpCallKind::Predicate),
                 GlobalKind::ExpMacro => call.kind = Some(ExpCallKind::Macro),
                 GlobalKind::AdtConstructor => call.kind = Some(ExpCallKind::AdtConstructor),

@@ -254,8 +254,9 @@ fn eval_pure_inst(
         }
         PureInst::FunctionCall(_heap, fc) => {
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            // Plain Silver functions are not generic yet — empty type instantiation.
-            ctx.add_func_app(fc, Box::new([]), ty.clone(), args.into())
+            // `type_args` is empty for a plain Silver function, the result-type
+            // vars for a (generic) domain function — part of the node identity.
+            ctx.add_func_app(fc, fc.type_args.clone().into(), ty.clone(), args.into())
         }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {

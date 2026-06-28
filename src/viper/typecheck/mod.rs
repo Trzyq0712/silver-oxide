@@ -727,9 +727,11 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             ExpCallKind::Predicate => Err(TypeError::PredicateInPureContext(
                 self.env.interner.resolve(&call_name).to_string(),
             )),
-            ExpCallKind::Function | ExpCallKind::AdtConstructor => {
+            ExpCallKind::Function | ExpCallKind::DomainFunction | ExpCallKind::AdtConstructor => {
                 let (params, ret_ty) = match sym.signature() {
-                    GlobalSignature::Function(s) => (s.params.clone(), s.ret.clone()),
+                    GlobalSignature::Function(s) | GlobalSignature::DomainFunction(s) => {
+                        (s.params.clone(), s.ret.clone())
+                    }
                     GlobalSignature::AdtConstructor(s) => (s.params.clone(), s.ret.clone()),
                     _ => {
                         return Err(TypeError::Other(format!(
@@ -1019,7 +1021,9 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
             ExpCallKind::Predicate => Err(TypeError::PredicateInPureContext(
                 self.env.interner.resolve(&call_name).to_string(),
             )),
-            kind @ (ExpCallKind::Function | ExpCallKind::AdtConstructor) => {
+            kind @ (ExpCallKind::Function
+            | ExpCallKind::DomainFunction
+            | ExpCallKind::AdtConstructor) => {
                 let mut args = Vec::with_capacity(call.args.len());
                 for arg in call.args.iter() {
                     args.push(self.lower_pure::<Ext>(arg)?);
@@ -1030,9 +1034,11 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                 };
                 match kind {
                     ExpCallKind::AdtConstructor => Ok(PureExpKind::AdtConstructor(call)),
+                    // A domain function call is pure — it lands in the pure node
+                    // directly (no heap dependence).
+                    ExpCallKind::DomainFunction => Ok(PureExpKind::DomainFunctionCall(call)),
                     // A Silver `function` call is heap-dependent — supplied via the
-                    // context's `Ext` (rejected in a pure context). Domain function
-                    // calls are not yet distinguished, so they land here too.
+                    // context's `Ext` (rejected in a pure context).
                     _ => Ok(PureExpKind::Ext(Ext::lower_heap(
                         typed::HeapNode::FunctionCall(call),
                     )?)),

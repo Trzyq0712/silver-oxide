@@ -13,6 +13,11 @@ pub struct Function {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionCall {
     pub function: MemberId,
+    /// Ground type instantiation of the callee's used type parameters. Empty for
+    /// a non-generic Silver `function`; for a domain function it records the
+    /// result-type vars (the mandatory part for e-graph distinctness — arg-only
+    /// vars ride their argument enodes). Rides the `FuncApp` payload, not the id.
+    pub type_args: Vec<Type>,
     pub args: Vec<Val>,
 }
 

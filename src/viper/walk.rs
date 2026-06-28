@@ -317,6 +317,7 @@ walk_enum!(
     walk_exp_call_kind,
     walk_mut_exp_call_kind,
     Function,
+    DomainFunction,
     Predicate,
     AdtConstructor,
     Macro

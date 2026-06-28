@@ -119,10 +119,14 @@ pub(crate) fn lower<Ext: PureExt>(
             })?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
-        // A domain function call (pure). Lowered as an ordinary VMIR function
-        // application. TODO: thread the used type vars once VMIR function calls
-        // carry a monomorphization key (Part 2).
-        P::DomainFunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
+        // A domain function call (pure). Lowered as a polymorphic VMIR function
+        // application (one `FuncId` for the function — no monomorphic copy). The
+        // recorded type args are the result-type vars (`exp.ty`); arg-only vars
+        // ride their argument enodes. (Fully concrete result ⇒ empty.)
+        P::DomainFunctionCall(call) => {
+            let type_args = adt_type_args(b, &exp.ty);
+            lower_func_app(b, env, sink, hctx, ty, type_args, call)
+        }
         // A constructor lowers to the semantic `AdtCons`; its type arguments are
         // its result type (`exp.ty`), the variant tag from `ctor_tag`.
         P::AdtConstructor(call) => {
@@ -352,6 +356,7 @@ fn lower_func_app<Ext: PureExt>(
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
     ty: vmir::Type,
+    type_args: Vec<vmir::Type>,
     call: &typed::Call<Ext>,
 ) -> Result<Val, TranslationError> {
     let mut args = Vec::with_capacity(call.args.len());
@@ -367,6 +372,7 @@ fn lower_func_app<Ext: PureExt>(
             None,
             vmir::FunctionCall {
                 function: func,
+                type_args,
                 args,
             },
         ),
@@ -390,7 +396,8 @@ pub(crate) fn lower_heap_node<Ext: PureExt>(
             let addr = crate::translate::resource::field_addr(b, sink, base, id.0)?;
             Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
         }
-        H::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
+        // A heap-dependent Silver `function` — not generic yet, so no type args.
+        H::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, Vec::new(), call),
         H::Unfolding(pwp, body) => {
             // `unfolding acc(P(args), perm) in body`: a scoped unfold. Emit an
             // `Unfold`, evaluate `body` against the unfolded heap, then discard it

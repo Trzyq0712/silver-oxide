@@ -50,6 +50,7 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
                     None,
                     vmir::FunctionCall {
                         function: pred_id,
+                        type_args: Vec::new(),
                         args,
                     },
                 ),
@@ -88,6 +89,7 @@ pub(crate) fn field_addr(
             None,
             vmir::FunctionCall {
                 function: field_id,
+                type_args: Vec::new(),
                 args: vec![base],
             },
         ),
