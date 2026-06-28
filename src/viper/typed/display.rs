@@ -11,9 +11,9 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::viper::interner::Interner;
 use crate::viper::typed::{
-    AssignLhs, AssignRhs, BinOp, Call, Declaration, Field, FuncEnsuresExt, Function, HeapExt,
-    HeapNode, Ident, Literal, Method, MethodBodyExt, MethodEnsuresExt, Predicate,
-    PredicateWithPerm, Program, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp,
+    AssignLhs, AssignRhs, BinOp, Call, Declaration, Domain, DomainFunction, Field, FuncEnsuresExt,
+    Function, HeapExt, HeapNode, Ident, Literal, Method, MethodBodyExt, MethodEnsuresExt,
+    Predicate, PredicateWithPerm, Program, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp,
     SpatialExpKind, StarOrFields, Statement, StmtBlock, Type, TypedIdent, TypedPureExp, UnOp,
 };
 
@@ -151,10 +151,10 @@ impl<'a> Display for Show<'a, &'a Declaration> {
             Declaration::Predicate(d) => write!(f, "{}", self.with(d)),
             Declaration::Method(d) => write!(f, "{}", self.with(d)),
             Declaration::Field(d) => write!(f, "{}", self.with(d)),
-            // ADT/Domain decls are not yet consumed by translation; a minimal
-            // header keeps the typed dump total.
+            // ADT decls are not yet consumed by translation; a minimal header
+            // keeps the typed dump total.
             Declaration::Adt(d) => write!(f, "adt {}", self.name(d.name)),
-            Declaration::Domain(d) => write!(f, "domain {}", self.name(d.name)),
+            Declaration::Domain(d) => write!(f, "{}", self.with(d)),
         }
     }
 }
@@ -185,7 +185,20 @@ impl<'a> Display for Show<'a, &'a Type> {
             Type::Ref => write!(f, "Ref"),
             Type::Generic(id) => write!(f, "{}", self.name(*id)),
             Type::Collection(_) => write!(f, "<collection>"),
-            Type::Domain(id, _) => write!(f, "{}", self.name(*id)),
+            Type::Domain(id, args) => {
+                write!(f, "{}", self.name(*id))?;
+                if !args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", self.with(a))?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -220,6 +233,35 @@ impl<'a> Display for Show<'a, &'a Function> {
             write!(f, "\n{{ {} }}", self.with(body))?;
         }
         Ok(())
+    }
+}
+
+impl<'a> Display for Show<'a, &'a Domain> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "domain {}", self.name(self.item.name))?;
+        if !self.item.type_params.is_empty() {
+            write!(f, "[")?;
+            for (i, p) in self.item.type_params.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", self.name(*p))?;
+            }
+            write!(f, "]")?;
+        }
+        writeln!(f, " {{")?;
+        for func in &self.item.functions {
+            writeln!(f, "  {}", self.with(func))?;
+        }
+        write!(f, "}}")
+    }
+}
+
+impl<'a> Display for Show<'a, &'a DomainFunction> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "function {}", self.name(self.item.name))?;
+        fmt_params(f, self, &self.item.params)?;
+        write!(f, ": {}", self.with(&self.item.ret))
     }
 }
 
