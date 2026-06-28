@@ -79,17 +79,52 @@ impl Snapshotter {
             .with_config_line("newrank=true")
             .to_string();
 
-        // Resolve `FuncApp` member ids (rendered `fn<id>(..)` by `Symbolic`'s
-        // type-free `Display`) to their source names, and annotate `Fresh<id>`
-        // nodes with their type — both live in the viz/context oracles, so the
-        // e-graph itself need not carry them.
-        let mut funcs: HashSet<crate::verify::lang::FuncId> = HashSet::new();
+        // Rewrite each `FuncApp` node's label from the type-free `fn<id>[tys]`
+        // that `Symbolic`'s `Display` emits to the **instantiated signature**
+        // `name(<arg types>): <ret type>` — names and types live in the
+        // viz/context oracles, so the e-graph itself need not carry them. The
+        // rewrite is per *node* (egg labels each as `<eclass>.<idx>`), since the
+        // argument types come from the node's own child e-classes. `Fresh<id>`
+        // nodes are likewise annotated with their type below.
+        let mut type_memo: HashMap<egg::Id, Option<Type>> = HashMap::new();
+        let infer = |memo: &mut HashMap<egg::Id, Option<Type>>, id: egg::Id| {
+            crate::verify::context::infer_type(
+                &ctx.egraph,
+                &ctx.fresh_types,
+                &ctx.func_ret_types,
+                id,
+                memo,
+            )
+        };
+        let type_label = |ty: &Option<Type>| match ty {
+            Some(t) => ctx.type_name(t),
+            None => "?".to_string(),
+        };
         let mut fresh: HashSet<u32> = HashSet::new();
         for class in ctx.egraph.classes() {
-            for node in &class.nodes {
+            for (idx, node) in class.nodes.iter().enumerate() {
                 match node {
-                    Symbolic::FuncApp(m, _, _) => {
-                        funcs.insert(*m);
+                    Symbolic::FuncApp(m, _, args) => {
+                        let name = ctx.func_name(*m);
+                        let arg_tys: Vec<String> = args
+                            .iter()
+                            .map(|&a| {
+                                let ty = infer(&mut type_memo, a);
+                                type_label(&ty)
+                            })
+                            .collect();
+                        let ret = type_label(&infer(&mut type_memo, class.id));
+                        let label = format!("{name}({}): {ret}", arg_tys.join(", "));
+                        // egg renders the node as `<eclass>.<idx>[label = "<raw>"]`
+                        // where `<raw>` is the node's `Display` (`fn<id>[tys]`).
+                        let raw = node.to_string();
+                        let needle = format!("{}.{idx}[label = \"{raw}\"]", usize::from(class.id));
+                        let repl = format!(
+                            "{}.{idx}[label = \"{}\"]",
+                            usize::from(class.id),
+                            escape(&label)
+                        );
+                        dot = dot.replace(&needle, &repl);
                     }
                     Symbolic::Fresh(u) => {
                         fresh.insert(*u);
@@ -97,17 +132,6 @@ impl Snapshotter {
                     _ => {}
                 }
             }
-        }
-        for m in funcs {
-            // `Symbolic` renders a func app as `fn<id>` (no type args) or
-            // `fn<id>[T0, T1]` (Viper-style square-bracket type args folded into
-            // the label). Resolve just the `fn<id>` token to the concept name,
-            // keeping any `[…]` type suffix. Anchor on the trailing label-quote
-            // `"` (no type args) or `[` (typed) so `fn1` doesn't also rewrite
-            // `fn10`.
-            let name = escape(&ctx.func_name(m));
-            dot = dot.replace(&format!("fn{}\"", m.0), &format!("{name}\""));
-            dot = dot.replace(&format!("fn{}[", m.0), &format!("{name}["));
         }
         // `Symbolic` renders a fresh value as `fresh<id>`; append its type from
         // the `fresh_types` oracle. Match the trailing `"` so `fresh1` doesn't

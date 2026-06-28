@@ -537,6 +537,47 @@ method m()
 }
 
 #[test]
+fn domain_function_call_is_pure_and_congruent() {
+    // A domain function is uninterpreted but a *function*: two syntactically
+    // identical calls land in one e-class by congruence, so `f(3) == f(3)`
+    // verifies. (Exercises the pure `DomainFunctionCall` lowering path — a
+    // domain call must reach the pure node, not the heap `FunctionCall`.)
+    let input = r#"
+domain D { function f(x: Int): Int }
+method m()
+{
+    assert f(3) == f(3)
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "f(3) == f(3) should verify by congruence"
+    );
+}
+
+#[test]
+fn domain_function_distinct_args_do_not_merge() {
+    // Uninterpreted: `f(3)` and `f(4)` have distinct argument enodes, so they
+    // are not provably equal — asserting their equality must fail.
+    let input = r#"
+domain D { function f(x: Int): Int }
+method m()
+{
+    assert f(3) == f(4)
+}
+"#;
+    let program = lower(input);
+    assert!(
+        matches!(
+            verify_named_method(&program, "m"),
+            Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)
+        ),
+        "f(3) == f(4) should fail"
+    );
+}
+
+#[test]
 fn fold_unfold_roundtrip_preserves_field() {
     // `fold` then `unfold` recovers the exact field value via the snapshot.
     let input = r#"
