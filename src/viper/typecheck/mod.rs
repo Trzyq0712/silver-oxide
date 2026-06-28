@@ -1491,15 +1491,28 @@ fn typecheck_adt(adt: &viper::Adt) -> Result<typed::Declaration, TypeError> {
     }))
 }
 
-/// A domain function as a bodyless typed `Function` (signature only).
-fn domain_function_to_typed(df: &viper::DomainFunction) -> typed::Function {
-    typed::Function {
+/// A domain function's typed signature. Argument and result types are lowered
+/// with the owning domain's `type_params` in scope, so a type-parameter use
+/// (`f1(x: T): Int`) becomes `Generic(T)` rather than an opaque `Domain(T, [])`.
+fn domain_function_to_typed(
+    df: &viper::DomainFunction,
+    type_params: &[lasso::Spur],
+) -> typed::DomainFunction {
+    let params = df
+        .signature
+        .args
+        .iter()
+        .filter_map(|p| {
+            p.idn().map(|idn| TypedIdent {
+                name: Ident(idn.0.id()),
+                ty: type_with_generics(p.ty(), type_params),
+            })
+        })
+        .collect();
+    typed::DomainFunction {
         name: Ident(df.signature.name.0.id()),
-        params: collect_params(&df.signature.args),
-        ret: Type::from(df.signature.ret[0].ty()),
-        requires: None,
-        ensures: None,
-        body: None,
+        params,
+        ret: type_with_generics(df.signature.ret[0].ty(), type_params),
     }
 }
 
@@ -1667,16 +1680,29 @@ pub fn typecheck_program(
     // Domain functions/axioms are separate `DomainElement` decls; gather the
     // functions per owning domain so each `Domain` can carry them. Axioms are
     // deferred (nothing consumes them yet).
-    let mut domain_fns: std::collections::HashMap<lasso::Spur, Vec<typed::Function>> =
+    let mut domain_fns: std::collections::HashMap<lasso::Spur, Vec<typed::DomainFunction>> =
         std::collections::HashMap::new();
+    // Each domain's type parameters, so a function signature that mentions one
+    // (`f1(x: T): Int`) lowers it to `Generic(T)` rather than an opaque domain.
+    let domain_params: std::collections::HashMap<lasso::Spur, Vec<lasso::Spur>> = program
+        .0
+        .iter()
+        .filter_map(|decl| match decl {
+            viper::Declaration::Domain(d) => {
+                Some((d.name.0.id(), d.params.iter().map(|p| p.0.id()).collect()))
+            }
+            _ => None,
+        })
+        .collect();
     for decl in &program.0 {
         if let viper::Declaration::DomainElement(de) = decl
             && let viper::DomainElementKind::Function(df) = &de.kind
         {
+            let params = domain_params.get(&de.domain.id()).map_or(&[][..], |v| v);
             domain_fns
                 .entry(de.domain.id())
                 .or_default()
-                .push(domain_function_to_typed(df));
+                .push(domain_function_to_typed(df, params));
         }
     }
 
@@ -1828,6 +1854,60 @@ function f(): Pair[Int, Bool] { mk(1, true) }
 "#,
         );
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn domain_generic_signatures_are_genericized_and_calls_infer() {
+        // A generic domain's function signatures must carry `Generic(T)` for a
+        // type-parameter use (not an opaque `Domain(T, [])`), and calls in a
+        // method body must infer the instantiation: `f2(2): U => Bool`,
+        // `f1(g): Int` with `T` pinned by `g`'s type.
+        let program = run_pipeline(
+            r#"
+domain Generic[T, U] {
+    function f1(x: T): Int
+    function f2(x: Int): U
+}
+domain Normal {
+    function f3(x: Int): Int
+}
+method client() {
+    var b: Bool := f2(2)
+    var g: Generic[Ref, Ref]
+    var i: Int := f1(g)
+    var n: Normal
+}
+"#,
+        )
+        .expect("expected Ok");
+
+        // The two-parameter domain's functions carry genericized signatures.
+        let generic = program
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                typed::Declaration::Domain(dom) if dom.type_params.len() == 2 => Some(dom),
+                _ => None,
+            })
+            .expect("Generic domain missing");
+        // f1(x: T): Int — generic param, concrete return.
+        assert!(
+            generic.functions.iter().any(|f| {
+                matches!(f.params.as_slice(), [p] if matches!(p.ty, Type::Generic(_)))
+                    && f.ret == Type::Int
+            }),
+            "f1 should be `Generic -> Int`, got {:?}",
+            generic.functions
+        );
+        // f2(x: Int): U — concrete param, generic return.
+        assert!(
+            generic.functions.iter().any(|f| {
+                matches!(f.params.as_slice(), [p] if p.ty == Type::Int)
+                    && matches!(f.ret, Type::Generic(_))
+            }),
+            "f2 should be `Int -> Generic`, got {:?}",
+            generic.functions
+        );
     }
 
     #[test]

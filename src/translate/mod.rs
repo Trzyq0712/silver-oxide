@@ -202,13 +202,24 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Pass 2: user functions (top-level + domain functions).
-        for func in decls.iter().flat_map(decl_functions) {
-            let name = self.interner.resolve(&func.name.0).to_string();
-            let id = self.fresh_decl(&name);
-            let params = func.params.iter().map(|p| self.lower_type(&p.ty)).collect();
-            let ret = self.lower_type(&func.ret);
-            self.set_decl(
+        // Pass 2: user functions (top-level + domain functions). Both lower to a
+        // bodyless `vmir::Function` from their `(name, params, ret)`.
+        // `generics` is the owning declaration's type parameters, in scope for the
+        // signature: a domain function may mention them (`Generic(T)`); a top-level
+        // Silver function is monomorphic (empty).
+        let emit_function = |this: &mut Self,
+                             name: Spur,
+                             generics: &[Spur],
+                             params: &[typed::Type],
+                             ret: &typed::Type| {
+            let name_str = this.interner.resolve(&name).to_string();
+            let id = this.fresh_decl(&name_str);
+            let params = params
+                .iter()
+                .map(|t| lower_type(&this.name_map, generics, t))
+                .collect();
+            let ret = lower_type(&this.name_map, generics, ret);
+            this.set_decl(
                 id,
                 vmir::Declaration::Function(vmir::Function {
                     params,
@@ -216,7 +227,24 @@ impl<'a> Builder<'a> {
                     body: None,
                 }),
             );
-            self.name_map.insert(func.name.0, id);
+            this.name_map.insert(name, id);
+        };
+        for decl in decls {
+            match decl {
+                typed::Declaration::Function(f) => {
+                    let params: Vec<typed::Type> = f.params.iter().map(|p| p.ty.clone()).collect();
+                    emit_function(self, f.name.0, &[], &params, &f.ret);
+                }
+                typed::Declaration::Domain(d) => {
+                    let generics: Vec<Spur> = d.type_params.iter().map(|i| i.0).collect();
+                    for df in &d.functions {
+                        let params: Vec<typed::Type> =
+                            df.params.iter().map(|p| p.ty.clone()).collect();
+                        emit_function(self, df.name.0, &generics, &params, &df.ret);
+                    }
+                }
+                _ => {}
+            }
         }
 
         // Pass 3: fill each ADT's variant shape and record constructor/destructor
@@ -465,16 +493,6 @@ impl<'a> Builder<'a> {
             interner: self.vmir_interner,
             groups: self.groups,
         }
-    }
-}
-
-/// The functions a declaration contributes to the global function namespace: a
-/// top-level function itself, or each of a domain's functions.
-fn decl_functions(decl: &typed::Declaration) -> &[typed::Function] {
-    match decl {
-        typed::Declaration::Function(f) => std::slice::from_ref(f),
-        typed::Declaration::Domain(d) => &d.functions,
-        _ => &[],
     }
 }
 

@@ -295,7 +295,7 @@ pub enum Declaration {
 pub struct Domain {
     pub name: Ident,
     pub type_params: Vec<Ident>,
-    pub functions: Vec<Function>,
+    pub functions: Vec<DomainFunction>,
     pub axioms: Vec<Axiom>,
 }
 
@@ -320,6 +320,13 @@ pub struct AdtVariant {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field(pub TypedIdent);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainFunction {
+    pub name: Ident,
+    pub params: Vec<TypedIdent>,
+    pub ret: Type,
+}
 
 /// A purely mathematical function that cannot mutate state.
 #[derive(Debug, Clone, PartialEq)]
