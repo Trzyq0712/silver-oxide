@@ -552,30 +552,152 @@ function inc(x: Int): Int
 }
 
 #[test]
-fn heap_dependent_function_is_unsupported() {
-    // A function whose precondition grants permission (`acc`) is heap-dependent,
-    // which is not yet supported (future separate declaration).
+fn heap_dependent_function_lowers_to_snapshot_passing() {
+    // A function whose precondition grants permission (`acc`) is heap-dependent:
+    // - `get#requires` is a self-framed Resource (footprint + bool);
+    // - `get` gains a trailing snapshot parameter `Snap(get#requires)` and its
+    //   body opens with `FromSnap` (no boolean entry assume) and exits with an
+    //   `assert get#ensures(params, result, snap)`;
+    // - `get#ensures` is a boolean Function over (params ++ [result, snap])
+    //   whose body also opens with `FromSnap`.
+    let input = r#"
+field f: Int
+function get(x: Ref): Int
+    requires acc(x.f) && x.f > 0
+    ensures result == x.f
+{ x.f }
+"#;
+    let p = run(input);
+
+    // #requires is a self-framed Resource, not a boolean Function.
+    let req_id = p.id("get#requires").expect("missing get#requires");
+    let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
+        panic!("get#requires must be a Resource");
+    };
+    assert_eq!(req.params, vec![vmir::Type::Ref]);
+    assert!(matches!(req.precond, vmir::Precond::SelfFramed));
+    assert!(req.body.is_some());
+
+    let snap_ty = vmir::Type::Snap(req_id);
+
+    // Main function: params ++ [Snap(get#requires)] -> Int.
+    let get_id = p.id("get").expect("missing get");
+    let vmir::Declaration::Function(get) = &p.decls[get_id] else {
+        panic!("get must be a Function");
+    };
+    assert_eq!(get.ret, vmir::Type::Int);
+    assert_eq!(
+        get.params,
+        vec![vmir::Type::Ref, snap_ty.clone()].into(),
+        "heap-dep function takes its precondition snapshot as trailing param"
+    );
+    let body = get.body.as_ref().expect("body must be lowered");
+    // Entry: FromSnap reconstructing the precondition heap from the snap param.
+    assert!(
+        matches!(
+            &body.insts[0].kind,
+            vmir::InstKind::Heap(vmir::HeapInst::FromSnap { resource, args, snap })
+                if *resource == req_id
+                    && args == &vec![vmir::Val::Temp(0)]
+                    && *snap == vmir::Val::Temp(1)
+        ),
+        "body must open with FromSnap of get#requires"
+    );
+    // No boolean entry assume — FromSnap assumes the resource bool implicitly.
+    assert!(
+        !body
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, vmir::InstKind::Assume(_))),
+        "heap-dep body has no boolean entry assume"
+    );
+    // Exit: assert get#ensures(params, result, snap).
+    let ens_id = p.id("get#ensures").expect("missing get#ensures");
+    let n = body.insts.len();
+    assert!(
+        matches!(
+            &body.insts[n - 2].kind,
+            vmir::InstKind::Pure(vmir::Type::Bool, vmir::PureInst::FunctionCall(fc))
+                if fc.function == ens_id
+                    && fc.args.iter().cloned().collect::<Vec<_>>()
+                        == vec![vmir::Val::Temp(0), body.res.clone(), vmir::Val::Temp(1)]
+        ),
+        "exit must call get#ensures(params, result, snap)"
+    );
+    assert!(matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)));
+
+    // #ensures: boolean Function over (params ++ [result, snap]), body opens
+    // with the same FromSnap.
+    let vmir::Declaration::Function(ens) = &p.decls[ens_id] else {
+        panic!("get#ensures must be a Function");
+    };
+    assert_eq!(ens.ret, vmir::Type::Bool);
+    assert_eq!(
+        ens.params,
+        vec![vmir::Type::Ref, vmir::Type::Int, snap_ty].into(),
+        "ensures params are params ++ [result, snap]"
+    );
+    let ens_body = ens.body.as_ref().expect("ensures body");
+    assert!(
+        matches!(
+            &ens_body.insts[0].kind,
+            vmir::InstKind::Heap(vmir::HeapInst::FromSnap { resource, snap, .. })
+                if *resource == req_id && *snap == vmir::Val::Temp(2)
+        ),
+        "ensures body must open with FromSnap (snap after result)"
+    );
+}
+
+#[test]
+fn heap_dependent_function_call_passes_snapshot() {
+    // A call to a heap-dependent function narrows the caller's heap with `Snap`
+    // (implicit precondition check), passes the snapshot as the extra trailing
+    // argument, and assumes `f#ensures(args, ret, snap)` — no boolean
+    // requires-assert.
     let input = r#"
 field f: Int
 function get(x: Ref): Int
     requires acc(x.f)
-    ensures result == x.f
 { x.f }
+
+method m(y: Ref)
+    requires acc(y.f)
+{
+    var a: Int := get(y)
+}
 "#;
-    let mut program = viper_parser::vpr_program(input).expect("parse failed");
-    let mut ident_collector = IdentCollector::default();
-    program.walk_mut(&mut ident_collector);
-    let interner = ident_collector.finalize();
-    let mut globals_collector = GlobalsCollector::new(&interner);
-    program.walk(&mut globals_collector);
-    let globals = globals_collector.finalize().expect("globals error");
-    disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
-    inline_macros(&mut program, &interner).expect("macro inlining failed");
-    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck failed");
-    let err = translate(&typed).expect_err("heap-dependent function must be rejected");
+    let p = run(input);
+    let req_id = p.id("get#requires").expect("missing get#requires");
+    let get_id = p.id("get").expect("missing get");
+    let m_id = p.id("m").expect("missing method m");
+    let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+        panic!("m must be a Method");
+    };
+    let snap_at = m.insts.iter().position(|i| {
+        matches!(
+            &i.kind,
+            vmir::InstKind::Pure(vmir::Type::Snap(r), vmir::PureInst::Snap { resource, .. })
+                if *r == req_id && *resource == req_id
+        )
+    });
+    let snap_at = snap_at.expect("call site must emit a Snap of get#requires");
+    // The following FunctionCall must carry the snapshot as its last argument.
+    let call = m.insts[snap_at..].iter().find_map(|i| match &i.kind {
+        vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == get_id => {
+            Some(fc)
+        }
+        _ => None,
+    });
+    let call = call.expect("call to get after the Snap");
+    let args: Vec<_> = call.args.iter().cloned().collect();
+    assert_eq!(args.len(), 2, "call args are (y, snap)");
+    // No boolean requires-assert for a heap-dep callee (Snap checks implicitly);
+    // `m` has no other assert-producing constructs before the call.
     assert!(
-        format!("{err:?}").contains("heap-dependent"),
-        "unexpected error: {err:?}"
+        !m.insts[..snap_at]
+            .iter()
+            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
+        "no boolean requires-assert before a heap-dep call"
     );
 }
 

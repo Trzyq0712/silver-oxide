@@ -128,8 +128,7 @@ pub(crate) fn lower<Ext: PureExt>(
         // function application (one `FuncId` for the function — no monomorphic
         // copy). `type_args` is the **full** instantiation in the function's own
         // type-parameter order, recovered from the concrete arg/result types, so
-        // the verifier reads it verbatim (no reconstruction). Precond-free ⟹
-        // heap-free (`heap: None`).
+        // the verifier reads it verbatim (no reconstruction).
         P::DomainFunctionCall(call) => {
             let arg_tys: Vec<&typed::Type> = call.args.iter().map(|a| &a.ty).collect();
             let type_args = b.call_type_args(call.name.0, &arg_tys, &exp.ty);
@@ -374,10 +373,13 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
 /// Per-context lowering of pure-expression extensions (`old`, `result`,
 /// `perm`, etc.). `hctx` carries the value/perm heaps; `ty` is the expression's
 /// result type.
-/// Lower a heap (Silver `function`) application to a VMIR `FunctionCall`.
-/// A plain function is monomorphic (no `type_args`) and, until preconditions are
-/// lowered, heap-free (`heap: None`). Heap-dependence is a later (purification)
-/// concern.
+/// Lower a Silver `function` application to a VMIR `FunctionCall` (monomorphic,
+/// no `type_args`). Calls are always pure: a **heap-dependent** callee (one
+/// whose `requires` grants permission) receives the snapshot of its `#requires`
+/// resource — built here from the current value heap by `PureInst::Snap`, which
+/// implicitly checks the precondition (footprint sufficiency + resource bool) —
+/// as an extra trailing argument. A **heap-free** callee's precondition is
+/// instead asserted as a boolean contract call.
 fn lower_func_app<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -393,12 +395,29 @@ fn lower_func_app<Ext: PureExt>(
     let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
         TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
     })?;
-    // Functions are pure and heap-free. Contract functions (`#requires` /
-    // `#ensures`) are stitched as pure asserts/assumes around the call.
-    let requires = b.contracts.get(&call.name.0).and_then(|c| c.requires);
-    let ensures = b.contracts.get(&call.name.0).and_then(|c| c.ensures);
-    // Use-side precondition: assert `f#requires(args)` before the call.
-    if let Some(req_id) = requires {
+    let contracts = b.contracts.get(&call.name.0);
+    let requires = contracts.and_then(|c| c.requires);
+    let ensures = contracts.and_then(|c| c.ensures);
+    let heap_dep = contracts.is_some_and(|c| c.heap_dep);
+    // Use-side precondition, and the call's actual argument list.
+    let mut call_args = args.clone();
+    let mut snap = None;
+    if heap_dep {
+        // Narrow the current value heap to the callee's precondition snapshot.
+        // `Snap` implicitly asserts the precondition under the running pc.
+        let req_id = requires.expect("heap-dep implies a requires");
+        let s = sink.emit_pure_guarded(
+            vmir::Type::Snap(req_id),
+            PureInst::Snap {
+                resource: req_id,
+                args: args.clone(),
+                heap: hctx.value,
+            },
+        );
+        call_args.push(s.clone());
+        snap = Some(s);
+    } else if let Some(req_id) = requires {
+        // Heap-free: assert `f#requires(args)` before the call.
         let check = call_contract(sink, req_id, args.clone());
         sink.emit_assert(check);
     }
@@ -407,12 +426,14 @@ fn lower_func_app<Ext: PureExt>(
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
-            args: args.clone().into(),
+            args: call_args.into(),
         }),
     );
-    // Use-side postcondition: assume `f#ensures(args, ret)` after the call.
+    // Use-side postcondition: assume `f#ensures(args, ret[, snap])` after the
+    // call.
     if let Some(ens_id) = ensures {
         args.push(ret.clone());
+        args.extend(snap);
         let check = call_contract(sink, ens_id, args);
         sink.emit_assume(check);
     }
@@ -609,11 +630,24 @@ impl PureExt for typed::FuncEnsuresExt {
 /// The contract functions to stitch around a function body: `assume
 /// requires(params)` at entry, `assert ensures(params ++ [body_result])` at
 /// exit. Each is `None` when the function omits that clause; `params` are the
-/// function's parameter `Val`s (`Temp(0..n_params)`).
+/// function's parameter `Val`s (`Temp(0..n_params)`). For a heap-dependent
+/// function `requires` is `None` (the precondition is assumed implicitly by
+/// the entry `FromSnap`) and `snap` is its snapshot parameter, appended after
+/// the result in the exit `ensures` call.
 pub(crate) struct FnContract {
     pub requires: Option<vmir::MemberId>,
     pub ensures: Option<vmir::MemberId>,
     pub params: Vec<Val>,
+    pub snap: Option<Val>,
+}
+
+/// The entry `FromSnap` of a heap-dependent function (or ensures-function)
+/// body: reconstruct the precondition heap from the snapshot parameter `snap`
+/// of `resource(args)`. The produced heap becomes the body's value/perm heap.
+pub(crate) struct SnapEntry {
+    pub resource: vmir::MemberId,
+    pub args: Vec<Val>,
+    pub snap: Val,
 }
 
 /// Emit a heap-free boolean contract call `func(args)` and return its `Val`.
@@ -630,11 +664,16 @@ fn call_contract(sink: &mut Sink, func: vmir::MemberId, args: Vec<Val>) -> Val {
 
 /// Lower a pure expression into a standalone [`vmir::FunctionBody`] (function
 /// body / contract-function definition). `val_base` is the first free pure-temp
-/// counter (params, plus a `result` slot for a postcondition function, occupy
-/// the lower temps); `heap` is the (heap-free) context heap the body reads from
-/// (`HeapVal::Empty`); `result` is `Some` only for a postcondition function.
-/// When `contract` is `Some`, the body **assumes** `requires(params)` at entry
-/// and **asserts** `ensures(params ++ [body_result])` at exit.
+/// counter (params, plus `result`/snapshot slots for a postcondition /
+/// heap-dependent function, occupy the lower temps); `heap` is the context heap
+/// the body reads from (`HeapVal::Empty` for a heap-free body); `result` is
+/// `Some` only for a postcondition function. When `snap_entry` is `Some`, the
+/// body opens with its `FromSnap` — reconstructing the precondition heap from
+/// the snapshot parameter (implicitly assuming the resource bool) — and that
+/// heap replaces `heap` as the body's value/perm heap. When `contract` is
+/// `Some`, the body **assumes** `requires(params)` at entry and **asserts**
+/// `ensures(params ++ [body_result] ++ [snap])` at exit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_function_body<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -643,15 +682,31 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     heap: HeapVal,
     result: Option<Val>,
     contract: Option<FnContract>,
+    snap_entry: Option<SnapEntry>,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
+    // A heap-dependent body reads the heap reconstructed from its snapshot
+    // parameter; a heap-free body reads the inert `heap` (`Empty`).
+    let heap = match snap_entry {
+        Some(SnapEntry {
+            resource,
+            args,
+            snap,
+        }) => sink.emit_heap(HeapInst::FromSnap {
+            resource,
+            args,
+            snap,
+        }),
+        None => heap,
+    };
     let hctx = HeapCtx {
         value: heap,
         perm: heap,
         old: None,
         result: result.as_ref(),
     };
-    // Entry: assume the precondition.
+    // Entry: assume the precondition. (Heap-dependent bodies skip this — the
+    // `FromSnap` above assumes the requires resource's bool implicitly.)
     if let Some(FnContract {
         requires: Some(req),
         params,
@@ -662,15 +717,18 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         sink.emit_assume(check);
     }
     let res = lower(b, env, &mut sink, hctx, exp)?;
-    // Exit: assert the postcondition on the actual body result.
+    // Exit: assert the postcondition on the actual body result (plus the
+    // snapshot parameter for a heap-dependent function).
     if let Some(FnContract {
         ensures: Some(ens),
         params,
+        snap,
         ..
     }) = &contract
     {
         let mut args = params.clone();
         args.push(res.clone());
+        args.extend(snap.clone());
         let check = call_contract(&mut sink, *ens, args);
         sink.emit_assert(check);
     }

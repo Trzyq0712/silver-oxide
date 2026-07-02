@@ -43,12 +43,18 @@ pub(crate) struct AdtInfo {
     pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
 }
 
-/// A method's contract resource ids (`#requires` / `#ensures`), absent when the
-/// method omits that clause.
+/// A member's contract ids (`#requires` / `#ensures`), absent when the member
+/// omits that clause. For a **method** both are Resource ids. For a **function**
+/// they are boolean Function ids, except a heap-dependent function's
+/// `requires` (`heap_dep == true`), which is a self-framed Resource id — the
+/// footprint whose snapshot the function takes as its trailing parameter.
 #[derive(Default)]
 pub(crate) struct MethodContracts {
     pub requires: Option<vmir::MemberId>,
     pub ensures: Option<vmir::MemberId>,
+    /// Set only for functions whose `requires` grants permission (`acc`):
+    /// call sites pass a `Snap` of the `requires` resource as an extra argument.
+    pub heap_dep: bool,
 }
 
 /// Mid-translation state.
@@ -284,9 +290,15 @@ impl<'a> Builder<'a> {
                     let (id, _) = self.fresh_decl(&name);
                     self.name_map.insert(f.name.0, id);
                     let mut contracts = MethodContracts::default();
-                    if f.requires.is_some() {
+                    if let Some(requires) = &f.requires {
                         let (rid, _) = self.fresh_decl(&format!("{name}#requires"));
                         contracts.requires = Some(rid);
+                        // An `acc` in the precondition makes the function
+                        // heap-dependent: its `#requires` slot is filled with a
+                        // Resource (not a boolean Function), and call sites pass
+                        // its snapshot as an extra argument. Recorded here so
+                        // call sites lowered before `define_function` see it.
+                        contracts.heap_dep = spatial::spatial_contains_acc(requires);
                     }
                     if f.ensures.is_some() {
                         let (eid, _) = self.fresh_decl(&format!("{name}#ensures"));
@@ -467,33 +479,36 @@ impl<'a> Builder<'a> {
 
     /// Fill a Silver `function`'s reserved slots (see the declare pass in
     /// [`Self::declare_adts_and_functions`]): the main function decl, plus
-    /// boolean `#requires` / `#ensures` contract functions when present.
+    /// `#requires` / `#ensures` contracts when present.
     ///
-    /// Functions are **pure and heap-free**. Their contracts are ordinary boolean
-    /// functions, stitched as pure `assume`/`assert`:
+    /// Functions are **pure and heap-free** in VMIR. A **heap-free** function
+    /// (no `acc` in its `requires`) gets boolean contract functions stitched as
+    /// pure `assume`/`assert`:
     /// - `#requires` → a boolean [`vmir::Function`] `params -> Bool`.
     /// - `#ensures` → a boolean [`vmir::Function`] `(params ++ result) -> Bool`.
     /// - the main function → its lowered body (when present) which **assumes**
     ///   `#requires(params)` at entry and **asserts** `#ensures(params, result)`
     ///   at exit.
     ///
-    /// A `requires` that mentions `acc` makes the function heap-dependent, which
-    /// is not yet supported (a future separate declaration) — rejected here.
+    /// A **heap-dependent** function (`acc` in its `requires`) instead receives
+    /// its precondition **snapshot** as a trailing parameter:
+    /// - `#requires` → a self-framed [`vmir::Resource`] (footprint + bool); its
+    ///   pure conjuncts live in the resource bool, so there is no separate
+    ///   boolean requires-function.
+    /// - `#ensures` → a boolean [`vmir::Function`]
+    ///   `(params ++ [result, s: Snap(req)]) -> Bool` whose body reconstructs
+    ///   the precondition heap from `s` (`FromSnap`) and reads it.
+    /// - the main function → `(params ++ [s: Snap(req)]) -> ret`; its body
+    ///   opens with the same `FromSnap` (which implicitly assumes the resource
+    ///   bool — no entry `assume`) and asserts `#ensures(params, result, s)` at
+    ///   exit. Call sites build `s` with `PureInst::Snap` (which implicitly
+    ///   asserts the precondition) — see `pure_exp::lower_func_app`.
     fn define_function(&mut self, f: &typed::Function) -> Result<(), TranslationError> {
         let fname = self.interner.resolve(&f.name.0).to_string();
         let n_params = f.params.len();
         let params: Vec<vmir::Type> = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
         let ret = self.lower_type(&f.ret);
-
-        // Heap-dependent functions (a `requires` granting permission) are a future
-        // separate declaration.
-        if let Some(requires) = &f.requires
-            && spatial::spatial_contains_acc(requires)
-        {
-            return Err(TranslationError::Unsupported(
-                "heap-dependent function (acc in precondition)",
-            ));
-        }
+        let heap_dep = self.contracts.get(&f.name.0).is_some_and(|c| c.heap_dep);
 
         // Params occupy `Val::Temp(0..n_params)` in every body lowered below.
         let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
@@ -501,29 +516,62 @@ impl<'a> Builder<'a> {
             env.insert(p.name.0, vmir::Val::Temp(i));
         }
 
-        // #requires: a boolean function `params -> Bool` (the pure precondition).
+        // #requires: heap-free → a boolean function `params -> Bool`;
+        // heap-dependent → a self-framed Resource (footprint + bool).
         if let Some(requires) = &f.requires {
             let req_id = self
                 .method_requires(f.name.0)
                 .expect("declared in declare pass");
-            let body = spatial::lower_pure_precond_body(self, &env, requires, n_params)?;
             let name = self
                 .vmir_interner
                 .get_or_intern(format!("{fname}#requires"));
-            self.set_decl(
-                req_id,
-                vmir::Declaration::Function(vmir::Function {
-                    name,
-                    ty_params: 0.into(),
-                    params: params.clone().into(),
-                    ret: vmir::Type::Bool,
-                    body: Some(body),
-                }),
-            );
+            if heap_dep {
+                let body = spatial::lower_spatial_never(
+                    self,
+                    &env,
+                    requires,
+                    n_params,
+                    vmir::HeapVal::Empty,
+                    0,
+                )?;
+                self.set_decl(
+                    req_id,
+                    vmir::Declaration::Resource(vmir::Resource {
+                        name,
+                        params: params.clone(),
+                        precond: vmir::Precond::SelfFramed,
+                        body: Some(body),
+                    }),
+                );
+            } else {
+                let body = spatial::lower_pure_precond_body(self, &env, requires, n_params)?;
+                self.set_decl(
+                    req_id,
+                    vmir::Declaration::Function(vmir::Function {
+                        name,
+                        ty_params: 0.into(),
+                        params: params.clone().into(),
+                        ret: vmir::Type::Bool,
+                        body: Some(body),
+                    }),
+                );
+            }
         }
 
-        // #ensures: a boolean function `(params ++ result) -> Bool`. `result`
-        // occupies `Val::Temp(n_params)`, so body temps start after it.
+        // The trailing snapshot parameter of a heap-dependent function (and of
+        // its ensures function, where it sits after `result`).
+        let snap_ty = heap_dep.then(|| {
+            let req_id = self
+                .method_requires(f.name.0)
+                .expect("heap-dep implies a requires");
+            vmir::Type::Snap(req_id)
+        });
+        let param_vals: Vec<vmir::Val> = (0..n_params).map(vmir::Val::Temp).collect();
+
+        // #ensures: a boolean function `(params ++ result) -> Bool`, with the
+        // snapshot appended for a heap-dependent function. `result` occupies
+        // `Val::Temp(n_params)`, the snapshot (if any) `Temp(n_params + 1)`;
+        // body temps start after them.
         if let Some(ensures) = &f.ensures {
             let ens_id = self
                 .method_ensures(f.name.0)
@@ -531,14 +579,29 @@ impl<'a> Builder<'a> {
             let mut ens_params = params.clone();
             ens_params.push(ret.clone());
             let result = vmir::Val::Temp(n_params);
+            let mut val_base = n_params + 1;
+            let mut snap_entry = None;
+            if let Some(snap_ty) = &snap_ty {
+                ens_params.push(snap_ty.clone());
+                let vmir::Type::Snap(req_id) = snap_ty else {
+                    unreachable!()
+                };
+                snap_entry = Some(pure_exp::SnapEntry {
+                    resource: *req_id,
+                    args: param_vals.clone(),
+                    snap: vmir::Val::Temp(val_base),
+                });
+                val_base += 1;
+            }
             let body = pure_exp::lower_function_body(
                 self,
                 &env,
                 ensures,
-                n_params + 1,
+                val_base,
                 vmir::HeapVal::Empty,
                 Some(result),
                 None,
+                snap_entry,
             )?;
             let name = self.vmir_interner.get_or_intern(format!("{fname}#ensures"));
             self.set_decl(
@@ -553,13 +616,40 @@ impl<'a> Builder<'a> {
             );
         }
 
-        // The main function: pure, heap-free. Its body (when present) assumes
-        // `#requires(params)` at entry and asserts `#ensures(params, result)` at
-        // exit — the contract functions applied to the actual body result.
+        // The main function: pure and heap-free at the call boundary. Its body
+        // (when present) assumes the precondition at entry — as a pure
+        // `assume #requires(params)` when heap-free, or implicitly via the
+        // `FromSnap` heap reconstruction when heap-dependent — and asserts
+        // `#ensures(params, result[, s])` at exit.
+        let mut fn_params = params;
+        let mut val_base = n_params;
+        let mut snap_entry = None;
+        let mut contract_snap = None;
+        if let Some(snap_ty) = &snap_ty {
+            fn_params.push(snap_ty.clone());
+            let vmir::Type::Snap(req_id) = snap_ty else {
+                unreachable!()
+            };
+            let snap_val = vmir::Val::Temp(n_params);
+            snap_entry = Some(pure_exp::SnapEntry {
+                resource: *req_id,
+                args: param_vals.clone(),
+                snap: snap_val.clone(),
+            });
+            contract_snap = Some(snap_val);
+            val_base += 1;
+        }
         let contract = pure_exp::FnContract {
-            requires: self.method_requires(f.name.0),
+            // Heap-dependent: the precondition is assumed by `FromSnap`, not by
+            // a boolean entry stitch.
+            requires: if heap_dep {
+                None
+            } else {
+                self.method_requires(f.name.0)
+            },
             ensures: self.method_ensures(f.name.0),
-            params: (0..n_params).map(vmir::Val::Temp).collect(),
+            params: param_vals,
+            snap: contract_snap,
         };
         let f_id = self.name_map[&f.name.0];
         let body = match &f.body {
@@ -568,10 +658,11 @@ impl<'a> Builder<'a> {
                 self,
                 &env,
                 body_exp,
-                n_params,
+                val_base,
                 vmir::HeapVal::Empty,
                 None,
                 Some(contract),
+                snap_entry,
             )?),
         };
         let name = self.vmir_interner.get_or_intern(&fname);
@@ -580,7 +671,7 @@ impl<'a> Builder<'a> {
             vmir::Declaration::Function(vmir::Function {
                 name,
                 ty_params: 0.into(),
-                params: params.into(),
+                params: fn_params.into(),
                 ret,
                 body,
             }),
