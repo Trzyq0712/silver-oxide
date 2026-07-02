@@ -274,10 +274,10 @@ fn eval_pure_inst(
             }
             app
         }
-        // Heap → snapshot narrowing at heap-dependent function call sites;
-        // verification not yet wired (see `HeapInst::FromSnap`).
+        // `Snap` needs the program + certificates; every inst walker intercepts
+        // it and dispatches to `eval_snap` before reaching this function.
         PureInst::Snap { .. } => {
-            unimplemented!("heap-dependent function verification (Snap)")
+            unreachable!("Snap is handled by eval_snap in the inst walkers")
         }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {
@@ -639,10 +639,10 @@ fn eval_heap_inst(
         HeapInst::Fold { .. } | HeapInst::Unfold { .. } => Err(VerifyError::Unimplemented(
             "fold/unfold outside method body",
         )),
-        // Snapshot → heap reconstruction (heap-dependent function bodies);
-        // verification not yet wired.
+        // Snapshot → heap reconstruction needs the program + certificates;
+        // handled in `eval_method_inst` (function bodies are walked there).
         HeapInst::FromSnap { .. } => Err(VerifyError::Unimplemented(
-            "heap-dependent function verification (FromSnap)",
+            "FromSnap outside a function/method body",
         )),
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).
@@ -685,6 +685,12 @@ fn eval_resource_body_inst(
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
+        // A heap-dependent function call inside a resource body narrows the
+        // body's footprint heap with `Snap` — shared with method bodies.
+        InstKind::Pure(ty, PureInst::Snap { .. }) => {
+            let id = eval_snap(ctx, program, state, inst, certs)?;
+            state.push_val(id, ty.clone());
+        }
         InstKind::Pure(ty, pi) => {
             let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id, ty.clone());
@@ -748,6 +754,12 @@ fn eval_method_inst(
     certs: &HashMap<MemberId, ResourceCertificate>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
+        // `Snap` needs the program + certificates (footprint graft), so it is
+        // handled here rather than in `eval_pure_inst`.
+        InstKind::Pure(ty, PureInst::Snap { .. }) => {
+            let id = eval_snap(ctx, program, state, inst, certs)?;
+            state.push_val(id, ty.clone());
+        }
         InstKind::Pure(ty, pi) => {
             let id = eval_pure_inst(ctx, state, ty, pi);
             state.push_val(id, ty.clone());
@@ -872,6 +884,12 @@ fn eval_method_inst(
         // footprint (fields recovered by projecting the snapshot), assume the
         // body's pure facts.
         InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
+        // `heap_of R(args), s`: reconstruct a heap from a snapshot (the entry of
+        // a heap-dependent function body), assuming the resource bool.
+        InstKind::Heap(HeapInst::FromSnap { .. }) => {
+            let heap = eval_from_snap(ctx, program, state, inst, certs)?;
+            state.push_heap(heap);
+        }
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -1003,6 +1021,147 @@ fn eval_unfold(
     // Collapse any snapshot tower created by repeated fold/unfold.
     ctx.reduce();
     Ok(())
+}
+
+/// Evaluate a `Snap`: narrow `heap` to the snapshot of the self-framed
+/// resource `resource(args)` — the implicit precondition check of a
+/// heap-dependent function call. Exhale-shaped but **non-consuming**: footprint
+/// sufficiency is proven on a scratch subtraction chain (so aliased slots
+/// require their sum) whose result is discarded — functions frame, they don't
+/// consume. The resource's boolean is **asserted** over the values read from
+/// `heap`, and the snapshot is the `cons` of those values
+/// (`present ? Some(v) : None` per slot, as in `fold`). Returns the snapshot
+/// e-class; the caller pushes it as the inst's `Val`.
+fn eval_snap(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    state: &EvalState,
+    inst: &Inst,
+    certs: &HashMap<MemberId, ResourceCertificate>,
+) -> Result<egg::Id, VerifyError> {
+    let InstKind::Pure(
+        _,
+        PureInst::Snap {
+            resource,
+            args,
+            heap,
+        },
+    ) = &inst.kind
+    else {
+        unreachable!("eval_snap called on a non-Snap instruction");
+    };
+    let h = get_heap(state, heap);
+    let vmir::Declaration::Resource(r) = &program.decls[*resource] else {
+        return Err(VerifyError::DependencyFailed);
+    };
+    let Some(vmir::Snapshot::Concrete(snap_adt)) = r.derive_snapshot() else {
+        return Err(VerifyError::Unimplemented("snapshot of abstract resource"));
+    };
+    let snap_head = *resource;
+    let field_types = snap_adt.variants.into_iter().next().unwrap().field_types;
+    let cert = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
+    let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+    let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+
+    let mut scratch = h.clone();
+    let mut values = Vec::with_capacity(cert.footprint.len());
+    let mut members = Vec::with_capacity(cert.footprint.len());
+    // As in fold, grow `subst` slot-by-slot so a value-dependent address (an
+    // inner predicate `P(this.next)`) resolves against the actual value read
+    // for an earlier slot.
+    let mut subst = ctx.footprint_param_subst(cert, &args);
+    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
+        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
+        // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
+        let elem = field_types[i]
+            .option_inner()
+            .unwrap_or(&field_types[i])
+            .clone();
+        // Values are read from the *original* heap (aliased slots agree);
+        // only the sufficiency accounting runs on the scratch chain.
+        let v = h
+            .entries()
+            .find_map(|(_, c)| (ctx.egraph.find(c.addr) == ctx.egraph.find(addr)).then(|| c.value))
+            .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone()));
+        scratch = heap_subtract(ctx, &scratch, kind, Chunk::new(addr, bperm, v), &pc_lits)?;
+        let present = ctx.perm_positive(bperm);
+        members.push(ctx.option_member(elem, present, v));
+        subst.insert(cert.egraph.find(*c_val), v);
+        values.push(v);
+    }
+    // Assert the precondition's pure facts over the read values.
+    let bool_id = ctx.graft_pred_bool(cert, &args, &values);
+    if !ctx.prove_under_pc(bool_id, &pc_lits) {
+        return Err(VerifyError::AssertionFailed);
+    }
+    let cons_args: Box<[egg::Id]> = members.into_iter().collect();
+    let snap_cons = ctx.alloc.cons(snap_head, 0);
+    let s = ctx.add_func_app_id(snap_cons, Box::new([]), Type::Snap(snap_head), cons_args);
+    ctx.reduce();
+    Ok(s)
+}
+
+/// Evaluate a `FromSnap`: widen a snapshot value back into a heap — the entry
+/// of a heap-dependent function body reconstructing its precondition heap from
+/// the snapshot parameter. Inverse of [`eval_snap`], inhale-shaped: one chunk
+/// per footprint slot at the grafted address with the footprint permission and
+/// value `unwrap(proj_i(s))` (as in `unfold`), and the resource's boolean is
+/// **assumed** over the projected values. Returns the reconstructed heap.
+fn eval_from_snap(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    state: &EvalState,
+    inst: &Inst,
+    certs: &HashMap<MemberId, ResourceCertificate>,
+) -> Result<Heap, VerifyError> {
+    let InstKind::Heap(HeapInst::FromSnap {
+        resource,
+        args,
+        snap,
+    }) = &inst.kind
+    else {
+        unreachable!("eval_from_snap called on a non-FromSnap instruction");
+    };
+    let vmir::Declaration::Resource(r) = &program.decls[*resource] else {
+        return Err(VerifyError::DependencyFailed);
+    };
+    let Some(vmir::Snapshot::Concrete(snap_adt)) = r.derive_snapshot() else {
+        return Err(VerifyError::Unimplemented("snapshot of abstract resource"));
+    };
+    let snap_head = *resource;
+    let field_types = snap_adt.variants.into_iter().next().unwrap().field_types;
+    let cert = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
+    let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+    let s = state.get_val(ctx, snap);
+    let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+
+    let mut out = Heap::empty();
+    let mut values = Vec::with_capacity(cert.footprint.len());
+    let mut subst = ctx.footprint_param_subst(cert, &args);
+    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
+        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
+        // `proj_i(s)` recovers the optional member (collapsing to the `cons`
+        // argument when `s` is concrete, staying uninterpreted when opaque);
+        // `unwrap` peels the `Option` to the field value.
+        let elem = field_types[i]
+            .option_inner()
+            .unwrap_or(&field_types[i])
+            .clone();
+        let proj_id = ctx.alloc.proj(snap_head, 0, i);
+        let opt_ty = ctx.alloc.option_type(elem.clone());
+        let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([s]));
+        let pv = ctx.option_unwrap(elem, opt);
+        out = heap_union(ctx, &out, kind, Chunk::new(addr, bperm, pv), &pc_lits);
+        subst.insert(cert.egraph.find(*c_val), pv);
+        values.push(pv);
+    }
+    // Assume the precondition's pure facts over the projected values.
+    let bool_id = ctx.graft_pred_bool(cert, &args, &values);
+    let true_ = ctx.true_();
+    ctx.egraph.union(bool_id, true_);
+    ctx.egraph.rebuild();
+    ctx.reduce();
+    Ok(out)
 }
 
 /// Scale every chunk's permission in `h` by `scale` (`perm := scale * perm`),
@@ -1222,11 +1381,19 @@ pub fn verify_resource(
     }))
 }
 
-/// Verify a non-recursive, heap-free function: walk its body in a fresh egraph
-/// with fresh symbolic params (`Val::Temp(0..n_params)`), discharging the stitched
+/// Verify a non-recursive function: walk its body in a fresh egraph with fresh
+/// symbolic params (`Val::Temp(0..n_params)`), discharging the stitched
 /// entry-`assume f#requires` / exit-`assert f#ensures` contract instructions, then
 /// snapshot the (saturated) result e-class into a [`FunctionCertificate`] for
 /// inlining at call sites. Abstract functions (no body) have nothing to verify.
+///
+/// A **heap-dependent** function's snapshot parameter seeds like any other param
+/// (a fresh symbolic of `Type::Snap(req)`); its entry `FromSnap` reconstructs the
+/// precondition heap `H(s)` and each body `Deref` congruence-resolves against
+/// those chunks (`unwrap(proj_i(s))`) — this *is* the purification: the cert's
+/// result is expressed over the snapshot, so `graft_function` at a call site
+/// (where the argument is a concrete `Snap` cons) collapses to the caller's
+/// chunk values.
 ///
 /// Callees — including the function's own `f#requires`/`f#ensures` contract
 /// functions — are ordinary `Function` decls verified earlier in dependency order,
@@ -1269,8 +1436,17 @@ pub fn verify_function(
             vals_before,
             heaps_before,
         );
-        // Functions are heap-free, so the method-body eval path handles every inst
-        // (pure ops plus the entry/exit `assume`/`assert`); `certs` is unused here.
+        // A heap-dependent body reads the heap its entry `FromSnap` reconstructs
+        // from the snapshot parameter: every `Deref` must be framed by that
+        // footprint (this failing = a read outside the precondition).
+        if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
+            let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
+            if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
+                return Err(err.with_inst(inst_text.clone()));
+            }
+        }
+        // The method-body eval path handles every inst (pure ops, the entry/exit
+        // `assume`/`assert`, and `Snap`/`FromSnap` for heap-dependent functions).
         if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst, certs) {
             return Err(err.with_inst(inst_text));
         }

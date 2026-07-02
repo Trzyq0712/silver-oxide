@@ -450,6 +450,54 @@ method m(x: Int)
     );
 }
 
+/// Jointly build resource and function certificates to a fixpoint (test
+/// helper) — the stand-in for the driver's topological order when the two
+/// kinds depend on each other: a heap-dependent function's body needs its
+/// `f#requires` **Resource** cert (`FromSnap`), while a resource body may call
+/// functions. Failures are tolerated (retried until no progress) so a
+/// deliberately-failing member simply ends up without a cert.
+#[allow(clippy::type_complexity)]
+fn build_all_certs(
+    program: &vmir::Program,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+) -> (
+    HashMap<MemberId, ResourceCertificate>,
+    HashMap<MemberId, FunctionCertificate>,
+) {
+    let mut certs = HashMap::new();
+    let mut fn_certs = HashMap::new();
+    loop {
+        let mut progress = false;
+        for (id, decl) in program.decls.iter_enumerated() {
+            match decl {
+                vmir::Declaration::Resource(r) if !certs.contains_key(&id) => {
+                    let name = program.name(id).to_string();
+                    if let Ok(Some(cert)) =
+                        verify_resource(program, &name, r, &certs, &fn_certs, alloc)
+                    {
+                        certs.insert(id, cert);
+                        progress = true;
+                    }
+                }
+                vmir::Declaration::Function(f) if !fn_certs.contains_key(&id) => {
+                    let name = program.name(id).to_string();
+                    if let Ok(Some(cert)) =
+                        verify_function(program, &name, f, &certs, &fn_certs, alloc)
+                    {
+                        fn_certs.insert(id, cert);
+                        progress = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    (certs, fn_certs)
+}
+
 /// Verify the method `name`, panicking if missing or not a `Method`.
 fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
     let id = program
@@ -459,9 +507,26 @@ fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), Verify
         panic!("{name} must be a Method");
     };
     let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
-    let fn_certs = build_fn_certs(program, &mut alloc);
-    let certs = build_certs(program, &fn_certs, &mut alloc);
+    let (certs, fn_certs) = build_all_certs(program, &mut alloc);
     verify_method(program, name, m, &certs, &fn_certs, &mut alloc)
+}
+
+/// Verify the function `name` with all other members' certs built (test
+/// helper for heap-dependent functions, which need their `#requires` Resource
+/// cert).
+fn verify_named_function(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
+    let id = program
+        .id(name)
+        .unwrap_or_else(|| panic!("missing function {name}"));
+    let vmir::Declaration::Function(f) = &program.decls[id] else {
+        panic!("{name} must be a Function");
+    };
+    let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
+    let (certs, mut fn_certs) = build_all_certs(program, &mut alloc);
+    // Re-verify the target itself so a failing target returns its `Err` (the
+    // fixpoint helper swallowed it).
+    fn_certs.remove(&id);
+    verify_function(program, name, f, &certs, &fn_certs, &mut alloc).map(|_| ())
 }
 
 #[test]
@@ -1708,23 +1773,6 @@ predicate Q(x: Ref) { acc(P(x), write) && (unfolding acc(P(x), write) in true) }
     );
 }
 
-/// Verify the function `name`, panicking if missing or not a `Function`. Builds
-/// certificates for every *other* function first (deps ≈ decl order for these
-/// fixtures) so the target's callees — including its own `#requires`/`#ensures` —
-/// inline.
-fn verify_named_function(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
-    let id = program
-        .id(name)
-        .unwrap_or_else(|| panic!("missing function {name}"));
-    let vmir::Declaration::Function(f) = &program.decls[id] else {
-        panic!("{name} must be a Function");
-    };
-    let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
-    let no_certs = HashMap::new();
-    let fn_certs = build_fn_certs_except(program, Some(id), &mut alloc);
-    verify_function(program, name, f, &no_certs, &fn_certs, &mut alloc).map(|_| ())
-}
-
 #[test]
 fn function_body_inlined_when_spec_insufficient() {
     // The spec (`result >= 0`) alone can't prove `five() == 5`; only the grafted
@@ -1795,4 +1843,158 @@ function loop(x: Int): Int { loop(x) }
         ),
         "self-recursive function should be a circular dependency"
     );
+}
+
+#[test]
+fn heap_dep_function_verifies_and_defines_at_call_site() {
+    // The full snapshot-passing pipeline: the call site's `Snap` checks the
+    // precondition (footprint + bool) against the caller heap, the callee's
+    // cert (verified against `H(s)`) grafts as `get(y, s) == unwrap(proj_0(s))`,
+    // and `s = cons(Some(y.f))` collapses it to the caller's chunk value — so
+    // `a == y.f` proves without any postcondition.
+    let input = r#"
+field f: Int
+
+function get(x: Ref): Int
+    requires acc(x.f) && x.f > 0
+    ensures result == x.f
+{ x.f }
+
+method m(y: Ref)
+    requires acc(y.f) && y.f > 0
+{
+    var a: Int := get(y)
+    assert a > 0
+    assert a == y.f
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_function(&program, "get").is_ok(),
+        "heap-dep function must verify (body framed by H(s), ensures from body)"
+    );
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn heap_dep_call_without_permission_fails() {
+    // `m` holds no permission to `y.f`: the call-site `Snap`'s footprint
+    // sufficiency check fails.
+    let input = r#"
+field f: Int
+
+function get(x: Ref): Int
+    requires acc(x.f)
+{ x.f }
+
+method m(y: Ref)
+{
+    var a: Int := get(y)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
+        "expected InsufficientPermission, got {result:?}"
+    );
+}
+
+#[test]
+fn heap_dep_call_precondition_bool_fails() {
+    // `m` holds the footprint but cannot prove the precondition's pure fact
+    // (`y.f > 0`): the `Snap`'s implicit bool assert fails.
+    let input = r#"
+field f: Int
+
+function get(x: Ref): Int
+    requires acc(x.f) && x.f > 0
+{ x.f }
+
+method m(y: Ref)
+    requires acc(y.f)
+{
+    var a: Int := get(y)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn heap_dep_body_read_outside_footprint_fails() {
+    // The body reads `x.g` but the precondition only grants `x.f`: the deref
+    // is not framed by the reconstructed `H(s)`.
+    let input = r#"
+field f: Int
+field g: Int
+
+function get(x: Ref): Int
+    requires acc(x.f)
+{ x.g }
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "get");
+    assert!(
+        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
+        "expected InsufficientPermission, got {result:?}"
+    );
+}
+
+#[test]
+fn heap_dep_calls_frame_across_unrelated_write() {
+    // Two calls on either side of a write to an *unrelated* field: the `f`
+    // chunk value is unchanged, so both `Snap`s build the same `cons` and the
+    // two applications are congruent — snapshot-passing gives heap framing for
+    // free.
+    let input = r#"
+field f: Int
+field g: Int
+
+function get(x: Ref): Int
+    requires acc(x.f)
+{ x.f }
+
+method m(y: Ref)
+    requires acc(y.f) && acc(y.g)
+{
+    var a: Int := get(y)
+    y.g := 5
+    var b: Int := get(y)
+    assert a == b
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn heap_dep_heap_reading_ensures_consumed_at_call_site() {
+    // The postcondition itself reads the heap (`result == x.f`). With an
+    // abstract (bodyless) heap-dep function the call site's only knowledge is
+    // the assumed `get#ensures(y, ret, s)` — whose `FromSnap` projects the same
+    // snapshot the call's `Snap` built, so `ret == y.f` follows.
+    let input = r#"
+field f: Int
+
+function get(x: Ref): Int
+    requires acc(x.f)
+    ensures result == x.f
+
+method m(y: Ref)
+    requires acc(y.f)
+{
+    var a: Int := get(y)
+    assert a == y.f
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
