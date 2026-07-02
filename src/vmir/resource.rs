@@ -4,6 +4,7 @@ use crate::vmir::{
     Val,
 };
 use std::fmt::{self, Display, Formatter};
+use lasso::Spur;
 
 /// A reusable unit of proof.
 ///
@@ -13,6 +14,7 @@ use std::fmt::{self, Display, Formatter};
 /// [`Resource::derive_location`]; the snapshot via [`Resource::derive_snapshot`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
+    pub name: Spur,
     pub params: Vec<Type>,
     pub precond: Precond,
     pub body: Option<ResourceBody>,
@@ -46,8 +48,11 @@ impl Resource {
     /// interned group tag (`Program.groups`).
     pub fn derive_location(&self, id: MemberId, group: lasso::Spur) -> Function {
         Function {
-            params: self.params.clone(),
+            name: self.name,
+            ty_params: 0.into(),
+            params: self.params.clone().into(),
             ret: Type::addr(group, Type::Snap(id), Bound::Unbounded),
+            precond: Precond::SelfFramed,
             body: None,
         }
     }
@@ -72,7 +77,10 @@ impl Resource {
             return None;
         }
         let Some(body) = &self.body else {
-            return Some(Snapshot::Abstract(Domain {}));
+            return Some(Snapshot::Abstract(Domain {
+                name: self.name,
+                ty_params: 0.into(),
+            }));
         };
         let mut val_types: Vec<Type> = self.params.clone();
         let mut field_types = Vec::new();
@@ -92,6 +100,8 @@ impl Resource {
             }
         }
         Some(Snapshot::Concrete(Adt {
+            name: self.name,
+            ty_params: 0.into(),
             // A snapshot's single constructor is synthetic — no source name.
             variants: vec![AdtVariant {
                 name: None,
@@ -132,7 +142,8 @@ pub struct ResourceCall {
 
 impl<'a> Display for VmirDisplay<'a, &'a Resource> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "(")?;
+        let name = self.interner.resolve(&self.item.name);
+        write!(f, "resource {name}(")?;
         for (i, param) in self.item.params.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;

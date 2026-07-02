@@ -5,12 +5,12 @@ use egg::{EGraph, Id};
 use crate::{
     verify::{
         analysis::ConstFold,
+        func_registry::FuncRegistry,
         heap::{Chunk, Heap, LocationKind},
         lang::{FuncId, Symbolic},
-        mono::Allocator,
         rewrite,
     },
-    vmir::{BinOp, FunctionCall, Literal, MemberId, Polarity, Type},
+    vmir::{BinOp, Literal, MemberId, Polarity, Type, Declaration},
 };
 use lasso::{Rodeo, Spur};
 use typed_index_collections::TiVec;
@@ -50,7 +50,8 @@ pub(crate) struct ResourceCertificate {
 pub(crate) struct VerifyContext<'a> {
     pub(crate) egraph: egg::EGraph<Symbolic, ConstFold>,
     /// Static structural rules. The ADT cons/proj/tag reductions are pulled from
-    /// the [`Allocator`] at saturation time (it grows as instances are minted).
+    /// the [`FuncRegistry`] at saturation time (it grows as ADT concepts are
+    /// minted).
     static_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     /// Terminating structural reductions, run after heap-producing ops to
     /// normalize (collapse snapshot towers) without a full saturation.
@@ -59,13 +60,14 @@ pub(crate) struct VerifyContext<'a> {
     /// Cheap string repr for member/constructor names.
     pub(crate) interner: &'a Rodeo,
     /// Member names indexed by `MemberId` (for `member_name`/`func_name`).
-    pub(crate) names: &'a TiVec<MemberId, Spur>,
+    pub(crate) decls: &'a TiVec<MemberId, Declaration>,
     /// Location group tags (`Type::Addr.group`), for display resolution.
     pub(crate) groups: &'a Rodeo<Spur>,
-    /// Shared verifier id allocator (minted ADT cons/proj/tag ids + their rules).
+    /// Shared verifier function-id registry (ADT cons/proj/tag ids + rules and
+    /// builtin operators).
     /// Owned by `verify::verify`, threaded `&mut` through each unit so ids stay
     /// consistent across certificate grafts.
-    pub(crate) alloc: &'a mut Allocator,
+    pub(crate) alloc: &'a mut FuncRegistry,
     /// Type side-oracle: the irreducible type sources that the type-free
     /// e-graph nodes no longer carry. Keyed by stable node payloads (the
     /// `Fresh` counter and the `FuncApp` member id), so no union upkeep is
@@ -77,9 +79,9 @@ pub(crate) struct VerifyContext<'a> {
 impl<'a> VerifyContext<'a> {
     pub(crate) fn new(
         interner: &'a Rodeo,
-        names: &'a TiVec<MemberId, Spur>,
+        decls: &'a TiVec<MemberId, Declaration>,
         groups: &'a Rodeo<Spur>,
-        alloc: &'a mut Allocator,
+        alloc: &'a mut FuncRegistry,
     ) -> Self {
         Self {
             egraph: egg::EGraph::default(),
@@ -87,7 +89,7 @@ impl<'a> VerifyContext<'a> {
             static_reduce: rewrite::reduce_rules(),
             fresh_counter: 0,
             interner,
-            names,
+            decls,
             groups,
             alloc,
             fresh_types: HashMap::new(),
@@ -106,8 +108,8 @@ impl<'a> VerifyContext<'a> {
     /// Display name for a member id. Registry-minted ids (outside the interner)
     /// resolve via the registry's name table.
     pub(crate) fn member_name(&self, m: MemberId) -> String {
-        if usize::from(m) < self.names.len() {
-            self.interner.resolve(&self.names[m]).to_string()
+        if usize::from(m) < self.decls.len() {
+            self.interner.resolve(&self.decls[m].name()).to_string()
         } else {
             format!("d{}", m.0)
         }
@@ -116,9 +118,9 @@ impl<'a> VerifyContext<'a> {
     /// Display name for an e-graph function id: a real declaration index resolves
     /// via the interner; an allocator-minted id via its name table.
     pub(crate) fn func_name(&self, f: FuncId) -> String {
-        if f.0 < self.names.len() {
+        if f.0 < self.decls.len() {
             self.interner
-                .resolve(&self.names[MemberId::from(f.0)])
+                .resolve(&self.decls[MemberId::from(f.0)].name())
                 .to_string()
         } else {
             self.alloc
@@ -152,11 +154,11 @@ impl<'a> VerifyContext<'a> {
                     head
                 } else {
                     let inner: Vec<String> = args.iter().map(|a| self.type_name(a)).collect();
-                    format!("{head}[{}]", inner.join(", "))
+                    format!("{head}<{}>", inner.join(", "))
                 }
             }
             Type::Snap(id) => format!("{}@snap", self.member_name(*id)),
-            Type::Option(t) => format!("Option[{}]", self.type_name(t)),
+            Type::Option(t) => format!("Option<{}>", self.type_name(t)),
             Type::Generic(i) => format!("?{i}"),
         }
     }
@@ -246,20 +248,6 @@ impl<'a> VerifyContext<'a> {
     /// The `false` boolean-literal e-class.
     pub(crate) fn false_(&mut self) -> egg::Id {
         self.add(Symbolic::Lit(Literal::Bool(false)))
-    }
-
-    /// Add a `FuncApp`, recording its return type in the side-oracle so the
-    /// viz can color the result (the node itself is type-free). `type_args` is the
-    /// ground type instantiation (empty for a non-generic plain function).
-    pub(crate) fn add_func_app(
-        &mut self,
-        fc: &FunctionCall,
-        type_args: Box<[Type]>,
-        ret_ty: Type,
-        args: Box<[egg::Id]>,
-    ) -> egg::Id {
-        // A plain function reuses its declaration's index as its `FuncId`.
-        self.add_func_app_id(FuncId(usize::from(fc.function)), type_args, ret_ty, args)
     }
 
     /// Add a `FuncApp` over an already-allocated [`FuncId`] (a plain function,

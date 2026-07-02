@@ -21,6 +21,7 @@ use crate::vmir::{
 pub(crate) fn lower_method(
     b: &Builder<'_>,
     m: &typed::Method,
+    name: Spur,
     body: &typed::StmtBlock,
 ) -> Result<vmir::Method, TranslationError> {
     // Control flow is linearized through the basic-block CFG: blocks are walked
@@ -194,7 +195,7 @@ pub(crate) fn lower_method(
         exit_env.insert(bid, env);
     }
 
-    Ok(vmir::Method { insts: sink.insts })
+    Ok(vmir::Method { name, insts: sink.insts })
 }
 
 /// Collect the VMIR type of every method-scoped `var` declaration (plus the
@@ -390,7 +391,8 @@ fn lower_stmt(
             if let Some(v) =
                 spatial::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
-                sink.emit_assert(v);
+                // The obligation is checked in the current heap.
+                sink.with_heap(current_heap, |sink| sink.emit_assert(v));
             }
             Ok(current_heap)
         }
@@ -402,7 +404,7 @@ fn lower_stmt(
             if let Some(v) =
                 spatial::lower_assertion_bool(b, env, sink, current_heap, Some(&old), e)?
             {
-                sink.emit_refute(v);
+                sink.with_heap(current_heap, |sink| sink.emit_refute(v));
             }
             Ok(current_heap)
         }
@@ -474,7 +476,9 @@ fn lower_stmt(
                 e,
             )?;
             if let Some(v) = bv {
-                sink.emit_assert(v);
+                // The exhale's boolean is over the pre-exhale state, so it is
+                // checked in `current_heap` (not the reduced `h_out`).
+                sink.with_heap(current_heap, |sink| sink.emit_assert(v));
             }
             Ok(h_out)
         }

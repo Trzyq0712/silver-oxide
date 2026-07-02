@@ -96,7 +96,7 @@ impl Display for Type {
                 fmt_args(f, args, |a, f| write!(f, "{a}"))
             }
             Type::Snap(id) => write!(f, "d{}@snap", id.0),
-            Type::Option(ty) => write!(f, "Option[{ty}]"),
+            Type::Option(ty) => write!(f, "Option<{ty}>"),
             Type::Addr {
                 group,
                 value,
@@ -125,7 +125,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Type> {
                 fmt_args(f, args, |a, f| write!(f, "{}", self.with(a)))
             }
             Type::Snap(id) => write!(f, "{}@snap", self.member(*id)),
-            Type::Option(ty) => write!(f, "Option[{}]", self.with(ty.as_ref())),
+            Type::Option(ty) => write!(f, "Option<{}>", self.with(ty.as_ref())),
             Type::Addr {
                 group,
                 value,
@@ -141,7 +141,9 @@ impl<'a> Display for VmirDisplay<'a, &'a Type> {
     }
 }
 
-/// Render `[a, b, …]` type arguments (nothing when empty).
+/// Render `<a, b, …>` type-argument instantiation (nothing when empty). Angle
+/// brackets denote a type **application**, distinct from a generic binder's
+/// arity `[n]` and a heap's `[h]`.
 fn fmt_args<T>(
     f: &mut Formatter<'_>,
     args: &[T],
@@ -150,12 +152,12 @@ fn fmt_args<T>(
     if args.is_empty() {
         return Ok(());
     }
-    write!(f, "[")?;
+    write!(f, "<")?;
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             write!(f, ", ")?;
         }
         each(a, f)?;
     }
-    write!(f, "]")
+    write!(f, ">")
 }

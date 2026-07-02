@@ -14,8 +14,8 @@ use typed_index_collections::TiVec;
 /// `VmirDisplay<&MyType>`.
 pub struct VmirDisplay<'a, T> {
     pub(super) item: T,
-    /// Member names, indexed by `MemberId` (for [`Self::member`]).
-    pub(super) names: &'a TiVec<MemberId, Spur>,
+    /// Program declarations, for resolving `MemberId` names.
+    pub(super) decls: &'a TiVec<MemberId, Declaration>,
     /// Cheap string repr for member/constructor names.
     pub(super) interner: &'a Rodeo,
     /// Location-group tags (`Type::Addr.group`), for resolving group names.
@@ -25,13 +25,13 @@ pub struct VmirDisplay<'a, T> {
 impl<'a, T> VmirDisplay<'a, T> {
     pub fn new(
         item: T,
-        names: &'a TiVec<MemberId, Spur>,
+        decls: &'a TiVec<MemberId, Declaration>,
         interner: &'a Rodeo,
         groups: &'a Rodeo<Spur>,
     ) -> Self {
         Self {
             item,
-            names,
+            decls,
             interner,
             groups,
         }
@@ -40,7 +40,7 @@ impl<'a, T> VmirDisplay<'a, T> {
     pub fn with<U>(&self, item: U) -> VmirDisplay<'a, U> {
         VmirDisplay {
             item,
-            names: self.names,
+            decls: self.decls,
             interner: self.interner,
             groups: self.groups,
         }
@@ -48,7 +48,7 @@ impl<'a, T> VmirDisplay<'a, T> {
 
     /// The display name of a member id.
     pub(super) fn member(&self, id: MemberId) -> &'a str {
-        self.interner.resolve(&self.names[id])
+        self.interner.resolve(&self.decls[id].name())
     }
 }
 
@@ -70,7 +70,7 @@ impl Program {
             let _ = writeln!(
                 out,
                 "function {name}@addr{}",
-                VmirDisplay::new(&loc, &self.names, &self.interner, &self.groups)
+                VmirDisplay::new(&loc, &self.decls, &self.interner, &self.groups)
             );
             // The derived snapshot type, printed by kind for every snapshottable
             // (self-framed) resource: a concrete one is an `adt` with a single
@@ -80,14 +80,14 @@ impl Program {
                     let _ = writeln!(
                         out,
                         "adt {name}@snap {}",
-                        VmirDisplay::new(&adt, &self.names, &self.interner, &self.groups)
+                        VmirDisplay::new(&adt, &self.decls, &self.interner, &self.groups)
                     );
                 }
                 Some(Snapshot::Abstract(domain)) => {
                     let _ = writeln!(
                         out,
                         "domain {name}@snap {}",
-                        VmirDisplay::new(&domain, &self.names, &self.interner, &self.groups)
+                        VmirDisplay::new(&domain, &self.decls, &self.interner, &self.groups)
                     );
                 }
                 None => {}
@@ -112,23 +112,22 @@ impl Display for Program {
             write!(
                 f,
                 "{}",
-                VmirDisplay::new(item, &self.names, &self.interner, &self.groups)
+                VmirDisplay::new(item.1, &self.decls, &self.interner, &self.groups)
             )?;
         }
         Ok(())
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, (MemberId, &'a Declaration)> {
+impl<'a> Display for VmirDisplay<'a, &'a Declaration> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let (id, decl) = self.item;
-        let name = self.member(id);
-        match decl {
-            Declaration::Domain(domain) => write!(f, "domain {name} {}", self.with(domain)),
-            Declaration::Function(function) => write!(f, "function {name}{}", self.with(function)),
-            Declaration::Method(method) => write!(f, "method {name} {}", self.with(method)),
-            Declaration::Resource(resource) => write!(f, "resource {name}{}", self.with(resource)),
-            Declaration::Adt(adt) => write!(f, "adt {name} {}", self.with(adt)),
+        match self.item {
+            Declaration::Domain(domain) => write!(f, "{}", self.with(domain)),
+            Declaration::DomainAxiom(ax) => write!(f, "{}", self.with(ax)),
+            Declaration::Function(function) => write!(f, "{}", self.with(function)),
+            Declaration::Method(method) => write!(f, "{}", self.with(method)),
+            Declaration::Resource(resource) => write!(f, "{}", self.with(resource)),
+            Declaration::Adt(adt) => write!(f, "{}", self.with(adt)),
         }
     }
 }

@@ -46,14 +46,12 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             let ret_ty = Type::addr(group, Type::Snap(pred_id), vmir::Bound::Unbounded);
             Ok(sink.emit_pure(
                 ret_ty,
-                PureInst::FunctionCall(
-                    None,
-                    vmir::FunctionCall {
-                        function: pred_id,
-                        type_args: Vec::new(),
-                        args,
-                    },
-                ),
+                PureInst::FunctionCall(vmir::FunctionCall {
+                    function: pred_id,
+                    type_args: Vec::new(),
+                    heap: None,
+                    args: args.into(),
+                }),
             ))
         }
     }
@@ -85,14 +83,12 @@ pub(crate) fn field_addr(
         .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
     Ok(sink.emit_pure(
         ret_ty,
-        PureInst::FunctionCall(
-            None,
-            vmir::FunctionCall {
-                function: field_id,
-                type_args: Vec::new(),
-                args: vec![base],
-            },
-        ),
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: field_id,
+            type_args: Vec::new(),
+            heap: None,
+            args: vec![base].into(),
+        }),
     ))
 }
 

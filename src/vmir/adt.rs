@@ -1,5 +1,5 @@
-use crate::vmir::Type;
 use crate::vmir::display::VmirDisplay;
+use crate::vmir::{Type, domain::TyParams};
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
 
@@ -9,6 +9,8 @@ use std::fmt::{self, Display, Formatter};
 /// (see `verify::mono`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Adt {
+    pub name: Spur,
+    pub ty_params: TyParams,
     pub variants: Vec<AdtVariant>,
 }
 
@@ -26,14 +28,16 @@ pub struct AdtVariant {
 
 impl<'a> Display for VmirDisplay<'a, &'a Adt> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{{ ")?;
+        let name = self.interner.resolve(&self.item.name);
+        let ty_params = &self.item.ty_params;
+        write!(f, "adt {name}{ty_params} {{ ")?;
         for (v, ctor) in self.item.variants.iter().enumerate() {
             if v > 0 {
                 write!(f, " | ")?;
             }
             match ctor.name {
                 Some(id) => write!(f, "{}(", self.interner.resolve(&id))?,
-                None => write!(f, "_{v}(")?,
+                None => write!(f, "#{v}(")?,
             }
             for (i, ty) in ctor.field_types.iter().enumerate() {
                 if i > 0 {

@@ -3,9 +3,9 @@ use crate::vmir;
 mod analysis;
 mod context;
 mod declaration;
+mod func_registry;
 mod heap;
 pub mod lang;
-mod mono;
 mod rewrite;
 mod stats;
 mod viz;
@@ -40,9 +40,9 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // call sites rather than re-walking the body.
     let mut certs: std::collections::HashMap<vmir::MemberId, context::ResourceCertificate> =
         std::collections::HashMap::new();
-    // Shared id allocator: one per run so minted ADT ids stay consistent across
-    // certificate grafts (see `verify::mono`). Threaded `&mut` into each unit.
-    let mut alloc = mono::Allocator::new(program);
+    // Shared function-id registry: one per run so ADT/builtin ids stay
+    // consistent across certificate grafts. Threaded `&mut` into each unit.
+    let mut alloc = func_registry::FuncRegistry::new(program);
     for id in order {
         let name = program.name(id).to_string();
         let outcome = match &program.decls[id] {

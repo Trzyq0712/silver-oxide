@@ -48,3 +48,38 @@ pub(crate) fn lower_type(
         typed::Type::Collection(_) => vmir::Type::Ref,
     }
 }
+
+/// Structurally match a declared type (which may mention `Type::Generic`
+/// parameters) against a concrete type, recording each parameter's binding in
+/// `out`. Used to recover a generic call's type-argument instantiation from its
+/// concrete argument/result types. First binding wins (bindings are consistent
+/// for a well-typed call).
+pub(crate) fn match_generic(
+    decl: &typed::Type,
+    actual: &typed::Type,
+    out: &mut HashMap<Spur, typed::Type>,
+) {
+    use crate::viper::typed::BuiltinCollection as C;
+    use typed::Type as T;
+    match (decl, actual) {
+        (T::Generic(n), _) => {
+            out.entry(n.0).or_insert_with(|| actual.clone());
+        }
+        (T::Domain(_, ds), T::Domain(_, as_)) => {
+            for (d, a) in ds.iter().zip(as_) {
+                match_generic(d, a, out);
+            }
+        }
+        (T::Collection(dc), T::Collection(ac)) => match (dc, ac) {
+            (C::Seq(d), C::Seq(a))
+            | (C::Set(d), C::Set(a))
+            | (C::MultiSet(d), C::MultiSet(a)) => match_generic(d, a, out),
+            (C::Map(dk, dv), C::Map(ak, av)) => {
+                match_generic(dk, ak, out);
+                match_generic(dv, av, out);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}

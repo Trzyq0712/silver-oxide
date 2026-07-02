@@ -317,7 +317,7 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
     let vmir::Declaration::Resource(r) = &program.decls[id] else {
         panic!("{name} must be a Resource");
     };
-    let mut alloc = crate::verify::mono::Allocator::new(program);
+    let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
     // Build certificates for the *other* resources (dependency order ≈ decl
     // order for these small fixtures), tolerating failures, so a body that
     // unfolds another predicate can graft its certificate. The target itself is
@@ -341,7 +341,7 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
 /// `alloc` so certificate ids match the method's later use.
 fn build_certs(
     program: &vmir::Program,
-    alloc: &mut crate::verify::mono::Allocator,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> HashMap<MemberId, ResourceCertificate> {
     let mut certs = HashMap::new();
     for (id, decl) in program.decls.iter_enumerated() {
@@ -410,7 +410,7 @@ fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), Verify
     let vmir::Declaration::Method(m) = &program.decls[id] else {
         panic!("{name} must be a Method");
     };
-    let mut alloc = crate::verify::mono::Allocator::new(program);
+    let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
     let certs = build_certs(program, &mut alloc);
     verify_method(program, name, m, &certs, &mut alloc)
 }

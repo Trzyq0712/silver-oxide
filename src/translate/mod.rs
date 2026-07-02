@@ -72,6 +72,21 @@ pub(crate) struct Builder<'a> {
     pub contracts: HashMap<Spur, MethodContracts>,
     /// ADT constructor/destructor metadata.
     pub adt: AdtInfo,
+    /// A generic function's `Spur` to its declared generic signature, used to
+    /// recover a call's **full** type-argument instantiation (in the function's
+    /// own type-parameter order) by matching the declared params/ret against the
+    /// concrete call types. Absent ⟹ monomorphic ⟹ no type args.
+    pub fn_generic_sigs: HashMap<Spur, GenericSig>,
+}
+
+/// A generic function's declared signature — the data needed to recover a call
+/// site's type-argument instantiation. `ty_params` is the ordered list of
+/// type-parameter names; `params`/`ret` are the declared types (possibly
+/// mentioning those names as `Type::Generic`).
+pub(crate) struct GenericSig {
+    pub ty_params: Vec<Spur>,
+    pub params: Vec<typed::Type>,
+    pub ret: typed::Type,
 }
 
 impl<'a> Builder<'a> {
@@ -86,7 +101,42 @@ impl<'a> Builder<'a> {
             field_types: HashMap::new(),
             contracts: HashMap::new(),
             adt: AdtInfo::default(),
+            fn_generic_sigs: HashMap::new(),
         }
+    }
+
+    /// A call's full type-argument instantiation, in the callee's own
+    /// type-parameter order, recovered by matching the callee's declared
+    /// generic signature against the concrete argument and result types. Empty
+    /// for a monomorphic callee (no registered generic signature). This is the
+    /// inference the backend would otherwise have to redo: doing it once here
+    /// lets the verifier read the instantiation verbatim.
+    pub(crate) fn call_type_args(
+        &self,
+        name: Spur,
+        arg_tys: &[&typed::Type],
+        ret_ty: &typed::Type,
+    ) -> Vec<vmir::Type> {
+        let Some(sig) = self.fn_generic_sigs.get(&name) else {
+            return Vec::new();
+        };
+        let mut subst: HashMap<Spur, typed::Type> = HashMap::new();
+        for (decl, actual) in sig.params.iter().zip(arg_tys) {
+            match_generic(decl, actual, &mut subst);
+        }
+        match_generic(&sig.ret, ret_ty, &mut subst);
+        // Every type parameter is guaranteed to occur in the params/ret (a
+        // parameter used only in the body is not a real type parameter), so the
+        // match populates all of them.
+        sig.ty_params
+            .iter()
+            .map(|n| {
+                let t = subst
+                    .get(n)
+                    .expect("type parameter must occur in params/ret");
+                self.lower_type(t)
+            })
+            .collect()
     }
 
     /// The `#requires` contract resource of method `m`, if it has one.
@@ -101,11 +151,12 @@ impl<'a> Builder<'a> {
 
     /// Reserve a `Declaration` slot (filled via `set_decl`), recording its name.
     /// `MemberId` is just the slot index; the interner key is unrelated.
-    fn fresh_decl(&mut self, name: &str) -> vmir::MemberId {
+    fn fresh_decl(&mut self, name: &str) -> (vmir::MemberId, Spur) {
         let id = vmir::MemberId(self.decls.len());
-        self.decl_names.push(self.vmir_interner.get_or_intern(name));
+        let name_spur = self.vmir_interner.get_or_intern(name);
+        self.decl_names.push(name_spur);
         self.decls.push(None);
-        id
+        (id, name_spur)
     }
 
     /// Reserve a slot and record metadata for every member — predicates, fields,
@@ -143,6 +194,7 @@ impl<'a> Builder<'a> {
             let r = match decl {
                 typed::Declaration::Predicate(p) => self.define_predicate(p),
                 typed::Declaration::Method(m) => self.define_method_contracts(m),
+                typed::Declaration::Function(f) => self.define_function(f),
                 _ => Ok(()),
             };
             if let Err(e) = r {
@@ -190,58 +242,98 @@ impl<'a> Builder<'a> {
         // and reductions from the variant shapes filled in pass 3).
         for decl in decls {
             if let typed::Declaration::Adt(adt) = decl {
-                let name = self.interner.resolve(&adt.name.0).to_string();
-                let adt_id = self.fresh_decl(&name);
+                let name_str = self.interner.resolve(&adt.name.0).to_string();
+                let (adt_id, name) = self.fresh_decl(&name_str);
                 self.set_decl(
                     adt_id,
                     vmir::Declaration::Adt(vmir::Adt {
+                        name,
+                        ty_params: adt.type_params.len().into(),
                         variants: Vec::new(),
                     }),
                 );
                 self.name_map.insert(adt.name.0, adt_id);
+            } else if let typed::Declaration::Domain(d) = decl {
+                let name_str = self.interner.resolve(&d.name.0).to_string();
+                let (dom_id, name) = self.fresh_decl(&name_str);
+                self.set_decl(
+                    dom_id,
+                    vmir::Declaration::Domain(vmir::Domain {
+                        name,
+                        ty_params: d.type_params.len().into(),
+                    })
+                );
+                self.name_map.insert(d.name.0, dom_id);
             }
         }
 
-        // Pass 2: user functions (top-level + domain functions). Both lower to a
-        // bodyless `vmir::Function` from their `(name, params, ret)`.
-        // `generics` is the owning declaration's type parameters, in scope for the
-        // signature: a domain function may mention them (`Generic(T)`); a top-level
-        // Silver function is monomorphic (empty).
-        let emit_function = |this: &mut Self,
-                             name: Spur,
-                             generics: &[Spur],
-                             params: &[typed::Type],
-                             ret: &typed::Type| {
-            let name_str = this.interner.resolve(&name).to_string();
-            let id = this.fresh_decl(&name_str);
-            let params = params
-                .iter()
-                .map(|t| lower_type(&this.name_map, generics, t))
-                .collect();
-            let ret = lower_type(&this.name_map, generics, ret);
-            this.set_decl(
-                id,
-                vmir::Declaration::Function(vmir::Function {
-                    params,
-                    ret,
-                    body: None,
-                }),
-            );
-            this.name_map.insert(name, id);
-        };
+        // Pass 2: user functions (top-level + domain functions).
+        //
+        // A top-level Silver `function` reserves slots (its own decl, plus a
+        // `#requires` resource and `#ensures` contract function when present) and
+        // is *filled* in `define_function` — where a `Sink` and the precondition
+        // framing heap are available for its body. A domain function has no
+        // contract/body and is emitted here directly as a bodyless
+        // `vmir::Function`. `generics` is the owning domain's type parameters, in
+        // scope for the signature (`Generic(T)`); top-level functions are
+        // monomorphic.
         for decl in decls {
             match decl {
                 typed::Declaration::Function(f) => {
-                    let params: Vec<typed::Type> = f.params.iter().map(|p| p.ty.clone()).collect();
-                    emit_function(self, f.name.0, &[], &params, &f.ret);
+                    let name = self.interner.resolve(&f.name.0).to_string();
+                    let (id, _) = self.fresh_decl(&name);
+                    self.name_map.insert(f.name.0, id);
+                    let mut contracts = MethodContracts::default();
+                    if f.requires.is_some() {
+                        let (rid, _) = self.fresh_decl(&format!("{name}#requires"));
+                        contracts.requires = Some(rid);
+                    }
+                    if f.ensures.is_some() {
+                        let (eid, _) = self.fresh_decl(&format!("{name}#ensures"));
+                        contracts.ensures = Some(eid);
+                    }
+                    self.contracts.insert(f.name.0, contracts);
                 }
                 typed::Declaration::Domain(d) => {
                     let generics: Vec<Spur> = d.type_params.iter().map(|i| i.0).collect();
                     for df in &d.functions {
-                        let params: Vec<typed::Type> =
+                        let typed_params: Vec<typed::Type> =
                             df.params.iter().map(|p| p.ty.clone()).collect();
-                        emit_function(self, df.name.0, &generics, &params, &df.ret);
+                        let name_str = self.interner.resolve(&df.name.0).to_string();
+                        let (id, name_spur) = self.fresh_decl(&name_str);
+                        let params = typed_params
+                            .iter()
+                            .map(|t| lower_type(&self.name_map, &generics, t))
+                            .collect();
+                        let ret = lower_type(&self.name_map, &generics, &df.ret);
+                        self.set_decl(
+                            id,
+                            vmir::Declaration::Function(vmir::Function {
+                                name: name_spur,
+                                ty_params: generics.len().into(),
+                                params,
+                                ret,
+                                precond: vmir::Precond::SelfFramed,
+                                body: None,
+                            }),
+                        );
+                        self.name_map.insert(df.name.0, id);
+                        // Record the declared generic signature so a call site can
+                        // recover its full type-argument instantiation (in this
+                        // domain's type-parameter order). Only generic functions
+                        // need it; a monomorphic one carries no type args.
+                        if !generics.is_empty() {
+                            self.fn_generic_sigs.insert(
+                                df.name.0,
+                                GenericSig {
+                                    ty_params: generics.clone(),
+                                    params: typed_params,
+                                    ret: df.ret.clone(),
+                                },
+                            );
+                        }
                     }
+                    // TODO: axioms are not yet translated
                 }
                 _ => {}
             }
@@ -298,7 +390,7 @@ impl<'a> Builder<'a> {
         let pred_name = self.interner.resolve(&p.name.0).to_owned();
         // Reserve the predicate's Resource slot (filled by `emit_predicate`) so its
         // id can serve as snapshot head, address `LocId`, and footprint reference.
-        let pred_id = self.fresh_decl(&pred_name);
+        let (pred_id, _) = self.fresh_decl(&pred_name);
         self.name_map.insert(p.name.0, pred_id);
         // Its address is grouped by the predicate name, not by `pred_id`.
         self.groups.get_or_intern(&pred_name);
@@ -309,7 +401,7 @@ impl<'a> Builder<'a> {
         // name, value = field type, bound = full permission `1/1`).
         let field_name = self.interner.resolve(&f.0.name.0).to_owned();
         self.groups.get_or_intern(&field_name);
-        let field_id = self.fresh_decl(&field_name);
+        let (field_id, name_spur) = self.fresh_decl(&field_name);
         let group = self.group_tag(f.0.name.0);
         let value = self.lower_type(&f.0.ty);
         self.field_types.insert(f.0.name.0, value.clone());
@@ -318,8 +410,11 @@ impl<'a> Builder<'a> {
         self.set_decl(
             field_id,
             vmir::Declaration::Function(vmir::Function {
-                params: vec![vmir::Type::Ref],
+                name: name_spur,
+                ty_params: 0.into(),
+                params: vec![vmir::Type::Ref].into(),
                 ret,
+                precond: vmir::Precond::SelfFramed,
                 body: None,
             }),
         );
@@ -357,11 +452,162 @@ impl<'a> Builder<'a> {
                 )?)
             }
         };
+        let name = self.vmir_interner.get_or_intern(self.interner.resolve(&p.name.0));
         self.set_decl(
             pred_id,
             vmir::Declaration::Resource(vmir::Resource {
+                name,
                 params,
                 precond: vmir::Precond::SelfFramed,
+                body,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Fill a Silver `function`'s reserved slots (see the declare pass in
+    /// [`Self::declare_adts_and_functions`]): the main function decl, plus a
+    /// `#requires` resource and an `#ensures` contract function when present.
+    ///
+    /// - `#requires` → a self-framed [`vmir::Resource`], exactly like a method's.
+    /// - `#ensures` → a boolean-returning [`vmir::Function`] over `params ++
+    ///   result`, carrying `#requires` as its precondition; its body is the
+    ///   lowered postcondition.
+    /// - the main function → `precond` wired to `#requires` (when present), body =
+    ///   its lowered Viper body (when present).
+    ///
+    /// A precondition resource frames the function's context heap in
+    /// `HeapVal::Temp(0)` (so body heaps start at `1`); a precond-free function is
+    /// heap-free (reads from `HeapVal::Empty`).
+    fn define_function(&mut self, f: &typed::Function) -> Result<(), TranslationError> {
+        let fname = self.interner.resolve(&f.name.0).to_string();
+        let n_params = f.params.len();
+        let params: Vec<vmir::Type> = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+        let ret = self.lower_type(&f.ret);
+
+        // Params occupy `Val::Temp(0..n_params)` in every body lowered below.
+        let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
+        for (i, p) in f.params.iter().enumerate() {
+            env.insert(p.name.0, vmir::Val::Temp(i));
+        }
+
+        // #requires: a self-framed resource (accumulate from `Empty`, heaps at 0).
+        if let Some(requires) = &f.requires {
+            let req_id = self
+                .method_requires(f.name.0)
+                .expect("declared in declare pass");
+            let body = spatial::lower_spatial_never(
+                self,
+                &env,
+                requires,
+                n_params,
+                vmir::HeapVal::Empty,
+                0,
+            )?;
+            let name = self
+                .vmir_interner
+                .get_or_intern(format!("{fname}#requires"));
+            self.set_decl(
+                req_id,
+                vmir::Declaration::Resource(vmir::Resource {
+                    name,
+                    params: params.clone(),
+                    precond: vmir::Precond::SelfFramed,
+                    body: Some(body),
+                }),
+            );
+        }
+
+        // The precondition, framed at the function's leading params
+        // `Val::Temp(0..n_params)` (for `#ensures`, this excludes the trailing
+        // `result`). `SelfFramed` ⟹ heap-free (reads from `Empty`); `Ctx` ⟹ the
+        // requires delta supplies the context heap in `HeapVal::Temp(0)`. The same
+        // precond is shared by the main function and its `#ensures`.
+        let precond = match self.method_requires(f.name.0) {
+            Some(req) => {
+                let args = (0..n_params).map(vmir::Val::Temp).collect();
+                vmir::Precond::Ctx(req, args)
+            }
+            None => vmir::Precond::SelfFramed,
+        };
+        // The heap a heap-dependent body reads from (`h0`); heap-free bodies read
+        // from `Empty`. `lower_function_body` derives its heap base from this.
+        let framing_heap = match &precond {
+            vmir::Precond::Ctx(..) => vmir::HeapVal::Temp(0),
+            vmir::Precond::SelfFramed => vmir::HeapVal::Empty,
+        };
+        // The context heap the `f#ensures` calls read: the framing heap for a
+        // heap-dependent function, `None` (heap-free) otherwise.
+        let ctx_heap = match &precond {
+            vmir::Precond::Ctx(..) => Some(framing_heap),
+            vmir::Precond::SelfFramed => None,
+        };
+
+        // #ensures: a boolean contract function `(params ++ result) -> Bool`,
+        // carrying the precondition. `result` occupies `Val::Temp(n_params)`, so
+        // body temps start after it. Its own body has no nested postcondition.
+        if let Some(ensures) = &f.ensures {
+            let ens_id = self
+                .method_ensures(f.name.0)
+                .expect("declared in declare pass");
+            let mut ens_params = params.clone();
+            ens_params.push(ret.clone());
+            let result = vmir::Val::Temp(n_params);
+            let body = pure_exp::lower_function_body(
+                self,
+                &env,
+                ensures,
+                n_params + 1,
+                framing_heap,
+                Some(result),
+                None,
+            )?;
+            let name = self.vmir_interner.get_or_intern(format!("{fname}#ensures"));
+            self.set_decl(
+                ens_id,
+                vmir::Declaration::Function(vmir::Function {
+                    name,
+                    ty_params: 0.into(),
+                    params: ens_params.into(),
+                    ret: vmir::Type::Bool,
+                    precond: precond.clone(),
+                    body: Some(body),
+                }),
+            );
+        }
+
+        // The main function: precond wired, body = lowered Viper body (if any).
+        // When it has a postcondition, the body ends by asserting
+        // `f#ensures(params, body_result)` (the definition-side obligation).
+        let ensures_check = self
+            .method_ensures(f.name.0)
+            .map(|ens_id| pure_exp::EnsuresCheck {
+                func: ens_id,
+                params: (0..n_params).map(vmir::Val::Temp).collect(),
+                ctx: ctx_heap,
+            });
+        let f_id = self.name_map[&f.name.0];
+        let body = match &f.body {
+            None => None,
+            Some(body_exp) => Some(pure_exp::lower_function_body(
+                self,
+                &env,
+                body_exp,
+                n_params,
+                framing_heap,
+                None,
+                ensures_check,
+            )?),
+        };
+        let name = self.vmir_interner.get_or_intern(&fname);
+        self.set_decl(
+            f_id,
+            vmir::Declaration::Function(vmir::Function {
+                name,
+                ty_params: 0.into(),
+                params: params.into(),
+                ret,
+                precond,
                 body,
             }),
         );
@@ -374,15 +620,17 @@ impl<'a> Builder<'a> {
     fn declare_method(&mut self, m: &typed::Method) {
         let name = self.interner.resolve(&m.name.0).to_owned();
         if m.body.is_some() {
-            let method_id = self.fresh_decl(&name);
+            let (method_id, _) = self.fresh_decl(&name);
             self.name_map.insert(m.name.0, method_id);
         }
         let mut contracts = MethodContracts::default();
         if m.requires.is_some() {
-            contracts.requires = Some(self.fresh_decl(&format!("{name}#requires")));
+            let (id, _) = self.fresh_decl(&format!("{name}#requires"));
+            contracts.requires = Some(id);
         }
         if m.ensures.is_some() {
-            contracts.ensures = Some(self.fresh_decl(&format!("{name}#ensures")));
+            let (id, _) = self.fresh_decl(&format!("{name}#ensures"));
+            contracts.ensures = Some(id);
         }
         self.contracts.insert(m.name.0, contracts);
     }
@@ -406,9 +654,11 @@ impl<'a> Builder<'a> {
                 vmir::HeapVal::Empty,
                 0,
             )?;
+            let name = self.vmir_interner.get_or_intern(&format!("{}#requires", self.interner.resolve(&m.name.0)));
             self.set_decl(
                 req_id,
                 vmir::Declaration::Resource(vmir::Resource {
+                    name,
                     params,
                     precond: vmir::Precond::SelfFramed,
                     body: Some(body),
@@ -457,9 +707,11 @@ impl<'a> Builder<'a> {
                 heap_base,
                 pre_state,
             )?;
+            let name = self.vmir_interner.get_or_intern(&format!("{}#ensures", self.interner.resolve(&m.name.0)));
             self.set_decl(
                 ens_id,
                 vmir::Declaration::Resource(vmir::Resource {
+                    name,
                     params,
                     precond,
                     body: Some(body),
@@ -476,7 +728,8 @@ impl<'a> Builder<'a> {
             .name_map
             .get(&m.name.0)
             .expect("method id should be interned");
-        let method = method::lower_method(self, m, body)?;
+        let name = self.vmir_interner.get_or_intern(self.interner.resolve(&m.name.0));
+        let method = method::lower_method(self, m, name, body)?;
         self.set_decl(method_id, vmir::Declaration::Method(method));
         Ok(())
     }
@@ -489,14 +742,13 @@ impl<'a> Builder<'a> {
             .collect();
         vmir::Program {
             decls,
-            names: self.decl_names.into(),
             interner: self.vmir_interner,
             groups: self.groups,
         }
     }
 }
 
-pub(crate) use types::lower_type;
+pub(crate) use types::{lower_type, match_generic};
 
 #[cfg(test)]
 mod tests;

@@ -4,8 +4,8 @@
 //! (resource delta+bool, method effects, function result).
 
 use crate::vmir::{
-    self, HeapInst, HeapVal, Inst, InstKind, PathConds, Polarity, PureInst, ResourceCall, Sign,
-    Type, Val, none,
+    self, BinOp, HeapInst, HeapVal, Inst, InstKind, PathConds, Polarity, PureInst, ResourceCall,
+    Sign, Type, Val, none,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -34,6 +34,11 @@ pub(crate) struct Sink {
     /// Running path condition of the lowering point. Sidecond instructions
     /// are emitted gated by this; branch arms push/pop guards via `with_cond`.
     pub pc: Vec<(Val, Polarity, PcKind)>,
+    /// The current heap an obligation's side condition is checked in. Delivered
+    /// like `pc`: set for a lowering region via [`Sink::with_heap`], snapshotted
+    /// onto a heapless obligation's `Inst` by the emitters. `None` outside any
+    /// heap-bearing region (e.g. before the first heap is threaded).
+    pub heap: Option<HeapVal>,
 }
 
 impl Sink {
@@ -44,6 +49,26 @@ impl Sink {
             val_count: 0,
             heap_count: heap_base,
             pc: Vec::new(),
+            heap: None,
+        }
+    }
+
+    /// Run `f` with `heap` as the current obligation check-in heap, restoring the
+    /// prior heap afterwards (analogous to [`Sink::with_cond`] for `pc`). The
+    /// restore runs even when `f` returns `Err`.
+    pub(crate) fn with_heap<R>(&mut self, heap: HeapVal, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.heap.replace(heap);
+        let r = f(self);
+        self.heap = prev;
+        r
+    }
+
+    /// Build an obligation instruction, attaching the current check-in heap when
+    /// one is set (see [`Sink::heap`]).
+    fn checked_inst(&self, pc: PathConds, kind: InstKind) -> Inst {
+        match self.heap {
+            Some(h) => Inst::in_heap(pc, h, kind),
+            None => Inst::new(pc, kind),
         }
     }
 
@@ -152,11 +177,20 @@ impl Sink {
     }
 
     /// Emit a pure instruction whose side condition (e.g. `Deref` permission,
-    /// `Div`/`Mod` divisor) must hold under the running path condition.
+    /// `Div`/`Mod` divisor) must hold under the running path condition. A
+    /// `Div`/`Mod` has no embedded heap, so it snapshots the current check-in heap
+    /// (see [`Sink::heap`]); a `Deref`/`Perm` embeds its own heap, so it does not.
     pub fn emit_pure_guarded(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
         let v = self.next_val_temp();
         let pc = self.guard();
-        self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
+        let heapless_obligation = matches!(inst, PureInst::Binary(BinOp::Div | BinOp::Mod, _, _));
+        let kind = InstKind::Pure(ty, inst);
+        let node = if heapless_obligation {
+            self.checked_inst(pc, kind)
+        } else {
+            Inst::new(pc, kind)
+        };
+        self.insts.push(node);
         v
     }
 
@@ -184,12 +218,14 @@ impl Sink {
 
     pub fn emit_assert(&mut self, v: Val) {
         let pc = self.guard();
-        self.insts.push(Inst::new(pc, InstKind::Assert(v)));
+        let node = self.checked_inst(pc, InstKind::Assert(v));
+        self.insts.push(node);
     }
 
     pub fn emit_refute(&mut self, v: Val) {
         let pc = self.guard();
-        self.insts.push(Inst::new(pc, InstKind::Refute(v)));
+        let node = self.checked_inst(pc, InstKind::Refute(v));
+        self.insts.push(node);
     }
 
     /// Emit a resource inhale (`base inhale call perm`, assumes the bool) or

@@ -1,9 +1,11 @@
 use crate::vmir::Inst;
 use crate::vmir::display::VmirDisplay;
 use std::fmt::{self, Display, Formatter};
+use lasso::Spur;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {
+    pub name: Spur,
     pub insts: Vec<Inst>,
 }
 
@@ -13,7 +15,8 @@ pub struct Method {
 
 impl<'a> Display for VmirDisplay<'a, &'a Method> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{{")?;
+        let name = self.interner.resolve(&self.item.name);
+        writeln!(f, "method {name} {{")?;
         write!(f, "{}", self.with((0usize, 0usize, &self.item.insts[..])))?;
         write!(f, "}}")
     }

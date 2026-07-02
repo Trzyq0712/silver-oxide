@@ -18,8 +18,8 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
-pub use domain::Domain;
-pub use function::{Function, FunctionCall};
+pub use domain::{Domain, DomainAxiom, TyParams};
+pub use function::{Args, Function, FunctionBody, FunctionCall, Params};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;
 pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
@@ -37,9 +37,6 @@ pub struct MemberId(pub usize);
 #[derive(Debug, Clone)]
 pub struct Program {
     pub decls: TiVec<MemberId, Declaration>,
-    /// Each member's name, for display/debug. VMIR proper references members by
-    /// `MemberId`, never by name.
-    pub names: TiVec<MemberId, Spur>,
     /// Cheap string repr for member (and constructor) names. Its `Spur` keys are
     /// independent of `MemberId`.
     pub interner: Rodeo,
@@ -51,16 +48,16 @@ pub struct Program {
 impl Program {
     /// The display name of a member.
     pub fn name(&self, id: MemberId) -> &str {
-        self.interner.resolve(&self.names[id])
+        self.interner.resolve(&self.decls[id].name())
     }
 
     /// The member with the given name, if any. A linear scan — for tests/debug
     /// only; VMIR proper never looks a member up by string.
     pub fn id(&self, name: &str) -> Option<MemberId> {
         let s = self.interner.get(name)?;
-        self.names
+        self.decls
             .iter_enumerated()
-            .find(|(_, n)| **n == s)
+            .find(|(_, d)| d.name() == s)
             .map(|(id, _)| id)
     }
 }
@@ -68,8 +65,22 @@ impl Program {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Declaration {
     Domain(Domain),
+    DomainAxiom(DomainAxiom),
     Function(Function),
     Method(Method),
     Resource(Resource),
     Adt(Adt),
+}
+
+impl Declaration {
+    pub fn name(&self) -> Spur {
+        match self {
+            Self::Domain(d) => d.name,
+            Self::DomainAxiom(a) => a.name.unwrap_or_default(),
+            Self::Function(f) => f.name,
+            Self::Method(m) => m.name,
+            Self::Resource(r) => r.name,
+            Self::Adt(a) => a.name,
+        }
+    }
 }

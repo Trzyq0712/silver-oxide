@@ -30,6 +30,10 @@ pub(crate) struct HeapCtx<'a> {
     pub value: HeapVal,
     pub perm: HeapVal,
     pub old: Option<&'a OldHeaps<'a>>,
+    /// The function result `Val`, available only while lowering a function
+    /// postcondition (`FuncEnsuresExt::Result`); `None` everywhere else. Held by
+    /// reference so `HeapCtx` stays `Copy` (`Val` is not `Copy`).
+    pub result: Option<&'a Val>,
 }
 
 impl<'a> HeapCtx<'a> {
@@ -39,6 +43,7 @@ impl<'a> HeapCtx<'a> {
             value: heap,
             perm: heap,
             old: Some(old),
+            result: None,
         }
     }
 }
@@ -119,13 +124,31 @@ pub(crate) fn lower<Ext: PureExt>(
             })?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
-        // A domain function call (pure). Lowered as a polymorphic VMIR function
-        // application (one `FuncId` for the function — no monomorphic copy). The
-        // recorded type args are the result-type vars (`exp.ty`); arg-only vars
-        // ride their argument enodes. (Fully concrete result ⇒ empty.)
+        // A domain function call (pure, heap-free). Lowered as a polymorphic VMIR
+        // function application (one `FuncId` for the function — no monomorphic
+        // copy). `type_args` is the **full** instantiation in the function's own
+        // type-parameter order, recovered from the concrete arg/result types, so
+        // the verifier reads it verbatim (no reconstruction). Precond-free ⟹
+        // heap-free (`heap: None`).
         P::DomainFunctionCall(call) => {
-            let type_args = adt_type_args(b, &exp.ty);
-            lower_func_app(b, env, sink, hctx, ty, type_args, call)
+            let arg_tys: Vec<&typed::Type> = call.args.iter().map(|a| &a.ty).collect();
+            let type_args = b.call_type_args(call.name.0, &arg_tys, &exp.ty);
+            let mut args = Vec::with_capacity(call.args.len());
+            for a in &call.args {
+                args.push(lower(b, env, sink, hctx, a)?);
+            }
+            let function = *b.name_map.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
+            Ok(sink.emit_pure(
+                ty,
+                PureInst::FunctionCall(vmir::FunctionCall {
+                    function,
+                    type_args,
+                    heap: None,
+                    args: args.into(),
+                }),
+            ))
         }
         // A constructor lowers to the semantic `AdtCons`; its type arguments are
         // its result type (`exp.ty`), the variant tag from `ctor_tag`.
@@ -295,8 +318,13 @@ fn lower_binary<Ext: PureExt>(
         B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
         B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),
         B::Mult => sink.emit_pure(ty, PureInst::Binary(V::Mult, lv, rv)),
-        B::Div => sink.emit_pure_guarded(ty, PureInst::Binary(V::Div, lv, rv)),
-        B::Mod => sink.emit_pure_guarded(ty, PureInst::Binary(V::Mod, lv, rv)),
+        // The divisor≠0 obligation is checked in the current value heap.
+        B::Div => sink.with_heap(hctx.value, |sink| {
+            sink.emit_pure_guarded(ty, PureInst::Binary(V::Div, lv, rv))
+        }),
+        B::Mod => sink.with_heap(hctx.value, |sink| {
+            sink.emit_pure_guarded(ty, PureInst::Binary(V::Mod, lv, rv))
+        }),
         B::Eq => sink.emit_pure(ty, PureInst::Binary(V::Eq, lv, rv)),
         B::Lt => sink.emit_pure(ty, PureInst::Binary(V::Lt, lv, rv)),
         // Desugarings:
@@ -347,16 +375,16 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
 /// Per-context lowering of pure-expression extensions (`old`, `result`,
 /// `perm`, etc.). `hctx` carries the value/perm heaps; `ty` is the expression's
 /// result type.
-/// Lower a function application (domain function, or a heap `function`) to a
-/// VMIR `FunctionCall`. Heap-dependence is a later (purification) concern; the
-/// context heap is left empty.
+/// Lower a heap (Silver `function`) application to a VMIR `FunctionCall`.
+/// A plain function is monomorphic (no `type_args`) and, until preconditions are
+/// lowered, heap-free (`heap: None`). Heap-dependence is a later (purification)
+/// concern.
 fn lower_func_app<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
     ty: vmir::Type,
-    type_args: Vec<vmir::Type>,
     call: &typed::Call<Ext>,
 ) -> Result<Val, TranslationError> {
     let mut args = Vec::with_capacity(call.args.len());
@@ -366,17 +394,37 @@ fn lower_func_app<Ext: PureExt>(
     let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
         TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
     })?;
-    Ok(sink.emit_pure(
+    // A heap-dependent callee (one with a `#requires`) reads the caller's current
+    // value heap; a precond-free / domain function is heap-free.
+    let contract = b.contracts.get(&call.name.0);
+    let heap_dep = contract.is_some_and(|c| c.requires.is_some());
+    let ctx = heap_dep.then_some(hctx.value);
+    let ret = sink.emit_pure(
         ty,
-        PureInst::FunctionCall(
-            None,
-            vmir::FunctionCall {
-                function: func,
-                type_args,
-                args,
-            },
-        ),
-    ))
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: func,
+            type_args: Vec::new(),
+            heap: ctx,
+            args: args.clone().into(),
+        }),
+    );
+    // Use-side postcondition: when the callee has an `ensures`, invoke its
+    // `f#ensures(args, ret)` and assume it (a pure boolean fact — no heap
+    // transfer, unlike a method call).
+    if let Some(ens_id) = contract.and_then(|c| c.ensures) {
+        args.push(ret.clone());
+        let check = sink.emit_pure(
+            vmir::Type::Bool,
+            PureInst::FunctionCall(vmir::FunctionCall {
+                function: ens_id,
+                type_args: Vec::new(),
+                heap: ctx,
+                args: args.into(),
+            }),
+        );
+        sink.emit_assume(check);
+    }
+    Ok(ret)
 }
 
 /// Lower a heap-reading node (`e.f`, a `function` call, `unfolding`). Shared by
@@ -397,7 +445,7 @@ pub(crate) fn lower_heap_node<Ext: PureExt>(
             Ok(sink.emit_pure_guarded(ty, PureInst::Deref(hctx.value, addr)))
         }
         // A heap-dependent Silver `function` — not generic yet, so no type args.
-        H::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, Vec::new(), call),
+        H::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
         H::Unfolding(pwp, body) => {
             // `unfolding acc(P(args), perm) in body`: a scoped unfold. Emit an
             // `Unfold`, evaluate `body` against the unfolded heap, then discard it
@@ -411,7 +459,7 @@ pub(crate) fn lower_heap_node<Ext: PureExt>(
             let inner = HeapCtx {
                 value: h,
                 perm: h,
-                old: hctx.old,
+                ..hctx
             };
             lower(b, env, sink, inner, body)
         }
@@ -486,7 +534,7 @@ impl PureExt for typed::MethodEnsuresExt {
                     HeapCtx {
                         value: heap,
                         perm: heap,
-                        old: hctx.old,
+                        ..hctx
                     },
                     inner,
                 )
@@ -527,7 +575,7 @@ impl PureExt for typed::MethodBodyExt {
                     HeapCtx {
                         value: heap,
                         perm: heap,
-                        old: hctx.old,
+                        ..hctx
                     },
                     inner,
                 )
@@ -540,4 +588,92 @@ impl PureExt for typed::MethodBodyExt {
             }
         }
     }
+}
+
+impl PureExt for typed::FuncEnsuresExt {
+    fn lower_ext(
+        b: &Builder<'_>,
+        env: &HashMap<Spur, Val>,
+        sink: &mut Sink,
+        hctx: HeapCtx<'_>,
+        ty: vmir::Type,
+        ext: &Self,
+    ) -> Result<Val, TranslationError> {
+        match ext {
+            typed::FuncEnsuresExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
+            // `result`: the function's return value, supplied by the ensures
+            // function's caller in the last parameter slot.
+            typed::FuncEnsuresExt::Result => hctx.result.cloned().ok_or(
+                TranslationError::Unsupported("`result` outside a function postcondition"),
+            ),
+            // A function is single-state: `old(e)` reads the same (only) heap the
+            // postcondition is framed by, so it re-reads `e` against the current
+            // context.
+            typed::FuncEnsuresExt::Old(inner) => lower(b, env, sink, hctx, inner),
+        }
+    }
+}
+
+/// The definition-side postcondition check appended to a function body: invoke
+/// `func(params ++ [body_result])` and `assert` it. `ctx` is the context heap the
+/// `f#ensures` call reads (`Some` for heap-dependent functions, `None` for
+/// heap-free).
+pub(crate) struct EnsuresCheck {
+    pub func: vmir::MemberId,
+    pub params: Vec<Val>,
+    pub ctx: Option<HeapVal>,
+}
+
+/// Lower a pure expression into a standalone [`vmir::FunctionBody`] (function
+/// body / contract-function definition). `val_base` is the first free pure-temp
+/// counter (params, plus a `result` slot for a postcondition function, occupy
+/// the lower temps); `heap` is the context heap the body reads from
+/// (`HeapVal::Empty` for a heap-free function — heaps then count from `h0` —
+/// `HeapVal::Temp(0)` when framed by a precondition resource — heaps start at
+/// `h1`); `result` is `Some` only for a postcondition function. When `ensures`
+/// is `Some`, the body ends by invoking that
+/// contract function on `params ++ [body_result]` and asserting it (the
+/// definition-side postcondition obligation).
+pub(crate) fn lower_function_body<Ext: PureExt>(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    exp: &typed::TypedPureExp<Ext>,
+    val_base: usize,
+    heap: HeapVal,
+    result: Option<Val>,
+    ensures: Option<EnsuresCheck>,
+) -> Result<vmir::FunctionBody, TranslationError> {
+    // A heap-free function reads from `Empty` and counts heaps from `h0`; a
+    // precond-framed one reserves `h0` for the ctx heap, so body heaps start at 1.
+    let heap_base = match heap {
+        HeapVal::Empty => 0,
+        _ => 1,
+    };
+    let mut sink = Sink::new(val_base, heap_base);
+    let hctx = HeapCtx {
+        value: heap,
+        perm: heap,
+        old: None,
+        result: result.as_ref(),
+    };
+    let res = lower(b, env, &mut sink, hctx, exp)?;
+    if let Some(ec) = ensures {
+        let mut args = ec.params;
+        args.push(res.clone());
+        let check = sink.emit_pure(
+            vmir::Type::Bool,
+            PureInst::FunctionCall(vmir::FunctionCall {
+                function: ec.func,
+                type_args: Vec::new(),
+                heap: ec.ctx,
+                args: args.into(),
+            }),
+        );
+        // The assert's check-in heap is the body's framing heap.
+        sink.with_heap(heap, |s| s.emit_assert(check));
+    }
+    Ok(vmir::FunctionBody {
+        insts: sink.insts,
+        res,
+    })
 }

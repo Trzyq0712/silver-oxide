@@ -6,7 +6,7 @@ use crate::vmir::Literal;
 use crate::vmir::Type;
 
 /// A verifier-allocated function-application id in the e-graph. **Disconnected
-/// from VMIR `MemberId`**: the verifier assigns these (see `verify::mono`) — a
+/// from VMIR `MemberId`**: the verifier assigns these (see `verify::func_registry`) — a
 /// plain function reuses its declaration's index, ADT constructor/projection/tag
 /// ops get one freshly-minted index per *concept* (polymorphic; the type
 /// instantiation rides in the `FuncApp` discriminant, not the id).
@@ -126,9 +126,11 @@ impl Display for Symbolic {
                 if tys.is_empty() {
                     write!(f, "fn{}", id.0)
                 } else {
-                    // Viper spells type arguments with square brackets (`Box[Int]`).
+                    // Type-argument instantiation is rendered in angle brackets
+                    // (`fn3<Int>`), matching VMIR Display — `[..]` is reserved for a
+                    // generic binder's arity and for heaps.
                     let args: Vec<String> = tys.iter().map(|t| t.to_string()).collect();
-                    write!(f, "fn{}[{}]", id.0, args.join(", "))
+                    write!(f, "fn{}<{}>", id.0, args.join(", "))
                 }
             }
         }

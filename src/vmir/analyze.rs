@@ -151,6 +151,24 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             }
         }
         Declaration::Method(m) => method_deps(m, out),
+        Declaration::DomainAxiom(ax) => {
+            for inst in &ax.body {
+                match &inst.kind {
+                    InstKind::Pure(ty, PureInst::FunctionCall(fc))
+                        if !matches!(ty, Type::Addr { .. }) =>
+                    {
+                        out.push(fc.function)
+                    }
+                    InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
+                        out.push(call.resource)
+                    }
+                    InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
+                        out.push(call.resource)
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Leaf declarations: nothing to depend on.
         Declaration::Function(_) | Declaration::Domain(_) | Declaration::Adt(_) => {}
     }
@@ -165,7 +183,7 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
     // (`acc(P(this.next))` in `P`'s body) a self-cycle.
     for inst in &body.insts {
         match &inst.kind {
-            InstKind::Pure(ty, PureInst::FunctionCall(_, fc))
+            InstKind::Pure(ty, PureInst::FunctionCall(fc))
                 if !matches!(ty, Type::Addr { .. }) =>
             {
                 out.push(fc.function)
@@ -186,7 +204,7 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
         match &inst.kind {
             // Address-typed `FunctionCall`s are not dependencies (see
             // `resource_body_deps`).
-            InstKind::Pure(ty, PureInst::FunctionCall(_, fc))
+            InstKind::Pure(ty, PureInst::FunctionCall(fc))
                 if !matches!(ty, Type::Addr { .. }) =>
             {
                 out.push(fc.function)
@@ -208,12 +226,13 @@ mod tests {
     use crate::vmir::{
         HeapInst, HeapVal, Inst, InstKind, PathConds, Precond, Resource, ResourceCall, write,
     };
-    use lasso::Rodeo;
+    use lasso::{Key, Rodeo};
     use std::collections::HashSet;
     use typed_index_collections::TiVec;
 
     fn resource_requiring(req: Option<MemberId>) -> Declaration {
         Declaration::Resource(Resource {
+            name: lasso::Spur::try_from_usize(0).unwrap(),
             params: vec![],
             precond: match req {
                 Some(r) => Precond::Ctx(r, vec![]),
@@ -231,21 +250,34 @@ mod tests {
         };
         let inst: Inst = Inst {
             pc: PathConds::default(),
+            heap: None,
             kind: InstKind::Heap(HeapInst::Inhale {
                 base: HeapVal::Empty,
                 call,
                 perm: write(),
             }),
         };
-        Declaration::Method(Method { insts: vec![inst] })
+        Declaration::Method(Method { name: lasso::Spur::try_from_usize(0).unwrap(), insts: vec![inst] })
     }
 
     fn program(names: &[&str], decls: Vec<Declaration>) -> Program {
         let mut interner = Rodeo::new();
-        let name_ids = names.iter().map(|n| interner.get_or_intern(n)).collect();
+        let mut name_ids = names.iter().map(|n| interner.get_or_intern(n));
+        let mut final_decls = decls;
+        for d in final_decls.iter_mut() {
+            if let Some(n) = name_ids.next() {
+                match d {
+                    Declaration::Resource(r) => r.name = n,
+                    Declaration::Method(m) => m.name = n,
+                    Declaration::Function(f) => f.name = n,
+                    Declaration::Adt(a) => a.name = n,
+                    Declaration::Domain(do_) => do_.name = n,
+                    Declaration::DomainAxiom(a) => a.name = Some(n),
+                }
+            }
+        }
         Program {
-            decls: TiVec::from(decls),
-            names: name_ids,
+            decls: TiVec::from(final_decls),
             interner,
             groups: Rodeo::new(),
         }

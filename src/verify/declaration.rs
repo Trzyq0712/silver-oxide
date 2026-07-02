@@ -5,7 +5,7 @@ use crate::{
     verify::{
         context::{ResourceCertificate, VerifyContext},
         heap::{Chunk, Heap, LocationKind},
-        lang::{FuncId, Symbolic},
+        lang::Symbolic,
         viz::Snapshotter,
     },
     vmir::{
@@ -130,7 +130,7 @@ impl EvalState {
 /// Render a single instruction (method or resource body) for error context.
 fn format_inst(
     inst: &Inst,
-    names: &typed_index_collections::TiVec<MemberId, lasso::Spur>,
+    decls: &typed_index_collections::TiVec<MemberId, Declaration>,
     interner: &lasso::Rodeo,
     groups: &lasso::Rodeo<lasso::Spur>,
     val_base: usize,
@@ -138,7 +138,7 @@ fn format_inst(
 ) -> String {
     VmirDisplay::new(
         (val_base, heap_base, std::slice::from_ref(inst)),
-        names,
+        decls,
         interner,
         groups,
     )
@@ -252,11 +252,18 @@ fn eval_pure_inst(
                 .and_then(|k| heap.value_at(&k, addr))
                 .unwrap_or_else(|| ctx.fresh_symbolic_value(ty.clone()))
         }
-        PureInst::FunctionCall(_heap, fc) => {
+        PureInst::FunctionCall(fc) => {
+            // A (possibly generic) Silver `function`: `type_args` are the
+            // result-type vars, part of the `FuncApp` node identity (discriminant);
+            // empty for a monomorphic call. The context heap (`fc.heap`) is not
+            // consulted — heap-dependence is a later (purification) concern.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            // `type_args` is empty for a plain Silver function, the result-type
-            // vars for a (generic) domain function — part of the node identity.
-            ctx.add_func_app(fc, fc.type_args.clone().into(), ty.clone(), args.into())
+            ctx.add_func_app_id(
+                crate::verify::func_registry::func_id_for_member(fc.function),
+                fc.type_args.clone().into(),
+                ty.clone(),
+                args.into(),
+            )
         }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {
@@ -827,7 +834,7 @@ fn eval_method_inst(
             // The predicate's address is an ordinary call to its address function
             // (the predicate's own id); the `Addr` type is the recorded return type.
             let pred_addr = ctx.add_func_app_id(
-                FuncId(usize::from(addr_fn)),
+                crate::verify::func_registry::func_id_for_member(addr_fn),
                 Box::new([]),
                 addr_ty,
                 args.into(),
@@ -857,6 +864,9 @@ fn eval_method_inst(
             ctx.egraph.rebuild();
         }
         InstKind::Assert(val) => {
+            // TODO(heap-consolidation): `inst.heap` carries the heap this obligation
+            // is checked in — once wired, consolidate it (materialise aliasing/
+            // perm-sum facts into the e-graph) before `prove_under_pc`. Unused today.
             let id = state.get_val(ctx, val);
             let pc_lits: Vec<(egg::Id, Polarity)> = inst
                 .pc
@@ -921,7 +931,7 @@ fn eval_unfold(
     // The predicate's address is an ordinary call to its address function (the
     // predicate's own id); the `Addr` type is the recorded return type.
     let pred_addr = ctx.add_func_app_id(
-        FuncId(usize::from(addr_fn)),
+        crate::verify::func_registry::func_id_for_member(addr_fn),
         Box::new([]),
         addr_ty,
         args.clone().into(),
@@ -995,9 +1005,9 @@ pub fn verify_method(
     method_name: &str,
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    alloc: &mut crate::verify::mono::Allocator,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<(), VerifyError> {
-    let mut ctx = VerifyContext::new(&program.interner, &program.names, &program.groups, alloc);
+    let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -1007,7 +1017,7 @@ pub fn verify_method(
         let heaps_before = state.heaps.len();
         let inst_text = format_inst(
             inst,
-            &program.names,
+            &program.decls,
             &program.interner,
             &program.groups,
             vals_before,
@@ -1040,14 +1050,14 @@ pub fn verify_resource(
     resource_name: &str,
     resource: &Resource,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    alloc: &mut crate::verify::mono::Allocator,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
         // Abstract resource: nothing to prove, no certificate.
         return Ok(None);
     };
 
-    let mut ctx = VerifyContext::new(&program.interner, &program.names, &program.groups, alloc);
+    let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1099,7 +1109,7 @@ pub fn verify_resource(
         let heaps_before = state.heaps.len();
         let inst_text = format_inst(
             inst,
-            &program.names,
+            &program.decls,
             &program.interner,
             &program.groups,
             vals_before,
@@ -1246,13 +1256,13 @@ mod tests {
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo) -> VerifyContext<'a> {
         // Leak a `'static` empty allocator, names table, and group interner so the
         // returned context can borrow them.
-        let alloc: &'static mut _ = Box::leak(Box::new(crate::verify::mono::Allocator::empty()));
-        let names: &'static _ = Box::leak(Box::new(typed_index_collections::TiVec::<
+        let alloc: &'static mut _ = Box::leak(Box::new(crate::verify::func_registry::FuncRegistry::empty()));
+        let decls: &'static _ = Box::leak(Box::new(typed_index_collections::TiVec::<
             vmir::MemberId,
-            lasso::Spur,
+            vmir::Declaration,
         >::new()));
         let groups: &'static _ = Box::leak(Box::new(lasso::Rodeo::<lasso::Spur>::new()));
-        VerifyContext::new(interner, names, groups, alloc)
+        VerifyContext::new(interner, decls, groups, alloc)
     }
 
     fn real(ctx: &mut VerifyContext<'_>, n: i64, d: i64) -> egg::Id {
@@ -1280,11 +1290,11 @@ mod tests {
     #[test]
     fn multiarg_location_nonaliasing_all_args_equal_is_inconsistent() {
         let interner = lasso::Rodeo::new();
-        let names = typed_index_collections::TiVec::<vmir::MemberId, lasso::Spur>::new();
+        let decls = typed_index_collections::TiVec::<vmir::MemberId, vmir::Declaration>::new();
         let mut groups = lasso::Rodeo::<lasso::Spur>::new();
         let g = groups.get_or_intern("g");
-        let mut alloc = crate::verify::mono::Allocator::empty();
-        let mut ctx = VerifyContext::new(&interner, &names, &groups, &mut alloc);
+        let mut alloc = crate::verify::func_registry::FuncRegistry::empty();
+        let mut ctx = VerifyContext::new(&interner, &decls, &groups, &mut alloc);
 
         // A 2-arg bounded address group `g` of held type `Int`, cap `1/1`. The
         // address is an ordinary `FuncApp` to the group's address function
@@ -1295,7 +1305,7 @@ mod tests {
             Type::Int,
             Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
         );
-        let addr_fn = FuncId(0);
+        let addr_fn = crate::verify::lang::FuncId(0);
         let (x0, y0) = (ctx.add(Symbolic::Fresh(0)), ctx.add(Symbolic::Fresh(1)));
         let (x1, y1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
         let a0 = ctx.add_func_app_id(addr_fn, Box::new([]), addr_ty.clone(), Box::new([x0, y0]));

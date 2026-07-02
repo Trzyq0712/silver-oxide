@@ -31,7 +31,7 @@ type Rule = egg::Rewrite<Symbolic, ConstFold>;
 
 /// Lazily allocates and names the verifier ids for polymorphic ADT
 /// constructors / projections / tags, and accumulates their reduction rules.
-pub struct Allocator {
+pub struct FuncRegistry {
     /// Next func id to mint (starts past every real declaration id, so a minted
     /// id never collides with a plain function reusing its declaration index).
     next: usize,
@@ -56,14 +56,18 @@ pub struct Allocator {
     /// synthetic variant — e.g. a snapshot's sole constructor). Drives minted-id
     /// names: `Adt::Ctor` when named, `Adt#i` when anonymous.
     variant_names: HashMap<MemberId, Vec<Option<String>>>,
-    /// The builtin `Option` ADT id, if present.
-    option_adt: Option<MemberId>,
     /// Verifier cost metrics, accumulated across every unit of the run (the
     /// allocator is the per-run shared state threaded into each `VerifyContext`).
     pub(crate) stats: crate::verify::VerifyStats,
 }
 
-impl Allocator {
+// Builtin reserved operator ids (starting from the top of the usize space).
+pub const BUILTIN_OPTION_SOME: FuncId = FuncId(usize::MAX - 1);
+pub const BUILTIN_OPTION_NONE: FuncId = FuncId(usize::MAX - 2);
+pub const BUILTIN_OPTION_VALUE: FuncId = FuncId(usize::MAX - 3);
+pub const BUILTIN_OPTION_TAG: FuncId = FuncId(usize::MAX - 4);
+
+impl FuncRegistry {
     /// Build an allocator for `program`: records the shape of every ADT head
     /// (ADT declarations and predicate snapshots, keyed by the predicate's own
     /// Resource id) so instances can be minted on demand. Mints nothing yet.
@@ -77,19 +81,6 @@ impl Allocator {
                 .map(|v| v.name.map(|n| program.interner.resolve(&n).to_string()))
                 .collect()
         };
-
-        // The builtin `Option` ADT (`vmir::Type::Option`): `Some(T)` (variant 0,
-        // one field) and `None` (variant 1, no fields). It is not a program
-        // declaration, so it gets a synthetic head id one past the last decl; its
-        // values are typed `Type::Option`, never `Type::Domain(option_head, …)`,
-        // so the head id is only ever a mono key (never resolved via the interner).
-        let option_head = MemberId(program.decls.len());
-        shapes.insert(option_head, vec![1, 0]);
-        head_names.insert(option_head, "Option".to_string());
-        variant_names.insert(
-            option_head,
-            vec![Some("Some".to_string()), Some("None".to_string())],
-        );
 
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Adt(adt) = decl {
@@ -105,11 +96,6 @@ impl Allocator {
             if let Declaration::Resource(r) = decl
                 && let Some(crate::vmir::Snapshot::Concrete(adt)) = r.derive_snapshot()
             {
-                // A concrete predicate's snapshot is a single-variant ADT over
-                // the footprint slots, headed by the predicate's own id
-                // (`Type::Snap(id)`). Derived from the body — only the variant
-                // field counts are needed here. (An abstract predicate derives an
-                // opaque Domain, which has no constructor to register.)
                 shapes.insert(
                     id,
                     adt.variants.iter().map(|v| v.field_types.len()).collect(),
@@ -118,19 +104,30 @@ impl Allocator {
                 variant_names.insert(id, vname(&adt));
             }
         }
-        Allocator {
-            // Mint func ids past the synthetic `Option` head, so neither a plain
-            // function (which reuses its decl index) nor the head id collides.
-            next: program.decls.len() + 1,
+
+        let mut names = HashMap::new();
+        names.insert(BUILTIN_OPTION_SOME, "Option::Some".to_string());
+        names.insert(BUILTIN_OPTION_NONE, "Option::None".to_string());
+        names.insert(BUILTIN_OPTION_VALUE, "Option::Some.0".to_string());
+        names.insert(BUILTIN_OPTION_TAG, "Option@tag".to_string());
+
+        let mut rules = Vec::new();
+        rules.push(proj_rule(BUILTIN_OPTION_VALUE, BUILTIN_OPTION_SOME, 0));
+        let mut option_tags = HashMap::new();
+        option_tags.insert(BUILTIN_OPTION_SOME, 0);
+        option_tags.insert(BUILTIN_OPTION_NONE, 1);
+        rules.push(tag_rule(BUILTIN_OPTION_TAG, option_tags));
+
+        FuncRegistry {
+            next: program.decls.len(),
             cons: HashMap::new(),
             proj: HashMap::new(),
             tag: HashMap::new(),
-            names: HashMap::new(),
-            rules: Vec::new(),
+            names,
+            rules,
             shapes,
             head_names,
             variant_names,
-            option_adt: Some(option_head),
             stats: Default::default(),
         }
     }
@@ -138,17 +135,29 @@ impl Allocator {
     /// An empty allocator (no ADT heads). For tests / programs without ADTs.
     #[cfg(test)]
     pub fn empty() -> Self {
-        Allocator {
+        let mut names = HashMap::new();
+        names.insert(BUILTIN_OPTION_SOME, "Option::Some".to_string());
+        names.insert(BUILTIN_OPTION_NONE, "Option::None".to_string());
+        names.insert(BUILTIN_OPTION_VALUE, "Option::Some.0".to_string());
+        names.insert(BUILTIN_OPTION_TAG, "Option@tag".to_string());
+
+        let mut rules = Vec::new();
+        rules.push(proj_rule(BUILTIN_OPTION_VALUE, BUILTIN_OPTION_SOME, 0));
+        let mut option_tags = HashMap::new();
+        option_tags.insert(BUILTIN_OPTION_SOME, 0);
+        option_tags.insert(BUILTIN_OPTION_NONE, 1);
+        rules.push(tag_rule(BUILTIN_OPTION_TAG, option_tags));
+
+        FuncRegistry {
             next: 0,
             cons: HashMap::new(),
             proj: HashMap::new(),
             tag: HashMap::new(),
-            names: HashMap::new(),
-            rules: Vec::new(),
+            names,
+            rules,
             shapes: HashMap::new(),
             head_names: HashMap::new(),
             variant_names: HashMap::new(),
-            option_adt: None,
             stats: Default::default(),
         }
     }
@@ -178,16 +187,10 @@ impl Allocator {
         self.tag[&adt]
     }
 
-    /// The builtin `Option` ADT's (synthetic) head id.
-    pub fn option_adt(&self) -> MemberId {
-        self.option_adt.expect("builtin Option head not registered")
-    }
-
     // ---- Builtin `Option` resolution -------------------------------------
     // `Option[T]` is a builtin parametric type (`vmir::Type::Option`). These are
     // the dedicated way to request its monomorphic instance, rather than open-
-    // coding `cons`/`proj` against `option_adt()`. (Future `Seq`/`Set` follow the
-    // same shape.)
+    // coding `cons`/`proj`. (Future `Seq`/`Set` follow the same shape.)
 
     /// `Option[elem]` as a vmir type (the builtin parametric `Type::Option`).
     pub fn option_type(&self, elem: Type) -> Type {
@@ -196,20 +199,17 @@ impl Allocator {
 
     /// Constructor id of `Some` (variant 0) of `Option`.
     pub fn option_some(&mut self) -> FuncId {
-        let opt = self.option_adt();
-        self.cons(opt, 0)
+        BUILTIN_OPTION_SOME
     }
 
     /// Constructor id of `None` (variant 1) of `Option`.
     pub fn option_none(&mut self) -> FuncId {
-        let opt = self.option_adt();
-        self.cons(opt, 1)
+        BUILTIN_OPTION_NONE
     }
 
     /// Projection id recovering the `Some` payload of `Option`.
     pub fn option_value(&mut self) -> FuncId {
-        let opt = self.option_adt();
-        self.proj(opt, 0, 0)
+        BUILTIN_OPTION_VALUE
     }
 
     /// The reduction rules minted so far, to inject into a context's runner.
@@ -282,4 +282,9 @@ impl Allocator {
             .cloned()
             .unwrap_or_else(|| format!("d{}", adt.0))
     }
+}
+
+/// Derives the verifier `FuncId` for a plain, declaration-backed function.
+pub fn func_id_for_member(member: MemberId) -> FuncId {
+    FuncId(usize::from(member))
 }

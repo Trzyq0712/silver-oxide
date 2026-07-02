@@ -52,9 +52,10 @@ pub enum PureInst {
     Deref(HeapVal, Val),
     /// Query the permission amount of an address in a heap.
     Perm(HeapVal, Val),
-    /// A function application. The heap is the function's context heap, present
-    /// only for heap-dependent functions (`None` for heap-independent ones).
-    FunctionCall(Option<HeapVal>, FunctionCall),
+    /// A (possibly generic) Silver `function` application. Generics
+    /// (`type_args`) and the optional context heap live inside the
+    /// `FunctionCall`; a precond-free function is heap-free (`heap: None`).
+    FunctionCall(FunctionCall),
     /// Construct ADT value: variant `variant` of the ADT `adt` instantiated at
     /// `type_args`, over `args`. The ADT is named by its (possibly generic)
     /// declaration `MemberId`; `type_args` is its monomorphization (empty for a
@@ -135,21 +136,9 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 write!(f, "{cond} ? {then_val} : {else_val}")
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
-            PureInst::FunctionCall(heap, call) => {
-                write!(f, "{}(", self.member(call.function))?;
-                for (i, arg) in call.args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")")?;
-                // Context heap only for heap-dependent functions.
-                if let Some(heap) = heap {
-                    write!(f, "[{heap}]")?;
-                }
-                Ok(())
-            }
+            // `FunctionCall` renders itself (`name[heap](args)`) via its own
+            // `VmirDisplay` impl, which resolves the callee `MemberId` → name.
+            PureInst::FunctionCall(call) => write!(f, "{}", self.with(call)),
             PureInst::Perm(heap, loc) => write!(f, "perm[{heap}] {loc}"),
             PureInst::AdtCons {
                 adt, variant, args, ..
