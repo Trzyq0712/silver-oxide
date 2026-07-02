@@ -261,7 +261,7 @@ impl<'a> Builder<'a> {
                     vmir::Declaration::Domain(vmir::Domain {
                         name,
                         ty_params: d.type_params.len().into(),
-                    })
+                    }),
                 );
                 self.name_map.insert(d.name.0, dom_id);
             }
@@ -450,7 +450,9 @@ impl<'a> Builder<'a> {
                 )?)
             }
         };
-        let name = self.vmir_interner.get_or_intern(self.interner.resolve(&p.name.0));
+        let name = self
+            .vmir_interner
+            .get_or_intern(self.interner.resolve(&p.name.0));
         self.set_decl(
             pred_id,
             vmir::Declaration::Resource(vmir::Resource {
@@ -626,7 +628,9 @@ impl<'a> Builder<'a> {
                 vmir::HeapVal::Empty,
                 0,
             )?;
-            let name = self.vmir_interner.get_or_intern(&format!("{}#requires", self.interner.resolve(&m.name.0)));
+            let name = self
+                .vmir_interner
+                .get_or_intern(&format!("{}#requires", self.interner.resolve(&m.name.0)));
             self.set_decl(
                 req_id,
                 vmir::Declaration::Resource(vmir::Resource {
@@ -679,7 +683,9 @@ impl<'a> Builder<'a> {
                 heap_base,
                 pre_state,
             )?;
-            let name = self.vmir_interner.get_or_intern(&format!("{}#ensures", self.interner.resolve(&m.name.0)));
+            let name = self
+                .vmir_interner
+                .get_or_intern(&format!("{}#ensures", self.interner.resolve(&m.name.0)));
             self.set_decl(
                 ens_id,
                 vmir::Declaration::Resource(vmir::Resource {
@@ -700,7 +706,9 @@ impl<'a> Builder<'a> {
             .name_map
             .get(&m.name.0)
             .expect("method id should be interned");
-        let name = self.vmir_interner.get_or_intern(self.interner.resolve(&m.name.0));
+        let name = self
+            .vmir_interner
+            .get_or_intern(self.interner.resolve(&m.name.0));
         let method = method::lower_method(self, m, name, body)?;
         self.set_decl(method_id, vmir::Declaration::Method(method));
         Ok(())

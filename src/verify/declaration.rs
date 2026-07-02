@@ -255,8 +255,8 @@ fn eval_pure_inst(
         PureInst::FunctionCall(fc) => {
             // A (possibly generic) Silver `function`: `type_args` are the
             // result-type vars, part of the `FuncApp` node identity (discriminant);
-            // empty for a monomorphic call. The context heap (`fc.heap`) is not
-            // consulted — heap-dependence is a later (purification) concern.
+            // empty for a monomorphic call. Always heap-free: a heap-dependent
+            // function receives its precondition snapshot as an ordinary arg.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let app = ctx.add_func_app_id(
                 crate::verify::func_registry::func_id_for_member(fc.function),
@@ -273,6 +273,11 @@ fn eval_pure_inst(
                 ctx.egraph.union(app, def);
             }
             app
+        }
+        // Heap → snapshot narrowing at heap-dependent function call sites;
+        // verification not yet wired (see `HeapInst::FromSnap`).
+        PureInst::Snap { .. } => {
+            unimplemented!("heap-dependent function verification (Snap)")
         }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {
@@ -633,6 +638,11 @@ fn eval_heap_inst(
         // `eval_method_inst`.
         HeapInst::Fold { .. } | HeapInst::Unfold { .. } => Err(VerifyError::Unimplemented(
             "fold/unfold outside method body",
+        )),
+        // Snapshot → heap reconstruction (heap-dependent function bodies);
+        // verification not yet wired.
+        HeapInst::FromSnap { .. } => Err(VerifyError::Unimplemented(
+            "heap-dependent function verification (FromSnap)",
         )),
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).

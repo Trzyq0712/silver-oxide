@@ -168,7 +168,8 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
 
 /// Collect the schedulable members referenced by an instruction stream: the
 /// callee of each non-address `FunctionCall`, and the resource of each
-/// inhale/exhale/fold/unfold. Shared by resource, method, and function bodies.
+/// inhale/exhale/fold/unfold/snap/from-snap. Shared by resource, method, and
+/// function bodies.
 ///
 /// An **address-typed** `FunctionCall` (result `Type::Addr`) is NOT a dependency:
 /// forming an address needs no certificate, and a predicate's address function is
@@ -186,6 +187,10 @@ fn inst_deps(insts: &[Inst], out: &mut Vec<MemberId>) {
             InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
                 out.push(call.resource)
             }
+            // Snapshot narrowing/widening needs the resource's certificate
+            // (footprint layout), so the resource must be verified first.
+            InstKind::Pure(_, PureInst::Snap { resource, .. })
+            | InstKind::Heap(HeapInst::FromSnap { resource, .. }) => out.push(*resource),
             _ => {}
         }
     }

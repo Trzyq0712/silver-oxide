@@ -49,7 +49,6 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
                 PureInst::FunctionCall(vmir::FunctionCall {
                     function: pred_id,
                     type_args: Vec::new(),
-                    heap: None,
                     args: args.into(),
                 }),
             ))
@@ -86,7 +85,6 @@ pub(crate) fn field_addr(
         PureInst::FunctionCall(vmir::FunctionCall {
             function: field_id,
             type_args: Vec::new(),
-            heap: None,
             args: vec![base].into(),
         }),
     ))

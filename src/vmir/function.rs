@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapVal, Inst, MemberId, TyParams, Type, Val};
+use crate::vmir::{Inst, MemberId, TyParams, Type, Val};
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
 
@@ -7,8 +7,14 @@ use std::fmt::{self, Display, Formatter};
 /// application in the e-graph — no context heap. A Silver function's contracts
 /// are *not* stored here: they are separate boolean functions (`f#requires`,
 /// `f#ensures`) recorded in the frontend `contracts` map and stitched as pure
-/// `assume`/`assert` at definition and call sites. (Heap-dependent functions
-/// will be a separate declaration.)
+/// `assume`/`assert` at definition and call sites.
+///
+/// A **heap-dependent** function (one whose `requires` grants permission) is
+/// still this same declaration: its `f#requires` is a self-framed `Resource`,
+/// and the function takes that resource's snapshot as an ordinary trailing
+/// parameter (`Type::Snap(req_id)`). Call sites build the snapshot with
+/// `PureInst::Snap`; the body reconstructs its precondition heap with
+/// `HeapInst::FromSnap` and reads it via `Deref`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Function {
     pub name: Spur,
@@ -66,14 +72,13 @@ impl Params {
 ///
 /// A (possibly generic) function application. `type_args` records the result-type
 /// instantiation for the verifier's `FuncApp` payload (empty for a fully-concrete
-/// result). `heap` is the context heap — `Some` only for heap-dependent
-/// (precond-carrying) functions; `None` for heap-free (precond-free / domain)
-/// calls.
+/// result). Always pure and heap-free: a heap-dependent function receives its
+/// precondition snapshot (built by `PureInst::Snap` at the call site) as an
+/// ordinary trailing argument.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionCall {
     pub function: MemberId,
     pub type_args: Vec<Type>,
-    pub heap: Option<HeapVal>,
     pub args: Args,
 }
 
@@ -153,12 +158,6 @@ impl Display for VmirDisplay<'_, &'_ FunctionCall> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let function = self.member(self.item.function);
         let args = &self.item.args;
-        // A heap-dependent (precond) call leads with `call[h] ` — the prefix flags
-        // heap dependence and carries the context heap. A heap-free (precond-free)
-        // call renders bare, like any other pure application.
-        if let Some(heap) = &self.item.heap {
-            write!(f, "call[{heap}] ")?;
-        }
         write!(f, "{function}")?;
         // A generic call shows its full type-argument instantiation in angle
         // brackets (`[..]` is reserved for heaps / addr groups).

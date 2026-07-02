@@ -145,7 +145,6 @@ pub(crate) fn lower<Ext: PureExt>(
                 PureInst::FunctionCall(vmir::FunctionCall {
                     function,
                     type_args,
-                    heap: None,
                     args: args.into(),
                 }),
             ))
@@ -408,7 +407,6 @@ fn lower_func_app<Ext: PureExt>(
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
-            heap: None,
             args: args.clone().into(),
         }),
     );
@@ -625,7 +623,6 @@ fn call_contract(sink: &mut Sink, func: vmir::MemberId, args: Vec<Val>) -> Val {
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
-            heap: None,
             args: args.into(),
         }),
     )

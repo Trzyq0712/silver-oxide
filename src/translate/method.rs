@@ -195,7 +195,10 @@ pub(crate) fn lower_method(
         exit_env.insert(bid, env);
     }
 
-    Ok(vmir::Method { name, insts: sink.insts })
+    Ok(vmir::Method {
+        name,
+        insts: sink.insts,
+    })
 }
 
 /// Collect the VMIR type of every method-scoped `var` declaration (plus the

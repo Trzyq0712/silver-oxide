@@ -3,8 +3,8 @@ use crate::vmir::{
     Adt, AdtVariant, Bound, Domain, Function, HeapInst, HeapVal, Inst, InstKind, MemberId, Type,
     Val,
 };
-use std::fmt::{self, Display, Formatter};
 use lasso::Spur;
+use std::fmt::{self, Display, Formatter};
 
 /// A reusable unit of proof.
 ///

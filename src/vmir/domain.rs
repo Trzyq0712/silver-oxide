@@ -1,5 +1,5 @@
-use crate::vmir::display::VmirDisplay;
 use crate::vmir::Inst;
+use crate::vmir::display::VmirDisplay;
 use std::fmt::{self, Display, Formatter};
 
 use lasso::Spur;

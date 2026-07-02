@@ -421,7 +421,10 @@ method m(x: Ref, y: Int)
             }
             InstKind::Pure(_, PureInst::Deref(..)) => {
                 saw_deref = true;
-                assert!(inst.heap.is_none(), "deref embeds its heap; no check-in heap");
+                assert!(
+                    inst.heap.is_none(),
+                    "deref embeds its heap; no check-in heap"
+                );
             }
             InstKind::Assert(_) => {
                 saw_assert = true;
@@ -488,7 +491,7 @@ function get(x: Int): Int
         matches!(
             &body.insts[i].kind,
             vmir::InstKind::Pure(vmir::Type::Bool, vmir::PureInst::FunctionCall(fc))
-                if fc.function == f && fc.heap.is_none()
+                if fc.function == f
         )
     };
     assert!(is_call(0, req_id), "entry must call get#requires");
@@ -543,7 +546,7 @@ function inc(x: Int): Int
     assert!(matches!(
         &body.insts[n - 2].kind,
         vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-            if fc.function == ens_id && fc.heap.is_none()
+            if fc.function == ens_id
     ));
     assert!(matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)));
 }

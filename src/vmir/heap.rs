@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{ResourceCall, Val};
+use crate::vmir::{MemberId, ResourceCall, Val};
 use std::fmt::{self, Display, Formatter};
 
 /// Heap-typed value.
@@ -53,6 +53,19 @@ pub enum HeapInst {
         base: HeapVal,
         call: ResourceCall,
         perm: Val,
+    },
+    /// `h := heap_of R(args), snap` — widen a snapshot value back into a heap:
+    /// one chunk per footprint slot of the self-framed resource `R(args)`, at
+    /// `addr_k` with permission `perm_k` (presence-gated) and value
+    /// `unwrap(proj_k(snap))`; the resource's boolean condition is **assumed**
+    /// implicitly. Inverse of [`PureInst::Snap`](crate::vmir::PureInst::Snap);
+    /// value-preserving like `Unfold` (values come from the snapshot), not
+    /// opaque like `Inhale`. Used at the entry of a heap-dependent function
+    /// body to reconstruct the precondition heap from the snapshot parameter.
+    FromSnap {
+        resource: MemberId,
+        args: Vec<Val>,
+        snap: Val,
     },
 }
 
@@ -140,6 +153,20 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 write!(f, "{base} unfold ")?;
                 call_head(f, call)?;
                 write!(f, " {perm}")
+            }
+            HeapInst::FromSnap {
+                resource,
+                args,
+                snap,
+            } => {
+                write!(f, "heap_of {}(", self.member(*resource))?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, "), {snap}")
             }
         }
     }

@@ -71,9 +71,9 @@ pub(crate) fn match_generic(
             }
         }
         (T::Collection(dc), T::Collection(ac)) => match (dc, ac) {
-            (C::Seq(d), C::Seq(a))
-            | (C::Set(d), C::Set(a))
-            | (C::MultiSet(d), C::MultiSet(a)) => match_generic(d, a, out),
+            (C::Seq(d), C::Seq(a)) | (C::Set(d), C::Set(a)) | (C::MultiSet(d), C::MultiSet(a)) => {
+                match_generic(d, a, out)
+            }
             (C::Map(dk, dv), C::Map(ak, av)) => {
                 match_generic(dk, ak, out);
                 match_generic(dv, av, out);

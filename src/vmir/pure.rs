@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{FunctionCall, HeapVal};
+use crate::vmir::{FunctionCall, HeapVal, MemberId};
 use std::fmt::{self, Display, Formatter};
 
 /// A value can be either a literal or a temporary variable defined earlier.
@@ -52,10 +52,26 @@ pub enum PureInst {
     Deref(HeapVal, Val),
     /// Query the permission amount of an address in a heap.
     Perm(HeapVal, Val),
-    /// A (possibly generic) Silver `function` application. Generics
-    /// (`type_args`) and the optional context heap live inside the
-    /// `FunctionCall`; a precond-free function is heap-free (`heap: None`).
+    /// A (possibly generic) Silver `function` application. Always pure and
+    /// heap-free: a heap-dependent function takes its precondition **snapshot**
+    /// (built by [`PureInst::Snap`] at the call site) as an ordinary trailing
+    /// argument. Generics (`type_args`) live inside the `FunctionCall`.
     FunctionCall(FunctionCall),
+    /// `snap[heap] R(args)` — narrow `heap` to the snapshot of the self-framed
+    /// resource `R(args)`: the tuple of `heap`'s chunk values at `R`'s footprint
+    /// addresses, each member `present ? Some(v) : None`. Produces a `Val` of
+    /// type `Type::Snap(resource)`.
+    ///
+    /// SIDECOND (implicit precondition check, exhale-shaped, **no** heap
+    /// mutation): for every footprint slot, `heap` must hold sufficient
+    /// permission (`perm(heap, addr_k) >= perm_k`) under the pc, and the
+    /// resource's boolean condition is **asserted**. No separate
+    /// `Assert`/`Assume` is emitted around this instruction.
+    Snap {
+        resource: MemberId,
+        args: Vec<Val>,
+        heap: HeapVal,
+    },
     /// Construct ADT value: variant `variant` of the ADT `adt` instantiated at
     /// `type_args`, over `args`. The ADT is named by its (possibly generic)
     /// declaration `MemberId`; `type_args` is its monomorphization (empty for a
@@ -136,6 +152,20 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 write!(f, "{cond} ? {then_val} : {else_val}")
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
+            PureInst::Snap {
+                resource,
+                args,
+                heap,
+            } => {
+                write!(f, "snap[{heap}] {}(", self.member(*resource))?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
             // `FunctionCall` renders itself (`name[heap](args)`) via its own
             // `VmirDisplay` impl, which resolves the callee `MemberId` → name.
             PureInst::FunctionCall(call) => write!(f, "{}", self.with(call)),

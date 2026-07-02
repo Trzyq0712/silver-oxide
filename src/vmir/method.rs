@@ -1,7 +1,7 @@
 use crate::vmir::Inst;
 use crate::vmir::display::VmirDisplay;
-use std::fmt::{self, Display, Formatter};
 use lasso::Spur;
+use std::fmt::{self, Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Method {
