@@ -394,34 +394,28 @@ fn lower_func_app<Ext: PureExt>(
     let func = *b.name_map.get(&call.name.0).ok_or_else(|| {
         TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
     })?;
-    // A heap-dependent callee (one with a `#requires`) reads the caller's current
-    // value heap; a precond-free / domain function is heap-free.
-    let contract = b.contracts.get(&call.name.0);
-    let heap_dep = contract.is_some_and(|c| c.requires.is_some());
-    let ctx = heap_dep.then_some(hctx.value);
+    // Functions are pure and heap-free. Contract functions (`#requires` /
+    // `#ensures`) are stitched as pure asserts/assumes around the call.
+    let requires = b.contracts.get(&call.name.0).and_then(|c| c.requires);
+    let ensures = b.contracts.get(&call.name.0).and_then(|c| c.ensures);
+    // Use-side precondition: assert `f#requires(args)` before the call.
+    if let Some(req_id) = requires {
+        let check = call_contract(sink, req_id, args.clone());
+        sink.emit_assert(check);
+    }
     let ret = sink.emit_pure(
         ty,
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
-            heap: ctx,
+            heap: None,
             args: args.clone().into(),
         }),
     );
-    // Use-side postcondition: when the callee has an `ensures`, invoke its
-    // `f#ensures(args, ret)` and assume it (a pure boolean fact — no heap
-    // transfer, unlike a method call).
-    if let Some(ens_id) = contract.and_then(|c| c.ensures) {
+    // Use-side postcondition: assume `f#ensures(args, ret)` after the call.
+    if let Some(ens_id) = ensures {
         args.push(ret.clone());
-        let check = sink.emit_pure(
-            vmir::Type::Bool,
-            PureInst::FunctionCall(vmir::FunctionCall {
-                function: ens_id,
-                type_args: Vec::new(),
-                heap: ctx,
-                args: args.into(),
-            }),
-        );
+        let check = call_contract(sink, ens_id, args);
         sink.emit_assume(check);
     }
     Ok(ret)
@@ -614,26 +608,36 @@ impl PureExt for typed::FuncEnsuresExt {
     }
 }
 
-/// The definition-side postcondition check appended to a function body: invoke
-/// `func(params ++ [body_result])` and `assert` it. `ctx` is the context heap the
-/// `f#ensures` call reads (`Some` for heap-dependent functions, `None` for
-/// heap-free).
-pub(crate) struct EnsuresCheck {
-    pub func: vmir::MemberId,
+/// The contract functions to stitch around a function body: `assume
+/// requires(params)` at entry, `assert ensures(params ++ [body_result])` at
+/// exit. Each is `None` when the function omits that clause; `params` are the
+/// function's parameter `Val`s (`Temp(0..n_params)`).
+pub(crate) struct FnContract {
+    pub requires: Option<vmir::MemberId>,
+    pub ensures: Option<vmir::MemberId>,
     pub params: Vec<Val>,
-    pub ctx: Option<HeapVal>,
+}
+
+/// Emit a heap-free boolean contract call `func(args)` and return its `Val`.
+fn call_contract(sink: &mut Sink, func: vmir::MemberId, args: Vec<Val>) -> Val {
+    sink.emit_pure(
+        vmir::Type::Bool,
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: func,
+            type_args: Vec::new(),
+            heap: None,
+            args: args.into(),
+        }),
+    )
 }
 
 /// Lower a pure expression into a standalone [`vmir::FunctionBody`] (function
 /// body / contract-function definition). `val_base` is the first free pure-temp
 /// counter (params, plus a `result` slot for a postcondition function, occupy
-/// the lower temps); `heap` is the context heap the body reads from
-/// (`HeapVal::Empty` for a heap-free function — heaps then count from `h0` —
-/// `HeapVal::Temp(0)` when framed by a precondition resource — heaps start at
-/// `h1`); `result` is `Some` only for a postcondition function. When `ensures`
-/// is `Some`, the body ends by invoking that
-/// contract function on `params ++ [body_result]` and asserting it (the
-/// definition-side postcondition obligation).
+/// the lower temps); `heap` is the (heap-free) context heap the body reads from
+/// (`HeapVal::Empty`); `result` is `Some` only for a postcondition function.
+/// When `contract` is `Some`, the body **assumes** `requires(params)` at entry
+/// and **asserts** `ensures(params ++ [body_result])` at exit.
 pub(crate) fn lower_function_body<Ext: PureExt>(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
@@ -641,36 +645,37 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     val_base: usize,
     heap: HeapVal,
     result: Option<Val>,
-    ensures: Option<EnsuresCheck>,
+    contract: Option<FnContract>,
 ) -> Result<vmir::FunctionBody, TranslationError> {
-    // A heap-free function reads from `Empty` and counts heaps from `h0`; a
-    // precond-framed one reserves `h0` for the ctx heap, so body heaps start at 1.
-    let heap_base = match heap {
-        HeapVal::Empty => 0,
-        _ => 1,
-    };
-    let mut sink = Sink::new(val_base, heap_base);
+    let mut sink = Sink::new(val_base, 0);
     let hctx = HeapCtx {
         value: heap,
         perm: heap,
         old: None,
         result: result.as_ref(),
     };
+    // Entry: assume the precondition.
+    if let Some(FnContract {
+        requires: Some(req),
+        params,
+        ..
+    }) = &contract
+    {
+        let check = call_contract(&mut sink, *req, params.clone());
+        sink.emit_assume(check);
+    }
     let res = lower(b, env, &mut sink, hctx, exp)?;
-    if let Some(ec) = ensures {
-        let mut args = ec.params;
+    // Exit: assert the postcondition on the actual body result.
+    if let Some(FnContract {
+        ensures: Some(ens),
+        params,
+        ..
+    }) = &contract
+    {
+        let mut args = params.clone();
         args.push(res.clone());
-        let check = sink.emit_pure(
-            vmir::Type::Bool,
-            PureInst::FunctionCall(vmir::FunctionCall {
-                function: ec.func,
-                type_args: Vec::new(),
-                heap: ec.ctx,
-                args: args.into(),
-            }),
-        );
-        // The assert's check-in heap is the body's framing heap.
-        sink.with_heap(heap, |s| s.emit_assert(check));
+        let check = call_contract(&mut sink, *ens, args);
+        sink.emit_assert(check);
     }
     Ok(vmir::FunctionBody {
         insts: sink.insts,

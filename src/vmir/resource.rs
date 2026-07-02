@@ -52,7 +52,6 @@ impl Resource {
             ty_params: 0.into(),
             params: self.params.clone().into(),
             ret: Type::addr(group, Type::Snap(id), Bound::Unbounded),
-            precond: Precond::SelfFramed,
             body: None,
         }
     }

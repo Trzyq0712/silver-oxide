@@ -1,8 +1,14 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapVal, Inst, MemberId, Precond, TyParams, Type, Val};
+use crate::vmir::{HeapVal, Inst, MemberId, TyParams, Type, Val};
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
 
+/// A **pure, heap-free** function. Its value is a plain uninterpreted
+/// application in the e-graph — no context heap. A Silver function's contracts
+/// are *not* stored here: they are separate boolean functions (`f#requires`,
+/// `f#ensures`) recorded in the frontend `contracts` map and stitched as pure
+/// `assume`/`assert` at definition and call sites. (Heap-dependent functions
+/// will be a separate declaration.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Function {
     pub name: Spur,
@@ -12,20 +18,11 @@ pub struct Function {
     pub ty_params: TyParams,
     pub params: Params,
     pub ret: Type,
-    /// Precondition framing. `SelfFramed` ⟹ precondition-free ⟹ **heap-free**
-    /// (domain functions, field `@addr`s, precond-free functions).
-    /// `Ctx(f#requires, args)` ⟹ the `#requires` resource framed at `args`
-    /// supplies the context heap in `HeapVal::Temp(0)`. `args` are the *leading*
-    /// params — for an `f#ensures` contract function they exclude the trailing
-    /// `result` param.
-    pub precond: Precond,
     /// The function's definition, when it has a body. `None` ⟹ abstract /
-    /// uninterpreted. A boolean-returning contract function (`f#ensures`) stores
-    /// its lowered postcondition here; a function *with* a postcondition ends its
-    /// body by invoking its `f#ensures` and asserting the result. There is no
-    /// postcondition builtin — the `f`→`f#ensures` link lives only in the
-    /// frontend's `contracts` map, which stitches the definition-side `assert`
-    /// and every use-side `assume`.
+    /// uninterpreted. A function with a body and contracts assumes `f#requires`
+    /// at entry and asserts `f#ensures` at exit (via their calls); a boolean
+    /// contract function (`f#requires` / `f#ensures`) stores the lowered
+    /// pre/postcondition here.
     pub body: Option<FunctionBody>,
 }
 
@@ -110,23 +107,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
             self.with(params),
             self.with(ret)
         )?;
-        // A precondition resource frames the body's context heap in `h0`, so
-        // body-emitted heaps start at `h1`; show it as `[req(a0, …)]`. A
-        // self-framed (heap-free) function counts heaps from `h0`.
-        let heap_base = match &self.item.precond {
-            Precond::Ctx(req_id, args) => {
-                write!(f, " [{}(", self.member(*req_id))?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, ")]")?;
-                1usize
-            }
-            Precond::SelfFramed => 0usize,
-        };
+        // Heap-free: body heaps count from `h0`.
         match &self.item.body {
             None => Ok(()),
             Some(body) => {
@@ -134,7 +115,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
                 write!(
                     f,
                     "{}",
-                    self.with((self.item.params.0.len(), heap_base, &body.insts[..]))
+                    self.with((self.item.params.0.len(), 0usize, &body.insts[..]))
                 )?;
                 writeln!(f, "  result: {}", body.res)?;
                 write!(f, "}}")

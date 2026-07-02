@@ -313,7 +313,6 @@ impl<'a> Builder<'a> {
                                 ty_params: generics.len().into(),
                                 params,
                                 ret,
-                                precond: vmir::Precond::SelfFramed,
                                 body: None,
                             }),
                         );
@@ -414,7 +413,6 @@ impl<'a> Builder<'a> {
                 ty_params: 0.into(),
                 params: vec![vmir::Type::Ref].into(),
                 ret,
-                precond: vmir::Precond::SelfFramed,
                 body: None,
             }),
         );
@@ -466,24 +464,34 @@ impl<'a> Builder<'a> {
     }
 
     /// Fill a Silver `function`'s reserved slots (see the declare pass in
-    /// [`Self::declare_adts_and_functions`]): the main function decl, plus a
-    /// `#requires` resource and an `#ensures` contract function when present.
+    /// [`Self::declare_adts_and_functions`]): the main function decl, plus
+    /// boolean `#requires` / `#ensures` contract functions when present.
     ///
-    /// - `#requires` → a self-framed [`vmir::Resource`], exactly like a method's.
-    /// - `#ensures` → a boolean-returning [`vmir::Function`] over `params ++
-    ///   result`, carrying `#requires` as its precondition; its body is the
-    ///   lowered postcondition.
-    /// - the main function → `precond` wired to `#requires` (when present), body =
-    ///   its lowered Viper body (when present).
+    /// Functions are **pure and heap-free**. Their contracts are ordinary boolean
+    /// functions, stitched as pure `assume`/`assert`:
+    /// - `#requires` → a boolean [`vmir::Function`] `params -> Bool`.
+    /// - `#ensures` → a boolean [`vmir::Function`] `(params ++ result) -> Bool`.
+    /// - the main function → its lowered body (when present) which **assumes**
+    ///   `#requires(params)` at entry and **asserts** `#ensures(params, result)`
+    ///   at exit.
     ///
-    /// A precondition resource frames the function's context heap in
-    /// `HeapVal::Temp(0)` (so body heaps start at `1`); a precond-free function is
-    /// heap-free (reads from `HeapVal::Empty`).
+    /// A `requires` that mentions `acc` makes the function heap-dependent, which
+    /// is not yet supported (a future separate declaration) — rejected here.
     fn define_function(&mut self, f: &typed::Function) -> Result<(), TranslationError> {
         let fname = self.interner.resolve(&f.name.0).to_string();
         let n_params = f.params.len();
         let params: Vec<vmir::Type> = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
         let ret = self.lower_type(&f.ret);
+
+        // Heap-dependent functions (a `requires` granting permission) are a future
+        // separate declaration.
+        if let Some(requires) = &f.requires
+            && spatial::spatial_contains_acc(requires)
+        {
+            return Err(TranslationError::Unsupported(
+                "heap-dependent function (acc in precondition)",
+            ));
+        }
 
         // Params occupy `Val::Temp(0..n_params)` in every body lowered below.
         let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
@@ -491,61 +499,29 @@ impl<'a> Builder<'a> {
             env.insert(p.name.0, vmir::Val::Temp(i));
         }
 
-        // #requires: a self-framed resource (accumulate from `Empty`, heaps at 0).
+        // #requires: a boolean function `params -> Bool` (the pure precondition).
         if let Some(requires) = &f.requires {
             let req_id = self
                 .method_requires(f.name.0)
                 .expect("declared in declare pass");
-            let body = spatial::lower_spatial_never(
-                self,
-                &env,
-                requires,
-                n_params,
-                vmir::HeapVal::Empty,
-                0,
-            )?;
+            let body = spatial::lower_pure_precond_body(self, &env, requires, n_params)?;
             let name = self
                 .vmir_interner
                 .get_or_intern(format!("{fname}#requires"));
             self.set_decl(
                 req_id,
-                vmir::Declaration::Resource(vmir::Resource {
+                vmir::Declaration::Function(vmir::Function {
                     name,
-                    params: params.clone(),
-                    precond: vmir::Precond::SelfFramed,
+                    ty_params: 0.into(),
+                    params: params.clone().into(),
+                    ret: vmir::Type::Bool,
                     body: Some(body),
                 }),
             );
         }
 
-        // The precondition, framed at the function's leading params
-        // `Val::Temp(0..n_params)` (for `#ensures`, this excludes the trailing
-        // `result`). `SelfFramed` ⟹ heap-free (reads from `Empty`); `Ctx` ⟹ the
-        // requires delta supplies the context heap in `HeapVal::Temp(0)`. The same
-        // precond is shared by the main function and its `#ensures`.
-        let precond = match self.method_requires(f.name.0) {
-            Some(req) => {
-                let args = (0..n_params).map(vmir::Val::Temp).collect();
-                vmir::Precond::Ctx(req, args)
-            }
-            None => vmir::Precond::SelfFramed,
-        };
-        // The heap a heap-dependent body reads from (`h0`); heap-free bodies read
-        // from `Empty`. `lower_function_body` derives its heap base from this.
-        let framing_heap = match &precond {
-            vmir::Precond::Ctx(..) => vmir::HeapVal::Temp(0),
-            vmir::Precond::SelfFramed => vmir::HeapVal::Empty,
-        };
-        // The context heap the `f#ensures` calls read: the framing heap for a
-        // heap-dependent function, `None` (heap-free) otherwise.
-        let ctx_heap = match &precond {
-            vmir::Precond::Ctx(..) => Some(framing_heap),
-            vmir::Precond::SelfFramed => None,
-        };
-
-        // #ensures: a boolean contract function `(params ++ result) -> Bool`,
-        // carrying the precondition. `result` occupies `Val::Temp(n_params)`, so
-        // body temps start after it. Its own body has no nested postcondition.
+        // #ensures: a boolean function `(params ++ result) -> Bool`. `result`
+        // occupies `Val::Temp(n_params)`, so body temps start after it.
         if let Some(ensures) = &f.ensures {
             let ens_id = self
                 .method_ensures(f.name.0)
@@ -558,7 +534,7 @@ impl<'a> Builder<'a> {
                 &env,
                 ensures,
                 n_params + 1,
-                framing_heap,
+                vmir::HeapVal::Empty,
                 Some(result),
                 None,
             )?;
@@ -570,22 +546,19 @@ impl<'a> Builder<'a> {
                     ty_params: 0.into(),
                     params: ens_params.into(),
                     ret: vmir::Type::Bool,
-                    precond: precond.clone(),
                     body: Some(body),
                 }),
             );
         }
 
-        // The main function: precond wired, body = lowered Viper body (if any).
-        // When it has a postcondition, the body ends by asserting
-        // `f#ensures(params, body_result)` (the definition-side obligation).
-        let ensures_check = self
-            .method_ensures(f.name.0)
-            .map(|ens_id| pure_exp::EnsuresCheck {
-                func: ens_id,
-                params: (0..n_params).map(vmir::Val::Temp).collect(),
-                ctx: ctx_heap,
-            });
+        // The main function: pure, heap-free. Its body (when present) assumes
+        // `#requires(params)` at entry and asserts `#ensures(params, result)` at
+        // exit — the contract functions applied to the actual body result.
+        let contract = pure_exp::FnContract {
+            requires: self.method_requires(f.name.0),
+            ensures: self.method_ensures(f.name.0),
+            params: (0..n_params).map(vmir::Val::Temp).collect(),
+        };
         let f_id = self.name_map[&f.name.0];
         let body = match &f.body {
             None => None,
@@ -594,9 +567,9 @@ impl<'a> Builder<'a> {
                 &env,
                 body_exp,
                 n_params,
-                framing_heap,
+                vmir::HeapVal::Empty,
                 None,
-                ensures_check,
+                Some(contract),
             )?),
         };
         let name = self.vmir_interner.get_or_intern(&fname);
@@ -607,7 +580,6 @@ impl<'a> Builder<'a> {
                 ty_params: 0.into(),
                 params: params.into(),
                 ret,
-                precond,
                 body,
             }),
         );

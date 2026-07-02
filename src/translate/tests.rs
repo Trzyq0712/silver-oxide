@@ -442,27 +442,29 @@ method m(x: Ref, y: Int)
 
 #[test]
 fn function_lowers_requires_ensures_and_body() {
+    // Heap-free function: `#requires` / `#ensures` are boolean Functions; the
+    // body assumes the precondition at entry and asserts the postcondition
+    // (applied to the body result) at exit.
     let input = r#"
-field f: Int
-
-function get(x: Ref): Int
-    requires acc(x.f)
-    ensures result == x.f
+function get(x: Int): Int
+    requires x > 0
+    ensures result == x
 {
-    x.f
+    x
 }
 "#;
     let p = run(input);
 
-    // #requires is a self-framed resource over the function's params.
+    // #requires is a boolean Function `params -> Bool` (NOT a Resource).
     let req_id = p.id("get#requires").expect("missing get#requires");
-    let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
-        panic!("get#requires must be a Resource");
+    let vmir::Declaration::Function(req) = &p.decls[req_id] else {
+        panic!("get#requires must be a Function");
     };
-    assert!(matches!(req.precond, vmir::Precond::SelfFramed));
-    assert!(req.body.is_some(), "requires resource must have a body");
+    assert_eq!(req.ret, vmir::Type::Bool);
+    assert_eq!(req.params, vec![vmir::Type::Int].into());
+    assert!(req.body.is_some());
 
-    // #ensures is a boolean function over (params ++ result), carrying #requires.
+    // #ensures is a boolean Function over (params ++ result).
     let ens_id = p.id("get#ensures").expect("missing get#ensures");
     let vmir::Declaration::Function(ens) = &p.decls[ens_id] else {
         panic!("get#ensures must be a Function");
@@ -470,45 +472,40 @@ function get(x: Ref): Int
     assert_eq!(ens.ret, vmir::Type::Bool);
     assert_eq!(
         ens.params,
-        vec![vmir::Type::Ref, vmir::Type::Int].into(),
+        vec![vmir::Type::Int, vmir::Type::Int].into(),
         "ensures params are the function params ++ result"
     );
-    // Precond framed at the function's params (`e0`), *excluding* result.
-    assert_eq!(
-        ens.precond,
-        vmir::Precond::Ctx(req_id, vec![vmir::Val::Temp(0)])
-    );
-    assert!(ens.body.is_some(), "ensures function must have a body");
+    assert!(ens.body.is_some());
 
-    // The main function: precond wired to #requires; its body ends with the
-    // definition-side check `assert get#ensures(params, body_result)`.
+    // The main function's body: assume #requires at entry, assert #ensures at exit.
     let get_id = p.id("get").expect("missing get");
     let vmir::Declaration::Function(get) = &p.decls[get_id] else {
         panic!("get must be a Function");
     };
     assert_eq!(get.ret, vmir::Type::Int);
-    assert_eq!(
-        get.precond,
-        vmir::Precond::Ctx(req_id, vec![vmir::Val::Temp(0)])
-    );
     let body = get.body.as_ref().expect("function body must be lowered");
-    let n = body.insts.len();
-    assert!(
+    let is_call = |i: usize, f: vmir::MemberId| {
         matches!(
-            &body.insts[n - 2].kind,
+            &body.insts[i].kind,
             vmir::InstKind::Pure(vmir::Type::Bool, vmir::PureInst::FunctionCall(fc))
-                if fc.function == ens_id
-        ),
-        "body's penultimate inst must call get#ensures"
+                if fc.function == f && fc.heap.is_none()
+        )
+    };
+    assert!(is_call(0, req_id), "entry must call get#requires");
+    assert!(
+        matches!(&body.insts[1].kind, vmir::InstKind::Assume(_)),
+        "entry must assume the precondition"
     );
+    let n = body.insts.len();
+    assert!(is_call(n - 2, ens_id), "exit must call get#ensures");
     assert!(
         matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)),
-        "body must end with an assert of the postcondition"
+        "exit must assert the postcondition"
     );
 }
 
 #[test]
-fn precondition_free_function_is_heap_free() {
+fn precondition_free_function_has_no_requires() {
     let input = r#"
 function inc(x: Int): Int
     ensures result == x + 1
@@ -518,26 +515,30 @@ function inc(x: Int): Int
 "#;
     let p = run(input);
 
-    assert!(p.id("inc#requires").is_none(), "no requires => no resource");
+    assert!(
+        p.id("inc#requires").is_none(),
+        "no requires => no contract fn"
+    );
 
     let ens_id = p.id("inc#ensures").expect("missing inc#ensures");
     let vmir::Declaration::Function(ens) = &p.decls[ens_id] else {
         panic!("inc#ensures must be a Function");
     };
-    assert_eq!(
-        ens.precond,
-        vmir::Precond::SelfFramed,
-        "precond-free ensures is self-framed"
-    );
     assert_eq!(ens.ret, vmir::Type::Bool);
 
     let inc_id = p.id("inc").expect("missing inc");
     let vmir::Declaration::Function(inc) = &p.decls[inc_id] else {
         panic!("inc must be a Function");
     };
-    assert_eq!(inc.precond, vmir::Precond::SelfFramed);
-    // Heap-free body: the definition-side `inc#ensures` call carries no ctx heap.
+    // No precondition ⟹ no entry assume; body ends with the #ensures assert.
     let body = inc.body.as_ref().expect("body");
+    assert!(
+        !body
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, vmir::InstKind::Assume(_))),
+        "no requires ⟹ no entry assume"
+    );
     let n = body.insts.len();
     assert!(matches!(
         &body.insts[n - 2].kind,
@@ -548,12 +549,41 @@ function inc(x: Int): Int
 }
 
 #[test]
-fn function_call_emits_use_side_postcondition_assume() {
-    // A method calling a postcondition-bearing function must, right after the
-    // call, invoke `f#ensures(args, result)` and `assume` it. A call to a
-    // postcondition-free function must not.
+fn heap_dependent_function_is_unsupported() {
+    // A function whose precondition grants permission (`acc`) is heap-dependent,
+    // which is not yet supported (future separate declaration).
+    let input = r#"
+field f: Int
+function get(x: Ref): Int
+    requires acc(x.f)
+    ensures result == x.f
+{ x.f }
+"#;
+    let mut program = viper_parser::vpr_program(input).expect("parse failed");
+    let mut ident_collector = IdentCollector::default();
+    program.walk_mut(&mut ident_collector);
+    let interner = ident_collector.finalize();
+    let mut globals_collector = GlobalsCollector::new(&interner);
+    program.walk(&mut globals_collector);
+    let globals = globals_collector.finalize().expect("globals error");
+    disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
+    inline_macros(&mut program, &interner).expect("macro inlining failed");
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck failed");
+    let err = translate(&typed).expect_err("heap-dependent function must be rejected");
+    assert!(
+        format!("{err:?}").contains("heap-dependent"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn function_call_emits_use_side_contract() {
+    // A method calling a function with contracts must, at the call site, assert
+    // `f#requires(args)` before the call and assume `f#ensures(args, result)`
+    // after. A call to a contract-free function does neither.
     let input = r#"
 function inc(x: Int): Int
+    requires x > 0
     ensures result == x + 1
 {
     x + 1
@@ -570,48 +600,54 @@ method m() {
 }
 "#;
     let p = run(input);
+    let inc_req = p.id("inc#requires").expect("missing inc#requires");
     let inc_ens = p.id("inc#ensures").expect("missing inc#ensures");
-    assert!(p.id("raw#ensures").is_none(), "raw has no postcondition");
+    assert!(p.id("raw#requires").is_none() && p.id("raw#ensures").is_none());
 
     let m_id = p.id("m").expect("missing m");
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
+    let calls = |f: vmir::MemberId| {
+        m.insts.iter().position(|i| {
+            matches!(
+                &i.kind,
+                vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == f
+            )
+        })
+    };
 
-    // An `inc#ensures(..)` call must be immediately followed by an `assume`.
-    let saw_inc_assume = m.insts.iter().enumerate().any(|(i, inst)| {
-        matches!(
-            &inst.kind,
-            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == inc_ens
-        ) && matches!(
-            m.insts.get(i + 1).map(|n| &n.kind),
-            Some(vmir::InstKind::Assume(_))
-        )
-    });
-    assert!(
-        saw_inc_assume,
-        "inc call must emit inc#ensures(..) + assume"
-    );
+    // `inc#requires(..)` call is followed by an assert.
+    let req_pos = calls(inc_req).expect("inc#requires call");
+    assert!(matches!(
+        &m.insts[req_pos + 1].kind,
+        vmir::InstKind::Assert(_)
+    ));
+    // `inc#ensures(..)` call is followed by an assume.
+    let ens_pos = calls(inc_ens).expect("inc#ensures call");
+    assert!(matches!(
+        &m.insts[ens_pos + 1].kind,
+        vmir::InstKind::Assume(_)
+    ));
+    // requires-assert precedes the `inc` value call, which precedes ensures-assume.
+    let inc_pos = calls(p.id("inc").unwrap()).expect("inc call");
+    assert!(req_pos < inc_pos && inc_pos < ens_pos);
 
-    // Exactly one assume in the method body (inc's postcondition; raw has none).
-    let assumes = m
-        .insts
-        .iter()
-        .filter(|i| matches!(i.kind, vmir::InstKind::Assume(_)))
-        .count();
-    assert_eq!(assumes, 1, "only the postcondition-bearing call assumes");
+    // Exactly one assert and one assume (raw contributes neither).
+    let count =
+        |pred: fn(&vmir::InstKind) -> bool| m.insts.iter().filter(|i| pred(&i.kind)).count();
+    assert_eq!(count(|k| matches!(k, vmir::InstKind::Assert(_))), 1);
+    assert_eq!(count(|k| matches!(k, vmir::InstKind::Assume(_))), 1);
 }
 
 #[test]
 fn function_display_smoke() {
     let input = r#"
-field f: Int
-
-function get(x: Ref): Int
-    requires acc(x.f)
-    ensures result == x.f
+function get(x: Int): Int
+    requires x > 0
+    ensures result == x
 {
-    x.f
+    x
 }
 "#;
     let p = run(input);

@@ -78,6 +78,38 @@ pub(crate) fn lower_spatial_never(
     })
 }
 
+/// Whether a spatial assertion mentions any `acc` (heap permission). An
+/// Acc-free assertion is purely logical, hence heap-free.
+pub(crate) fn spatial_contains_acc<Ext>(exp: &typed::SpatialExp<Ext>) -> bool {
+    use typed::SpatialExpKind as S;
+    match &*exp.0 {
+        S::Acc(..) => true,
+        S::Pure(_) => false,
+        S::Conj(l, r) => spatial_contains_acc(l) || spatial_contains_acc(r),
+        S::Implies(_, r) => spatial_contains_acc(r),
+        S::Ternary { then, else_, .. } => spatial_contains_acc(then) || spatial_contains_acc(else_),
+    }
+}
+
+/// Lower an **Acc-free** (purely logical) precondition into a boolean
+/// [`vmir::FunctionBody`] — the body of a heap-free function's `f#requires`
+/// contract function. The caller must have rejected any `acc` first (see
+/// [`spatial_contains_acc`]); with none present `lower_assertion_bool` never
+/// touches the heap, so the passed `HeapVal::Empty` is inert.
+pub(crate) fn lower_pure_precond_body(
+    b: &Builder<'_>,
+    env: &HashMap<Spur, Val>,
+    exp: &typed::SpatialExp<typed::HeapExt>,
+    val_base: usize,
+) -> Result<vmir::FunctionBody, TranslationError> {
+    let mut sink = Sink::new(val_base, 0);
+    let bv = lower_assertion_bool(b, env, &mut sink, HeapVal::Empty, None, exp)?;
+    Ok(vmir::FunctionBody {
+        insts: sink.insts,
+        res: bv.unwrap_or(TRUE),
+    })
+}
+
 pub(crate) fn lower_spatial_ensures(
     b: &Builder<'_>,
     env: &HashMap<Spur, Val>,
