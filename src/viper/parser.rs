@@ -145,7 +145,7 @@ peg::parser! {
             / kw(<"perm">) _ "(" _ l:exp() _ ")" { ExpKind::UnOp(UnOp::Perm, l) }
             / "[" _ e:exp() _ "," _ f:exp() _ "]" { ExpKind::BinOp(BinOp::InhaleExhale, e, f)}
 
-            / kw(<"unfolding">) _ acc:acc_exp() _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Unfold, acc, e) }
+            / kw(<"unfolding">) _ acc:fold_target() _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Unfold, acc, e) }
             // / kw(<"folding">) _ acc:predicate_perm() _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Fold, acc, e) }
 
             // / kw(<"applying">) _ "(" _ mwexp:magic_wand_exp() _ ")" _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Apply, mwexp, e) }
