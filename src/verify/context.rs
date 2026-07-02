@@ -10,7 +10,7 @@ use crate::{
         lang::{FuncId, Symbolic},
         rewrite,
     },
-    vmir::{BinOp, Literal, MemberId, Polarity, Type, Declaration},
+    vmir::{BinOp, Declaration, Literal, MemberId, Polarity, Type},
 };
 use lasso::{Rodeo, Spur};
 use typed_index_collections::TiVec;
@@ -47,6 +47,50 @@ pub(crate) struct ResourceCertificate {
     pub(crate) old_reads: Vec<(Id, Id)>,
 }
 
+/// A (non-recursive, heap-free) function's verified body, kept for **inlining at
+/// call sites**: the saturated body e-graph plus the roots needed to re-attach
+/// it. Grafting it (formal params → actual args) yields the e-class of the
+/// function's result expression, which the caller `union`s with the uninterpreted
+/// `FuncApp` node to install the definitional equality `f(args) == body`.
+pub(crate) struct FunctionCertificate {
+    pub(crate) egraph: EGraph<Symbolic, ConstFold>,
+    pub(crate) fresh_types: HashMap<u32, Type>,
+    pub(crate) func_ret_types: HashMap<FuncId, Type>,
+    /// Formal-param e-classes, in order (the call's args substitute these).
+    pub(crate) params: Vec<Id>,
+    /// The body's result e-class.
+    pub(crate) result: Id,
+}
+
+impl ResourceCertificate {
+    fn src(&self) -> TransplantSrc<'_> {
+        TransplantSrc {
+            egraph: &self.egraph,
+            fresh_types: &self.fresh_types,
+            func_ret_types: &self.func_ret_types,
+        }
+    }
+}
+
+impl FunctionCertificate {
+    fn src(&self) -> TransplantSrc<'_> {
+        TransplantSrc {
+            egraph: &self.egraph,
+            fresh_types: &self.fresh_types,
+            func_ret_types: &self.func_ret_types,
+        }
+    }
+}
+
+/// The read-only slice of a certificate that [`transplant`] copies from: the
+/// source e-graph and its type side-oracles. Lets grafting be shared between
+/// [`ResourceCertificate`] and [`FunctionCertificate`].
+struct TransplantSrc<'a> {
+    egraph: &'a EGraph<Symbolic, ConstFold>,
+    fresh_types: &'a HashMap<u32, Type>,
+    func_ret_types: &'a HashMap<FuncId, Type>,
+}
+
 pub(crate) struct VerifyContext<'a> {
     pub(crate) egraph: egg::EGraph<Symbolic, ConstFold>,
     /// Static structural rules. The ADT cons/proj/tag reductions are pulled from
@@ -74,6 +118,10 @@ pub(crate) struct VerifyContext<'a> {
     /// needed — the visualization reads them directly to reconstruct types.
     pub(crate) fresh_types: HashMap<u32, Type>,
     pub(crate) func_ret_types: HashMap<FuncId, Type>,
+    /// Verified non-recursive function bodies, keyed by `MemberId`. Read from the
+    /// shared `eval_pure_inst` to inline (`union`) a call's body definition. `None`
+    /// in isolated contexts (unit tests) that never evaluate a `FunctionCall`.
+    pub(crate) fn_certs: Option<&'a HashMap<MemberId, FunctionCertificate>>,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -94,6 +142,7 @@ impl<'a> VerifyContext<'a> {
             alloc,
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
+            fn_certs: None,
         }
     }
 
@@ -283,21 +332,22 @@ impl<'a> VerifyContext<'a> {
             subst.insert(cert.egraph.find(*p), *a);
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
+        let src = cert.src();
         let mut delta = Heap::empty();
         for (kind, addr, perm, value) in &cert.delta {
-            let a = transplant(self, cert, *addr, &subst, &mut memo);
-            let p = transplant(self, cert, *perm, &subst, &mut memo);
-            let v = transplant(self, cert, *value, &subst, &mut memo);
+            let a = transplant(self, &src, *addr, &subst, &mut memo);
+            let p = transplant(self, &src, *perm, &subst, &mut memo);
+            let v = transplant(self, &src, *value, &subst, &mut memo);
             delta = delta.with_chunk(kind, Chunk::new(a, p, v));
         }
-        let bool_id = transplant(self, cert, cert.bool_id, &subst, &mut memo);
+        let bool_id = transplant(self, &src, cert.bool_id, &subst, &mut memo);
         // Bind each `old(...)` read to the caller's concrete pre-state value at
         // the (transplanted) address, so the cert's symbolic pre-value unifies
         // with the real one.
         if let Some(ctx_heap) = old_ctx {
             for &(addr, value) in &cert.old_reads {
-                let a = transplant(self, cert, addr, &subst, &mut memo);
-                let v = transplant(self, cert, value, &subst, &mut memo);
+                let a = transplant(self, &src, addr, &subst, &mut memo);
+                let v = transplant(self, &src, value, &subst, &mut memo);
                 let a_canon = self.egraph.find(a);
                 let caller_val = ctx_heap
                     .entries()
@@ -340,8 +390,9 @@ impl<'a> VerifyContext<'a> {
         subst: &HashMap<Id, Id>,
     ) -> (Id, Id) {
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        let a = transplant(self, cert, addr, subst, &mut memo);
-        let p = transplant(self, cert, perm, subst, &mut memo);
+        let src = cert.src();
+        let a = transplant(self, &src, addr, subst, &mut memo);
+        let p = transplant(self, &src, perm, subst, &mut memo);
         self.egraph.rebuild();
         (a, p)
     }
@@ -367,9 +418,27 @@ impl<'a> VerifyContext<'a> {
             subst.insert(cert.egraph.find(slot.3), v);
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        let b = transplant(self, cert, cert.bool_id, &subst, &mut memo);
+        let src = cert.src();
+        let b = transplant(self, &src, cert.bool_id, &subst, &mut memo);
         self.egraph.rebuild();
         b
+    }
+
+    /// Inline a verified function body at a call site: transplant the cert's
+    /// result e-class under `params → args`, yielding the caller-space e-class of
+    /// the function's body expression. The caller `union`s this with the
+    /// uninterpreted `FuncApp(f, args)` node to install `f(args) == body`.
+    pub(crate) fn graft_function(&mut self, cert: &FunctionCertificate, args: &[Id]) -> Id {
+        self.alloc.stats.cert_grafts += 1;
+        let mut subst: HashMap<Id, Id> = HashMap::new();
+        for (p, a) in cert.params.iter().zip(args) {
+            subst.insert(cert.egraph.find(*p), *a);
+        }
+        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
+        let src = cert.src();
+        let result = transplant(self, &src, cert.result, &subst, &mut memo);
+        self.egraph.rebuild();
+        result
     }
 
     pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
@@ -507,20 +576,20 @@ enum Transplanted {
 
 fn transplant(
     caller: &mut VerifyContext<'_>,
-    cert: &ResourceCertificate,
+    src: &TransplantSrc<'_>,
     id: Id,
     subst: &HashMap<Id, Id>,
     memo: &mut HashMap<Id, Transplanted>,
 ) -> Id {
-    let cc = cert.egraph.find(id);
+    let cc = src.egraph.find(id);
     if let Some(&a) = subst.get(&cc) {
         return a;
     }
     let cc_ty = || {
         infer_type(
-            &cert.egraph,
-            &cert.fresh_types,
-            &cert.func_ret_types,
+            src.egraph,
+            src.fresh_types,
+            src.func_ret_types,
             cc,
             &mut HashMap::new(),
         )
@@ -540,7 +609,7 @@ fn transplant(
     }
     memo.insert(cc, Transplanted::InProgress(None));
 
-    let nodes = cert.egraph[cc].nodes.clone();
+    let nodes = src.egraph[cc].nodes.clone();
     let mut built: Vec<Id> = Vec::with_capacity(nodes.len());
     for node in &nodes {
         let b = match node {
@@ -549,26 +618,26 @@ fn transplant(
             Symbolic::Fresh(_) => caller.fresh_symbolic_value(cc_ty()),
             Symbolic::Lit(l) => caller.add(Symbolic::Lit(l.clone())),
             Symbolic::Binary(op, [l, r]) => {
-                let l = transplant(caller, cert, *l, subst, memo);
-                let r = transplant(caller, cert, *r, subst, memo);
+                let l = transplant(caller, src, *l, subst, memo);
+                let r = transplant(caller, src, *r, subst, memo);
                 caller.add(Symbolic::Binary(*op, [l, r]))
             }
             Symbolic::Ite([a, b, c]) => {
-                let a = transplant(caller, cert, *a, subst, memo);
-                let b = transplant(caller, cert, *b, subst, memo);
-                let c = transplant(caller, cert, *c, subst, memo);
+                let a = transplant(caller, src, *a, subst, memo);
+                let b = transplant(caller, src, *b, subst, memo);
+                let c = transplant(caller, src, *c, subst, memo);
                 caller.add(Symbolic::Ite([a, b, c]))
             }
             Symbolic::RealCast(x) => {
-                let x = transplant(caller, cert, *x, subst, memo);
+                let x = transplant(caller, src, *x, subst, memo);
                 caller.add(Symbolic::RealCast(x))
             }
             Symbolic::FuncApp(m, tys, fargs) => {
                 let fargs: Box<[Id]> = fargs
                     .iter()
-                    .map(|a| transplant(caller, cert, *a, subst, memo))
+                    .map(|a| transplant(caller, src, *a, subst, memo))
                     .collect();
-                let ret = cert.func_ret_types.get(m).cloned().unwrap_or(Type::Int);
+                let ret = src.func_ret_types.get(m).cloned().unwrap_or(Type::Int);
                 // The ground type instantiation has no e-class — copy it verbatim.
                 caller.add_func_app_id(*m, tys.clone(), ret, fargs)
             }

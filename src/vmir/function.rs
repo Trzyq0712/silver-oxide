@@ -50,6 +50,18 @@ impl FromIterator<Type> for Params {
     }
 }
 
+impl Params {
+    pub fn iter(&self) -> std::slice::Iter<'_, Type> {
+        self.0.iter()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A function invocation.
 ///
 /// A (possibly generic) function application. `type_args` records the result-type

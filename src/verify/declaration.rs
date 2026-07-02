@@ -3,15 +3,15 @@ use std::collections::HashMap;
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
-        context::{ResourceCertificate, VerifyContext},
+        context::{FunctionCertificate, ResourceCertificate, VerifyContext},
         heap::{Chunk, Heap, LocationKind},
         lang::Symbolic,
         viz::Snapshotter,
     },
     vmir::{
-        self, Assign, BinOp, Bound, Declaration, HeapInst, HeapVal, Inst, InstKind, Literal,
-        MemberId, Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall, Sign,
-        Type, Val,
+        self, Assign, BinOp, Bound, Declaration, Function, HeapInst, HeapVal, Inst, InstKind,
+        Literal, MemberId, Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall,
+        Sign, Type, Val,
     },
 };
 
@@ -258,12 +258,21 @@ fn eval_pure_inst(
             // empty for a monomorphic call. The context heap (`fc.heap`) is not
             // consulted — heap-dependence is a later (purification) concern.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add_func_app_id(
+            let app = ctx.add_func_app_id(
                 crate::verify::func_registry::func_id_for_member(fc.function),
                 fc.type_args.clone().into(),
                 ty.clone(),
-                args.into(),
-            )
+                args.clone().into(),
+            );
+            // Inline the callee's verified body: `f(args) == body`. `fn_certs`
+            // carries a cert for every non-recursive function already verified in
+            // dependency order (callees before callers). Abstract/heap-dependent
+            // functions have no cert and stay uninterpreted.
+            if let Some(cert) = ctx.fn_certs.and_then(|m| m.get(&fc.function)) {
+                let def = ctx.graft_function(cert, &args);
+                ctx.egraph.union(app, def);
+            }
+            app
         }
         // perm(loc): permission amount held at `loc` in the given heap.
         PureInst::Perm(hv, loc) => {
@@ -1005,9 +1014,11 @@ pub fn verify_method(
     method_name: &str,
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
+    fn_certs: &HashMap<MemberId, FunctionCertificate>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
+    ctx.fn_certs = Some(fn_certs);
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -1050,6 +1061,7 @@ pub fn verify_resource(
     resource_name: &str,
     resource: &Resource,
     certs: &HashMap<MemberId, ResourceCertificate>,
+    fn_certs: &HashMap<MemberId, FunctionCertificate>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
@@ -1058,6 +1070,7 @@ pub fn verify_resource(
     };
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
+    ctx.fn_certs = Some(fn_certs);
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1199,6 +1212,78 @@ pub fn verify_resource(
     }))
 }
 
+/// Verify a non-recursive, heap-free function: walk its body in a fresh egraph
+/// with fresh symbolic params (`Val::Temp(0..n_params)`), discharging the stitched
+/// entry-`assume f#requires` / exit-`assert f#ensures` contract instructions, then
+/// snapshot the (saturated) result e-class into a [`FunctionCertificate`] for
+/// inlining at call sites. Abstract functions (no body) have nothing to verify.
+///
+/// Callees — including the function's own `f#requires`/`f#ensures` contract
+/// functions — are ordinary `Function` decls verified earlier in dependency order,
+/// so their definitions are already grafted into `fn_certs` and inline here (via
+/// [`eval_pure_inst`]'s `FunctionCall` arm) to discharge the contract obligations.
+pub fn verify_function(
+    program: &vmir::Program,
+    function_name: &str,
+    function: &Function,
+    certs: &HashMap<MemberId, ResourceCertificate>,
+    fn_certs: &HashMap<MemberId, FunctionCertificate>,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+) -> Result<Option<FunctionCertificate>, VerifyError> {
+    let Some(body) = function.body.as_ref() else {
+        // Abstract/uninterpreted function: no body to verify, no certificate.
+        return Ok(None);
+    };
+
+    let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
+    ctx.fn_certs = Some(fn_certs);
+    // Params seed the initial `Val::Temp(0..n_params)` slots (heap-free: no ctx heap).
+    let params: Vec<egg::Id> = function
+        .params
+        .iter()
+        .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
+        .collect();
+    let param_types: Vec<Type> = function.params.iter().cloned().collect();
+    let mut state = EvalState::with_args(params.clone(), param_types);
+
+    let mut snap = Snapshotter::from_env(function_name);
+    snap.snapshot(&ctx, &[], "init", None);
+    for inst in &body.insts {
+        let vals_before = state.vals.len();
+        let heaps_before = state.heaps.len();
+        let inst_text = format_inst(
+            inst,
+            &program.decls,
+            &program.interner,
+            &program.groups,
+            vals_before,
+            heaps_before,
+        );
+        // Functions are heap-free, so the method-body eval path handles every inst
+        // (pure ops plus the entry/exit `assume`/`assert`); `certs` is unused here.
+        if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst, certs) {
+            return Err(err.with_inst(inst_text));
+        }
+        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
+        let heaps = display_heaps(&state, &inst.kind, heaps_before);
+        snap.snapshot(&ctx, &heaps, &inst_text, highlight);
+    }
+
+    // Saturate so the certificate carries the fully-reduced body expression, then
+    // snapshot the canonicalized result/param roots for grafting at call sites.
+    ctx.saturate();
+    let result = state.get_val(&mut ctx, &body.res);
+    let result = ctx.egraph.find(result);
+    let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
+    Ok(Some(FunctionCertificate {
+        egraph: ctx.egraph.clone(),
+        fresh_types: ctx.fresh_types.clone(),
+        func_ret_types: ctx.func_ret_types.clone(),
+        params,
+        result,
+    }))
+}
+
 /// Side-condition obligations implied by an instruction's kind, as
 /// `(goal, description)` pairs that must each be proven `true` under the
 /// instruction's path condition. `acc` requires a non-negative permission;
@@ -1256,7 +1341,8 @@ mod tests {
     fn fresh_ctx<'a>(interner: &'a lasso::Rodeo) -> VerifyContext<'a> {
         // Leak a `'static` empty allocator, names table, and group interner so the
         // returned context can borrow them.
-        let alloc: &'static mut _ = Box::leak(Box::new(crate::verify::func_registry::FuncRegistry::empty()));
+        let alloc: &'static mut _ =
+            Box::leak(Box::new(crate::verify::func_registry::FuncRegistry::empty()));
         let decls: &'static _ = Box::leak(Box::new(typed_index_collections::TiVec::<
             vmir::MemberId,
             vmir::Declaration,

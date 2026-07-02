@@ -9,8 +9,8 @@ use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
-    Declaration, HeapInst, InstKind, MemberId, Method, Precond, Program, PureInst, ResourceBody,
-    Type,
+    Declaration, HeapInst, Inst, InstKind, MemberId, Method, Precond, Program, PureInst,
+    ResourceBody, Type,
 };
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
@@ -151,73 +151,52 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             }
         }
         Declaration::Method(m) => method_deps(m, out),
-        Declaration::DomainAxiom(ax) => {
-            for inst in &ax.body {
-                match &inst.kind {
-                    InstKind::Pure(ty, PureInst::FunctionCall(fc))
-                        if !matches!(ty, Type::Addr { .. }) =>
-                    {
-                        out.push(fc.function)
-                    }
-                    InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
-                        out.push(call.resource)
-                    }
-                    InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
-                        out.push(call.resource)
-                    }
-                    _ => {}
-                }
+        Declaration::Function(f) => {
+            // A function depends on every function it calls — including its own
+            // `f#requires`/`f#ensures`, which are ordinary `Function` decls. This
+            // orders callees before callers (so their bodies inline) and turns any
+            // (mutual) recursion into a dependency cycle, rejected by `analyze`.
+            if let Some(body) = &f.body {
+                inst_deps(&body.insts, out);
             }
         }
+        Declaration::DomainAxiom(ax) => inst_deps(&ax.body, out),
         // Leaf declarations: nothing to depend on.
-        Declaration::Function(_) | Declaration::Domain(_) | Declaration::Adt(_) => {}
+        Declaration::Domain(_) | Declaration::Adt(_) => {}
+    }
+}
+
+/// Collect the schedulable members referenced by an instruction stream: the
+/// callee of each non-address `FunctionCall`, and the resource of each
+/// inhale/exhale/fold/unfold. Shared by resource, method, and function bodies.
+///
+/// An **address-typed** `FunctionCall` (result `Type::Addr`) is NOT a dependency:
+/// forming an address needs no certificate, and a predicate's address function is
+/// the predicate's own id, so treating it as a dependency would make a recursive
+/// predicate (`acc(P(this.next))` in `P`'s body) a self-cycle.
+fn inst_deps(insts: &[Inst], out: &mut Vec<MemberId>) {
+    for inst in insts {
+        match &inst.kind {
+            InstKind::Pure(ty, PureInst::FunctionCall(fc)) if !matches!(ty, Type::Addr { .. }) => {
+                out.push(fc.function)
+            }
+            InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
+                out.push(call.resource)
+            }
+            InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
+                out.push(call.resource)
+            }
+            _ => {}
+        }
     }
 }
 
 fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
-    // Resource bodies reference members through `FunctionCall`s and the
-    // resource of a `ResourceCall`/fold/unfold. An **address-typed** `FunctionCall`
-    // (result `Type::Addr`) is NOT a dependency: forming an address needs no
-    // certificate, and a predicate's address function is the predicate's own id,
-    // so treating it as a dependency would make a recursive predicate
-    // (`acc(P(this.next))` in `P`'s body) a self-cycle.
-    for inst in &body.insts {
-        match &inst.kind {
-            InstKind::Pure(ty, PureInst::FunctionCall(fc))
-                if !matches!(ty, Type::Addr { .. }) =>
-            {
-                out.push(fc.function)
-            }
-            InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
-                out.push(call.resource)
-            }
-            InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
-                out.push(call.resource)
-            }
-            _ => {}
-        }
-    }
+    inst_deps(&body.insts, out);
 }
 
 fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
-    for inst in &m.insts {
-        match &inst.kind {
-            // Address-typed `FunctionCall`s are not dependencies (see
-            // `resource_body_deps`).
-            InstKind::Pure(ty, PureInst::FunctionCall(fc))
-                if !matches!(ty, Type::Addr { .. }) =>
-            {
-                out.push(fc.function)
-            }
-            InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
-                out.push(call.resource)
-            }
-            InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
-                out.push(call.resource)
-            }
-            _ => {}
-        }
-    }
+    inst_deps(&m.insts, out);
 }
 
 #[cfg(test)]
@@ -257,7 +236,10 @@ mod tests {
                 perm: write(),
             }),
         };
-        Declaration::Method(Method { name: lasso::Spur::try_from_usize(0).unwrap(), insts: vec![inst] })
+        Declaration::Method(Method {
+            name: lasso::Spur::try_from_usize(0).unwrap(),
+            insts: vec![inst],
+        })
     }
 
     fn program(names: &[&str], decls: Vec<Declaration>) -> Program {

@@ -10,7 +10,7 @@ mod rewrite;
 mod stats;
 mod viz;
 
-pub use declaration::{VerifyError, verify_resource};
+pub use declaration::{VerifyError, verify_function, verify_resource};
 pub use stats::VerifyStats;
 
 /// Result for one verification unit (method or resource): its name and whether
@@ -40,6 +40,11 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // call sites rather than re-walking the body.
     let mut certs: std::collections::HashMap<vmir::MemberId, context::ResourceCertificate> =
         std::collections::HashMap::new();
+    // Verified function bodies, cached in dependency order (callees before
+    // callers) and inlined at call sites (see `eval_pure_inst`'s `FunctionCall`
+    // arm) to install the definitional equality `f(args) == body`.
+    let mut fn_certs: std::collections::HashMap<vmir::MemberId, context::FunctionCertificate> =
+        std::collections::HashMap::new();
     // Shared function-id registry: one per run so ADT/builtin ids stay
     // consistent across certificate grafts. Threaded `&mut` into each unit.
     let mut alloc = func_registry::FuncRegistry::new(program);
@@ -47,7 +52,8 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
         let name = program.name(id).to_string();
         let outcome = match &program.decls[id] {
             vmir::Declaration::Resource(r) => {
-                match declaration::verify_resource(program, &name, r, &certs, &mut alloc) {
+                match declaration::verify_resource(program, &name, r, &certs, &fn_certs, &mut alloc)
+                {
                     Ok(cert) => {
                         if let Some(cert) = cert {
                             certs.insert(id, cert);
@@ -57,8 +63,20 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
                     Err(e) => Some(Err(e)),
                 }
             }
+            vmir::Declaration::Function(f) => {
+                match declaration::verify_function(program, &name, f, &certs, &fn_certs, &mut alloc)
+                {
+                    // Abstract functions produce no certificate and no result row.
+                    Ok(None) => None,
+                    Ok(Some(cert)) => {
+                        fn_certs.insert(id, cert);
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }
             vmir::Declaration::Method(m) => Some(declaration::verify_method(
-                program, &name, m, &certs, &mut alloc,
+                program, &name, m, &certs, &fn_certs, &mut alloc,
             )),
             _ => None,
         };

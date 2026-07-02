@@ -322,6 +322,7 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
     // order for these small fixtures), tolerating failures, so a body that
     // unfolds another predicate can graft its certificate. The target itself is
     // skipped so a deliberately-failing target still returns `Err`.
+    let fn_certs = build_fn_certs(program, &mut alloc);
     let mut certs = HashMap::new();
     for (cid, decl) in program.decls.iter_enumerated() {
         if cid == id {
@@ -329,26 +330,73 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
         }
         if let vmir::Declaration::Resource(cr) = decl {
             let cname = program.name(cid).to_string();
-            if let Ok(Some(cert)) = verify_resource(program, &cname, cr, &certs, &mut alloc) {
+            if let Ok(Some(cert)) =
+                verify_resource(program, &cname, cr, &certs, &fn_certs, &mut alloc)
+            {
                 certs.insert(cid, cert);
             }
         }
     }
-    verify_resource(program, name, r, &certs, &mut alloc).map(|_| ())
+    verify_resource(program, name, r, &certs, &fn_certs, &mut alloc).map(|_| ())
+}
+
+/// Verify every function in `program` except `skip` (test helper), caching
+/// certificates. Iterates to a fixpoint so callees are certified before callers
+/// (a function whose ensures/callees aren't yet grafted fails and is retried on a
+/// later pass) — the helper's stand-in for the driver's topological order.
+/// Functions are heap-free and never call resources, so an empty resource-cert
+/// map suffices.
+fn build_fn_certs_except(
+    program: &vmir::Program,
+    skip: Option<MemberId>,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+) -> HashMap<MemberId, FunctionCertificate> {
+    let no_certs = HashMap::new();
+    let mut fn_certs = HashMap::new();
+    loop {
+        let mut progress = false;
+        for (id, decl) in program.decls.iter_enumerated() {
+            if Some(id) == skip || fn_certs.contains_key(&id) {
+                continue;
+            }
+            if let vmir::Declaration::Function(f) = decl {
+                let name = program.name(id).to_string();
+                if let Ok(Some(cert)) =
+                    verify_function(program, &name, f, &no_certs, &fn_certs, alloc)
+                {
+                    fn_certs.insert(id, cert);
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    fn_certs
+}
+
+/// Verify every function in `program` (test helper). See [`build_fn_certs_except`].
+fn build_fn_certs(
+    program: &vmir::Program,
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+) -> HashMap<MemberId, FunctionCertificate> {
+    build_fn_certs_except(program, None, alloc)
 }
 
 /// Build certificates for every resource in `program` (test helper). Shares the
 /// `alloc` so certificate ids match the method's later use.
 fn build_certs(
     program: &vmir::Program,
+    fn_certs: &HashMap<MemberId, FunctionCertificate>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> HashMap<MemberId, ResourceCertificate> {
     let mut certs = HashMap::new();
     for (id, decl) in program.decls.iter_enumerated() {
         if let vmir::Declaration::Resource(r) = decl {
             let name = program.name(id).to_string();
-            if let Some(cert) =
-                verify_resource(program, &name, r, &certs, alloc).expect("resource verifies")
+            if let Some(cert) = verify_resource(program, &name, r, &certs, fn_certs, alloc)
+                .expect("resource verifies")
             {
                 certs.insert(id, cert);
             }
@@ -411,8 +459,9 @@ fn verify_named_method(program: &vmir::Program, name: &str) -> Result<(), Verify
         panic!("{name} must be a Method");
     };
     let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
-    let certs = build_certs(program, &mut alloc);
-    verify_method(program, name, m, &certs, &mut alloc)
+    let fn_certs = build_fn_certs(program, &mut alloc);
+    let certs = build_certs(program, &fn_certs, &mut alloc);
+    verify_method(program, name, m, &certs, &fn_certs, &mut alloc)
 }
 
 #[test]
@@ -1656,5 +1705,94 @@ predicate Q(x: Ref) { acc(P(x), write) && (unfolding acc(P(x), write) in true) }
             Err(crate::vmir::AnalysisError::CircularDependency(_))
         ),
         "mutually-unfolding predicates should be a circular dependency"
+    );
+}
+
+/// Verify the function `name`, panicking if missing or not a `Function`. Builds
+/// certificates for every *other* function first (deps ≈ decl order for these
+/// fixtures) so the target's callees — including its own `#requires`/`#ensures` —
+/// inline.
+fn verify_named_function(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {
+    let id = program
+        .id(name)
+        .unwrap_or_else(|| panic!("missing function {name}"));
+    let vmir::Declaration::Function(f) = &program.decls[id] else {
+        panic!("{name} must be a Function");
+    };
+    let mut alloc = crate::verify::func_registry::FuncRegistry::new(program);
+    let no_certs = HashMap::new();
+    let fn_certs = build_fn_certs_except(program, Some(id), &mut alloc);
+    verify_function(program, name, f, &no_certs, &fn_certs, &mut alloc).map(|_| ())
+}
+
+#[test]
+fn function_body_inlined_when_spec_insufficient() {
+    // The spec (`result >= 0`) alone can't prove `five() == 5`; only the grafted
+    // body definition (`five() == 5`) discharges the assert.
+    let input = r#"
+function five(): Int
+    ensures result >= 0
+{ 5 }
+
+method m()
+{
+    assert five() == 5
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "grafted function body should discharge `five() == 5`"
+    );
+}
+
+#[test]
+fn chained_function_bodies_inlined() {
+    // `six` calls `five`; proving `six() == 6` needs both bodies inlined.
+    let input = r#"
+function five(): Int { 5 }
+function six(): Int { five() + 1 }
+
+method m()
+{
+    assert six() == 6
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "chained function bodies should inline to prove `six() == 6`"
+    );
+}
+
+#[test]
+fn function_postcondition_discharged_by_body() {
+    // The exit `assert inc#ensures(x, result)` is discharged via the grafted
+    // `inc#ensures` definition against the body result `x + 1`.
+    let input = r#"
+function inc(x: Int): Int
+    ensures result == x + 1
+{ x + 1 }
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_function(&program, "inc").is_ok(),
+        "function whose ensures follows from its body should verify"
+    );
+}
+
+#[test]
+fn recursive_function_rejected_as_cycle() {
+    // A self-recursive function is a dependency self-loop → `analyze` rejects it.
+    let input = r#"
+function loop(x: Int): Int { loop(x) }
+"#;
+    let program = lower(input);
+    assert!(
+        matches!(
+            crate::vmir::analyze(program),
+            Err(crate::vmir::AnalysisError::CircularDependency(_))
+        ),
+        "self-recursive function should be a circular dependency"
     );
 }
