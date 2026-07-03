@@ -308,6 +308,59 @@ method m(x: Ref)
     );
 }
 
+#[test]
+fn old_over_heap_dependent_function_binds_pre_state() {
+    // `old(get(this))` applies a heap-dependent function under `old`: the
+    // ensures body reads the pre-state via `Snap` on the `FromSnap`-widened
+    // snapshot parameter, which must congruence-collapse to the caller's real
+    // pre-state values at the exhale graft (regression: the old `old_reads`
+    // mechanism recorded only direct `Deref`s and left these unbound).
+    let unchanged = r#"
+field v: Int
+
+predicate number(this: Ref) { acc(this.v) }
+
+function get(this: Ref): Int
+    requires number(this)
+{ unfolding number(this) in this.v }
+
+method keep(this: Ref)
+    requires number(this)
+    ensures number(this) && old(get(this)) == get(this)
+{ }
+"#;
+    let program = lower(unchanged);
+    assert!(
+        verify_named_method(&program, "keep").is_ok(),
+        "old(get(this)) must equal get(this) for an untouched predicate"
+    );
+
+    // Mutating the value under the predicate must break the equality.
+    let mutated = r#"
+field v: Int
+
+predicate number(this: Ref) { acc(this.v) }
+
+function get(this: Ref): Int
+    requires number(this)
+{ unfolding number(this) in this.v }
+
+method bump(this: Ref)
+    requires number(this)
+    ensures number(this) && old(get(this)) == get(this)
+{
+    unfold number(this)
+    this.v := this.v + 1
+    fold number(this)
+}
+"#;
+    let program = lower(mutated);
+    assert!(
+        verify_named_method(&program, "bump").is_err(),
+        "old(get(this)) must not equal get(this) after mutating this.v"
+    );
+}
+
 /// Verify the resource interned under `name`, panicking if it is missing or
 /// is not a `Resource`.
 fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), VerifyError> {

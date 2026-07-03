@@ -231,16 +231,23 @@ impl Sink {
     /// Emit a resource inhale (`base inhale call perm`, assumes the bool) or
     /// exhale (`base exhale call perm`, asserts the bool). Inhale is total;
     /// exhale carries the running pc as its side-condition guard.
+    ///
+    /// When `yields_snap` (the callee is self-framed) the inst additionally
+    /// produces a pure `Val` — the snapshot of the in/ex-haled resource — so the
+    /// `Val` counter bumps alongside the heap counter.
     pub fn emit_resource_combine(
         &mut self,
         base: HeapVal,
         sign: Sign,
         call: ResourceCall,
         perm: Val,
-    ) -> HeapVal {
-        match sign {
+        yields_snap: bool,
+    ) -> (HeapVal, Option<Val>) {
+        let h = match sign {
             Sign::Add => self.emit_heap(HeapInst::Inhale { base, call, perm }),
             Sign::Sub => self.emit_heap_guarded(HeapInst::Exhale { base, call, perm }),
-        }
+        };
+        let snap = yields_snap.then(|| self.next_val_temp());
+        (h, snap)
     }
 }

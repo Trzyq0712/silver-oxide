@@ -109,7 +109,19 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                     e_idx += 1;
                 }
                 InstKind::Heap(hi) => {
-                    writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), self.with(hi))?;
+                    // A snapshot-yielding inhale/exhale also produces a pure
+                    // temp: `h1, e5 := h0 inhale R(...) 1/1`.
+                    if hi.snap_yield(self.decls).is_some() {
+                        writeln!(
+                            f,
+                            "  h{h_idx}, e{e_idx} := {}{}",
+                            PcPrefix(&inst.pc),
+                            self.with(hi)
+                        )?;
+                        e_idx += 1;
+                    } else {
+                        writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), self.with(hi))?;
+                    }
                     h_idx += 1;
                 }
                 InstKind::Assume(v) => writeln!(f, "  {}assume {v}", PcPrefix(&inst.pc))?,

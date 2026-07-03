@@ -116,14 +116,27 @@ pub(crate) fn lower_spatial_ensures(
     exp: &typed::SpatialExp<typed::MethodEnsuresExt>,
     val_base: usize,
     initial_heap: HeapVal,
-    heap_base: usize,
-    pre_state: Option<HeapVal>,
+    snap_entry: Option<pure_exp::SnapEntry>,
 ) -> Result<vmir::ResourceBody, TranslationError> {
-    let mut sink = Sink::new(val_base, heap_base);
-    // `old(e)` in the postcondition reads the method pre-state. For a two-state
-    // (`Ctx`) resource that heap is the caller-supplied ctx slot `HeapVal::Temp(0)`;
-    // bind it as the (unlabeled) `old` baseline. A self-framed ensures has no
-    // pre-state, so `old` is rejected at lowering (see `MethodEnsuresExt`).
+    let mut sink = Sink::new(val_base, 0);
+    // A two-state ensures opens with `heap_of req(args), s` (`FromSnap`):
+    // reconstruct the method pre-state from the trailing snapshot parameter.
+    // That heap is the (unlabeled) `old` baseline `old(e)` reads. A self-framed
+    // ensures has no pre-state, so `old` is rejected at lowering (see
+    // `MethodEnsuresExt`).
+    let pre_state = snap_entry.map(
+        |pure_exp::SnapEntry {
+             resource,
+             args,
+             snap,
+         }| {
+            sink.emit_heap(HeapInst::FromSnap {
+                resource,
+                args,
+                snap,
+            })
+        },
+    );
     let labeled: HashMap<Spur, HeapVal> = HashMap::new();
     let old = pre_state.map(|baseline| OldHeaps {
         baseline,

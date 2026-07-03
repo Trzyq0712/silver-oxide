@@ -39,12 +39,6 @@ pub(crate) struct ResourceCertificate {
     pub(crate) footprint: Vec<(LocationKind, Id, Id, Id)>,
     /// Result boolean e-class.
     pub(crate) bool_id: Id,
-    /// `old(...)` reads: `(addr, value)` e-classes (in cert id-space) of each
-    /// `Deref` against the ctx slot `HeapVal::Temp(0)`. At a graft site the
-    /// caller binds `value` to its concrete pre-state heap value at `addr`, so a
-    /// postcondition like `r == old(x.f)` connects to the real pre-value. Empty
-    /// for self-framed resources.
-    pub(crate) old_reads: Vec<(Id, Id)>,
 }
 
 /// A (non-recursive, heap-free) function's verified body, kept for **inlining at
@@ -317,15 +311,19 @@ impl<'a> VerifyContext<'a> {
 
     /// Graft a resource certificate into this (caller) e-graph, substituting the
     /// certificate's formal params for `args`. Returns the grafted result heap
-    /// delta and boolean e-class. Every merge proven in the certificate
-    /// transfers for free (reconstruction is keyed by certificate e-class), so
-    /// the caller never re-derives or re-saturates the resource's facts.
+    /// delta, boolean e-class, and the transplanted **footprint** slots
+    /// `(perm, value)` in program order — the snapshot layout a snapshot-yielding
+    /// inhale/exhale builds its `cons` from (the footprint values share e-classes
+    /// with the delta chunk values, so they bind to the caller's heap values
+    /// through the usual union/subtract accounting). Every merge proven in the
+    /// certificate transfers for free (reconstruction is keyed by certificate
+    /// e-class), so the caller never re-derives or re-saturates the resource's
+    /// facts.
     pub(crate) fn graft_certificate(
         &mut self,
         cert: &ResourceCertificate,
         args: &[egg::Id],
-        old_ctx: Option<&Heap>,
-    ) -> (Heap, egg::Id) {
+    ) -> (Heap, egg::Id, Vec<(Id, Id)>) {
         self.alloc.stats.cert_grafts += 1;
         let mut subst: HashMap<Id, Id> = HashMap::new();
         for (p, a) in cert.params.iter().zip(args) {
@@ -341,23 +339,19 @@ impl<'a> VerifyContext<'a> {
             delta = delta.with_chunk(kind, Chunk::new(a, p, v));
         }
         let bool_id = transplant(self, &src, cert.bool_id, &subst, &mut memo);
-        // Bind each `old(...)` read to the caller's concrete pre-state value at
-        // the (transplanted) address, so the cert's symbolic pre-value unifies
-        // with the real one.
-        if let Some(ctx_heap) = old_ctx {
-            for &(addr, value) in &cert.old_reads {
-                let a = transplant(self, &src, addr, &subst, &mut memo);
-                let v = transplant(self, &src, value, &subst, &mut memo);
-                let a_canon = self.egraph.find(a);
-                let caller_val = ctx_heap
-                    .entries()
-                    .find_map(|(_, c)| (self.egraph.find(c.addr) == a_canon).then_some(c.value))
-                    .unwrap_or_else(|| self.fresh_symbolic_value(Type::Int));
-                self.egraph.union(v, caller_val);
-            }
-        }
+        // The memo is shared, so a footprint value lands in the same caller
+        // e-class as its delta chunk value.
+        let footprint: Vec<(Id, Id)> = cert
+            .footprint
+            .iter()
+            .map(|(_, _, perm, value)| {
+                let p = transplant(self, &src, *perm, &subst, &mut memo);
+                let v = transplant(self, &src, *value, &subst, &mut memo);
+                (p, v)
+            })
+            .collect();
         self.egraph.rebuild();
-        (delta, bool_id)
+        (delta, bool_id, footprint)
     }
 
     /// Seed a footprint-graft substitution with the call's `args` bound to the

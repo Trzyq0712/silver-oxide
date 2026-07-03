@@ -758,12 +758,20 @@ impl<'a> Builder<'a> {
                     vmir::Precond::Ctx(req_id, req_args)
                 })
                 .unwrap_or(vmir::Precond::SelfFramed);
-            // Two-state (`Ctx`) ensures reserves `HeapVal::Temp(0)` as the pre-state
-            // slot that `old(...)` reads (so emitted heaps start at 1); self-framed
-            // ensures has no pre-state.
-            let (heap_base, pre_state) = match &precond {
-                vmir::Precond::Ctx(..) => (1, Some(vmir::HeapVal::Temp(0))),
-                vmir::Precond::SelfFramed => (0, None),
+            // A two-state (`Ctx`) ensures receives the pre-state as a trailing
+            // snapshot parameter `s : Snap(req)`; its body opens with a
+            // `FromSnap` reconstructing the pre-state heap `old(...)` reads.
+            let snap_entry = match &precond {
+                vmir::Precond::Ctx(req_id, req_args) => {
+                    let snap = vmir::Val::Temp(params.len());
+                    params.push(vmir::Type::Snap(*req_id));
+                    Some(pure_exp::SnapEntry {
+                        resource: *req_id,
+                        args: req_args.clone(),
+                        snap,
+                    })
+                }
+                vmir::Precond::SelfFramed => None,
             };
             let body = spatial::lower_spatial_ensures(
                 self,
@@ -771,8 +779,7 @@ impl<'a> Builder<'a> {
                 ensures,
                 params.len(),
                 vmir::HeapVal::Empty,
-                heap_base,
-                pre_state,
+                snap_entry,
             )?;
             let name = self
                 .vmir_interner

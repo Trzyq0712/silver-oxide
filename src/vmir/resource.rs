@@ -24,10 +24,12 @@ pub struct Resource {
 ///
 /// - `SelfFramed`: one-state — the body reads only its own footprint. Predicates,
 ///   `#requires`, and function preconditions. Snapshottable / foldable.
-/// - `Ctx(req, args)`: two-state — the body additionally reads a context heap
-///   (`HeapVal::Temp(0)`), the delta of the precondition resource `req` applied
-///   to `args` (the caller-supplied pre-state). `#ensures`. Opaque-only; never
-///   snapshotted or folded.
+/// - `Ctx(req, args)`: two-state — the body additionally reads the pre-state of
+///   the precondition resource `req` applied to `args`, received as a trailing
+///   snapshot parameter `s : Snap(req)` and widened back into a heap by the
+///   body's entry `HeapInst::FromSnap`. `#ensures`. Opaque-only; never
+///   snapshotted or folded. (The payload is metadata — the entry `FromSnap`
+///   carries the same information explicitly.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Precond {
     SelfFramed,
@@ -129,9 +131,8 @@ pub struct ResourceBody {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceCall {
     pub resource: MemberId,
-    /// The context heap, present only when the called resource has a
-    /// precondition resource. `None` for self-framed (context-free) calls.
-    pub ctx_heap: Option<HeapVal>,
+    /// Call arguments. A two-state resource's pre-state snapshot is an ordinary
+    /// trailing argument here (matching its trailing `Snap(req)` param).
     pub args: Vec<Val>,
 }
 
@@ -156,30 +157,14 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
         match &self.item.body {
             None => Ok(()),
             Some(body) => {
-                // A self-framed resource has no precondition: print no `[..]`
-                // annotation and count emitted heaps from `h0` (its initial heap
-                // is `empty`). A two-state resource shows its context resource
-                // `[req(args)]` and reserves `h0` for that ctx heap, so its body
-                // heaps start at `h1`.
-                let heap_base = match &self.item.precond {
-                    Precond::SelfFramed => 0usize,
-                    Precond::Ctx(req_id, req_args) => {
-                        write!(f, "[{}(", self.member(*req_id))?;
-                        for (i, arg) in req_args.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{}", arg)?;
-                        }
-                        write!(f, ")]")?;
-                        1usize
-                    }
-                };
+                // Body heaps always count from `h0` (a two-state resource's
+                // pre-state is reconstructed by its explicit entry `FromSnap`,
+                // which is `h0` itself — no reserved slot).
                 writeln!(f, " {{")?;
                 write!(
                     f,
                     "{}",
-                    self.with((self.item.params.len(), heap_base, &body.insts[..]))
+                    self.with((self.item.params.len(), 0usize, &body.insts[..]))
                 )?;
                 writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
                 write!(f, "}}")

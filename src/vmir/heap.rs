@@ -21,15 +21,19 @@ pub enum HeapInst {
         loc: Val,
         perm: Val,
     },
-    /// `h := base inhale <call> <perm>`. Add the resource's delta (scaled by
-    /// `perm`) to `base` **and assume** its boolean condition.
+    /// `h[, s] := base inhale <call> <perm>`. Add the resource's delta (scaled by
+    /// `perm`) to `base` **and assume** its boolean condition. When the callee is
+    /// **self-framed** the inst additionally yields a pure `Val` `s : Snap(callee)`
+    /// — the snapshot of the just-inhaled resource (see [`HeapInst::snap_yield`]),
+    /// passed on as the trailing snapshot argument of a two-state resource call.
     Inhale {
         base: HeapVal,
         call: ResourceCall,
         perm: Val,
     },
-    /// `h := base exhale <call> <perm>`. Subtract the resource's delta (scaled by
-    /// `perm`) from `base` **and assert** its boolean condition.
+    /// `h[, s] := base exhale <call> <perm>`. Subtract the resource's delta (scaled by
+    /// `perm`) from `base` **and assert** its boolean condition. Yields a snapshot
+    /// `Val` exactly like `Inhale` (values = the consumed caller chunk values).
     Exhale {
         base: HeapVal,
         call: ResourceCall,
@@ -67,6 +71,30 @@ pub enum HeapInst {
         args: Vec<Val>,
         snap: Val,
     },
+}
+
+impl HeapInst {
+    /// The resource whose snapshot this instruction *additionally* yields as a
+    /// pure `Val` (bumping the `Val` counter): an `Inhale`/`Exhale` of a
+    /// **self-framed** resource produces `s : Snap(callee)` alongside the new
+    /// heap. Two-state callees (and every other heap inst) yield none. Derived
+    /// from the callee declaration — not stored on the inst.
+    pub fn snap_yield(
+        &self,
+        decls: &typed_index_collections::TiVec<MemberId, crate::vmir::Declaration>,
+    ) -> Option<MemberId> {
+        match self {
+            HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. } => {
+                match &decls[call.resource] {
+                    crate::vmir::Declaration::Resource(r) if r.is_self_framed() => {
+                        Some(call.resource)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Whether a [`HeapInst::Combine`] adds or subtracts its operand.
@@ -118,14 +146,11 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             }
             write!(f, ")")
         };
-        // Render `base <kw> call[ctx] perm` for a resource inhale/exhale.
+        // Render `base <kw> call perm` for a resource inhale/exhale.
         let resource_combine =
             |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &Val| {
                 write!(f, "{base} {kw} ")?;
                 call_head(f, call)?;
-                if let Some(ctx) = call.ctx_heap {
-                    write!(f, "[{ctx}]")?;
-                }
                 write!(f, " {perm}")
             };
         match self.item {

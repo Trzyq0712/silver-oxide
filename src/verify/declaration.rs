@@ -10,8 +10,8 @@ use crate::{
     },
     vmir::{
         self, Assign, BinOp, Bound, Declaration, Function, HeapInst, HeapVal, Inst, InstKind,
-        Literal, MemberId, Method, PathConds, Polarity, Precond, PureInst, Resource, ResourceCall,
-        Sign, Type, Val,
+        Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, ResourceCall, Sign,
+        Type, Val,
     },
 };
 
@@ -698,6 +698,13 @@ fn eval_resource_body_inst(
         // `unfold` inside a resource body verifies identically to a method
         // body (shared `eval_unfold`); only `Unfold` is emitted here.
         InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
+        // The entry `heap_of req(args), s` of a two-state resource body:
+        // reconstruct the pre-state heap from the snapshot parameter (implicitly
+        // assuming the precondition resource's boolean).
+        InstKind::Heap(HeapInst::FromSnap { .. }) => {
+            let heap = eval_from_snap(ctx, program, state, inst, certs)?;
+            state.push_heap(heap);
+        }
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -711,19 +718,24 @@ fn eval_resource_body_inst(
     Ok(())
 }
 
+/// A grafted resource call: the heap delta, the boolean handle, and the
+/// transplanted footprint slots `(perm, value)` in program order.
+type GraftedCall = (Heap, egg::Id, Vec<(egg::Id, egg::Id)>);
+
 /// Evaluate a resource invocation as a **reusable proof** by grafting the
 /// resource's pre-verified certificate (see [`verify_resource`]) into the
-/// caller's e-graph, substituting the formal params for the call args. This
+/// caller's e-graph, substituting the formal params for the call args (a
+/// two-state resource's pre-state snapshot is an ordinary trailing arg). This
 /// transfers every proven merge for free — no re-walk, no re-saturation — and
-/// returns `(heap_delta, bool_handle)`. The *outer* boolean is **not** assumed
-/// or asserted here; the caller decides.
+/// returns `(heap_delta, bool_handle, footprint_slots)`. The *outer* boolean is
+/// **not** assumed or asserted here; the caller decides.
 fn eval_resource_call(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,
     caller_state: &EvalState,
     call: &ResourceCall,
     certs: &HashMap<MemberId, ResourceCertificate>,
-) -> Result<(Heap, egg::Id), VerifyError> {
+) -> Result<GraftedCall, VerifyError> {
     let Declaration::Resource(r) = &program.decls[call.resource] else {
         panic!("ResourceCall targets non-Resource declaration");
     };
@@ -740,10 +752,7 @@ fn eval_resource_call(
         .map(|v| caller_state.get_val(ctx, v))
         .collect();
 
-    // A two-state resource carries a ctx (pre-state) heap; bind the cert's
-    // `old(...)` reads against it.
-    let old_ctx = call.ctx_heap.as_ref().map(|h| get_heap(caller_state, h));
-    Ok(ctx.graft_certificate(cert, &args, old_ctx.as_ref()))
+    Ok(ctx.graft_certificate(cert, &args))
 }
 
 fn eval_method_inst(
@@ -767,12 +776,17 @@ fn eval_method_inst(
         // `base inhale <resource>(args) perm`: graft the resource's certificate,
         // scale its delta by `perm`, union against `base`, and **assume** the
         // resource's boolean. `base exhale ...` subtracts and **asserts** it.
+        // A self-framed callee additionally yields its snapshot as a pure `Val`
+        // (the pre-state handle a two-state call receives as trailing arg): on
+        // inhale the slot values are the grafted delta values; on exhale the
+        // subtraction below unions them with the consumed caller chunk values,
+        // so the snapshot binds to the real pre-state either way.
         InstKind::Heap(
             hi @ (HeapInst::Inhale { base, call, perm } | HeapInst::Exhale { base, call, perm }),
         ) => {
             let is_inhale = matches!(hi, HeapInst::Inhale { .. });
             let base_h = get_heap(state, base);
-            let (delta, bool_id) = eval_resource_call(ctx, program, state, call, certs)?;
+            let (delta, bool_id, footprint) = eval_resource_call(ctx, program, state, call, certs)?;
             let scale = state.get_val(ctx, perm);
             let scaled = scale_heap_perm(ctx, &delta, scale);
             let pc_lits: Vec<(egg::Id, Polarity)> = inst
@@ -801,6 +815,10 @@ fn eval_method_inst(
                 h
             };
             state.push_heap(out);
+            if let Some(res_id) = hi.snap_yield(&program.decls) {
+                let s = snap_of_footprint(ctx, program, res_id, &footprint)?;
+                state.push_val(s, Type::Snap(res_id));
+            }
         }
         // `fold`: consume the predicate footprint (scaled by `perm`), assert the
         // body's pure facts, and produce a predicate chunk holding the snapshot
@@ -1101,6 +1119,40 @@ fn eval_snap(
     Ok(s)
 }
 
+/// Build the snapshot a **self-framed** inhale/exhale yields: the `cons` of
+/// `present ? Some(v) : None` per footprint slot, over the grafted
+/// `(perm, value)` slot ids returned by [`eval_resource_call`]. Unlike
+/// [`eval_snap`] there is no sufficiency check here — the inhale/exhale's own
+/// union/subtract accounting already established (and bound) the chunks.
+fn snap_of_footprint(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    resource: MemberId,
+    footprint: &[(egg::Id, egg::Id)],
+) -> Result<egg::Id, VerifyError> {
+    let vmir::Declaration::Resource(r) = &program.decls[resource] else {
+        return Err(VerifyError::DependencyFailed);
+    };
+    let Some(vmir::Snapshot::Concrete(snap_adt)) = r.derive_snapshot() else {
+        return Err(VerifyError::Unimplemented("snapshot of abstract resource"));
+    };
+    let field_types = snap_adt.variants.into_iter().next().unwrap().field_types;
+    let mut members = Vec::with_capacity(footprint.len());
+    for (i, (perm, value)) in footprint.iter().enumerate() {
+        let elem = field_types[i]
+            .option_inner()
+            .unwrap_or(&field_types[i])
+            .clone();
+        let present = ctx.perm_positive(*perm);
+        members.push(ctx.option_member(elem, present, *value));
+    }
+    let cons = ctx.alloc.cons(resource, 0);
+    let cons_args: Box<[egg::Id]> = members.into_iter().collect();
+    let s = ctx.add_func_app_id(cons, Box::new([]), Type::Snap(resource), cons_args);
+    ctx.reduce();
+    Ok(s)
+}
+
 /// Evaluate a `FromSnap`: widen a snapshot value back into a heap — the entry
 /// of a heap-dependent function body reconstructing its precondition heap from
 /// the snapshot parameter. Inverse of [`eval_snap`], inhale-shaped: one chunk
@@ -1221,10 +1273,11 @@ pub fn verify_method(
 }
 
 /// Verify a resource self-contained: run its body in a fresh egraph with fresh
-/// symbolic params and a parametric (empty) ctx heap, discharging each
-/// instruction's side-condition obligations under its path condition. Abstract
-/// resources have nothing to check. This establishes well-formedness **once**;
-/// method call sites reuse it without re-checking (see [`eval_resource_call`]).
+/// symbolic params (a two-state resource's pre-state snapshot is an ordinary
+/// trailing param), discharging each instruction's side-condition obligations
+/// under its path condition. Abstract resources have nothing to check. This
+/// establishes well-formedness **once**; method call sites reuse it without
+/// re-checking (see [`eval_resource_call`]).
 pub fn verify_resource(
     program: &vmir::Program,
     resource_name: &str,
@@ -1245,29 +1298,11 @@ pub fn verify_resource(
         .iter()
         .map(|ty| ctx.fresh_symbolic_value(ty.clone()))
         .collect();
+    // A two-state (`Ctx`) resource needs no special seeding: its pre-state
+    // arrives as the trailing snapshot parameter (a fresh symbolic like any
+    // other param) and its body's entry `FromSnap` reconstructs the pre-state
+    // heap, implicitly assuming the precondition resource's boolean.
     let mut state = EvalState::with_args(params.clone(), resource.params.clone());
-    // A two-state (`Ctx`) resource's context slot `HeapVal::Temp(0)` is its
-    // pre-state. Graft the precondition resource's certificate into it — both its
-    // heap delta (so `old(...)` reads are framed) and its boolean, *assumed* (so
-    // the precondition's facts, e.g. a nonzero divisor, are available to this
-    // body). A self-framed resource has no precondition: its initial heap is
-    // `Empty` and its emitted heaps start at `Temp(0)`, so push nothing.
-    match &resource.precond {
-        Precond::SelfFramed => {}
-        Precond::Ctx(req_id, req_args) => {
-            let req_cert = certs.get(req_id).ok_or(VerifyError::DependencyFailed)?;
-            let arg_ids: Vec<egg::Id> = req_args
-                .iter()
-                .map(|v| state.get_val(&mut ctx, v))
-                .collect();
-            // The precondition is itself self-framed (no nested ctx / old-reads).
-            let (req_delta, req_bool) = ctx.graft_certificate(req_cert, &arg_ids, None);
-            state.push_heap(req_delta);
-            let true_ = ctx.true_();
-            ctx.egraph.union(req_bool, true_);
-            ctx.egraph.rebuild();
-        }
-    }
 
     let mut snap = Snapshotter::from_env(resource_name);
     snap.snapshot(&ctx, &[], "init", None);
@@ -1276,12 +1311,6 @@ pub fn verify_resource(
     // syntactic `acc` (location target), kept unmerged for the fold/unfold
     // snapshot layout (the merged `delta` below is for inhale/exhale).
     let mut footprint_ops: Vec<(Val, Val)> = Vec::new();
-
-    // For a two-state resource, a `Deref` against the ctx slot `HeapVal::Temp(0)`
-    // is an `old(...)` read; record `(addr, value)` so call sites can bind the
-    // value to the caller's pre-state (see `graft_certificate`).
-    let is_ctx = !matches!(resource.precond, Precond::SelfFramed);
-    let mut old_reads: Vec<(egg::Id, egg::Id)> = Vec::new();
 
     for inst in &body.insts {
         if let InstKind::Heap(HeapInst::Combine { loc, perm, .. }) = &inst.kind {
@@ -1311,11 +1340,6 @@ pub fn verify_resource(
 
         if let Err(err) = eval_resource_body_inst(&mut ctx, program, &mut state, inst, certs) {
             return Err(err.with_inst(inst_text));
-        }
-        if is_ctx && let InstKind::Pure(_, PureInst::Deref(HeapVal::Temp(0), loc)) = &inst.kind {
-            let addr = state.get_val(&mut ctx, loc);
-            let value = *state.vals.last().expect("Deref pushes a value");
-            old_reads.push((addr, value));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
         let heaps = display_heaps(&state, &inst.kind, heaps_before);
@@ -1364,10 +1388,6 @@ pub fn verify_resource(
     let bool_val = state.get_val(&mut ctx, &body.res.1);
     let bool_id = ctx.egraph.find(bool_val);
     let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
-    let old_reads: Vec<(egg::Id, egg::Id)> = old_reads
-        .into_iter()
-        .map(|(a, v)| (ctx.egraph.find(a), ctx.egraph.find(v)))
-        .collect();
 
     Ok(Some(ResourceCertificate {
         egraph: ctx.egraph.clone(),
@@ -1377,7 +1397,6 @@ pub fn verify_resource(
         delta,
         footprint,
         bool_id,
-        old_reads,
     }))
 }
 
@@ -2076,14 +2095,13 @@ mod tests {
             delta: vec![],
             footprint: vec![],
             bool_id: rctx.egraph.find(d_ne0),
-            old_reads: vec![],
         };
 
         // --- caller side: graft, then check `a != 0` is known true ---
         let mut cctx = fresh_ctx(&interner);
         let a = cctx.fresh_symbolic_value(Type::Int);
         // No `Assume` anywhere — the only knowledge injected is the graft.
-        let _ = cctx.graft_certificate(&cert, &[a], None);
+        let _ = cctx.graft_certificate(&cert, &[a]);
         cctx.egraph.rebuild();
 
         let a_ne0 = ne_zero(&mut cctx, a);

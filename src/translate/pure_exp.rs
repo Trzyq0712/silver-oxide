@@ -66,10 +66,8 @@ pub(crate) fn lower_pred_call<Ext: PureExt>(
         args.push(lower(b, env, sink, hctx, a)?);
     }
     let perm = lower(b, env, sink, hctx, &pwp.perm)?;
-    // Predicates are self-framed (context-free): no ctx heap.
     let call = ResourceCall {
         resource: pred_id,
-        ctx_heap: None,
         args,
     };
     Ok((call, perm))
@@ -530,11 +528,12 @@ impl PureExt for typed::MethodEnsuresExt {
         match ext {
             typed::MethodEnsuresExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
             // old(e): re-read `e` against the method pre-state. For a two-state
-            // ensures that heap is the ctx slot (`HeapVal::Temp(0)`), supplied as
-            // the `old` baseline by `lower_spatial_ensures`. Ensures-`old` is
-            // always unlabeled (`old[L]` is a type error). A self-framed ensures
-            // has no pre-state (`hctx.old == None`): `old` there needs a
-            // `requires` to frame it.
+            // ensures that heap is the one its entry `FromSnap` reconstructs
+            // from the trailing snapshot parameter, supplied as the `old`
+            // baseline by `lower_spatial_ensures`. Ensures-`old` is always
+            // unlabeled (`old[L]` is a type error). A self-framed ensures has no
+            // pre-state (`hctx.old == None`): `old` there needs a `requires` to
+            // frame it.
             typed::MethodEnsuresExt::Old(inner) => {
                 let old = hctx.old.ok_or(TranslationError::Unsupported(
                     "`old` in method ensures needs a precondition framing it",

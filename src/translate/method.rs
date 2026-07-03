@@ -62,19 +62,22 @@ pub(crate) fn lower_method(
     collect_var_types(&b.name_map, &body.0, &mut var_types);
 
     // Inhale this method's own precondition into the linear heap that every
-    // block threads: `h := current + acc self#requires`.
+    // block threads: `h, s := current + acc self#requires`. The yielded
+    // snapshot is the method's pre-state handle, passed to the `#ensures`
+    // exhale at every exit.
     let mut current_heap: HeapVal = HeapVal::Empty;
+    let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(m.name.0) {
-        current_heap = emit_resource_combine(
+        let (h, s) = emit_resource_combine(
             b,
             &mut sink,
             vmir::Sign::Add,
             req_id,
             current_heap,
             param_vals.clone(),
-            // `#requires` is self-framed; ctx source is unused.
-            current_heap,
         );
+        current_heap = h;
+        req_snap = s;
     }
     // Baseline for unlabeled `old`: the post-requires-inhale heap.
     let baseline = current_heap;
@@ -171,18 +174,18 @@ pub(crate) fn lower_method(
                         for name in &ret_names {
                             ens_args.push(env.get(name).cloned().expect("return var bound"));
                         }
-                        // `base` is the exit heap (delta subtracted from it); the
-                        // ctx/pre-state that `old(...)` reads is the method-entry
-                        // `baseline` heap.
-                        heap = emit_resource_combine(
-                            b,
-                            sink,
-                            vmir::Sign::Sub,
-                            ens_id,
-                            heap,
-                            ens_args,
-                            baseline,
-                        );
+                        // A two-state `#ensures` reads the pre-state through its
+                        // trailing snapshot parameter — the snapshot yielded by
+                        // the entry `#requires` inhale.
+                        if b.is_ctx_resource(ens_id) {
+                            let s = req_snap
+                                .clone()
+                                .expect("two-state ensures implies an inhaled requires");
+                            ens_args.push(s);
+                        }
+                        // `base` is the exit heap (delta subtracted from it).
+                        (heap, _) =
+                            emit_resource_combine(b, sink, vmir::Sign::Sub, ens_id, heap, ens_args);
                     }
                     None
                 }
@@ -580,11 +583,14 @@ fn lower_method_call(
 
     let mut heap = current_heap;
 
-    // Exhale precondition (if present): `h := heap - acc m#requires(args)`
-    // (implicitly asserts the requires bool).
+    // Exhale precondition (if present): `h, s := heap - acc m#requires(args)`
+    // (implicitly asserts the requires bool). The yielded snapshot captures the
+    // callee's pre-state (the consumed chunk values) for the ensures inhale.
+    let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(call.name.0) {
-        // `#requires` is self-framed; ctx source is unused.
-        heap = emit_resource_combine(b, sink, vmir::Sign::Sub, req_id, heap, args.clone(), heap);
+        let (h, s) = emit_resource_combine(b, sink, vmir::Sign::Sub, req_id, heap, args.clone());
+        heap = h;
+        req_snap = s;
     }
 
     // Allocate fresh return values BEFORE the post-condition inhale.
@@ -595,37 +601,32 @@ fn lower_method_call(
         ret_vals.push(v);
     }
 
-    // Inhale postcondition (if present): `h := heap + acc m#ensures(args, rets)`
-    // (implicitly assumes the ensures bool).
+    // Inhale postcondition (if present): `h := heap + acc m#ensures(args, rets[, s])`
+    // (implicitly assumes the ensures bool). A two-state `#ensures` reads the
+    // callee's pre-state through its trailing snapshot argument — the snapshot
+    // yielded by the precondition exhale above.
     if let Some(ens_id) = b.method_ensures(call.name.0) {
         let mut ens_args = args.clone();
         ens_args.extend(ret_vals.iter().cloned());
-        // The callee's `old(...)` reads its pre-state = the caller's heap at the
-        // call, *before* the precondition exhale (`current_heap`), not `heap`.
-        heap = emit_resource_combine(
-            b,
-            sink,
-            vmir::Sign::Add,
-            ens_id,
-            heap,
-            ens_args,
-            current_heap,
-        );
+        if b.is_ctx_resource(ens_id) {
+            let s = req_snap
+                .clone()
+                .expect("two-state ensures implies an exhaled requires");
+            ens_args.push(s);
+        }
+        (heap, _) = emit_resource_combine(b, sink, vmir::Sign::Add, ens_id, heap, ens_args);
     }
 
     Ok(heap)
 }
 
-/// Emit `h := base <sign> acc <resource>(args) write`: combine the resource's
-/// full-permission delta onto `base`, implicitly assuming (`Add`) or asserting
-/// (`Sub`) its boolean. Returns the resulting heap.
-///
-/// The ctx heap is supplied (`Some(ctx_source)`) only when the called resource
-/// has a precondition resource (two-state, e.g. `#ensures`); self-framed
-/// resources (`#requires`, predicates) are context-free (`None`). `ctx_source`
-/// is the **pre-state** the resource's `old(...)` reads, which is *not* `base`:
-/// for a postcondition exhale `base` is the exit heap but the pre-state is the
-/// method-entry (`baseline`) heap.
+/// Emit `h[, s] := base <sign> acc <resource>(args) write`: combine the
+/// resource's full-permission delta onto `base`, implicitly assuming (`Add`) or
+/// asserting (`Sub`) its boolean. Returns the resulting heap plus, for a
+/// **self-framed** callee, the snapshot `Val` the inst yields (the pre-state
+/// handle passed on as the trailing argument of a two-state resource call —
+/// e.g. `m#requires`'s snapshot feeding `m#ensures`). A two-state callee
+/// yields no snapshot.
 fn emit_resource_combine(
     b: &Builder<'_>,
     sink: &mut Sink,
@@ -633,9 +634,8 @@ fn emit_resource_combine(
     resource: vmir::MemberId,
     base: HeapVal,
     args: Vec<Val>,
-    ctx_source: HeapVal,
-) -> HeapVal {
-    let ctx_heap = b.is_ctx_resource(resource).then_some(ctx_source);
+) -> (HeapVal, Option<Val>) {
+    let yields_snap = !b.is_ctx_resource(resource);
     // Gate the permission by the current branch path condition so a contract
     // inhaled/exhaled inside an `if` arm contributes nothing on the other path
     // (the empty top-level pc leaves `write` unchanged).
@@ -643,11 +643,8 @@ fn emit_resource_combine(
     sink.emit_resource_combine(
         base,
         sign,
-        ResourceCall {
-            resource,
-            ctx_heap,
-            args,
-        },
+        ResourceCall { resource, args },
         perm,
+        yields_snap,
     )
 }
