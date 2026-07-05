@@ -1,8 +1,13 @@
-//! `TranslationContext` — the read-only view every body-lowering helper
-//! (`resource.rs`/`method.rs`/`pure_exp.rs`/`spatial.rs`) consumes. It borrows
-//! its fields from the in-progress [`super::Builder`]; no lowering helper ever
-//! mutates shared state directly — all `set_decl`/interning happens in the
-//! coordinator (`mod.rs`).
+//! `TranslationContext` — the read-only state every body-lowering helper
+//! (`resource.rs`/`method.rs`/`pure_exp.rs`/`spatial.rs`) consumes. It **owns**
+//! its maps (`name_map`, `contracts`, ...), built up progressively by the
+//! coordinator (`mod.rs`) folding each `Translator::declare`'s `Meta` as
+//! members are declared — it is a genuinely separate value from `Builder`
+//! (the write side: `decls`/`vmir_interner`/`decl_names`/`groups`), not a
+//! borrowed view of it. That separation is what lets a `Translator::define`
+//! take `&TranslationContext` and `&mut impl Definer` (effectively `&mut
+//! Builder`) in the same call without an aliasing conflict — the two values
+//! share no lifetime.
 
 use std::collections::HashMap;
 
@@ -39,32 +44,49 @@ pub(crate) struct MethodContracts {
 /// site's type-argument instantiation. `ty_params` is the ordered list of
 /// type-parameter names; `params`/`ret` are the declared types (possibly
 /// mentioning those names as `Type::Generic`).
+#[derive(Clone)]
 pub(crate) struct GenericSig {
     pub ty_params: Vec<Spur>,
     pub params: Vec<typed::Type>,
     pub ret: typed::Type,
 }
 
-/// Read-only view over mid-translation state, borrowed from [`super::Builder`].
-/// Every body-lowering helper takes `&TranslationContext` — none of them touch
-/// `Builder`'s write side (`decls`/`vmir_interner`/`decl_names`) directly.
+/// Read-only mid-translation state, owned and progressively folded by the
+/// coordinator. Every body-lowering helper takes `&TranslationContext` — none
+/// of them touch `Builder`'s write side (`decls`/`vmir_interner`/`decl_names`)
+/// directly.
 pub(crate) struct TranslationContext<'a> {
     pub interner: &'a Interner,
     /// Silver `Spur` names to VMIR `MemberId`s.
-    pub name_map: &'a HashMap<Spur, vmir::MemberId>,
+    pub name_map: HashMap<Spur, vmir::MemberId>,
     /// A field's `Spur` to its lowered value type (for `field@addr`'s `Addr<T>`).
-    pub field_types: &'a HashMap<Spur, vmir::Type>,
+    pub field_types: HashMap<Spur, vmir::Type>,
     /// A method's `Spur` to its contract resource ids.
-    pub contracts: &'a HashMap<Spur, MethodContracts>,
+    pub contracts: HashMap<Spur, MethodContracts>,
     /// ADT constructor/destructor metadata.
-    pub adt: &'a AdtInfo,
+    pub adt: AdtInfo,
     /// A generic function's `Spur` to its declared generic signature.
-    pub fn_generic_sigs: &'a HashMap<Spur, GenericSig>,
+    pub fn_generic_sigs: HashMap<Spur, GenericSig>,
     /// Location **group** tags (`Type::Addr.group`) — field/predicate names.
-    pub(crate) groups: &'a Rodeo<Spur>,
+    /// A clone of `Builder`'s `groups` interner, taken once `declare`
+    /// finishes (fields/predicates are the only ones that register groups,
+    /// all during `declare`; nothing registers one afterwards).
+    pub(crate) groups: Rodeo<Spur>,
 }
 
 impl<'a> TranslationContext<'a> {
+    pub(crate) fn new(interner: &'a Interner) -> Self {
+        Self {
+            interner,
+            name_map: HashMap::new(),
+            field_types: HashMap::new(),
+            contracts: HashMap::new(),
+            adt: AdtInfo::default(),
+            fn_generic_sigs: HashMap::new(),
+            groups: Rodeo::new(),
+        }
+    }
+
     /// A call's full type-argument instantiation, in the callee's own
     /// type-parameter order, recovered by matching the callee's declared
     /// generic signature against the concrete argument and result types. Empty
@@ -113,7 +135,7 @@ impl<'a> TranslationContext<'a> {
     /// field types (which may mention type parameters) call the free
     /// [`super::lower_type`] with the owning ADT's parameter list instead.
     pub(crate) fn lower_type(&self, ty: &typed::Type) -> vmir::Type {
-        super::lower_type(self.name_map, &[], ty)
+        super::lower_type(&self.name_map, &[], ty)
     }
 
     /// The interned group tag for a field/predicate name (registered in the

@@ -8,15 +8,265 @@ use std::collections::HashMap;
 use lasso::Spur;
 use typed_index_collections::TiVec;
 
+use crate::translate::hole::{Declarator, Definer, Hole};
 use crate::translate::reach::{and_val, block_reach, build_entry_env, not_val};
 use crate::translate::sink::Sink;
 use crate::translate::spatial::{self, SpatialMode};
 use crate::translate::{TranslationContext, TranslationError, lower_type, pure_exp, resource};
+use crate::viper::Interner;
 use crate::viper::cfg::{self, BlockId, EdgeSide, Terminator};
 use crate::viper::typed;
 use crate::vmir::{
     self, HeapInst, HeapVal, PathConds, Polarity, PureInst, ResourceCall, TRUE, Type, Val,
 };
+
+/// Metadata the coordinator folds into `TranslationContext` (`contracts`)
+/// once a method's contract resources are declared.
+pub(crate) struct MethodContractsMeta {
+    pub silver_name: Spur,
+    pub requires: Option<vmir::MemberId>,
+    pub ensures: Option<vmir::MemberId>,
+}
+
+/// Reserves and fills a method's `#requires`/`#ensures` contract resources.
+/// Split from [`MethodBodyTranslator`] because "all contracts before all
+/// bodies" is a program-wide ordering constraint (a method body inhales/
+/// exhales *any* callee's contract, not just its own) — the coordinator runs
+/// every `MethodContractsTranslator::define` before any
+/// `MethodBodyTranslator::define`.
+pub(crate) struct MethodContractsTranslator {
+    requires_hole: Option<Hole<vmir::Resource>>,
+    ensures_hole: Option<Hole<vmir::Resource>>,
+    meta: MethodContractsMeta,
+}
+
+impl MethodContractsTranslator {
+    pub(crate) fn declare(
+        m: &typed::Method,
+        interner: &Interner,
+        declarator: &mut impl Declarator,
+    ) -> Self {
+        let name = interner.resolve(&m.name.0).to_owned();
+        let mut requires = None;
+        let mut requires_hole = None;
+        if m.requires.is_some() {
+            let (id, hole) =
+                declarator.allocate_hole::<vmir::Resource>(&format!("{name}#requires"));
+            requires = Some(id);
+            requires_hole = Some(hole);
+        }
+        let mut ensures = None;
+        let mut ensures_hole = None;
+        if m.ensures.is_some() {
+            let (id, hole) =
+                declarator.allocate_hole::<vmir::Resource>(&format!("{name}#ensures"));
+            ensures = Some(id);
+            ensures_hole = Some(hole);
+        }
+        MethodContractsTranslator {
+            requires_hole,
+            ensures_hole,
+            meta: MethodContractsMeta {
+                silver_name: m.name.0,
+                requires,
+                ensures,
+            },
+        }
+    }
+
+    pub(crate) fn meta(&self) -> &MethodContractsMeta {
+        &self.meta
+    }
+
+    pub(crate) fn define(
+        self,
+        ctx: &TranslationContext<'_>,
+        m: &typed::Method,
+        definer: &mut impl Definer,
+    ) -> Result<(), TranslationError> {
+        let MethodContractsTranslator {
+            mut requires_hole,
+            mut ensures_hole,
+            meta,
+        } = self;
+
+        if let Some(requires) = &m.requires {
+            let hole = requires_hole.take().expect("declared when m.requires is Some");
+            let params: Vec<vmir::Type> = m.params.iter().map(|p| ctx.lower_type(&p.ty)).collect();
+            let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
+            for (i, p) in m.params.iter().enumerate() {
+                env.insert(p.name.0, vmir::Val::Temp(i));
+            }
+            // Self-framed: accumulate from `Empty`, heaps start at `HeapVal::Temp(0)`.
+            let body = match spatial::lower_spatial_never(
+                ctx,
+                &env,
+                requires,
+                params.len(),
+                vmir::HeapVal::Empty,
+                0,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    hole.abandon();
+                    if let Some(h) = ensures_hole {
+                        h.abandon();
+                    }
+                    return Err(e);
+                }
+            };
+            let name = definer.intern_name(&format!(
+                "{}#requires",
+                ctx.interner.resolve(&meta.silver_name)
+            ));
+            definer.define_resource(
+                hole,
+                vmir::Resource {
+                    name,
+                    params,
+                    precond: vmir::Precond::SelfFramed,
+                    body: Some(body),
+                },
+            );
+        }
+
+        if let Some(ensures) = &m.ensures {
+            let hole = ensures_hole.take().expect("declared when m.ensures is Some");
+            let mut params: Vec<vmir::Type> =
+                m.params.iter().map(|p| ctx.lower_type(&p.ty)).collect();
+            params.extend(m.rets.iter().map(|r| ctx.lower_type(&r.ty)));
+            let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
+            for (i, p) in m.params.iter().enumerate() {
+                env.insert(p.name.0, vmir::Val::Temp(i));
+            }
+            for (i, r) in m.rets.iter().enumerate() {
+                env.insert(r.name.0, vmir::Val::Temp(m.params.len() + i));
+            }
+            // The ensures precondition is `m#requires` (when present). Its delta
+            // accumulates from `Empty` so a resource in both contracts isn't
+            // double-counted.
+            let precond = meta
+                .requires
+                .map(|req_id| {
+                    let req_args: Vec<vmir::Val> =
+                        (0..m.params.len()).map(vmir::Val::Temp).collect();
+                    vmir::Precond::Ctx(req_id, req_args)
+                })
+                .unwrap_or(vmir::Precond::SelfFramed);
+            // A two-state (`Ctx`) ensures receives the pre-state as a trailing
+            // snapshot parameter `s : Snap(req)`; its body opens with a
+            // `FromSnap` reconstructing the pre-state heap `old(...)` reads.
+            let snap_entry = match &precond {
+                vmir::Precond::Ctx(req_id, req_args) => {
+                    let snap = vmir::Val::Temp(params.len());
+                    params.push(vmir::Type::Snap(*req_id));
+                    Some(pure_exp::SnapEntry {
+                        resource: *req_id,
+                        args: req_args.clone(),
+                        snap,
+                    })
+                }
+                vmir::Precond::SelfFramed => None,
+            };
+            let body = match spatial::lower_spatial_ensures(
+                ctx,
+                &env,
+                ensures,
+                params.len(),
+                vmir::HeapVal::Empty,
+                snap_entry,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    hole.abandon();
+                    return Err(e);
+                }
+            };
+            let name = definer.intern_name(&format!(
+                "{}#ensures",
+                ctx.interner.resolve(&meta.silver_name)
+            ));
+            definer.define_resource(
+                hole,
+                vmir::Resource {
+                    name,
+                    params,
+                    precond,
+                    body: Some(body),
+                },
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Metadata the coordinator folds into `TranslationContext` (`name_map`) once
+/// a method's body slot is declared. `id` is `None` for a body-less (abstract)
+/// method.
+pub(crate) struct MethodBodyMeta {
+    pub silver_name: Spur,
+    pub id: Option<vmir::MemberId>,
+}
+
+/// Reserves and fills a method's own `vmir::Method` body. Its `define` must
+/// run only after every [`MethodContractsTranslator::define`] in the
+/// program — a method body inhales/exhales its callees' contracts, which must
+/// already be defined (see `Builder::define`).
+pub(crate) struct MethodBodyTranslator {
+    hole: Option<Hole<vmir::Method>>,
+    meta: MethodBodyMeta,
+}
+
+impl MethodBodyTranslator {
+    pub(crate) fn declare(
+        m: &typed::Method,
+        interner: &Interner,
+        declarator: &mut impl Declarator,
+    ) -> Self {
+        let mut id = None;
+        let mut hole = None;
+        if m.body.is_some() {
+            let name = interner.resolve(&m.name.0).to_owned();
+            let (i, h) = declarator.allocate_hole::<vmir::Method>(&name);
+            id = Some(i);
+            hole = Some(h);
+        }
+        MethodBodyTranslator {
+            hole,
+            meta: MethodBodyMeta {
+                silver_name: m.name.0,
+                id,
+            },
+        }
+    }
+
+    pub(crate) fn meta(&self) -> &MethodBodyMeta {
+        &self.meta
+    }
+
+    pub(crate) fn define(
+        self,
+        ctx: &TranslationContext<'_>,
+        m: &typed::Method,
+        definer: &mut impl Definer,
+    ) -> Result<(), TranslationError> {
+        let Some(hole) = self.hole else {
+            return Ok(());
+        };
+        let body = m.body.as_ref().expect("hole implies a body");
+        let name = definer.intern_name(ctx.interner.resolve(&self.meta.silver_name));
+        let method = match lower_method(ctx, m, name, body) {
+            Ok(m) => m,
+            Err(e) => {
+                hole.abandon();
+                return Err(e);
+            }
+        };
+        definer.define_method(hole, method);
+        Ok(())
+    }
+}
 
 pub(crate) fn lower_method(
     b: &TranslationContext<'_>,
@@ -59,7 +309,7 @@ pub(crate) fn lower_method(
     for r in &m.rets {
         var_types.insert(r.name.0, b.lower_type(&r.ty));
     }
-    collect_var_types(b.name_map, &body.0, &mut var_types);
+    collect_var_types(&b.name_map, &body.0, &mut var_types);
 
     // Inhale this method's own precondition into the linear heap that every
     // block threads: `h, s := current + acc self#requires`. The yielded
