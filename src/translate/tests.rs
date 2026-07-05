@@ -766,6 +766,43 @@ method m() {
 }
 
 #[test]
+fn translation_error_abandons_hole_without_panicking() {
+    // A predicate body using a `wildcard` permission is valid Silver (parses
+    // and typechecks) but not yet lowerable —
+    // `TranslationError::Unsupported("wildcard literal")` in `pure_exp.rs`'s
+    // `lower_literal`. This exercises `PredicateTranslator::define`'s
+    // `Hole::abandon()` path: on this error it must mark its
+    // `Hole<vmir::Resource>` filled without writing a decl, or the drop bomb
+    // would panic on top of the `TranslationError` being propagated — a path
+    // with no coverage before the `Hole<T>`/`Translator` refactor (the old
+    // `Builder` had no affine "must fill" check to abandon in the first
+    // place).
+    let input = r#"
+field f: Int
+
+predicate broken(this: Ref) {
+    acc(this.f, wildcard)
+}
+"#;
+    let mut program = viper_parser::vpr_program(input).expect("parse failed");
+    let mut ident_collector = IdentCollector::default();
+    program.walk_mut(&mut ident_collector);
+    let interner = ident_collector.finalize();
+    let mut globals_collector = GlobalsCollector::new(&interner);
+    program.walk(&mut globals_collector);
+    let globals = globals_collector.finalize().expect("globals error");
+    disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
+    inline_macros(&mut program, &interner).expect("macro inlining failed");
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck failed");
+
+    // Must return `Err` cleanly — no panic from an unfilled `Hole`'s drop bomb.
+    match translate(&typed) {
+        Err(errors) => assert!(!errors.is_empty(), "expected at least one error"),
+        Ok(_) => panic!("expected translation to reject the wildcard permission"),
+    }
+}
+
+#[test]
 fn function_display_smoke() {
     let input = r#"
 function get(x: Int): Int
