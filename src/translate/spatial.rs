@@ -8,7 +8,7 @@ use lasso::Spur;
 use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PureExt};
 use crate::translate::resource::lower_resource_addr;
 use crate::translate::sink::{PcKind, Sink};
-use crate::translate::{Builder, TranslationError};
+use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{self, FALSE, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val};
 
@@ -55,7 +55,7 @@ impl SpatialMode {
 /// resource has its own precondition resource. `heap_base` is the first
 /// heap counter the body's emitted heap insts will use.
 pub(crate) fn lower_spatial_never(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     exp: &typed::SpatialExp<typed::HeapExt>,
     val_base: usize,
@@ -97,7 +97,7 @@ pub(crate) fn spatial_contains_acc<Ext>(exp: &typed::SpatialExp<Ext>) -> bool {
 /// [`spatial_contains_acc`]); with none present `lower_assertion_bool` never
 /// touches the heap, so the passed `HeapVal::Empty` is inert.
 pub(crate) fn lower_pure_precond_body(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     exp: &typed::SpatialExp<typed::HeapExt>,
     val_base: usize,
@@ -111,7 +111,7 @@ pub(crate) fn lower_pure_precond_body(
 }
 
 pub(crate) fn lower_spatial_ensures(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     exp: &typed::SpatialExp<typed::MethodEnsuresExt>,
     val_base: usize,
@@ -172,7 +172,7 @@ pub(crate) fn lower_spatial_ensures(
 /// mutually-exclusive branches isolated, since their fractions are never both
 /// positive.
 pub(crate) fn lower_spatial<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     acc_heap: HeapVal,
@@ -281,7 +281,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
 /// Lower `acc(res, perm)` to its location and (pc-gated) permission amount. The
 /// caller emits the `HeapInst::Combine` that adds/subtracts the chunk.
 fn lower_acc<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -298,7 +298,7 @@ fn lower_acc<Ext: PureExt>(
 /// boolean over `heap` (returns `None` when trivially true). Permission is
 /// **not** moved: each `acc(loc, p)` becomes the boolean `perm(loc) >= p`.
 pub(crate) fn lower_assertion_bool<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     heap: HeapVal,

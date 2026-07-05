@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use lasso::Spur;
 
 use crate::translate::sink::{PcKind, Sink};
-use crate::translate::{Builder, TranslationError};
+use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{
     self, FALSE, HeapInst, HeapVal, Literal, Polarity, PureInst, ResourceCall, TRUE, Val,
@@ -52,7 +52,7 @@ impl<'a> HeapCtx<'a> {
 /// `ResourceCall` plus the lowered permission `Val`. Shared by `unfolding`
 /// expressions and method-body `fold`/`unfold` statements.
 pub(crate) fn lower_pred_call<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -74,7 +74,7 @@ pub(crate) fn lower_pred_call<Ext: PureExt>(
 }
 
 pub(crate) fn lower<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -221,7 +221,7 @@ pub(crate) fn lower<Ext: PureExt>(
 /// The type arguments of an ADT/domain-typed expression — its head's type
 /// parameters at this use site. `Domain(_, args)` → lower each; any other type
 /// (a non-generic / non-ADT result) → empty.
-fn adt_type_args(b: &Builder<'_>, ty: &typed::Type) -> Vec<vmir::Type> {
+fn adt_type_args(b: &TranslationContext<'_>, ty: &typed::Type) -> Vec<vmir::Type> {
     match ty {
         typed::Type::Domain(_, args) => args.iter().map(|t| b.lower_type(t)).collect(),
         _ => Vec::new(),
@@ -258,7 +258,7 @@ fn real_cast_if(sink: &mut Sink, v: Val, operand_ty: &vmir::Type, target_ty: &vm
 }
 
 fn lower_binary<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -379,7 +379,7 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
 /// as an extra trailing argument. A **heap-free** callee's precondition is
 /// instead asserted as a boolean contract call.
 fn lower_func_app<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -441,7 +441,7 @@ fn lower_func_app<Ext: PureExt>(
 /// Lower a heap-reading node (`e.f`, a `function` call, `unfolding`). Shared by
 /// every heap-bearing context's `lower_ext`.
 pub(crate) fn lower_heap_node<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -479,7 +479,7 @@ pub(crate) fn lower_heap_node<Ext: PureExt>(
 
 pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
     fn lower_ext(
-        b: &Builder<'_>,
+        b: &TranslationContext<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink,
         hctx: HeapCtx<'_>,
@@ -490,7 +490,7 @@ pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
 
 impl PureExt for ! {
     fn lower_ext(
-        _b: &Builder<'_>,
+        _b: &TranslationContext<'_>,
         _env: &HashMap<Spur, Val>,
         _sink: &mut Sink,
         _hctx: HeapCtx<'_>,
@@ -503,7 +503,7 @@ impl PureExt for ! {
 
 impl PureExt for typed::HeapExt {
     fn lower_ext(
-        b: &Builder<'_>,
+        b: &TranslationContext<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink,
         hctx: HeapCtx<'_>,
@@ -518,7 +518,7 @@ impl PureExt for typed::HeapExt {
 
 impl PureExt for typed::MethodEnsuresExt {
     fn lower_ext(
-        b: &Builder<'_>,
+        b: &TranslationContext<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink,
         hctx: HeapCtx<'_>,
@@ -557,7 +557,7 @@ impl PureExt for typed::MethodEnsuresExt {
 
 impl PureExt for typed::MethodBodyExt {
     fn lower_ext(
-        b: &Builder<'_>,
+        b: &TranslationContext<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink,
         hctx: HeapCtx<'_>,
@@ -604,7 +604,7 @@ impl PureExt for typed::MethodBodyExt {
 
 impl PureExt for typed::FuncEnsuresExt {
     fn lower_ext(
-        b: &Builder<'_>,
+        b: &TranslationContext<'_>,
         env: &HashMap<Spur, Val>,
         sink: &mut Sink,
         hctx: HeapCtx<'_>,
@@ -674,7 +674,7 @@ fn call_contract(sink: &mut Sink, func: vmir::MemberId, args: Vec<Val>) -> Val {
 /// `ensures(params ++ [body_result] ++ [snap])` at exit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_function_body<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     exp: &typed::TypedPureExp<Ext>,
     val_base: usize,

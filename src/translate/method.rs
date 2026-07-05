@@ -11,7 +11,7 @@ use typed_index_collections::TiVec;
 use crate::translate::reach::{and_val, block_reach, build_entry_env, not_val};
 use crate::translate::sink::Sink;
 use crate::translate::spatial::{self, SpatialMode};
-use crate::translate::{Builder, TranslationError, lower_type, pure_exp, resource};
+use crate::translate::{TranslationContext, TranslationError, lower_type, pure_exp, resource};
 use crate::viper::cfg::{self, BlockId, EdgeSide, Terminator};
 use crate::viper::typed;
 use crate::vmir::{
@@ -19,7 +19,7 @@ use crate::vmir::{
 };
 
 pub(crate) fn lower_method(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     m: &typed::Method,
     name: Spur,
     body: &typed::StmtBlock,
@@ -59,7 +59,7 @@ pub(crate) fn lower_method(
     for r in &m.rets {
         var_types.insert(r.name.0, b.lower_type(&r.ty));
     }
-    collect_var_types(&b.name_map, &body.0, &mut var_types);
+    collect_var_types(b.name_map, &body.0, &mut var_types);
 
     // Inhale this method's own precondition into the linear heap that every
     // block threads: `h, s := current + acc self#requires`. The yielded
@@ -233,7 +233,7 @@ fn collect_var_types(
 }
 
 fn lower_stmt(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink,
     current_heap: HeapVal,
@@ -495,7 +495,7 @@ fn lower_stmt(
 /// inhale full permission to each listed field (`acc(lhs.f, write)`), adding the
 /// chunks to the current heap. `new(*)` is not yet supported.
 fn lower_new(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink,
     current_heap: HeapVal,
@@ -528,7 +528,7 @@ fn lower_new(
 /// predicate id, args, and perm come from the statement; the resulting heap is
 /// the new working heap.
 fn lower_fold_unfold(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     current_heap: HeapVal,
@@ -558,7 +558,7 @@ fn lower_fold_unfold(
 }
 
 fn lower_method_call(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &mut HashMap<Spur, Val>,
     sink: &mut Sink,
     current_heap: HeapVal,
@@ -628,7 +628,7 @@ fn lower_method_call(
 /// e.g. `m#requires`'s snapshot feeding `m#ensures`). A two-state callee
 /// yields no snapshot.
 fn emit_resource_combine(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     sink: &mut Sink,
     sign: vmir::Sign,
     resource: vmir::MemberId,

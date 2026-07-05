@@ -8,6 +8,8 @@ use crate::viper::{Interner, typed};
 use crate::vmir;
 
 pub mod errors;
+mod context;
+mod function;
 mod method;
 mod pure_exp;
 mod reach;
@@ -17,6 +19,8 @@ mod spatial;
 mod types;
 
 pub use errors::TranslationError;
+
+pub(crate) use context::{AdtInfo, GenericSig, MethodContracts, TranslationContext};
 
 /// Build a `vmir::Program` from a typed `typed::Program`.
 ///
@@ -31,30 +35,6 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
         return Err(errors);
     }
     Ok(builder.finalize())
-}
-
-/// ADT shape metadata recorded in `declare`, consumed when lowering `AdtCons` /
-/// `AdtProj` / `AdtTag` use sites.
-#[derive(Default)]
-pub(crate) struct AdtInfo {
-    /// A constructor's `Spur` to `(owning ADT `Spur`, tag index)`.
-    pub ctor_tag: HashMap<Spur, (Spur, usize)>,
-    /// A destructor's `Spur` to the `(adt id, variant, field)` it projects.
-    pub dtor_sem: HashMap<Spur, (vmir::MemberId, usize, usize)>,
-}
-
-/// A member's contract ids (`#requires` / `#ensures`), absent when the member
-/// omits that clause. For a **method** both are Resource ids. For a **function**
-/// they are boolean Function ids, except a heap-dependent function's
-/// `requires` (`heap_dep == true`), which is a self-framed Resource id — the
-/// footprint whose snapshot the function takes as its trailing parameter.
-#[derive(Default)]
-pub(crate) struct MethodContracts {
-    pub requires: Option<vmir::MemberId>,
-    pub ensures: Option<vmir::MemberId>,
-    /// Set only for functions whose `requires` grants permission (`acc`):
-    /// call sites pass a `Snap` of the `requires` resource as an extra argument.
-    pub heap_dep: bool,
 }
 
 /// Mid-translation state.
@@ -85,16 +65,6 @@ pub(crate) struct Builder<'a> {
     pub fn_generic_sigs: HashMap<Spur, GenericSig>,
 }
 
-/// A generic function's declared signature — the data needed to recover a call
-/// site's type-argument instantiation. `ty_params` is the ordered list of
-/// type-parameter names; `params`/`ret` are the declared types (possibly
-/// mentioning those names as `Type::Generic`).
-pub(crate) struct GenericSig {
-    pub ty_params: Vec<Spur>,
-    pub params: Vec<typed::Type>,
-    pub ret: typed::Type,
-}
-
 impl<'a> Builder<'a> {
     fn new(interner: &'a Interner) -> Self {
         Self {
@@ -111,48 +81,32 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// A call's full type-argument instantiation, in the callee's own
-    /// type-parameter order, recovered by matching the callee's declared
-    /// generic signature against the concrete argument and result types. Empty
-    /// for a monomorphic callee (no registered generic signature). This is the
-    /// inference the backend would otherwise have to redo: doing it once here
-    /// lets the verifier read the instantiation verbatim.
-    pub(crate) fn call_type_args(
-        &self,
-        name: Spur,
-        arg_tys: &[&typed::Type],
-        ret_ty: &typed::Type,
-    ) -> Vec<vmir::Type> {
-        let Some(sig) = self.fn_generic_sigs.get(&name) else {
-            return Vec::new();
-        };
-        let mut subst: HashMap<Spur, typed::Type> = HashMap::new();
-        for (decl, actual) in sig.params.iter().zip(arg_tys) {
-            match_generic(decl, actual, &mut subst);
+    /// A read-only view of this `Builder`'s state, for the body-lowering
+    /// helpers (`resource.rs`/`method.rs`/`pure_exp.rs`/`spatial.rs`). Built on
+    /// demand — never stored — since it borrows shared-state fields (immutably)
+    /// alongside `decls` (also immutably), while `set_decl` needs a fresh
+    /// mutable borrow right after the helper call returns.
+    pub(crate) fn ctx(&self) -> TranslationContext<'_> {
+        TranslationContext {
+            interner: self.interner,
+            name_map: &self.name_map,
+            field_types: &self.field_types,
+            contracts: &self.contracts,
+            adt: &self.adt,
+            fn_generic_sigs: &self.fn_generic_sigs,
+            groups: &self.groups,
+            decls: &self.decls,
         }
-        match_generic(&sig.ret, ret_ty, &mut subst);
-        // Every type parameter is guaranteed to occur in the params/ret (a
-        // parameter used only in the body is not a real type parameter), so the
-        // match populates all of them.
-        sig.ty_params
-            .iter()
-            .map(|n| {
-                let t = subst
-                    .get(n)
-                    .expect("type parameter must occur in params/ret");
-                self.lower_type(t)
-            })
-            .collect()
     }
 
     /// The `#requires` contract resource of method `m`, if it has one.
     pub(crate) fn method_requires(&self, m: Spur) -> Option<vmir::MemberId> {
-        self.contracts.get(&m).and_then(|c| c.requires)
+        self.ctx().method_requires(m)
     }
 
     /// The `#ensures` contract resource of method `m`, if it has one.
     pub(crate) fn method_ensures(&self, m: Spur) -> Option<vmir::MemberId> {
-        self.contracts.get(&m).and_then(|c| c.ensures)
+        self.ctx().method_ensures(m)
     }
 
     /// Reserve a `Declaration` slot (filled via `set_decl`), recording its name.
@@ -217,20 +171,11 @@ impl<'a> Builder<'a> {
         errors
     }
 
-    /// Whether `id` is a two-state resource (has a precondition resource, e.g.
-    /// `#ensures`). Such calls carry a context heap; self-framed resources don't.
-    pub(crate) fn is_ctx_resource(&self, id: vmir::MemberId) -> bool {
-        matches!(
-            self.decls.get(usize::from(id)),
-            Some(Some(vmir::Declaration::Resource(r))) if !matches!(r.precond, vmir::Precond::SelfFramed)
-        )
-    }
-
     /// Lower a type in a concrete (non-generic) context. For ADT-declaration
     /// field types (which may mention type parameters) call the free
     /// [`lower_type`] with the owning ADT's parameter list instead.
     pub(crate) fn lower_type(&self, ty: &typed::Type) -> vmir::Type {
-        lower_type(&self.name_map, &[], ty)
+        self.ctx().lower_type(ty)
     }
 
     fn set_decl(&mut self, id: vmir::MemberId, decl: vmir::Declaration) {
@@ -434,10 +379,7 @@ impl<'a> Builder<'a> {
     /// The interned group tag for a field/predicate name (registered in the
     /// declare phase).
     pub fn group_tag(&self, name: Spur) -> Spur {
-        let s = self.interner.resolve(&name);
-        self.groups
-            .get(s)
-            .unwrap_or_else(|| panic!("group tag `{s}` not registered"))
+        self.ctx().group_tag(name)
     }
 
     fn define_predicate(&mut self, p: &typed::Predicate) -> Result<(), TranslationError> {
@@ -453,7 +395,7 @@ impl<'a> Builder<'a> {
                     env.insert(param.name.0, vmir::Val::Temp(i));
                 }
                 Some(spatial::lower_spatial_never(
-                    self,
+                    &self.ctx(),
                     &env,
                     body_exp,
                     params.len(),
@@ -527,7 +469,7 @@ impl<'a> Builder<'a> {
                 .get_or_intern(format!("{fname}#requires"));
             if heap_dep {
                 let body = spatial::lower_spatial_never(
-                    self,
+                    &self.ctx(),
                     &env,
                     requires,
                     n_params,
@@ -544,7 +486,7 @@ impl<'a> Builder<'a> {
                     }),
                 );
             } else {
-                let body = spatial::lower_pure_precond_body(self, &env, requires, n_params)?;
+                let body = spatial::lower_pure_precond_body(&self.ctx(), &env, requires, n_params)?;
                 self.set_decl(
                     req_id,
                     vmir::Declaration::Function(vmir::Function {
@@ -594,7 +536,7 @@ impl<'a> Builder<'a> {
                 val_base += 1;
             }
             let body = pure_exp::lower_function_body(
-                self,
+                &self.ctx(),
                 &env,
                 ensures,
                 val_base,
@@ -655,7 +597,7 @@ impl<'a> Builder<'a> {
         let body = match &f.body {
             None => None,
             Some(body_exp) => Some(pure_exp::lower_function_body(
-                self,
+                &self.ctx(),
                 &env,
                 body_exp,
                 val_base,
@@ -712,7 +654,7 @@ impl<'a> Builder<'a> {
             }
             // Self-framed: accumulate from `Empty`, heaps start at `HeapVal::Temp(0)`.
             let body = spatial::lower_spatial_never(
-                self,
+                &self.ctx(),
                 &env,
                 requires,
                 params.len(),
@@ -774,7 +716,7 @@ impl<'a> Builder<'a> {
                 vmir::Precond::SelfFramed => None,
             };
             let body = spatial::lower_spatial_ensures(
-                self,
+                &self.ctx(),
                 &env,
                 ensures,
                 params.len(),
@@ -807,7 +749,7 @@ impl<'a> Builder<'a> {
         let name = self
             .vmir_interner
             .get_or_intern(self.interner.resolve(&m.name.0));
-        let method = method::lower_method(self, m, name, body)?;
+        let method = method::lower_method(&self.ctx(), m, name, body)?;
         self.set_decl(method_id, vmir::Declaration::Method(method));
         Ok(())
     }

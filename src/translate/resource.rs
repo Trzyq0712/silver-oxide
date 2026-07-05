@@ -8,7 +8,7 @@ use lasso::Spur;
 
 use crate::translate::pure_exp::{self, HeapCtx, PureExt};
 use crate::translate::sink::Sink;
-use crate::translate::{Builder, TranslationError};
+use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{self, PureInst, Type, Val};
 
@@ -16,7 +16,7 @@ use crate::vmir::{self, PureInst, Type, Val};
 /// resource's base/arguments (`field@addr(base)` or `pred@addr(args)`). The
 /// `@addr` call is heap-independent. Shared by `acc`, `perm`, and `new`.
 pub(crate) fn lower_resource_addr<Ext: PureExt>(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
@@ -60,7 +60,7 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
 /// applied to the receiver, typed `Addr<field_ty>`. Shared by every site that
 /// needs a field location (`acc`, `perm`, `new`, field assignment).
 pub(crate) fn field_addr(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     sink: &mut Sink,
     base: Val,
     fname: Spur,
@@ -94,7 +94,7 @@ pub(crate) fn field_addr(
 /// function applied to `base`, paired with the permission amount. The caller
 /// emits the `HeapInst::Combine`. Shared by `new(...)` lowering.
 pub(crate) fn field_acc(
-    b: &Builder<'_>,
+    b: &TranslationContext<'_>,
     sink: &mut Sink,
     base: Val,
     fname: Spur,
