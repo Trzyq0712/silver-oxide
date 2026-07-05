@@ -68,13 +68,14 @@ pub(crate) fn lower_method(
     let mut current_heap: HeapVal = HeapVal::Empty;
     let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(m.name.0) {
+        // `#requires` is always self-framed, so it always yields its snapshot.
         let (h, s) = emit_resource_combine(
-            b,
             &mut sink,
             vmir::Sign::Add,
             req_id,
             current_heap,
             param_vals.clone(),
+            true,
         );
         current_heap = h;
         req_snap = s;
@@ -174,18 +175,27 @@ pub(crate) fn lower_method(
                         for name in &ret_names {
                             ens_args.push(env.get(name).cloned().expect("return var bound"));
                         }
-                        // A two-state `#ensures` reads the pre-state through its
-                        // trailing snapshot parameter — the snapshot yielded by
-                        // the entry `#requires` inhale.
-                        if b.is_ctx_resource(ens_id) {
+                        // A two-state `#ensures` (this method has its own
+                        // `#requires`) reads the pre-state through its trailing
+                        // snapshot parameter — the snapshot yielded by the entry
+                        // `#requires` inhale.
+                        let is_ctx = b.method_requires(m.name.0).is_some();
+                        if is_ctx {
                             let s = req_snap
                                 .clone()
                                 .expect("two-state ensures implies an inhaled requires");
                             ens_args.push(s);
                         }
-                        // `base` is the exit heap (delta subtracted from it).
-                        (heap, _) =
-                            emit_resource_combine(b, sink, vmir::Sign::Sub, ens_id, heap, ens_args);
+                        // `base` is the exit heap (delta subtracted from it). A
+                        // self-framed callee (`!is_ctx`) yields its snapshot.
+                        (heap, _) = emit_resource_combine(
+                            sink,
+                            vmir::Sign::Sub,
+                            ens_id,
+                            heap,
+                            ens_args,
+                            !is_ctx,
+                        );
                     }
                     None
                 }
@@ -588,7 +598,9 @@ fn lower_method_call(
     // callee's pre-state (the consumed chunk values) for the ensures inhale.
     let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(call.name.0) {
-        let (h, s) = emit_resource_combine(b, sink, vmir::Sign::Sub, req_id, heap, args.clone());
+        // `#requires` is always self-framed, so it always yields its snapshot.
+        let (h, s) =
+            emit_resource_combine(sink, vmir::Sign::Sub, req_id, heap, args.clone(), true);
         heap = h;
         req_snap = s;
     }
@@ -608,13 +620,17 @@ fn lower_method_call(
     if let Some(ens_id) = b.method_ensures(call.name.0) {
         let mut ens_args = args.clone();
         ens_args.extend(ret_vals.iter().cloned());
-        if b.is_ctx_resource(ens_id) {
+        // Two-state iff the callee has its own `#requires` (`is_ctx_resource`
+        // on `ens_id` — the callee's own resource, never queried on `req_id`).
+        let is_ctx = b.method_requires(call.name.0).is_some();
+        if is_ctx {
             let s = req_snap
                 .clone()
                 .expect("two-state ensures implies an exhaled requires");
             ens_args.push(s);
         }
-        (heap, _) = emit_resource_combine(b, sink, vmir::Sign::Add, ens_id, heap, ens_args);
+        (heap, _) =
+            emit_resource_combine(sink, vmir::Sign::Add, ens_id, heap, ens_args, !is_ctx);
     }
 
     Ok(heap)
@@ -626,16 +642,17 @@ fn lower_method_call(
 /// **self-framed** callee, the snapshot `Val` the inst yields (the pre-state
 /// handle passed on as the trailing argument of a two-state resource call —
 /// e.g. `m#requires`'s snapshot feeding `m#ensures`). A two-state callee
-/// yields no snapshot.
+/// yields no snapshot. `yields_snap` is the caller's `!is_ctx` for `resource` —
+/// always `true` for a `#requires` id (always self-framed), and
+/// `method_requires(owner).is_none()` for a `#ensures` id.
 fn emit_resource_combine(
-    b: &TranslationContext<'_>,
     sink: &mut Sink,
     sign: vmir::Sign,
     resource: vmir::MemberId,
     base: HeapVal,
     args: Vec<Val>,
+    yields_snap: bool,
 ) -> (HeapVal, Option<Val>) {
-    let yields_snap = !b.is_ctx_resource(resource);
     // Gate the permission by the current branch path condition so a contract
     // inhaled/exhaled inside an `if` arm contributes nothing on the other path
     // (the empty top-level pc leaves `write` unchanged).

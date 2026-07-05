@@ -83,9 +83,8 @@ impl<'a> Builder<'a> {
 
     /// A read-only view of this `Builder`'s state, for the body-lowering
     /// helpers (`resource.rs`/`method.rs`/`pure_exp.rs`/`spatial.rs`). Built on
-    /// demand — never stored — since it borrows shared-state fields (immutably)
-    /// alongside `decls` (also immutably), while `set_decl` needs a fresh
-    /// mutable borrow right after the helper call returns.
+    /// demand — never stored — since `set_decl` needs a fresh mutable borrow
+    /// right after the helper call returns.
     pub(crate) fn ctx(&self) -> TranslationContext<'_> {
         TranslationContext {
             interner: self.interner,
@@ -95,7 +94,6 @@ impl<'a> Builder<'a> {
             adt: &self.adt,
             fn_generic_sigs: &self.fn_generic_sigs,
             groups: &self.groups,
-            decls: &self.decls,
         }
     }
 
@@ -146,8 +144,9 @@ impl<'a> Builder<'a> {
 
     /// Fill every reserved slot with its body, collecting per-member errors.
     /// Contract resources are defined before method bodies: a method body inhales
-    /// /exhales its callees' contracts and inspects their `precond`
-    /// ([`Self::is_ctx_resource`]), which must already be set.
+    /// /exhales its callees' contracts and checks whether a callee has its own
+    /// `#requires` (`method_requires(callee).is_some()`, i.e. its `#ensures` is
+    /// two-state), which must already be recorded in `contracts`.
     fn define(&mut self, decls: &[typed::Declaration]) -> Vec<TranslationError> {
         let mut errors = Vec::new();
         for decl in decls {

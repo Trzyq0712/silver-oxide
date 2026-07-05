@@ -62,9 +62,6 @@ pub(crate) struct TranslationContext<'a> {
     pub fn_generic_sigs: &'a HashMap<Spur, GenericSig>,
     /// Location **group** tags (`Type::Addr.group`) — field/predicate names.
     pub(crate) groups: &'a Rodeo<Spur>,
-    /// Declarations filled so far, indexed by `MemberId` — read-only here,
-    /// consulted only by [`Self::is_ctx_resource`].
-    pub(crate) decls: &'a [Option<vmir::Declaration>],
 }
 
 impl<'a> TranslationContext<'a> {
@@ -110,15 +107,6 @@ impl<'a> TranslationContext<'a> {
     /// The `#ensures` contract resource of method `m`, if it has one.
     pub(crate) fn method_ensures(&self, m: Spur) -> Option<vmir::MemberId> {
         self.contracts.get(&m).and_then(|c| c.ensures)
-    }
-
-    /// Whether `id` is a two-state resource (has a precondition resource, e.g.
-    /// `#ensures`). Such calls carry a context heap; self-framed resources don't.
-    pub(crate) fn is_ctx_resource(&self, id: vmir::MemberId) -> bool {
-        matches!(
-            self.decls.get(usize::from(id)),
-            Some(Some(vmir::Declaration::Resource(r))) if !matches!(r.precond, vmir::Precond::SelfFramed)
-        )
     }
 
     /// Lower a type in a concrete (non-generic) context. For ADT-declaration
