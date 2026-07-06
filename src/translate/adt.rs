@@ -1,101 +1,85 @@
 //! Lower a Silver `adt` (ADT) declaration to its `vmir::Adt` stub + variant
 //! shapes, plus per-constructor/destructor metadata.
 
-use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use lasso::Spur;
 
-use crate::translate::context::AdtInfo;
-use crate::translate::hole::{Declarator, Definer, Hole};
 use crate::translate::lower_type;
-use crate::viper::{Interner, typed};
+use crate::translate::{DeclSlot, Declarator, Definer};
+use crate::translate::{Declared, Metaed, TranslationContext, TranslationError};
+use crate::viper::typed;
 use crate::vmir;
 
-pub(crate) struct AdtMeta {
-    pub silver_name: Spur,
-    pub id: vmir::MemberId,
-}
-
 /// An ADT's `declare` reserves only the stub id (+ type-param count) — no
-/// variant computation, since a variant field type or constructor may
-/// reference *any* ADT by id (including one declared later in the source).
-/// [`compute_adt_info`] runs once every ADT's stub id is in `name_map`
-/// (mirroring the pass-1/pass-3 split of the original `declare_adts_and_functions`),
-/// and its result is what `define` fills the `Hole` with.
-pub(crate) struct AdtTranslator {
-    name_str: String,
-    ty_params: usize,
-    hole: Hole<vmir::Adt>,
-    meta: AdtMeta,
+/// variant computation, since a variant field type or constructor may reference
+/// *any* ADT by id (including one declared later in the source). `meta`
+/// publishes the constructor (`ctor_tag`) / destructor (`dtor_sem`) metadata
+/// once every ADT stub id is in `name_map`; `define` recomputes the variant
+/// shapes and fills the `Slot`.
+pub(crate) struct AdtTranslator<'a, P = Declared> {
+    src: &'a typed::Adt,
+    silver_name: Spur,
+    id: vmir::MemberId,
+    slot: DeclSlot<vmir::Adt>,
+    _p: PhantomData<P>,
 }
 
-impl AdtTranslator {
+impl<'a> AdtTranslator<'a, Declared> {
     pub(crate) fn declare(
-        adt: &typed::Adt,
-        interner: &Interner,
-        declarator: &mut impl Declarator,
+        adt: &'a typed::Adt,
+        ctx: &mut TranslationContext<'_>,
+        d: &mut impl Declarator,
     ) -> Self {
-        let name_str = interner.resolve(&adt.name.0).to_string();
-        let (id, hole) = declarator.allocate_hole::<vmir::Adt>(&name_str);
+        let name_str = ctx.interner.resolve(&adt.name.0).to_string();
+        let (id, slot) = d.alloc_slot::<vmir::Adt>(&name_str);
+        ctx.name_map.insert(adt.name.0, id);
         AdtTranslator {
-            name_str,
-            ty_params: adt.type_params.len(),
-            hole,
-            meta: AdtMeta {
-                silver_name: adt.name.0,
-                id,
-            },
+            src: adt,
+            silver_name: adt.name.0,
+            id,
+            slot,
+            _p: PhantomData,
         }
     }
 
-    pub(crate) fn meta(&self) -> &AdtMeta {
-        &self.meta
-    }
-
-    pub(crate) fn define(self, variants: Vec<vmir::AdtVariant>, definer: &mut impl Definer) {
-        let name = definer.intern_name(&self.name_str);
-        definer.define_adt(
-            self.hole,
-            vmir::Adt {
-                name,
-                ty_params: self.ty_params.into(),
-                variants,
-            },
-        );
+    /// Publish constructor/destructor metadata. A constructor/destructor is not
+    /// itself a declaration: `ctor_tag` maps a constructor name to its
+    /// `(owning ADT, tag)`, `dtor_sem` maps a field name to its
+    /// `(adt id, variant, field)` projection.
+    pub(crate) fn meta(self, ctx: &mut TranslationContext<'_>) -> AdtTranslator<'a, Metaed> {
+        for (tag, v) in self.src.variants.iter().enumerate() {
+            ctx.adt.ctor_tag.insert(v.name.0, (self.silver_name, tag));
+            for (field, p) in v.params.iter().enumerate() {
+                ctx.adt.dtor_sem.insert(p.name.0, (self.id, tag, field));
+            }
+        }
+        AdtTranslator {
+            src: self.src,
+            silver_name: self.silver_name,
+            id: self.id,
+            slot: self.slot,
+            _p: PhantomData,
+        }
     }
 }
 
-/// Compute every ADT's variant shape and constructor (`ctor_tag`) /
-/// destructor (`dtor_sem`) metadata, given `name_map` populated with every
-/// ADT/domain stub id. A constructor/destructor is not itself a declaration:
-/// the constructor name is interned for display only, and a destructor maps a
-/// field name to its `(adt, variant, field)` projection. Returns each ADT's
-/// filled variant shape, keyed by its Silver name, for [`AdtTranslator::define`].
-pub(crate) fn compute_adt_info(
-    adts: &[&typed::Adt],
-    interner: &Interner,
-    name_map: &HashMap<Spur, vmir::MemberId>,
-    adt_info: &mut AdtInfo,
-    definer: &mut impl Definer,
-) -> HashMap<Spur, Vec<vmir::AdtVariant>> {
-    let mut out = HashMap::new();
-    for adt in adts {
-        let adt_id = name_map[&adt.name.0];
+impl AdtTranslator<'_, Metaed> {
+    pub(crate) fn define(
+        self,
+        ctx: &TranslationContext<'_>,
+        definer: &mut impl Definer,
+    ) -> Result<(), TranslationError> {
         // Variant field types may mention the ADT's type parameters (→ `Generic`).
-        let type_params: Vec<Spur> = adt.type_params.iter().map(|i| i.0).collect();
+        let type_params: Vec<Spur> = self.src.type_params.iter().map(|i| i.0).collect();
         let mut variants: Vec<vmir::AdtVariant> = Vec::new();
-        for (tag, v) in adt.variants.iter().enumerate() {
-            adt_info.ctor_tag.insert(v.name.0, (adt.name.0, tag));
-            let ctor_str = interner.resolve(&v.name.0).to_string();
-            let ctor_name = definer.intern_name(&ctor_str);
+        for (tag, v) in self.src.variants.iter().enumerate() {
+            let ctor_name = definer.intern_name(ctx.interner.resolve(&v.name.0));
             let field_types: Vec<vmir::Type> = v
                 .params
                 .iter()
-                .map(|p| lower_type(name_map, &type_params, &p.ty))
+                .map(|p| lower_type(&ctx.name_map, &type_params, &p.ty))
                 .collect();
-            for (field, p) in v.params.iter().enumerate() {
-                adt_info.dtor_sem.insert(p.name.0, (adt_id, tag, field));
-            }
             if variants.len() <= tag {
                 variants.resize(
                     tag + 1,
@@ -110,7 +94,15 @@ pub(crate) fn compute_adt_info(
                 field_types,
             };
         }
-        out.insert(adt.name.0, variants);
+        let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
+        definer.define_adt(
+            self.slot,
+            vmir::Adt {
+                name,
+                ty_params: type_params.len().into(),
+                variants,
+            },
+        );
+        Ok(())
     }
-    out
 }

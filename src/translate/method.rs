@@ -4,94 +4,120 @@
 //! condition, with phi (`ite`) nodes at joins and a single linear heap.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use lasso::Spur;
 use typed_index_collections::TiVec;
 
-use crate::translate::hole::{Declarator, Definer, Hole};
 use crate::translate::reach::{and_val, block_reach, build_entry_env, not_val};
 use crate::translate::sink::Sink;
 use crate::translate::spatial::{self, SpatialMode};
-use crate::translate::{TranslationContext, TranslationError, lower_type, pure_exp, resource};
-use crate::viper::Interner;
+use crate::translate::{DeclSlot, Declarator, Definer};
+use crate::translate::{
+    Declared, Metaed, MethodContracts, TranslationContext, TranslationError, lower_type, pure_exp,
+    resource,
+};
 use crate::viper::cfg::{self, BlockId, EdgeSide, Terminator};
 use crate::viper::typed;
 use crate::vmir::{
     self, HeapInst, HeapVal, PathConds, Polarity, PureInst, ResourceCall, TRUE, Type, Val,
 };
 
-/// Metadata the coordinator folds into `TranslationContext` (`contracts`)
-/// once a method's contract resources are declared.
-pub(crate) struct MethodContractsMeta {
-    pub silver_name: Spur,
-    pub requires: Option<vmir::MemberId>,
-    pub ensures: Option<vmir::MemberId>,
+/// One translator per Silver `method`: owns its `#requires` / `#ensures`
+/// contract resources **and** its `vmir::Method` body slot. Merging them is
+/// sound because define order is free — a method body inhales/exhales any
+/// callee's contract by *id* (recorded in `ctx.contracts` at declare), never
+/// its filled slot.
+pub(crate) struct MethodTranslator<'a, P = Declared> {
+    src: &'a typed::Method,
+    silver_name: Spur,
+    requires_slot: Option<DeclSlot<vmir::Resource>>,
+    ensures_slot: Option<DeclSlot<vmir::Resource>>,
+    body_slot: Option<DeclSlot<vmir::Method>>,
+    /// `#requires` resource id (the pre-state a two-state `#ensures` reads).
+    requires: Option<vmir::MemberId>,
+    _p: PhantomData<P>,
 }
 
-/// Reserves and fills a method's `#requires`/`#ensures` contract resources.
-/// Split from [`MethodBodyTranslator`] because "all contracts before all
-/// bodies" is a program-wide ordering constraint (a method body inhales/
-/// exhales *any* callee's contract, not just its own) — the coordinator runs
-/// every `MethodContractsTranslator::define` before any
-/// `MethodBodyTranslator::define`.
-pub(crate) struct MethodContractsTranslator {
-    requires_hole: Option<Hole<vmir::Resource>>,
-    ensures_hole: Option<Hole<vmir::Resource>>,
-    meta: MethodContractsMeta,
-}
-
-impl MethodContractsTranslator {
+impl<'a> MethodTranslator<'a, Declared> {
     pub(crate) fn declare(
-        m: &typed::Method,
-        interner: &Interner,
-        declarator: &mut impl Declarator,
+        m: &'a typed::Method,
+        ctx: &mut TranslationContext<'_>,
+        d: &mut impl Declarator,
     ) -> Self {
-        let name = interner.resolve(&m.name.0).to_owned();
-        let mut requires = None;
-        let mut requires_hole = None;
-        if m.requires.is_some() {
-            let (id, hole) =
-                declarator.allocate_hole::<vmir::Resource>(&format!("{name}#requires"));
-            requires = Some(id);
-            requires_hole = Some(hole);
-        }
-        let mut ensures = None;
-        let mut ensures_hole = None;
-        if m.ensures.is_some() {
-            let (id, hole) =
-                declarator.allocate_hole::<vmir::Resource>(&format!("{name}#ensures"));
-            ensures = Some(id);
-            ensures_hole = Some(hole);
-        }
-        MethodContractsTranslator {
-            requires_hole,
-            ensures_hole,
-            meta: MethodContractsMeta {
-                silver_name: m.name.0,
+        let name = ctx.interner.resolve(&m.name.0).to_owned();
+        let (requires, requires_slot) = if m.requires.is_some() {
+            let (id, slot) = d.alloc_slot::<vmir::Resource>(&format!("{name}#requires"));
+            (Some(id), Some(slot))
+        } else {
+            (None, None)
+        };
+        let (ensures, ensures_slot) = if m.ensures.is_some() {
+            let (id, slot) = d.alloc_slot::<vmir::Resource>(&format!("{name}#ensures"));
+            (Some(id), Some(slot))
+        } else {
+            (None, None)
+        };
+        let body_slot = if m.body.is_some() {
+            let (id, slot) = d.alloc_slot::<vmir::Method>(&name);
+            ctx.name_map.insert(m.name.0, id);
+            Some(slot)
+        } else {
+            None
+        };
+        ctx.contracts.insert(
+            m.name.0,
+            MethodContracts {
                 requires,
                 ensures,
+                heap_dep: false,
             },
+        );
+        MethodTranslator {
+            src: m,
+            silver_name: m.name.0,
+            requires_slot,
+            ensures_slot,
+            body_slot,
+            requires,
+            _p: PhantomData,
         }
     }
 
-    pub(crate) fn meta(&self) -> &MethodContractsMeta {
-        &self.meta
+    /// No `name_map`-dependent metadata to publish (contracts were published at
+    /// declare).
+    pub(crate) fn meta(self, _ctx: &mut TranslationContext<'_>) -> MethodTranslator<'a, Metaed> {
+        MethodTranslator {
+            src: self.src,
+            silver_name: self.silver_name,
+            requires_slot: self.requires_slot,
+            ensures_slot: self.ensures_slot,
+            body_slot: self.body_slot,
+            requires: self.requires,
+            _p: PhantomData,
+        }
     }
+}
 
+impl MethodTranslator<'_, Metaed> {
     pub(crate) fn define(
         self,
         ctx: &TranslationContext<'_>,
-        m: &typed::Method,
         definer: &mut impl Definer,
     ) -> Result<(), TranslationError> {
-        let MethodContractsTranslator {
-            mut requires_hole,
-            mut ensures_hole,
-            meta,
+        let MethodTranslator {
+            src: m,
+            silver_name,
+            requires_slot,
+            mut ensures_slot,
+            mut body_slot,
+            requires: meta_requires,
+            _p,
         } = self;
 
+        // #requires: a self-framed Resource.
         if let Some(requires) = &m.requires {
-            let hole = requires_hole.take().expect("declared when m.requires is Some");
+            let slot = requires_slot.expect("declared when m.requires is Some");
             let params: Vec<vmir::Type> = m.params.iter().map(|p| ctx.lower_type(&p.ty)).collect();
             let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
             for (i, p) in m.params.iter().enumerate() {
@@ -108,19 +134,20 @@ impl MethodContractsTranslator {
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    hole.abandon();
-                    if let Some(h) = ensures_hole {
+                    slot.abandon();
+                    if let Some(h) = ensures_slot.take() {
+                        h.abandon();
+                    }
+                    if let Some(h) = body_slot.take() {
                         h.abandon();
                     }
                     return Err(e);
                 }
             };
-            let name = definer.intern_name(&format!(
-                "{}#requires",
-                ctx.interner.resolve(&meta.silver_name)
-            ));
+            let name =
+                definer.intern_name(&format!("{}#requires", ctx.interner.resolve(&silver_name)));
             definer.define_resource(
-                hole,
+                slot,
                 vmir::Resource {
                     name,
                     params,
@@ -130,8 +157,11 @@ impl MethodContractsTranslator {
             );
         }
 
+        // #ensures: a Resource, two-state (`Ctx`) when the method has a requires.
         if let Some(ensures) = &m.ensures {
-            let hole = ensures_hole.take().expect("declared when m.ensures is Some");
+            let slot = ensures_slot
+                .take()
+                .expect("declared when m.ensures is Some");
             let mut params: Vec<vmir::Type> =
                 m.params.iter().map(|p| ctx.lower_type(&p.ty)).collect();
             params.extend(m.rets.iter().map(|r| ctx.lower_type(&r.ty)));
@@ -145,8 +175,7 @@ impl MethodContractsTranslator {
             // The ensures precondition is `m#requires` (when present). Its delta
             // accumulates from `Empty` so a resource in both contracts isn't
             // double-counted.
-            let precond = meta
-                .requires
+            let precond = meta_requires
                 .map(|req_id| {
                     let req_args: Vec<vmir::Val> =
                         (0..m.params.len()).map(vmir::Val::Temp).collect();
@@ -178,16 +207,17 @@ impl MethodContractsTranslator {
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    hole.abandon();
+                    slot.abandon();
+                    if let Some(h) = body_slot.take() {
+                        h.abandon();
+                    }
                     return Err(e);
                 }
             };
-            let name = definer.intern_name(&format!(
-                "{}#ensures",
-                ctx.interner.resolve(&meta.silver_name)
-            ));
+            let name =
+                definer.intern_name(&format!("{}#ensures", ctx.interner.resolve(&silver_name)));
             definer.define_resource(
-                hole,
+                slot,
                 vmir::Resource {
                     name,
                     params,
@@ -197,73 +227,20 @@ impl MethodContractsTranslator {
             );
         }
 
-        Ok(())
-    }
-}
-
-/// Metadata the coordinator folds into `TranslationContext` (`name_map`) once
-/// a method's body slot is declared. `id` is `None` for a body-less (abstract)
-/// method.
-pub(crate) struct MethodBodyMeta {
-    pub silver_name: Spur,
-    pub id: Option<vmir::MemberId>,
-}
-
-/// Reserves and fills a method's own `vmir::Method` body. Its `define` must
-/// run only after every [`MethodContractsTranslator::define`] in the
-/// program — a method body inhales/exhales its callees' contracts, which must
-/// already be defined (see `Builder::define`).
-pub(crate) struct MethodBodyTranslator {
-    hole: Option<Hole<vmir::Method>>,
-    meta: MethodBodyMeta,
-}
-
-impl MethodBodyTranslator {
-    pub(crate) fn declare(
-        m: &typed::Method,
-        interner: &Interner,
-        declarator: &mut impl Declarator,
-    ) -> Self {
-        let mut id = None;
-        let mut hole = None;
-        if m.body.is_some() {
-            let name = interner.resolve(&m.name.0).to_owned();
-            let (i, h) = declarator.allocate_hole::<vmir::Method>(&name);
-            id = Some(i);
-            hole = Some(h);
+        // The method's own body (when present).
+        if let Some(slot) = body_slot {
+            let body = m.body.as_ref().expect("slot implies a body");
+            let name = definer.intern_name(ctx.interner.resolve(&silver_name));
+            let method = match lower_method(ctx, m, name, body) {
+                Ok(mm) => mm,
+                Err(e) => {
+                    slot.abandon();
+                    return Err(e);
+                }
+            };
+            definer.define_method(slot, method);
         }
-        MethodBodyTranslator {
-            hole,
-            meta: MethodBodyMeta {
-                silver_name: m.name.0,
-                id,
-            },
-        }
-    }
 
-    pub(crate) fn meta(&self) -> &MethodBodyMeta {
-        &self.meta
-    }
-
-    pub(crate) fn define(
-        self,
-        ctx: &TranslationContext<'_>,
-        m: &typed::Method,
-        definer: &mut impl Definer,
-    ) -> Result<(), TranslationError> {
-        let Some(hole) = self.hole else {
-            return Ok(());
-        };
-        let body = m.body.as_ref().expect("hole implies a body");
-        let name = definer.intern_name(ctx.interner.resolve(&self.meta.silver_name));
-        let method = match lower_method(ctx, m, name, body) {
-            Ok(m) => m,
-            Err(e) => {
-                hole.abandon();
-                return Err(e);
-            }
-        };
-        definer.define_method(hole, method);
         Ok(())
     }
 }
@@ -849,8 +826,7 @@ fn lower_method_call(
     let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(call.name.0) {
         // `#requires` is always self-framed, so it always yields its snapshot.
-        let (h, s) =
-            emit_resource_combine(sink, vmir::Sign::Sub, req_id, heap, args.clone(), true);
+        let (h, s) = emit_resource_combine(sink, vmir::Sign::Sub, req_id, heap, args.clone(), true);
         heap = h;
         req_snap = s;
     }
@@ -879,8 +855,7 @@ fn lower_method_call(
                 .expect("two-state ensures implies an exhaled requires");
             ens_args.push(s);
         }
-        (heap, _) =
-            emit_resource_combine(sink, vmir::Sign::Add, ens_id, heap, ens_args, !is_ctx);
+        (heap, _) = emit_resource_combine(sink, vmir::Sign::Add, ens_id, heap, ens_args, !is_ctx);
     }
 
     Ok(heap)

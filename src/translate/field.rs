@@ -1,70 +1,77 @@
-//! Lower a Silver `field` to its `@addr` function (`Ref -> Addr<T>`).
+//! Lower a Silver `field` to its address function (`Ref -> Addr<T>`).
+//!
+//! A field is an ordinary [`vmir::Function`] interned under the field's **bare
+//! name** (no `@`-suffix) — there is no distinct "address" declaration. It has
+//! no body, so `meta` only publishes the field's value type into
+//! `field_types`, and `define` recomputes that type for the function's
+//! `Addr<T>` return.
+
+use std::marker::PhantomData;
 
 use lasso::Spur;
 
-use crate::translate::TranslationContext;
-use crate::translate::hole::{Declarator, Definer, Hole};
-use crate::viper::{Interner, typed};
+use crate::translate::{DeclSlot, Declarator, Definer};
+use crate::translate::{Declared, Metaed, TranslationContext, TranslationError};
+use crate::viper::typed;
 use crate::vmir;
 
-/// Metadata the coordinator folds into `TranslationContext` (`name_map`,
-/// `field_types`) once a field is declared.
-pub(crate) struct FieldMeta {
-    pub silver_name: Spur,
-    pub id: vmir::MemberId,
-    pub value: vmir::Type,
-}
-
-/// A field's address is an ordinary function `Ref -> Addr<T>` (group = field
-/// name, value = field type, bound = full permission `1/1`). A field has no
-/// separate body to lower, so `declare` and `define` are called back to back
-/// by the coordinator — the `Hole` still passes through both, for the same
-/// affine discipline every other kind gets.
-pub(crate) struct FieldTranslator {
-    name_str: String,
+pub(crate) struct FieldTranslator<'a, P = Declared> {
+    src: &'a typed::Field,
+    silver_name: Spur,
     group: Spur,
-    hole: Hole<vmir::Function>,
-    meta: FieldMeta,
+    slot: DeclSlot<vmir::Function>,
+    _p: PhantomData<P>,
 }
 
-impl FieldTranslator {
-    /// `ctx` reflects `name_map` as built up to this point in `declare` —
-    /// predicates/fields are declared before ADTs, so a field type mentioning
-    /// an ADT would not resolve here (preserved unchanged from before this
-    /// refactor: `types::lower_type` falls back to `Ref` for an unknown
-    /// `Domain` head).
+impl<'a> FieldTranslator<'a, Declared> {
+    /// Reserve the field's `Function` slot and publish its `name_map` entry.
+    /// The value type is *not* resolved here — it may reference an ADT declared
+    /// later, so its lowering waits for a complete `name_map` (see `meta`).
     pub(crate) fn declare(
-        f: &typed::Field,
-        interner: &Interner,
-        ctx: &TranslationContext<'_>,
-        declarator: &mut impl Declarator,
+        f: &'a typed::Field,
+        ctx: &mut TranslationContext<'_>,
+        d: &mut impl Declarator,
     ) -> Self {
-        let name_str = interner.resolve(&f.0.name.0).to_owned();
-        let group = declarator.intern_group(&name_str);
-        let (id, hole) = declarator.allocate_hole::<vmir::Function>(&name_str);
-        let value = ctx.lower_type(&f.0.ty);
+        let name_str = ctx.interner.resolve(&f.0.name.0).to_owned();
+        let group = d.intern_group(&name_str);
+        let (id, slot) = d.alloc_slot::<vmir::Function>(&name_str);
+        ctx.name_map.insert(f.0.name.0, id);
         FieldTranslator {
-            name_str,
+            src: f,
+            silver_name: f.0.name.0,
             group,
-            hole,
-            meta: FieldMeta {
-                silver_name: f.0.name.0,
-                id,
-                value,
-            },
+            slot,
+            _p: PhantomData,
         }
     }
 
-    pub(crate) fn meta(&self) -> &FieldMeta {
-        &self.meta
+    /// Publish the field's lowered value type (`name_map` is complete now, so
+    /// an ADT-typed field resolves to its real `Addr<Adt>` value).
+    pub(crate) fn meta(self, ctx: &mut TranslationContext<'_>) -> FieldTranslator<'a, Metaed> {
+        let value = ctx.lower_type(&self.src.0.ty);
+        ctx.field_types.insert(self.silver_name, value);
+        FieldTranslator {
+            src: self.src,
+            silver_name: self.silver_name,
+            group: self.group,
+            slot: self.slot,
+            _p: PhantomData,
+        }
     }
+}
 
-    pub(crate) fn define(self, definer: &mut impl Definer) {
+impl FieldTranslator<'_, Metaed> {
+    pub(crate) fn define(
+        self,
+        ctx: &TranslationContext<'_>,
+        definer: &mut impl Definer,
+    ) -> Result<(), TranslationError> {
+        let value = ctx.lower_type(&self.src.0.ty);
         let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
-        let ret = vmir::Type::addr(self.group, self.meta.value.clone(), bound);
-        let name = definer.intern_name(&self.name_str);
+        let ret = vmir::Type::addr(self.group, value, bound);
+        let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
         definer.define_function(
-            self.hole,
+            self.slot,
             vmir::Function {
                 name,
                 ty_params: 0.into(),
@@ -73,5 +80,6 @@ impl FieldTranslator {
                 body: None,
             },
         );
+        Ok(())
     }
 }

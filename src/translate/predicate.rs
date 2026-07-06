@@ -1,57 +1,61 @@
 //! Lower a Silver `predicate` to its `vmir::Resource` (always self-framed).
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use lasso::Spur;
 
-use crate::translate::hole::{Declarator, Definer, Hole};
-use crate::translate::{TranslationContext, TranslationError, spatial};
-use crate::viper::{Interner, typed};
+use crate::translate::{DeclSlot, Declarator, Definer};
+use crate::translate::{Declared, Metaed, TranslationContext, TranslationError, spatial};
+use crate::viper::typed;
 use crate::vmir;
 
-/// Metadata the coordinator folds into `TranslationContext` (`name_map`) once
-/// a predicate is declared.
-pub(crate) struct PredicateMeta {
-    pub silver_name: Spur,
-    pub id: vmir::MemberId,
+pub(crate) struct PredicateTranslator<'a, P = Declared> {
+    src: &'a typed::Predicate,
+    silver_name: Spur,
+    slot: DeclSlot<vmir::Resource>,
+    _p: PhantomData<P>,
 }
 
-pub(crate) struct PredicateTranslator {
-    hole: Hole<vmir::Resource>,
-    meta: PredicateMeta,
-}
-
-impl PredicateTranslator {
+impl<'a> PredicateTranslator<'a, Declared> {
     /// Reserve the predicate's `Resource` slot (filled by `define`) so its id
     /// can serve as snapshot head, address `LocId`, and footprint reference.
     /// Its address is grouped by the predicate name, not by the reserved id.
     pub(crate) fn declare(
-        p: &typed::Predicate,
-        interner: &Interner,
-        declarator: &mut impl Declarator,
+        p: &'a typed::Predicate,
+        ctx: &mut TranslationContext<'_>,
+        d: &mut impl Declarator,
     ) -> Self {
-        let name_str = interner.resolve(&p.name.0).to_owned();
-        declarator.intern_group(&name_str);
-        let (id, hole) = declarator.allocate_hole::<vmir::Resource>(&name_str);
+        let name_str = ctx.interner.resolve(&p.name.0).to_owned();
+        d.intern_group(&name_str);
+        let (id, slot) = d.alloc_slot::<vmir::Resource>(&name_str);
+        ctx.name_map.insert(p.name.0, id);
         PredicateTranslator {
-            hole,
-            meta: PredicateMeta {
-                silver_name: p.name.0,
-                id,
-            },
+            src: p,
+            silver_name: p.name.0,
+            slot,
+            _p: PhantomData,
         }
     }
 
-    pub(crate) fn meta(&self) -> &PredicateMeta {
-        &self.meta
+    /// No `name_map`-dependent metadata to publish.
+    pub(crate) fn meta(self, _ctx: &mut TranslationContext<'_>) -> PredicateTranslator<'a, Metaed> {
+        PredicateTranslator {
+            src: self.src,
+            silver_name: self.silver_name,
+            slot: self.slot,
+            _p: PhantomData,
+        }
     }
+}
 
+impl PredicateTranslator<'_, Metaed> {
     pub(crate) fn define(
         self,
         ctx: &TranslationContext<'_>,
-        p: &typed::Predicate,
         definer: &mut impl Definer,
     ) -> Result<(), TranslationError> {
+        let p = self.src;
         let params: Vec<vmir::Type> = p.params.iter().map(|pp| ctx.lower_type(&pp.ty)).collect();
         // Self-framed: params occupy `Val::Temp(0..n)`, heaps accumulate from
         // `Empty` starting at `HeapVal::Temp(0)`.
@@ -72,18 +76,18 @@ impl PredicateTranslator {
                 ) {
                     Ok(body) => Some(body),
                     Err(e) => {
-                        // The Hole is still unfilled on this error path — abandon
+                        // The Slot is still unfilled on this error path — abandon
                         // it explicitly so the drop bomb doesn't panic on top of
                         // the `TranslationError` we're about to propagate.
-                        self.hole.abandon();
+                        self.slot.abandon();
                         return Err(e);
                     }
                 }
             }
         };
-        let name = definer.intern_name(ctx.interner.resolve(&self.meta.silver_name));
+        let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
         definer.define_resource(
-            self.hole,
+            self.slot,
             vmir::Resource {
                 name,
                 params,

@@ -1,135 +1,124 @@
 //! Lower a Silver `domain` declaration to its `vmir::Domain` stub, and each of
-//! its (bodyless) domain functions to a `vmir::Function`.
+//! its (bodyless) domain functions to a `vmir::Function`. One `DomainTranslator`
+//! owns the domain stub *and* every function slot the domain declares.
+
+use std::marker::PhantomData;
 
 use lasso::Spur;
 
 use crate::translate::GenericSig;
-use crate::translate::hole::{Declarator, Definer, Hole};
 use crate::translate::lower_type;
-use crate::viper::{Interner, typed};
+use crate::translate::{DeclSlot, Declarator, Definer};
+use crate::translate::{Declared, Metaed, TranslationContext, TranslationError};
+use crate::viper::typed;
 use crate::vmir;
 
-pub(crate) struct DomainMeta {
-    pub silver_name: Spur,
-    pub id: vmir::MemberId,
+pub(crate) struct DomainTranslator<'a, P = Declared> {
+    src: &'a typed::Domain,
+    silver_name: Spur,
+    generics: Vec<Spur>,
+    slot: DeclSlot<vmir::Domain>,
+    /// One slot per domain function, parallel to `src.functions`.
+    fn_slots: Vec<DeclSlot<vmir::Function>>,
+    _p: PhantomData<P>,
 }
 
-pub(crate) struct DomainTranslator {
-    name_str: String,
-    ty_params: usize,
-    hole: Hole<vmir::Domain>,
-    meta: DomainMeta,
-}
-
-impl DomainTranslator {
+impl<'a> DomainTranslator<'a, Declared> {
+    /// Reserve the domain stub + a `Function` slot per domain function, and
+    /// publish every `name_map` entry (and each generic function's declared
+    /// signature). A domain function's param/ret types are *not* lowered here —
+    /// they may reference any ADT/domain by id, so lowering waits for `define`.
     pub(crate) fn declare(
-        d: &typed::Domain,
-        interner: &Interner,
-        declarator: &mut impl Declarator,
+        d: &'a typed::Domain,
+        ctx: &mut TranslationContext<'_>,
+        decl: &mut impl Declarator,
     ) -> Self {
-        let name_str = interner.resolve(&d.name.0).to_string();
-        let (id, hole) = declarator.allocate_hole::<vmir::Domain>(&name_str);
+        let name_str = ctx.interner.resolve(&d.name.0).to_string();
+        let (id, slot) = decl.alloc_slot::<vmir::Domain>(&name_str);
+        ctx.name_map.insert(d.name.0, id);
+
+        let generics: Vec<Spur> = d.type_params.iter().map(|i| i.0).collect();
+        let mut fn_slots = Vec::with_capacity(d.functions.len());
+        for df in &d.functions {
+            let fn_name = ctx.interner.resolve(&df.name.0).to_string();
+            let (fid, fslot) = decl.alloc_slot::<vmir::Function>(&fn_name);
+            ctx.name_map.insert(df.name.0, fid);
+            // Record the declared generic signature so a call site can recover
+            // its full type-argument instantiation (in this domain's
+            // type-parameter order). Only generic functions need it; a
+            // monomorphic one carries no type args.
+            if !generics.is_empty() {
+                let typed_params: Vec<typed::Type> =
+                    df.params.iter().map(|p| p.ty.clone()).collect();
+                ctx.fn_generic_sigs.insert(
+                    df.name.0,
+                    GenericSig {
+                        ty_params: generics.clone(),
+                        params: typed_params,
+                        ret: df.ret.clone(),
+                    },
+                );
+            }
+            fn_slots.push(fslot);
+        }
+
         DomainTranslator {
-            name_str,
-            ty_params: d.type_params.len(),
-            hole,
-            meta: DomainMeta {
-                silver_name: d.name.0,
-                id,
-            },
+            src: d,
+            silver_name: d.name.0,
+            generics,
+            slot,
+            fn_slots,
+            _p: PhantomData,
         }
     }
 
-    pub(crate) fn meta(&self) -> &DomainMeta {
-        &self.meta
+    /// No `name_map`-dependent metadata to publish.
+    pub(crate) fn meta(self, _ctx: &mut TranslationContext<'_>) -> DomainTranslator<'a, Metaed> {
+        DomainTranslator {
+            src: self.src,
+            silver_name: self.silver_name,
+            generics: self.generics,
+            slot: self.slot,
+            fn_slots: self.fn_slots,
+            _p: PhantomData,
+        }
     }
+}
 
-    pub(crate) fn define(self, definer: &mut impl Definer) {
-        let name = definer.intern_name(&self.name_str);
+impl DomainTranslator<'_, Metaed> {
+    pub(crate) fn define(
+        self,
+        ctx: &TranslationContext<'_>,
+        definer: &mut impl Definer,
+    ) -> Result<(), TranslationError> {
+        let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
         definer.define_domain(
-            self.hole,
+            self.slot,
             vmir::Domain {
                 name,
-                ty_params: self.ty_params.into(),
-            },
-        );
-    }
-}
-
-/// Metadata the coordinator folds into `TranslationContext` (`name_map`,
-/// `fn_generic_sigs`) once a domain function is declared.
-pub(crate) struct DomainFunctionMeta {
-    pub silver_name: Spur,
-    pub id: vmir::MemberId,
-    /// `None` for a monomorphic (non-generic-owning-domain) function.
-    pub generic_sig: Option<GenericSig>,
-}
-
-/// A domain function is bodyless and fully known at declare time — its
-/// `Hole` filling still happens in a nominal `define` step for structural
-/// uniformity with every other kind (trivial, infallible). `declare` needs
-/// `name_map` populated with every ADT/domain stub id (its param/ret types may
-/// reference any of them), so it runs only after every [`super::adt::AdtTranslator`]
-/// / [`DomainTranslator`] has declared its stub.
-pub(crate) struct DomainFunctionTranslator {
-    name_str: String,
-    generics: Vec<Spur>,
-    params: Vec<vmir::Type>,
-    ret: vmir::Type,
-    hole: Hole<vmir::Function>,
-    meta: DomainFunctionMeta,
-}
-
-impl DomainFunctionTranslator {
-    pub(crate) fn declare(
-        df: &typed::DomainFunction,
-        interner: &Interner,
-        generics: &[Spur],
-        name_map: &std::collections::HashMap<Spur, vmir::MemberId>,
-        declarator: &mut impl Declarator,
-    ) -> Self {
-        let typed_params: Vec<typed::Type> = df.params.iter().map(|p| p.ty.clone()).collect();
-        let name_str = interner.resolve(&df.name.0).to_string();
-        let (id, hole) = declarator.allocate_hole::<vmir::Function>(&name_str);
-        let params = typed_params
-            .iter()
-            .map(|t| lower_type(name_map, generics, t))
-            .collect();
-        let ret = lower_type(name_map, generics, &df.ret);
-        let generic_sig = (!generics.is_empty()).then(|| GenericSig {
-            ty_params: generics.to_vec(),
-            params: typed_params,
-            ret: df.ret.clone(),
-        });
-        DomainFunctionTranslator {
-            name_str,
-            generics: generics.to_vec(),
-            params,
-            ret,
-            hole,
-            meta: DomainFunctionMeta {
-                silver_name: df.name.0,
-                id,
-                generic_sig,
-            },
-        }
-    }
-
-    pub(crate) fn meta(&self) -> &DomainFunctionMeta {
-        &self.meta
-    }
-
-    pub(crate) fn define(self, definer: &mut impl Definer) {
-        let name = definer.intern_name(&self.name_str);
-        definer.define_function(
-            self.hole,
-            vmir::Function {
-                name,
                 ty_params: self.generics.len().into(),
-                params: self.params.into(),
-                ret: self.ret,
-                body: None,
             },
         );
+        for (df, fslot) in self.src.functions.iter().zip(self.fn_slots) {
+            let params: Vec<vmir::Type> = df
+                .params
+                .iter()
+                .map(|p| lower_type(&ctx.name_map, &self.generics, &p.ty))
+                .collect();
+            let ret = lower_type(&ctx.name_map, &self.generics, &df.ret);
+            let fn_name = definer.intern_name(ctx.interner.resolve(&df.name.0));
+            definer.define_function(
+                fslot,
+                vmir::Function {
+                    name: fn_name,
+                    ty_params: self.generics.len().into(),
+                    params: params.into(),
+                    ret,
+                    body: None,
+                },
+            );
+        }
+        // TODO: axioms are not yet translated
+        Ok(())
     }
 }

@@ -1,127 +1,141 @@
-//! Lower a Silver `function` to its `vmir::Function` (+ `#requires`/`#ensures`
-//! contracts). See [`FunctionTranslator::define`] for the heap-free vs.
-//! heap-dependent split.
-
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use lasso::Spur;
 
-use crate::translate::hole::{Declarator, Definer, Hole};
-use crate::translate::{TranslationContext, TranslationError, pure_exp, spatial};
-use crate::viper::{Interner, typed};
+use crate::translate::{DeclSlot, Declarator, Definer};
+use crate::translate::{
+    Declared, Metaed, MethodContracts, TranslationContext, TranslationError, pure_exp, spatial,
+};
+use crate::viper::typed;
 use crate::vmir;
-
-/// Metadata the coordinator folds into `TranslationContext` (`contracts`,
-/// `name_map`) once a function is declared.
-#[derive(Debug)]
-pub(crate) struct FunctionMeta {
-    pub silver_name: Spur,
-    pub function: vmir::MemberId,
-    pub requires: Option<vmir::MemberId>,
-    pub ensures: Option<vmir::MemberId>,
-    /// Set when `requires` contains an `acc` — the function's `#requires`
-    /// slot is a self-framed `Resource` (not a boolean function), and call
-    /// sites pass its snapshot as an extra argument.
-    pub heap_dep: bool,
-}
 
 /// A function's `#requires` slot is a boolean [`vmir::Function`] when
 /// heap-free, or a self-framed [`vmir::Resource`] (footprint + bool) when the
 /// precondition grants permission (`heap_dep`, decided at declare time via
 /// [`spatial::spatial_contains_acc`]).
-pub(crate) enum RequiresHole {
-    HeapFree(Hole<vmir::Function>),
-    HeapDep(Hole<vmir::Resource>),
+pub(crate) enum RequiresSlot {
+    HeapFree(DeclSlot<vmir::Function>),
+    HeapDep(DeclSlot<vmir::Resource>),
 }
 
-impl RequiresHole {
+impl RequiresSlot {
     fn abandon(self) {
         match self {
-            RequiresHole::HeapFree(h) => h.abandon(),
-            RequiresHole::HeapDep(h) => h.abandon(),
+            RequiresSlot::HeapFree(h) => h.abandon(),
+            RequiresSlot::HeapDep(h) => h.abandon(),
         }
     }
 }
 
-pub(crate) struct FunctionTranslator {
-    fn_hole: Hole<vmir::Function>,
-    requires_hole: Option<RequiresHole>,
-    ensures_hole: Option<Hole<vmir::Function>>,
-    meta: FunctionMeta,
+pub(crate) struct FunctionTranslator<'a, P = Declared> {
+    src: &'a typed::Function,
+    silver_name: Spur,
+    fn_slot: DeclSlot<vmir::Function>,
+    requires_slot: Option<RequiresSlot>,
+    ensures_slot: Option<DeclSlot<vmir::Function>>,
+    requires: Option<vmir::MemberId>,
+    ensures: Option<vmir::MemberId>,
+    /// Set when `requires` contains an `acc` — the `#requires` slot is a
+    /// self-framed `Resource` (not a boolean function), and call sites pass its
+    /// snapshot as an extra argument.
+    heap_dep: bool,
+    _p: PhantomData<P>,
 }
 
-impl FunctionTranslator {
+impl<'a> FunctionTranslator<'a, Declared> {
     pub(crate) fn declare(
-        f: &typed::Function,
-        interner: &Interner,
-        declarator: &mut impl Declarator,
+        f: &'a typed::Function,
+        ctx: &mut TranslationContext<'_>,
+        d: &mut impl Declarator,
     ) -> Self {
-        let name = interner.resolve(&f.name.0).to_string();
-        let (fn_id, fn_hole) = declarator.allocate_hole::<vmir::Function>(&name);
+        let name = ctx.interner.resolve(&f.name.0).to_string();
+        let (fn_id, fn_slot) = d.alloc_slot::<vmir::Function>(&name);
 
         let mut requires = None;
-        let mut requires_hole = None;
+        let mut requires_slot = None;
         let mut heap_dep = false;
         if let Some(req_exp) = &f.requires {
             // An `acc` in the precondition makes the function heap-dependent:
             // its `#requires` slot is filled with a Resource (not a boolean
-            // Function), and call sites pass its snapshot as an extra
-            // argument. Recorded here so call sites lowered before this
-            // function's `define` see it (via the folded `Meta`).
+            // Function), and call sites pass its snapshot as an extra argument.
             heap_dep = spatial::spatial_contains_acc(req_exp);
             let req_name = format!("{name}#requires");
             if heap_dep {
-                let (id, hole) = declarator.allocate_hole::<vmir::Resource>(&req_name);
+                let (id, slot) = d.alloc_slot::<vmir::Resource>(&req_name);
                 requires = Some(id);
-                requires_hole = Some(RequiresHole::HeapDep(hole));
+                requires_slot = Some(RequiresSlot::HeapDep(slot));
             } else {
-                let (id, hole) = declarator.allocate_hole::<vmir::Function>(&req_name);
+                let (id, slot) = d.alloc_slot::<vmir::Function>(&req_name);
                 requires = Some(id);
-                requires_hole = Some(RequiresHole::HeapFree(hole));
+                requires_slot = Some(RequiresSlot::HeapFree(slot));
             }
         }
 
         let mut ensures = None;
-        let mut ensures_hole = None;
+        let mut ensures_slot = None;
         if f.ensures.is_some() {
-            let (id, hole) = declarator.allocate_hole::<vmir::Function>(&format!("{name}#ensures"));
+            let (id, slot) = d.alloc_slot::<vmir::Function>(&format!("{name}#ensures"));
             ensures = Some(id);
-            ensures_hole = Some(hole);
+            ensures_slot = Some(slot);
         }
 
-        FunctionTranslator {
-            fn_hole,
-            requires_hole,
-            ensures_hole,
-            meta: FunctionMeta {
-                silver_name: f.name.0,
-                function: fn_id,
+        ctx.name_map.insert(f.name.0, fn_id);
+        ctx.contracts.insert(
+            f.name.0,
+            MethodContracts {
                 requires,
                 ensures,
                 heap_dep,
             },
+        );
+
+        FunctionTranslator {
+            src: f,
+            silver_name: f.name.0,
+            fn_slot,
+            requires_slot,
+            ensures_slot,
+            requires,
+            ensures,
+            heap_dep,
+            _p: PhantomData,
         }
     }
 
-    pub(crate) fn meta(&self) -> &FunctionMeta {
-        &self.meta
+    /// No `name_map`-dependent metadata to publish (contracts + `heap_dep` were
+    /// published at declare).
+    pub(crate) fn meta(self, _ctx: &mut TranslationContext<'_>) -> FunctionTranslator<'a, Metaed> {
+        FunctionTranslator {
+            src: self.src,
+            silver_name: self.silver_name,
+            fn_slot: self.fn_slot,
+            requires_slot: self.requires_slot,
+            ensures_slot: self.ensures_slot,
+            requires: self.requires,
+            ensures: self.ensures,
+            heap_dep: self.heap_dep,
+            _p: PhantomData,
+        }
     }
+}
 
-    /// Abandon every `Hole` this translator still owns — called on an error
+impl FunctionTranslator<'_, Metaed> {
+    /// Abandon every `Slot` this translator still owns — called on an error
     /// path so the drop bomb doesn't panic on top of the `TranslationError`
     /// being propagated.
     fn abandon(
-        fn_hole: Option<Hole<vmir::Function>>,
-        requires_hole: Option<RequiresHole>,
-        ensures_hole: Option<Hole<vmir::Function>>,
+        fn_slot: Option<DeclSlot<vmir::Function>>,
+        requires_slot: Option<RequiresSlot>,
+        ensures_slot: Option<DeclSlot<vmir::Function>>,
     ) {
-        if let Some(h) = fn_hole {
+        if let Some(h) = fn_slot {
             h.abandon();
         }
-        if let Some(h) = requires_hole {
+        if let Some(h) = requires_slot {
             h.abandon();
         }
-        if let Some(h) = ensures_hole {
+        if let Some(h) = ensures_slot {
             h.abandon();
         }
     }
@@ -155,24 +169,27 @@ impl FunctionTranslator {
     pub(crate) fn define(
         self,
         ctx: &TranslationContext<'_>,
-        f: &typed::Function,
         definer: &mut impl Definer,
     ) -> Result<(), TranslationError> {
         let FunctionTranslator {
-            fn_hole,
-            requires_hole,
-            ensures_hole,
-            meta,
+            src: f,
+            silver_name,
+            fn_slot,
+            requires_slot,
+            ensures_slot,
+            requires: meta_requires,
+            ensures: meta_ensures,
+            heap_dep,
+            _p,
         } = self;
-        let mut fn_hole = Some(fn_hole);
-        let mut requires_hole = requires_hole;
-        let mut ensures_hole = ensures_hole;
+        let mut fn_slot = Some(fn_slot);
+        let mut requires_slot = requires_slot;
+        let mut ensures_slot = ensures_slot;
 
-        let fname = ctx.interner.resolve(&meta.silver_name).to_string();
+        let fname = ctx.interner.resolve(&silver_name).to_string();
         let n_params = f.params.len();
         let params: Vec<vmir::Type> = f.params.iter().map(|p| ctx.lower_type(&p.ty)).collect();
         let ret = ctx.lower_type(&f.ret);
-        let heap_dep = meta.heap_dep;
 
         // Params occupy `Val::Temp(0..n_params)` in every body lowered below.
         let mut env: HashMap<Spur, vmir::Val> = HashMap::new();
@@ -184,8 +201,11 @@ impl FunctionTranslator {
         // heap-dependent → a self-framed Resource (footprint + bool).
         if let Some(requires) = f.requires.as_ref() {
             let name = definer.intern_name(&format!("{fname}#requires"));
-            match requires_hole.take().expect("declared when f.requires is Some") {
-                RequiresHole::HeapDep(hole) => {
+            match requires_slot
+                .take()
+                .expect("declared when f.requires is Some")
+            {
+                RequiresSlot::HeapDep(slot) => {
                     let body = match spatial::lower_spatial_never(
                         ctx,
                         &env,
@@ -196,13 +216,13 @@ impl FunctionTranslator {
                     ) {
                         Ok(b) => b,
                         Err(e) => {
-                            hole.abandon();
-                            Self::abandon(fn_hole.take(), None, ensures_hole.take());
+                            slot.abandon();
+                            Self::abandon(fn_slot.take(), None, ensures_slot.take());
                             return Err(e);
                         }
                     };
                     definer.define_resource(
-                        hole,
+                        slot,
                         vmir::Resource {
                             name,
                             params: params.clone(),
@@ -211,18 +231,18 @@ impl FunctionTranslator {
                         },
                     );
                 }
-                RequiresHole::HeapFree(hole) => {
-                    let body =
-                        match spatial::lower_pure_precond_body(ctx, &env, requires, n_params) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                hole.abandon();
-                                Self::abandon(fn_hole.take(), None, ensures_hole.take());
-                                return Err(e);
-                            }
-                        };
+                RequiresSlot::HeapFree(slot) => {
+                    let body = match spatial::lower_pure_precond_body(ctx, &env, requires, n_params)
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            slot.abandon();
+                            Self::abandon(fn_slot.take(), None, ensures_slot.take());
+                            return Err(e);
+                        }
+                    };
                     definer.define_function(
-                        hole,
+                        slot,
                         vmir::Function {
                             name,
                             ty_params: 0.into(),
@@ -238,7 +258,7 @@ impl FunctionTranslator {
         // The trailing snapshot parameter of a heap-dependent function (and of
         // its ensures function, where it sits after `result`).
         let snap_ty = heap_dep.then(|| {
-            let req_id = meta.requires.expect("heap-dep implies a requires");
+            let req_id = meta_requires.expect("heap-dep implies a requires");
             vmir::Type::Snap(req_id)
         });
         let param_vals: Vec<vmir::Val> = (0..n_params).map(vmir::Val::Temp).collect();
@@ -248,7 +268,9 @@ impl FunctionTranslator {
         // `Val::Temp(n_params)`, the snapshot (if any) `Temp(n_params + 1)`;
         // body temps start after them.
         if let Some(ensures) = &f.ensures {
-            let hole = ensures_hole.take().expect("declared when f.ensures is Some");
+            let slot = ensures_slot
+                .take()
+                .expect("declared when f.ensures is Some");
             let mut ens_params = params.clone();
             ens_params.push(ret.clone());
             let result = vmir::Val::Temp(n_params);
@@ -278,14 +300,14 @@ impl FunctionTranslator {
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    hole.abandon();
-                    Self::abandon(fn_hole.take(), None, None);
+                    slot.abandon();
+                    Self::abandon(fn_slot.take(), None, None);
                     return Err(e);
                 }
             };
             let name = definer.intern_name(&format!("{fname}#ensures"));
             definer.define_function(
-                hole,
+                slot,
                 vmir::Function {
                     name,
                     ty_params: 0.into(),
@@ -322,12 +344,12 @@ impl FunctionTranslator {
         let contract = pure_exp::FnContract {
             // Heap-dependent: the precondition is assumed by `FromSnap`, not
             // by a boolean entry stitch.
-            requires: if heap_dep { None } else { meta.requires },
-            ensures: meta.ensures,
+            requires: if heap_dep { None } else { meta_requires },
+            ensures: meta_ensures,
             params: param_vals,
             snap: contract_snap,
         };
-        let fn_hole = fn_hole.take().expect("not yet consumed");
+        let fn_slot = fn_slot.take().expect("not yet consumed");
         let body = match &f.body {
             None => None,
             Some(body_exp) => match pure_exp::lower_function_body(
@@ -342,14 +364,14 @@ impl FunctionTranslator {
             ) {
                 Ok(b) => Some(b),
                 Err(e) => {
-                    fn_hole.abandon();
+                    fn_slot.abandon();
                     return Err(e);
                 }
             },
         };
         let name = definer.intern_name(&fname);
         definer.define_function(
-            fn_hole,
+            fn_slot,
             vmir::Function {
                 name,
                 ty_params: 0.into(),
