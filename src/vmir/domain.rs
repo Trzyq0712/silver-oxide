@@ -1,4 +1,4 @@
-use crate::vmir::Inst;
+use crate::vmir::FunctionBody;
 use crate::vmir::display::VmirDisplay;
 use std::fmt::{self, Display, Formatter};
 
@@ -10,11 +10,20 @@ pub struct Domain {
     pub ty_params: TyParams,
 }
 
+/// A ground (quantifier-free) domain axiom: a closed boolean fact the verifier
+/// **assumes** in every verification unit. The body is a pure, heap-free inst
+/// stream (`Pure` + the `Assume`s stitched from a callee's `#ensures`; no
+/// params, so `Val::Temp` counts from 0) whose `res` is the axiom's boolean —
+/// merged with `true` before verification. Axiom bodies are **never verified**:
+/// no well-definedness obligations (div-by-zero etc.) are checked on them. A
+/// generic axiom (`ty_params > 0`) holds for every ground instantiation of its
+/// type parameters ("forall over types"); the verifier instantiates it lazily,
+/// triggered by ground applications of the functions it mentions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DomainAxiom {
     pub name: Option<Spur>,
     pub ty_params: TyParams,
-    pub body: Vec<Inst>,
+    pub body: FunctionBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -23,6 +32,38 @@ pub struct TyParams(usize);
 impl From<usize> for TyParams {
     fn from(n: usize) -> Self {
         Self(n)
+    }
+}
+
+impl TyParams {
+    /// The type-parameter arity.
+    pub fn count(&self) -> usize {
+        self.0
+    }
+}
+
+impl DomainAxiom {
+    /// The axiom's **trigger**: the first `FunctionCall` in the body whose
+    /// `type_args` mention all of the axiom's type parameters. A ground
+    /// instantiation of that one application determines the instantiation of
+    /// the whole (closed) axiom — the verifier reads σ off matched
+    /// applications of it. `None` when the axiom is generic but no single call
+    /// covers every parameter (rejected at translation); for a monomorphic
+    /// axiom the first call (if any) trivially covers zero parameters.
+    pub fn covering_trigger(&self) -> Option<&crate::vmir::FunctionCall> {
+        let n = self.ty_params.count();
+        self.body.insts.iter().find_map(|inst| {
+            let crate::vmir::InstKind::Pure(_, crate::vmir::PureInst::FunctionCall(call)) =
+                &inst.kind
+            else {
+                return None;
+            };
+            let mut seen = std::collections::HashSet::new();
+            for ty in &call.type_args {
+                ty.collect_generics(&mut seen);
+            }
+            (0..n).all(|i| seen.contains(&i)).then_some(call)
+        })
     }
 }
 
@@ -54,8 +95,14 @@ impl<'a> Display for VmirDisplay<'a, &'a DomainAxiom> {
         if let Some(n) = &self.item.name {
             write!(f, " {}", self.interner.resolve(n))?;
         }
+        write!(f, "{}", self.item.ty_params)?;
         writeln!(f, " {{")?;
-        write!(f, "{}", self.with((0usize, 0usize, &self.item.body[..])))?;
+        write!(
+            f,
+            "{}",
+            self.with((0usize, 0usize, &self.item.body.insts[..]))
+        )?;
+        writeln!(f, "  result: {}", self.item.body.res)?;
         write!(f, "}}")
     }
 }

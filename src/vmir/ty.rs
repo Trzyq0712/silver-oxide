@@ -82,6 +82,81 @@ impl Type {
             _ => None,
         }
     }
+
+    /// Record every `Generic(i)` index occurring in this type into `out`.
+    pub fn collect_generics(&self, out: &mut std::collections::HashSet<usize>) {
+        match self {
+            Type::Generic(i) => {
+                out.insert(*i);
+            }
+            Type::Domain(_, args) => {
+                for a in args {
+                    a.collect_generics(out);
+                }
+            }
+            Type::Option(t) => t.collect_generics(out),
+            Type::Addr { value, .. } => value.collect_generics(out),
+            Type::Int | Type::Bool | Type::Real | Type::Ref | Type::Snap(_) => {}
+        }
+    }
+
+    /// Substitute each `Generic(i)` with `args[i]`, recursing structurally.
+    pub fn subst_generics(&self, args: &[Type]) -> Type {
+        match self {
+            Type::Generic(i) => args[*i].clone(),
+            Type::Domain(id, tys) => {
+                Type::Domain(*id, tys.iter().map(|t| t.subst_generics(args)).collect())
+            }
+            Type::Option(t) => Type::Option(Box::new(t.subst_generics(args))),
+            Type::Addr {
+                group,
+                value,
+                bound,
+            } => Type::Addr {
+                group: *group,
+                value: Box::new(value.subst_generics(args)),
+                bound: bound.clone(),
+            },
+            Type::Int | Type::Bool | Type::Real | Type::Ref | Type::Snap(_) => self.clone(),
+        }
+    }
+
+    /// Structurally match this (possibly generic) type against a `ground` type,
+    /// binding each `Generic(i)` in `out[i]`. Returns `false` on a structural
+    /// mismatch or on conflicting bindings for the same parameter.
+    pub fn match_generics(&self, ground: &Type, out: &mut [Option<Type>]) -> bool {
+        match (self, ground) {
+            (Type::Generic(i), g) => match &out[*i] {
+                Some(prev) => prev == g,
+                None => {
+                    out[*i] = Some(g.clone());
+                    true
+                }
+            },
+            (Type::Domain(a, xs), Type::Domain(b, ys)) => {
+                a == b
+                    && xs.len() == ys.len()
+                    && xs
+                        .iter()
+                        .zip(ys.iter())
+                        .all(|(x, y)| x.match_generics(y, out))
+            }
+            (Type::Option(x), Type::Option(y)) => x.match_generics(y, out),
+            (
+                Type::Addr {
+                    group: g1,
+                    value: v1,
+                    ..
+                },
+                Type::Addr {
+                    group: g2,
+                    value: v2,
+                    ..
+                },
+            ) => g1 == g2 && v1.match_generics(v2, out),
+            (a, b) => a == b,
+        }
+    }
 }
 
 impl Display for Type {

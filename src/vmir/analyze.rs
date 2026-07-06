@@ -160,7 +160,7 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
                 inst_deps(&body.insts, out);
             }
         }
-        Declaration::DomainAxiom(ax) => inst_deps(&ax.body, out),
+        Declaration::DomainAxiom(ax) => inst_deps(&ax.body.insts, out),
         // Leaf declarations: nothing to depend on.
         Declaration::Domain(_) | Declaration::Adt(_) => {}
     }
