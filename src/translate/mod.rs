@@ -29,6 +29,7 @@ use crate::vmir;
 pub(crate) struct Declared;
 pub(crate) struct Metaed;
 
+mod builder;
 mod context;
 mod decl;
 pub mod errors;
@@ -36,14 +37,13 @@ mod pure_exp;
 mod reach;
 mod resource;
 mod sink;
-mod slot;
 mod spatial;
 mod types;
 
 pub use errors::TranslationError;
 
+pub(crate) use builder::{Builder, DeclSlot, Declarator, Definer};
 pub(crate) use context::{GenericSig, MethodContracts, TranslationContext};
-pub(crate) use slot::{Builder, DeclSlot, Declarator, Definer};
 
 /// Build a `vmir::Program` from a typed `typed::Program`.
 pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<TranslationError>> {

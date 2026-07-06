@@ -121,7 +121,7 @@ impl<'a> FunctionTranslator<'a, Declared> {
 }
 
 impl FunctionTranslator<'_, Metaed> {
-    /// Abandon every `Slot` this translator still owns — called on an error
+    /// Abandon every `DeclSlot` this translator still owns — called on an error
     /// path so the drop bomb doesn't panic on top of the `TranslationError`
     /// being propagated.
     fn abandon(

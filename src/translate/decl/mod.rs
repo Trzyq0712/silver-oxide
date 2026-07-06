@@ -2,7 +2,7 @@
 //! (field, predicate, function, method, adt, domain). Each runs the
 //! `declare → meta → define` typestate phases described in the parent module,
 //! self-publishing its metadata into `TranslationContext` and consuming its
-//! `DeclSlot`s (from the sibling `slot` module) to emit `vmir::Declaration`s.
+//! `DeclSlot`s (from the sibling `builder` module) to emit `vmir::Declaration`s.
 
 mod adt;
 mod domain;

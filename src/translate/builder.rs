@@ -1,5 +1,13 @@
-//! Declaration slots — an **unforgeable, affine write capability**, and
-//! [`Builder`], the sole authority that mints and fills them.
+//! The **write side** of translation: [`Builder`], which owns the growing
+//! `vmir::Program`, and the [`DeclSlot`] capability it hands out to reserve and
+//! later fill each declaration. `Builder` implements the [`Declarator`] /
+//! [`Definer`] interfaces the translators drive.
+//!
+//! `Builder` and `DeclSlot` live in the *same* module on purpose — that
+//! co-location is what makes the capability sound (see below), so they cannot
+//! be split apart.
+//!
+//! ## `DeclSlot` — an unforgeable, affine write capability
 //!
 //! A [`DeclSlot<T>`] is a write-capability token for exactly one declaration
 //! slot. It replaces the informal "don't forget to fill every slot" discipline
@@ -8,11 +16,11 @@
 //! `DeclSlot<T>` by value, so "filled twice" is unrepresentable.
 //!
 //! **Unforgeable.** `DeclSlot::new` and `DeclSlot::fill` are private to *this*
-//! module, and `Builder` (which owns the only `Declarator`/`Definer` impls)
-//! lives here too. The translator submodules (`field`, `adt`, …) are
-//! *siblings* of this module, not descendants, so they cannot reach the private
-//! constructor or filler: a translator can hold a slot, hand it to `define_*`,
-//! or `abandon` it — but can neither fabricate nor fill one. This is what makes
+//! module, and `Builder` (the only `Declarator`/`Definer` impl) lives here too.
+//! The translator submodules (`decl::field`, `decl::adt`, …) are *not*
+//! descendants of this module, so they cannot reach the private constructor or
+//! filler: a translator can hold a slot, hand it to `define_*`, or `abandon` it
+//! — but can neither fabricate nor fill one. This is what makes
 //! `Builder::alloc_slot` the single source of every slot.
 
 use std::marker::PhantomData;
@@ -34,7 +42,7 @@ pub(crate) struct DeclSlot<T> {
 }
 
 impl<T> DeclSlot<T> {
-    /// Mint a fresh, unfilled slot for `id`. **Private to `slot`** — only
+    /// Mint a fresh, unfilled slot for `id`. **Private to `builder`** — only
     /// [`Builder::alloc_slot`] calls it, which is what makes a slot unforgeable
     /// outside this module.
     fn new(id: vmir::MemberId) -> Self {
@@ -47,7 +55,7 @@ impl<T> DeclSlot<T> {
 
     /// Consume the slot, marking it filled, and hand back its id so the
     /// `Definer` impl can write the actual `Declaration` there. **Private to
-    /// `slot`** — only `Builder`'s `Definer` impl fills a slot.
+    /// `builder`** — only `Builder`'s `Definer` impl fills a slot.
     fn fill(mut self) -> vmir::MemberId {
         self.filled = true;
         self.id

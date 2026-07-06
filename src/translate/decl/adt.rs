@@ -16,7 +16,7 @@ use crate::vmir;
 /// *any* ADT by id (including one declared later in the source). `meta`
 /// publishes the constructor (`ctor_tag`) / destructor (`dtor_sem`) metadata
 /// once every ADT stub id is in `name_map`; `define` recomputes the variant
-/// shapes and fills the `Slot`.
+/// shapes and fills the `DeclSlot`.
 pub(crate) struct AdtTranslator<'a, P = Declared> {
     src: &'a typed::Adt,
     silver_name: Spur,

@@ -771,7 +771,7 @@ fn translation_error_abandons_slot_without_panicking() {
     // and typechecks) but not yet lowerable —
     // `TranslationError::Unsupported("wildcard literal")` in `pure_exp.rs`'s
     // `lower_literal`. This exercises `PredicateTranslator::define`'s
-    // `Slot::abandon()` path: on this error it must mark its
+    // `DeclSlot::abandon()` path: on this error it must mark its
     // `Slot<vmir::Resource>` filled without writing a decl, or the drop bomb
     // would panic on top of the `TranslationError` being propagated — a path
     // with no coverage before the `Slot<T>`/`Translator` refactor (the old
@@ -795,7 +795,7 @@ predicate broken(this: Ref) {
     inline_macros(&mut program, &interner).expect("macro inlining failed");
     let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck failed");
 
-    // Must return `Err` cleanly — no panic from an unfilled `Slot`'s drop bomb.
+    // Must return `Err` cleanly — no panic from an unfilled `DeclSlot`'s drop bomb.
     match translate(&typed) {
         Err(errors) => assert!(!errors.is_empty(), "expected at least one error"),
         Ok(_) => panic!("expected translation to reject the wildcard permission"),
