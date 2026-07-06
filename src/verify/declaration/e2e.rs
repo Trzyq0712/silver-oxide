@@ -2051,3 +2051,171 @@ method m(y: Ref)
     let result = verify_named_method(&program, "m");
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
+
+// ---- Domain axioms ---------------------------------------------------------
+
+#[test]
+fn ground_axiom_discharges_assert() {
+    // `size()` is uninterpreted; only the axiom pins its value.
+    let input = r#"
+domain D {
+    function size(): Int
+    axiom sz { size() == 0 }
+}
+method client() {
+    assert size() == 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn ground_axiom_over_abstract_silver_function() {
+    // `f` is an abstract (bodyless, contractless) Silver function — the axiom
+    // is the only source of `f() == 42`.
+    let input = r#"
+function f(): Int
+domain D {
+    axiom a { f() == 42 }
+}
+method client() {
+    assert f() == 42
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn unbacked_assert_still_fails_with_axioms_present() {
+    // Negative control: the axiom pins `f`, not `g` — asserting about `g`
+    // must still fail.
+    let input = r#"
+function f(): Int
+function g(): Int
+domain D {
+    axiom a { f() == 42 }
+}
+method client() {
+    assert g() == 42
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn generic_axiom_instantiates_at_use_site() {
+    // The axiom is generic over T; `client` grounds it at `Int` through the
+    // annotated local. The lazy rule fires on the `nil[Int]()` application,
+    // instantiates `len(nil()) == 0` at Int, and congruence closes the goal.
+    let input = r#"
+domain List[T] {
+    function nil(): List[T]
+    function len(xs: List[T]): Int
+    axiom { len(nil()) == 0 }
+}
+method client() {
+    var l: List[Int] := nil()
+    assert len(l) == 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn generic_axiom_two_instantiations_in_one_unit() {
+    let input = r#"
+domain List[T] {
+    function nil(): List[T]
+    function len(xs: List[T]): Int
+    axiom { len(nil()) == 0 }
+}
+method client() {
+    var l: List[Int] := nil()
+    var m: List[Bool] := nil()
+    assert len(l) == 0
+    assert len(m) == 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn axiom_body_is_never_verified() {
+    // The axiom divides by zero; axioms are trusted (no well-definedness
+    // obligations), so an unrelated method still verifies.
+    let input = r#"
+domain D {
+    function w(): Int
+    axiom bad { w() == 1 / 0 }
+}
+method client() {
+    assert true
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn ground_axiom_available_in_function_bodies() {
+    // Axioms are assumed in every unit, not just methods: the function body's
+    // exit `assert f#ensures` needs the axiom.
+    let input = r#"
+domain D {
+    function size(): Int
+    axiom sz { size() == 0 }
+}
+function probe(): Int
+    ensures result == 0
+{
+    size()
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "probe");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn generic_axiom_monomorphic_conjunct_not_yet_split() {
+    // KNOWN DIVERGENCE (documented, fix deferred): the axiom is generic over T
+    // (via `mk`), so the whole body — including the monomorphic conjunct
+    // `tag() == 7` — sits behind the `mk[T]` trigger, and `client` never
+    // applies `mk`. Silicon happens to pass this variant only because
+    // `ground()` defaults `tag()`'s unconstrained T to Ref at the call site,
+    // minting a D[Ref] occurrence that instantiates the axiom (and fails the
+    // variant with `tag` declared outside the domain). Planned fix: split
+    // top-level `&&` conjuncts into separate axioms (sound — types are
+    // non-empty, so ∀T distributes over ∧), making this conjunct ground.
+    let input = r#"
+domain D[T] {
+    function mk(): D[T]
+    function tag(): Int
+    axiom { mk() == mk() && tag() == 7 }
+}
+method client() {
+    assert tag() == 7
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "documents the current divergence; if this starts passing, conjunct \
+         splitting (or equivalent) landed — update this test to assert Ok"
+    );
+}

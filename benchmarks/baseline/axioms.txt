@@ -1,0 +1,11 @@
+saturations=1
+reduces=0
+sat_iterations=3
+egraph_nodes_peak=15
+egraph_classes_peak=9
+rule_applications=6
+prove_calls=4
+prove_tier3=0
+cert_grafts=0
+rule.axiom-len_nil=2
+rule.eq-true-union=4

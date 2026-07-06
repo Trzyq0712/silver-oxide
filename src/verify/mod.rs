@@ -35,6 +35,17 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // directly instead.
     let order = petgraph::algo::toposort(&analyzed.dep_graph, None)
         .expect("dep_graph proven acyclic by analyze");
+    // Refine the order: all functions/resources before any method (valid —
+    // nothing ever depends on a method). Domain axioms are assumed in every
+    // unit and may call Silver functions; verifying methods last guarantees
+    // every function certificate exists by the time the main assertion-bearing
+    // units (methods) assume the axioms. (Inside the function/resource passes
+    // an axiom mentioning a not-yet-verified function stays sound — the call
+    // is merely uninterpreted, i.e. weaker.)
+    let (early, methods): (Vec<_>, Vec<_>) = order
+        .into_iter()
+        .partition(|&id| !matches!(program.decls[id], vmir::Declaration::Method(_)));
+    let order = early.into_iter().chain(methods);
     // Resources are verified before the methods that use them (dependency
     // order), so each resource's proof certificate is cached and grafted at
     // call sites rather than re-walking the body.

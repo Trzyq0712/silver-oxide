@@ -1,6 +1,7 @@
 //! Structural egg rewrite rules for the verifier.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use egg::{
     Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
@@ -9,7 +10,7 @@ use egg::{
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
-use crate::vmir::Literal;
+use crate::vmir::{BinOp, Literal, Type, Val};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 
@@ -354,6 +355,237 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
     fn vars(&self) -> Vec<Var> {
         vec![tag_x()]
     }
+}
+
+// ---- Generic domain axioms ("forall over types") --------------------------
+
+/// A pure step of a prepared axiom body. Mirrors the `PureInst` subset legal in
+/// an axiom, with every callee resolved to its verifier `FuncId` up front (the
+/// applier has no registry access) and types still mentioning the axiom's
+/// `Generic(i)` parameters — substituted per instantiation.
+pub(crate) enum AxiomPure {
+    Binary(BinOp, Val, Val),
+    Ternary(Val, Val, Val),
+    RealCast(Val),
+    App {
+        func: FuncId,
+        type_args: Vec<Type>,
+        args: Vec<Val>,
+    },
+}
+
+/// One instruction of a prepared axiom body: a value-producing pure step, or an
+/// assumption (stitched from a callee's `#ensures`) merged with `true`.
+pub(crate) enum AxiomInst {
+    Val(AxiomPure),
+    Assume(Val),
+}
+
+/// A generic domain axiom prepared for lazy instantiation: the body as
+/// registry-resolved pure steps, its boolean result, and the **trigger** — the
+/// one function application whose `type_args` cover all `n_params` type
+/// parameters, so a ground application of it determines σ for the whole
+/// (closed) axiom.
+pub(crate) struct PreparedAxiom {
+    pub n_params: usize,
+    pub trigger_func: FuncId,
+    /// The trigger's declared (generic) `type_args` — the pattern matched
+    /// against a ground application's payload to extract σ.
+    pub trigger_type_args: Vec<Type>,
+    pub insts: Vec<AxiomInst>,
+    pub res: Val,
+}
+
+/// Searcher: any e-class containing an application of the trigger function
+/// (type-blind — every ground instantiation lives in one `classes_by_op`
+/// bucket, as in [`UnaryAppSearcher`]). σ extraction happens in the applier,
+/// which re-reads the matched e-class's nodes (an egg `Subst` cannot carry
+/// types).
+struct AxiomTriggerSearcher {
+    func: FuncId,
+}
+
+impl Searcher<Symbolic, ConstFold> for AxiomTriggerSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let Some(ids) = egraph.classes_for_op(&Discriminant::FuncApp(self.func)) else {
+            return vec![];
+        };
+        let mut ms = Vec::new();
+        let mut limit = limit;
+        for eclass in ids {
+            if limit == 0 {
+                break;
+            }
+            if let Some(m) = self.search_eclass_with_limit(egraph, eclass, limit) {
+                limit -= m.substs.len();
+                ms.push(m);
+            }
+        }
+        ms
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        let hit = egraph[eclass]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::FuncApp(f, _, _) if *f == self.func));
+        hit.then(|| SearchMatches {
+            eclass,
+            // One empty subst: the applier extracts σ from the e-class itself.
+            substs: vec![Subst::default()],
+            ast: None,
+        })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Applier: for each ground application of the trigger in the matched e-class,
+/// extract σ from its type payload, instantiate the whole axiom body at σ, and
+/// merge its boolean with `true`. Memoized per σ (instantiation is idempotent —
+/// re-adding hash-conses and re-unioning no-ops — so the memo is purely a
+/// saturation-cost guard). Axiom bodies are never verified: no obligations.
+struct AxiomApplier {
+    axiom: PreparedAxiom,
+    memo: Mutex<HashSet<Vec<Type>>>,
+}
+
+impl AxiomApplier {
+    /// Add the axiom body instantiated at `sigma` and merge `res` with `true`.
+    /// Returns the e-classes changed by the unions.
+    fn instantiate(&self, egraph: &mut EGraph<Symbolic, ConstFold>, sigma: &[Type]) -> Vec<Id> {
+        let mut vals: Vec<Id> = Vec::new();
+        let mut changed = Vec::new();
+        fn get(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
+            match v {
+                Val::Temp(n) => vals[*n],
+                Val::Literal(lit) => egraph.add(Symbolic::Lit(lit.clone())),
+            }
+        }
+        let true_of = |egraph: &mut EGraph<Symbolic, ConstFold>| {
+            egraph.add(Symbolic::Lit(Literal::Bool(true)))
+        };
+        for inst in &self.axiom.insts {
+            match inst {
+                AxiomInst::Val(p) => {
+                    let id = match p {
+                        AxiomPure::Binary(op, l, r) => {
+                            let l = get(egraph, &vals, l);
+                            let r = get(egraph, &vals, r);
+                            egraph.add(Symbolic::Binary(*op, [l, r]))
+                        }
+                        AxiomPure::Ternary(c, t, e) => {
+                            let c = get(egraph, &vals, c);
+                            let t = get(egraph, &vals, t);
+                            let e = get(egraph, &vals, e);
+                            egraph.add(Symbolic::Ite([c, t, e]))
+                        }
+                        AxiomPure::RealCast(v) => {
+                            let v = get(egraph, &vals, v);
+                            egraph.add(Symbolic::RealCast(v))
+                        }
+                        AxiomPure::App {
+                            func,
+                            type_args,
+                            args,
+                        } => {
+                            let tys: Box<[Type]> =
+                                type_args.iter().map(|t| t.subst_generics(sigma)).collect();
+                            let args: Box<[Id]> =
+                                args.iter().map(|v| get(egraph, &vals, v)).collect();
+                            egraph.add(Symbolic::FuncApp(*func, tys, args))
+                        }
+                    };
+                    vals.push(id);
+                }
+                AxiomInst::Assume(v) => {
+                    let id = get(egraph, &vals, v);
+                    let t = true_of(egraph);
+                    if egraph.union(id, t) {
+                        changed.push(egraph.find(id));
+                    }
+                }
+            }
+        }
+        let res = get(egraph, &vals, &self.axiom.res);
+        let t = true_of(egraph);
+        if egraph.union(res, t) {
+            changed.push(egraph.find(res));
+        }
+        changed
+    }
+}
+
+impl Applier<Symbolic, ConstFold> for AxiomApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        // Extract every distinct ground σ this e-class's trigger applications
+        // determine. Collected first: `instantiate` needs `&mut egraph`.
+        let mut sigmas: Vec<Vec<Type>> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::FuncApp(f, tys, _) = node else {
+                continue;
+            };
+            if *f != self.axiom.trigger_func || tys.len() != self.axiom.trigger_type_args.len() {
+                continue;
+            }
+            let mut sigma: Vec<Option<Type>> = vec![None; self.axiom.n_params];
+            let matched = self
+                .axiom
+                .trigger_type_args
+                .iter()
+                .zip(tys.iter())
+                .all(|(pat, ground)| pat.match_generics(ground, &mut sigma));
+            if !matched {
+                continue;
+            }
+            let Some(sigma): Option<Vec<Type>> = sigma.into_iter().collect() else {
+                continue;
+            };
+            let mut memo = self.memo.lock().unwrap();
+            if memo.insert(sigma.clone()) {
+                sigmas.push(sigma);
+            }
+        }
+        let mut changed = Vec::new();
+        for sigma in sigmas {
+            changed.extend(self.instantiate(egraph, &sigma));
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Mint the lazy-instantiation rule for one prepared generic axiom.
+pub(crate) fn axiom_rule(name: &str, axiom: PreparedAxiom) -> Rule {
+    let searcher = AxiomTriggerSearcher {
+        func: axiom.trigger_func,
+    };
+    let applier = AxiomApplier {
+        axiom,
+        memo: Mutex::new(HashSet::new()),
+    };
+    Rewrite::new(format!("axiom-{name}"), searcher, applier).expect("axiom rule")
 }
 
 #[cfg(test)]

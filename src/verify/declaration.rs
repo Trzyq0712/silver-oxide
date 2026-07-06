@@ -1230,6 +1230,135 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
     out
 }
 
+/// Axiomatize the state: make every domain axiom's fact available to the unit
+/// about to be verified. A **ground** axiom (`ty_params == 0`) is evaluated
+/// into the e-graph and its boolean merged with `true` up front; a **generic**
+/// one becomes a lazy-instantiation rule (see `rewrite::axiom_rule`) chained
+/// into this context's saturations, firing on each ground application of its
+/// trigger. Axiom bodies are trusted — no obligations (div-by-zero, deref
+/// permission) are checked on them.
+fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
+    for decl in program.decls.iter() {
+        let vmir::Declaration::DomainAxiom(ax) = decl else {
+            continue;
+        };
+        if ax.ty_params.count() == 0 {
+            let mut state = EvalState::new();
+            for inst in &ax.body.insts {
+                match &inst.kind {
+                    InstKind::Pure(ty, pi) => {
+                        let id = eval_pure_inst(ctx, &state, ty, pi);
+                        state.push_val(id, ty.clone());
+                    }
+                    InstKind::Assume(val) => {
+                        let id = state.get_val(ctx, val);
+                        let true_ = ctx.true_();
+                        ctx.egraph.union(id, true_);
+                        ctx.egraph.rebuild();
+                    }
+                    // An axiom body is never verified — a stray obligation
+                    // (there are none today: callees are precondition-free)
+                    // would be skipped, and heap insts cannot occur.
+                    InstKind::Assert(_) => {}
+                    _ => return Err(VerifyError::Unimplemented("non-pure inst in axiom body")),
+                }
+            }
+            let res = state.get_val(ctx, &ax.body.res);
+            let true_ = ctx.true_();
+            ctx.egraph.union(res, true_);
+            ctx.egraph.rebuild();
+        } else {
+            let prepared = prepare_axiom(ctx.alloc, ax)?;
+            let name = ax
+                .name
+                .map(|n| ctx.interner.resolve(&n).to_string())
+                .unwrap_or_else(|| "anon".to_string());
+            ctx.axiom_rules
+                .push(crate::verify::rewrite::axiom_rule(&name, prepared));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a generic axiom's body into registry-level pure steps (every callee
+/// down to its verifier `FuncId`) plus its trigger, ready for the applier —
+/// which has no registry access at rule-application time.
+fn prepare_axiom(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+    ax: &vmir::DomainAxiom,
+) -> Result<crate::verify::rewrite::PreparedAxiom, VerifyError> {
+    use crate::verify::rewrite::{AxiomInst, AxiomPure, PreparedAxiom};
+    let trigger = ax
+        .covering_trigger()
+        .ok_or(VerifyError::Unimplemented("generic axiom without trigger"))?;
+    let trigger_func = crate::verify::func_registry::func_id_for_member(trigger.function);
+    let trigger_type_args = trigger.type_args.clone();
+
+    let mut insts = Vec::with_capacity(ax.body.insts.len());
+    for inst in &ax.body.insts {
+        let prepared = match &inst.kind {
+            InstKind::Pure(_, pi) => AxiomInst::Val(match pi {
+                PureInst::Binary(op, l, r) => AxiomPure::Binary(*op, l.clone(), r.clone()),
+                PureInst::Ternary(c, t, e) => AxiomPure::Ternary(c.clone(), t.clone(), e.clone()),
+                PureInst::RealCast(v) => AxiomPure::RealCast(v.clone()),
+                PureInst::FunctionCall(fc) => AxiomPure::App {
+                    func: crate::verify::func_registry::func_id_for_member(fc.function),
+                    type_args: fc.type_args.clone(),
+                    args: fc.args.iter().cloned().collect(),
+                },
+                PureInst::AdtCons {
+                    adt,
+                    type_args,
+                    variant,
+                    args,
+                } => AxiomPure::App {
+                    func: alloc.cons(*adt, *variant),
+                    type_args: type_args.clone(),
+                    args: args.clone(),
+                },
+                PureInst::AdtProj {
+                    adt,
+                    type_args,
+                    variant,
+                    field,
+                    base,
+                } => AxiomPure::App {
+                    func: alloc.proj(*adt, *variant, *field),
+                    type_args: type_args.clone(),
+                    args: vec![base.clone()],
+                },
+                PureInst::AdtTag {
+                    adt,
+                    type_args,
+                    base,
+                } => AxiomPure::App {
+                    func: alloc.tag(*adt),
+                    type_args: type_args.clone(),
+                    args: vec![base.clone()],
+                },
+                PureInst::Fresh
+                | PureInst::Deref(..)
+                | PureInst::Perm(..)
+                | PureInst::Snap { .. } => {
+                    return Err(VerifyError::Unimplemented("impure inst in axiom body"));
+                }
+            }),
+            InstKind::Assume(v) => AxiomInst::Assume(v.clone()),
+            // Never verified; nothing to record.
+            InstKind::Assert(_) => continue,
+            _ => return Err(VerifyError::Unimplemented("non-pure inst in axiom body")),
+        };
+        insts.push(prepared);
+    }
+    Ok(PreparedAxiom {
+        n_params: ax.ty_params.count(),
+        trigger_func,
+        trigger_type_args,
+        insts,
+        res: ax.body.res.clone(),
+    })
+}
+
 pub fn verify_method(
     program: &vmir::Program,
     method_name: &str,
@@ -1240,6 +1369,7 @@ pub fn verify_method(
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
+    assume_axioms(&mut ctx, program)?;
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
 
@@ -1293,6 +1423,7 @@ pub fn verify_resource(
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
+    assume_axioms(&mut ctx, program)?;
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1433,6 +1564,7 @@ pub fn verify_function(
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
+    assume_axioms(&mut ctx, program)?;
     // Params seed the initial `Val::Temp(0..n_params)` slots (heap-free: no ctx heap).
     let params: Vec<egg::Id> = function
         .params

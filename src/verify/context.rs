@@ -94,6 +94,10 @@ pub(crate) struct VerifyContext<'a> {
     /// Terminating structural reductions, run after heap-producing ops to
     /// normalize (collapse snapshot towers) without a full saturation.
     static_reduce: Vec<egg::Rewrite<Symbolic, ConstFold>>,
+    /// Per-unit lazy-instantiation rules for **generic** domain axioms (one per
+    /// axiom, minted by `assume_axioms`; ground axioms are pre-added instead).
+    /// Chained into full saturation (incl. the tier-3 probe) but not `reduce`.
+    pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     fresh_counter: usize,
     /// Cheap string repr for member/constructor names.
     pub(crate) interner: &'a Rodeo,
@@ -129,6 +133,7 @@ impl<'a> VerifyContext<'a> {
             egraph: egg::EGraph::default(),
             static_rules: rewrite::rules(),
             static_reduce: rewrite::reduce_rules(),
+            axiom_rules: Vec::new(),
             fresh_counter: 0,
             interner,
             decls,
@@ -252,6 +257,7 @@ impl<'a> VerifyContext<'a> {
             .static_rules
             .iter()
             .chain(self.alloc.rules())
+            .chain(self.axiom_rules.iter())
             .cloned()
             .collect();
         let egraph = std::mem::take(&mut self.egraph);
@@ -538,6 +544,7 @@ impl<'a> VerifyContext<'a> {
                 .static_rules
                 .iter()
                 .chain(self.alloc.rules())
+                .chain(self.axiom_rules.iter())
                 .cloned()
                 .collect();
             let runner = egg::Runner::default().with_egraph(probe).run(&rules);

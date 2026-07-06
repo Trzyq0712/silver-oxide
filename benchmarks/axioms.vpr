@@ -1,0 +1,24 @@
+// Ground + generic domain axioms, incl. a normal (precondition-free) Silver
+// function referenced from an axiom.
+function f(): Int
+
+domain D {
+    function size(): Int
+    axiom sz { size() == 0 }
+    axiom { f() == 42 }
+}
+
+domain List[T] {
+    function nil(): List[T]
+    function len(xs: List[T]): Int
+    axiom len_nil { len(nil()) == 0 }
+}
+
+method client() {
+    assert size() == 0
+    assert f() == 42
+    var l: List[Int] := nil()
+    var m: List[Bool] := nil()
+    assert len(l) == 0
+    assert len(m) == 0
+}
