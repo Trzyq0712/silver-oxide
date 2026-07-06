@@ -29,14 +29,9 @@ use crate::vmir;
 pub(crate) struct Declared;
 pub(crate) struct Metaed;
 
-mod adt;
 mod context;
-mod domain;
+mod decl;
 pub mod errors;
-mod field;
-mod function;
-mod method;
-mod predicate;
 mod pure_exp;
 mod reach;
 mod resource;
@@ -66,33 +61,29 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
     let mut methods = Vec::new();
     let mut adts = Vec::new();
     let mut domains = Vec::new();
-    for decl in decls {
-        match decl {
+    for decl_node in decls {
+        match decl_node {
             typed::Declaration::Field(f) => {
-                fields.push(field::FieldTranslator::declare(f, &mut ctx, &mut builder));
+                fields.push(decl::FieldTranslator::declare(f, &mut ctx, &mut builder));
             }
             typed::Declaration::Predicate(p) => {
-                preds.push(predicate::PredicateTranslator::declare(
+                preds.push(decl::PredicateTranslator::declare(
                     p,
                     &mut ctx,
                     &mut builder,
                 ));
             }
             typed::Declaration::Function(f) => {
-                funcs.push(function::FunctionTranslator::declare(
-                    f,
-                    &mut ctx,
-                    &mut builder,
-                ));
+                funcs.push(decl::FunctionTranslator::declare(f, &mut ctx, &mut builder));
             }
             typed::Declaration::Method(m) => {
-                methods.push(method::MethodTranslator::declare(m, &mut ctx, &mut builder));
+                methods.push(decl::MethodTranslator::declare(m, &mut ctx, &mut builder));
             }
             typed::Declaration::Adt(a) => {
-                adts.push(adt::AdtTranslator::declare(a, &mut ctx, &mut builder));
+                adts.push(decl::AdtTranslator::declare(a, &mut ctx, &mut builder));
             }
             typed::Declaration::Domain(d) => {
-                domains.push(domain::DomainTranslator::declare(d, &mut ctx, &mut builder));
+                domains.push(decl::DomainTranslator::declare(d, &mut ctx, &mut builder));
             }
         }
     }
