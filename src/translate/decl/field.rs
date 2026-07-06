@@ -3,7 +3,7 @@
 //! A field is an ordinary [`vmir::Function`] interned under the field's **bare
 //! name** (no `@`-suffix) — there is no distinct "address" declaration. It has
 //! no body, so `meta` only publishes the field's value type into
-//! `field_types`, and `define` recomputes that type for the function's
+//! `field_types`, and `define` reuses that published type for the function's
 //! `Addr<T>` return.
 
 use std::marker::PhantomData;
@@ -66,7 +66,12 @@ impl FieldTranslator<'_, Metaed> {
         ctx: &TranslationContext<'_>,
         definer: &mut impl Definer,
     ) -> Result<(), TranslationError> {
-        let value = ctx.lower_type(&self.src.0.ty);
+        // Reuse the value type `meta` already lowered into `field_types`.
+        let value = ctx
+            .field_types
+            .get(&self.silver_name)
+            .expect("meta publishes every field's value type before define")
+            .clone();
         let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
         let ret = vmir::Type::addr(self.group, value, bound);
         let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
