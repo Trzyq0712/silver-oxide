@@ -105,23 +105,38 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
 
     // Barrier: `ctx` is complete.
     // ── Phase 3: define ──
-    // Lower bodies and consume every `DeclSlot`. Order across kinds is free.
+    // Lower bodies and consume every `DeclSlot`, collecting any errors. Order
+    // across kinds is free.
     let mut errors = Vec::new();
-    macro_rules! define_all {
-        ($v:expr) => {
-            for t in $v {
-                if let Err(e) = t.define(&ctx, &mut builder) {
-                    errors.push(e);
-                }
-            }
-        };
-    }
-    define_all!(fields);
-    define_all!(preds);
-    define_all!(funcs);
-    define_all!(adts);
-    define_all!(methods);
-    define_all!(domains);
+    errors.extend(
+        fields
+            .into_iter()
+            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+    );
+    errors.extend(
+        preds
+            .into_iter()
+            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+    );
+    errors.extend(
+        funcs
+            .into_iter()
+            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+    );
+    errors.extend(
+        adts.into_iter()
+            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+    );
+    errors.extend(
+        methods
+            .into_iter()
+            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+    );
+    errors.extend(
+        domains
+            .into_iter()
+            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+    );
 
     if !errors.is_empty() {
         return Err(errors);
