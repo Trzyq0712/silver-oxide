@@ -1,7 +1,9 @@
-//! Lower a Silver `domain` declaration to its `vmir::Domain` stub, and each of
-//! its (bodyless) domain functions to a `vmir::Function`. One `DomainTranslator`
-//! owns the domain stub *and* every function slot the domain declares.
+//! Lower a Silver `domain` declaration to its `vmir::Domain` stub, each of
+//! its (bodyless) domain functions to a `vmir::Function`, and each of its
+//! axioms to a `vmir::DomainAxiom`. One `DomainTranslator` owns the domain
+//! stub *and* every function/axiom slot the domain declares.
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use lasso::Spur;
@@ -9,7 +11,7 @@ use lasso::Spur;
 use crate::translate::GenericSig;
 use crate::translate::lower_type;
 use crate::translate::{DeclSlot, Declarator, Definer};
-use crate::translate::{Declared, Metaed, TranslationContext, TranslationError};
+use crate::translate::{Declared, Metaed, TranslationContext, TranslationError, pure_exp};
 use crate::viper::typed;
 use crate::vmir;
 
@@ -25,7 +27,37 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
     /// function's meaning and cannot be inferred at a call site — so the lowered
     /// function's `ty_params` and `Generic(i)` indices count only the used ones.
     fn_slots: Vec<(DeclSlot<vmir::Function>, Vec<Spur>)>,
+    /// One slot per axiom, parallel to `src.axioms`. An anonymous axiom's slot
+    /// is registered under the generated name `{domain}@axiom{i}` (`@` marks a
+    /// generated member); axioms are not callable, so no `name_map` entry.
+    axiom_slots: Vec<DeclSlot<vmir::DomainAxiom>>,
     _p: PhantomData<P>,
+}
+
+/// Record in `out` (order of first appearance, deduped) every member of
+/// `generics` occurring in `ty`, recursing into type arguments.
+fn collect_generics(ty: &typed::Type, generics: &[Spur], out: &mut Vec<Spur>) {
+    use typed::BuiltinCollection as C;
+    match ty {
+        typed::Type::Generic(id) => {
+            if generics.contains(&id.0) && !out.contains(&id.0) {
+                out.push(id.0);
+            }
+        }
+        typed::Type::Domain(_, args) => {
+            for a in args {
+                collect_generics(a, generics, out);
+            }
+        }
+        typed::Type::Collection(c) => match c {
+            C::Seq(t) | C::Set(t) | C::MultiSet(t) => collect_generics(t, generics, out),
+            C::Map(k, v) => {
+                collect_generics(k, generics, out);
+                collect_generics(v, generics, out);
+            }
+        },
+        typed::Type::Bool | typed::Type::Int | typed::Type::Real | typed::Type::Ref => {}
+    }
 }
 
 /// The subset of `generics` that occur anywhere in `params`/`ret`, in order of
@@ -33,35 +65,56 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
 /// its domain's type parameters, but one it never mentions is dropped so the
 /// lowered function is (correctly) monomorphic in that parameter.
 fn used_generics(generics: &[Spur], params: &[typed::TypedIdent], ret: &typed::Type) -> Vec<Spur> {
-    fn collect(ty: &typed::Type, generics: &[Spur], out: &mut Vec<Spur>) {
-        use typed::BuiltinCollection as C;
-        match ty {
-            typed::Type::Generic(id) => {
-                if generics.contains(&id.0) && !out.contains(&id.0) {
-                    out.push(id.0);
-                }
-            }
-            typed::Type::Domain(_, args) => {
-                for a in args {
-                    collect(a, generics, out);
-                }
-            }
-            typed::Type::Collection(c) => match c {
-                C::Seq(t) | C::Set(t) | C::MultiSet(t) => collect(t, generics, out),
-                C::Map(k, v) => {
-                    collect(k, generics, out);
-                    collect(v, generics, out);
-                }
-            },
-            typed::Type::Bool | typed::Type::Int | typed::Type::Real | typed::Type::Ref => {}
-        }
-    }
     let mut out = Vec::new();
     for p in params {
-        collect(&p.ty, generics, &mut out);
+        collect_generics(&p.ty, generics, &mut out);
     }
-    collect(ret, generics, &mut out);
+    collect_generics(ret, generics, &mut out);
     out
+}
+
+/// The subset of `generics` an axiom expression mentions, in order of first
+/// appearance — the axiom's own type parameters. Every instantiated type at a
+/// call inside the expression is recoverable from some node's synthesized
+/// type (arguments carry the params, the call node the result), so walking the
+/// `ty` of every node covers all type-argument positions.
+fn used_generics_in_exp(
+    exp: &typed::TypedPureExp<typed::AxiomExt>,
+    generics: &[Spur],
+    out: &mut Vec<Spur>,
+) {
+    use typed::PureExpKind as P;
+    collect_generics(&exp.ty, generics, out);
+    let mut walk_call = |call: &typed::Call<typed::AxiomExt>| {
+        for a in &call.args {
+            used_generics_in_exp(a, generics, out);
+        }
+    };
+    match exp.exp.as_ref() {
+        P::Ident(_) | P::Const(_) => {}
+        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
+            used_generics_in_exp(e, generics, out)
+        }
+        P::Ascribe(e, ty) => {
+            collect_generics(ty, generics, out);
+            used_generics_in_exp(e, generics, out);
+        }
+        P::Binary(_, l, r) => {
+            used_generics_in_exp(l, generics, out);
+            used_generics_in_exp(r, generics, out);
+        }
+        P::Ternary { if_, then, else_ } => {
+            used_generics_in_exp(if_, generics, out);
+            used_generics_in_exp(then, generics, out);
+            used_generics_in_exp(else_, generics, out);
+        }
+        P::LetIn { value, exp, .. } => {
+            used_generics_in_exp(value, generics, out);
+            used_generics_in_exp(exp, generics, out);
+        }
+        P::DomainFunctionCall(call) | P::AdtConstructor(call) => walk_call(call),
+        P::Ext(typed::AxiomExt::FunctionCall(call)) => walk_call(call),
+    }
 }
 
 impl<'a> DomainTranslator<'a, Declared> {
@@ -109,12 +162,23 @@ impl<'a> DomainTranslator<'a, Declared> {
             fn_slots.push((fslot, used));
         }
 
+        let mut axiom_slots = Vec::with_capacity(d.axioms.len());
+        for (i, ax) in d.axioms.iter().enumerate() {
+            let ax_name = match &ax.name {
+                Some(n) => ctx.interner.resolve(&n.0).to_string(),
+                None => format!("{name_str}@axiom{i}"),
+            };
+            let (_, aslot) = decl.alloc_slot::<vmir::DomainAxiom>(&ax_name);
+            axiom_slots.push(aslot);
+        }
+
         DomainTranslator {
             src: d,
             silver_name: d.name.0,
             generics,
             slot,
             fn_slots,
+            axiom_slots,
             _p: PhantomData,
         }
     }
@@ -127,6 +191,7 @@ impl<'a> DomainTranslator<'a, Declared> {
             generics: self.generics,
             slot: self.slot,
             fn_slots: self.fn_slots,
+            axiom_slots: self.axiom_slots,
             _p: PhantomData,
         }
     }
@@ -135,7 +200,7 @@ impl<'a> DomainTranslator<'a, Declared> {
 impl DomainTranslator<'_, Metaed> {
     pub(crate) fn define(
         self,
-        ctx: &TranslationContext<'_>,
+        ctx: &mut TranslationContext<'_>,
         definer: &mut impl Definer,
     ) -> Result<(), TranslationError> {
         let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
@@ -168,7 +233,52 @@ impl DomainTranslator<'_, Metaed> {
                 },
             );
         }
-        // TODO: axioms are not yet translated
+        // Axioms: lower each body against its own used generics (scoped into
+        // `ctx.decl_generics` so `Type::Generic` lowers positionally). The
+        // body is pure and heap-free — a callee is at most a precondition-free
+        // Silver function (typecheck-enforced), so the inert `Empty` heap is
+        // never read. Axiom bodies are never verified, only assumed.
+        let env = HashMap::new();
+        for (i, (ax, aslot)) in self.src.axioms.iter().zip(self.axiom_slots).enumerate() {
+            let mut used = Vec::new();
+            used_generics_in_exp(&ax.exp, &self.generics, &mut used);
+            ctx.decl_generics = used.clone();
+            let lowered = pure_exp::lower_function_body(
+                ctx,
+                &env,
+                &ax.exp,
+                0,
+                vmir::HeapVal::Empty,
+                None,
+                None,
+                None,
+            );
+            ctx.decl_generics = Vec::new();
+            let body = lowered?;
+            // A generic axiom must contain a trigger: one function application
+            // instantiating all its type parameters, from which the verifier
+            // reads each ground instantiation.
+            // The axiom's carried name matches its slot registration: the
+            // Silver name when given, the generated `{domain}@axiom{i}` slot
+            // name otherwise.
+            let ax_name = match &ax.name {
+                Some(n) => ctx.interner.resolve(&n.0).to_string(),
+                None => format!("{}@axiom{i}", ctx.interner.resolve(&self.silver_name)),
+            };
+            let name = definer.intern_name(&ax_name);
+            let axiom = vmir::DomainAxiom {
+                name: Some(name),
+                ty_params: used.len().into(),
+                body,
+            };
+            // A generic axiom must contain a trigger: one function application
+            // instantiating all its type parameters, from which the verifier
+            // reads each ground instantiation.
+            if !used.is_empty() && axiom.covering_trigger().is_none() {
+                return Err(TranslationError::AxiomGenericsNotInferable(ax_name));
+            }
+            definer.define_axiom(aslot, axiom);
+        }
         Ok(())
     }
 }

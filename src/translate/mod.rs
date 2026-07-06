@@ -133,10 +133,12 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
             .into_iter()
             .filter_map(|t| t.define(&ctx, &mut builder).err()),
     );
+    // Domains take `&mut ctx`: axiom lowering scopes the axiom's type
+    // parameters into `ctx.decl_generics` (cleared before returning).
     errors.extend(
         domains
             .into_iter()
-            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+            .filter_map(|t| t.define(&mut ctx, &mut builder).err()),
     );
 
     if !errors.is_empty() {

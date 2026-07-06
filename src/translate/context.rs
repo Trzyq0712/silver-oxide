@@ -72,6 +72,12 @@ pub(crate) struct TranslationContext<'a> {
     /// finishes (fields/predicates are the only ones that register groups,
     /// all during `declare`; nothing registers one afterwards).
     pub(crate) groups: Rodeo<Spur>,
+    /// Type parameters of the **generic body currently being lowered** (a
+    /// domain axiom's used generics), so `lower_type`/`call_type_args` map a
+    /// `typed::Type::Generic` to its positional `vmir::Type::Generic(i)`.
+    /// Scoped by `DomainTranslator::define` (set per axiom, cleared after);
+    /// empty everywhere else — method/function/resource bodies are monomorphic.
+    pub(crate) decl_generics: Vec<Spur>,
 }
 
 impl<'a> TranslationContext<'a> {
@@ -84,6 +90,7 @@ impl<'a> TranslationContext<'a> {
             adt: AdtInfo::default(),
             fn_generic_sigs: HashMap::new(),
             groups: Rodeo::new(),
+            decl_generics: Vec::new(),
         }
     }
 
@@ -131,11 +138,13 @@ impl<'a> TranslationContext<'a> {
         self.contracts.get(&m).and_then(|c| c.ensures)
     }
 
-    /// Lower a type in a concrete (non-generic) context. For ADT-declaration
-    /// field types (which may mention type parameters) call the free
-    /// [`super::lower_type`] with the owning ADT's parameter list instead.
+    /// Lower a type against the current body's type parameters
+    /// (`decl_generics` — empty outside generic bodies, i.e. everywhere but a
+    /// domain axiom). For ADT-declaration field types (which may mention type
+    /// parameters) call the free [`super::lower_type`] with the owning ADT's
+    /// parameter list instead.
     pub(crate) fn lower_type(&self, ty: &typed::Type) -> vmir::Type {
-        super::lower_type(&self.name_map, &[], ty)
+        super::lower_type(&self.name_map, &self.decl_generics, ty)
     }
 
     /// The interned group tag for a field/predicate name (registered in the
