@@ -12,7 +12,8 @@ use crate::vmir;
 /// `names` resolves a domain/ADT name `Spur` to its VMIR declaration id;
 /// `generics` is the enclosing generic declaration's type-parameter list (used
 /// to map a `Type::Generic` to its 0-based index). Both are empty in fully
-/// concrete contexts (most call sites go through [`super::Builder::lower_type`]).
+/// concrete contexts (most call sites go through
+/// [`super::TranslationContext::lower_type`]).
 pub(crate) fn lower_type(
     names: &HashMap<Spur, vmir::MemberId>,
     generics: &[Spur],
