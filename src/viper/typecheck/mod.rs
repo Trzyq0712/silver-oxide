@@ -93,6 +93,47 @@ impl<'g> LocalEnv<'g> {
         LoweringCtx::new(self, &table).lower_pure::<Ext>(exp)
     }
 
+    /// Typecheck a domain axiom body: a closed boolean expression with the
+    /// owning domain's type parameters (`rigid`) in scope as rigid types.
+    /// Applies Silver's `ground()` rule: a generic-instantiation variable no
+    /// argument pinned defaults to the enclosing domain's parameter itself
+    /// (making the axiom implicitly generic over it); one from a foreign
+    /// domain's function is an error.
+    fn typecheck_axiom(
+        &self,
+        exp: &mut viper::Exp,
+        rigid: &[Spur],
+    ) -> Result<TypedPureExp<typed::AxiomExt>, TypeError> {
+        let mut c = ConstraintCtx::new(self, None);
+        c.rigid_generics = rigid.iter().copied().collect();
+        let root = c.constrain_pure(exp)?;
+        c.impose_type(root, &Type::Bool, &HashMap::new())?;
+        // Peek at the solved variants (preliminary pass on a clone; the real
+        // checker stays open for the defaulting impositions below).
+        let prelim =
+            c.tc.clone()
+                .type_check_preliminary()
+                .map_err(TypeError::from)?;
+        let insts = std::mem::take(&mut c.generic_insts);
+        for (name, key) in insts {
+            let unconstrained = prelim
+                .get(&key)
+                .is_none_or(|p| matches!(p.variant, ViperTcType::Top));
+            if !unconstrained {
+                continue;
+            }
+            if c.rigid_generics.contains(&name) {
+                c.tc.impose(key.concretizes_explicit(ViperTcType::Generic(Ident(name))))?;
+            } else {
+                return Err(TypeError::UnconstrainedTypeParamInAxiom(
+                    self.interner.resolve(&name).to_string(),
+                ));
+            }
+        }
+        let table = c.tc.type_check().map_err(TypeError::from)?;
+        LoweringCtx::new(self, &table).lower_pure::<typed::AxiomExt>(exp)
+    }
+
     /// Typecheck a spatial (assertion) expression and lower it to `typed`.
     fn typecheck_spatial<Ext: PureExt>(
         &self,
@@ -140,6 +181,14 @@ struct ConstraintCtx<'a, 'g> {
     let_bindings: HashMap<Spur, TcKey>,
     /// Return type for the enclosing function, enabling `result`; None otherwise.
     result_ty: Option<Type>,
+    /// Type parameters in scope as **rigid** types (a domain's params while
+    /// typechecking its axioms): a `Generic` mentioning one is legal without a
+    /// `subst` entry and unifies only with itself. Empty everywhere else.
+    rigid_generics: HashSet<Spur>,
+    /// Every generic-instantiation variable minted by `instantiate_generics`,
+    /// with the type-parameter name it instantiates. Lets the axiom path apply
+    /// Silver's `ground()` defaulting to the ones no argument pinned.
+    generic_insts: Vec<(Spur, TcKey)>,
 }
 
 impl<'a, 'g> ConstraintCtx<'a, 'g> {
@@ -149,6 +198,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
             tc: TypeChecker::without_vars(),
             let_bindings: HashMap::new(),
             result_ty,
+            rigid_generics: HashSet::new(),
+            generic_insts: Vec::new(),
         }
     }
 }
@@ -196,6 +247,42 @@ trait PureExt: Sized {
     /// Lift a heap-reading construct (`e.f`, `function` call, `unfolding`) into
     /// this context's extension. A pure context (`!`) rejects it.
     fn lower_heap(node: typed::HeapNode<Self>) -> Result<Self, TypeError>;
+    /// Whether a quantifier may appear in this context. Axioms (ground-only)
+    /// reject it; everywhere else it currently lowers to `true` until proper
+    /// quantifier support lands.
+    fn check_quantifier() -> Result<(), TypeError> {
+        Ok(())
+    }
+}
+
+/// Domain axioms: Silver `function` calls allowed (the no-precondition check
+/// happens after lowering, in `typecheck_program`), everything else
+/// heap-flavoured rejected. Ground only — quantifiers rejected.
+impl PureExt for typed::AxiomExt {
+    fn lower_old(
+        _label: Option<Spur>,
+        _inner: TypedPureExp<Self>,
+        _known_labels: &HashSet<Spur>,
+        _interner: &Interner,
+    ) -> Result<Self, TypeError> {
+        Err(TypeError::IllegalOldUsage)
+    }
+    fn lower_result() -> Result<Self, TypeError> {
+        Err(TypeError::IllegalResultUsage)
+    }
+    fn lower_perm(_resource: ResourceExp<Self>) -> Result<Self, TypeError> {
+        Err(TypeError::PermissionInPureContext)
+    }
+    fn lower_heap(node: typed::HeapNode<Self>) -> Result<Self, TypeError> {
+        match node {
+            typed::HeapNode::FunctionCall(call) => Ok(typed::AxiomExt::FunctionCall(call)),
+            typed::HeapNode::Field(..) => Err(TypeError::FieldAccessInAxiom),
+            typed::HeapNode::Unfolding(..) => Err(TypeError::UnfoldingInAxiom),
+        }
+    }
+    fn check_quantifier() -> Result<(), TypeError> {
+        Err(TypeError::QuantifierInAxiom)
+    }
 }
 
 impl PureExt for ! {
@@ -677,11 +764,17 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 .impose(key.concretizes_explicit(ViperTcType::Real))?,
             Type::Ref => self.tc.impose(key.concretizes_explicit(ViperTcType::Ref))?,
             Type::Generic(id) => {
-                let var = subst.get(&id.0).copied().ok_or_else(|| {
-                    TypeError::UnboundTypeParam(self.env.interner.resolve(&id.0).to_string())
-                })?;
-                if var != key {
-                    self.tc.impose(key.equate_with(var))?;
+                if let Some(&var) = subst.get(&id.0) {
+                    if var != key {
+                        self.tc.impose(key.equate_with(var))?;
+                    }
+                } else if self.rigid_generics.contains(&id.0) {
+                    self.tc
+                        .impose(key.concretizes_explicit(ViperTcType::Generic(*id)))?;
+                } else {
+                    return Err(TypeError::UnboundTypeParam(
+                        self.env.interner.resolve(&id.0).to_string(),
+                    ));
                 }
             }
             Type::Domain(id, args) => {
@@ -708,7 +801,11 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
         }
         names
             .into_iter()
-            .map(|n| (n, self.tc.new_term_key()))
+            .map(|n| {
+                let key = self.tc.new_term_key();
+                self.generic_insts.push((n, key));
+                (n, key)
+            })
             .collect()
     }
 
@@ -981,7 +1078,11 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
             }
 
             // Quantifiers emitted as bool constant (proper typed support later).
-            ExpKind::Quantifier(..) => Ok(PureExpKind::Const(Literal::Bool(true))),
+            // Contexts assumed verbatim (axioms) reject them instead.
+            ExpKind::Quantifier(..) => {
+                Ext::check_quantifier()?;
+                Ok(PureExpKind::Const(Literal::Bool(true)))
+            }
 
             _ => Err(TypeError::Other(format!(
                 "unsupported pure expression: {:?}",
@@ -1663,6 +1764,51 @@ fn typecheck_method(
     }))
 }
 
+/// Reject calls to Silver functions with a precondition anywhere in an axiom —
+/// Viper's one restriction on normal functions in axioms (a precondition-free
+/// function is also heap-free, so no snapshot argument is needed downstream).
+fn check_axiom_function_calls(
+    exp: &TypedPureExp<typed::AxiomExt>,
+    fns_with_precond: &HashSet<Spur>,
+    interner: &Interner,
+) -> Result<(), TypeError> {
+    use PureExpKind as P;
+    let check_call = |call: &Call<typed::AxiomExt>| -> Result<(), TypeError> {
+        for arg in &call.args {
+            check_axiom_function_calls(arg, fns_with_precond, interner)?;
+        }
+        Ok(())
+    };
+    match exp.exp.as_ref() {
+        P::Ident(_) | P::Const(_) => Ok(()),
+        P::Unary(_, e) | P::Ascribe(e, _) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
+            check_axiom_function_calls(e, fns_with_precond, interner)
+        }
+        P::Binary(_, l, r) => {
+            check_axiom_function_calls(l, fns_with_precond, interner)?;
+            check_axiom_function_calls(r, fns_with_precond, interner)
+        }
+        P::Ternary { if_, then, else_ } => {
+            check_axiom_function_calls(if_, fns_with_precond, interner)?;
+            check_axiom_function_calls(then, fns_with_precond, interner)?;
+            check_axiom_function_calls(else_, fns_with_precond, interner)
+        }
+        P::LetIn { value, exp, .. } => {
+            check_axiom_function_calls(value, fns_with_precond, interner)?;
+            check_axiom_function_calls(exp, fns_with_precond, interner)
+        }
+        P::DomainFunctionCall(call) | P::AdtConstructor(call) => check_call(call),
+        P::Ext(typed::AxiomExt::FunctionCall(call)) => {
+            if fns_with_precond.contains(&call.name.0) {
+                return Err(TypeError::PreconditionedFunctionInAxiom(
+                    interner.resolve(&call.name.0).to_string(),
+                ));
+            }
+            check_call(call)
+        }
+    }
+}
+
 // ==========================================
 // 12. Entry point
 // ==========================================
@@ -1678,8 +1824,7 @@ pub fn typecheck_program(
     let mut errors = Vec::new();
 
     // Domain functions/axioms are separate `DomainElement` decls; gather the
-    // functions per owning domain so each `Domain` can carry them. Axioms are
-    // deferred (nothing consumes them yet).
+    // functions and axioms per owning domain so each `Domain` can carry them.
     let mut domain_fns: std::collections::HashMap<lasso::Spur, Vec<typed::DomainFunction>> =
         std::collections::HashMap::new();
     // Each domain's type parameters, so a function signature that mentions one
@@ -1706,6 +1851,46 @@ pub fn typecheck_program(
         }
     }
 
+    // Silver functions with a precondition — barred from axioms.
+    let fns_with_precond: HashSet<Spur> = program
+        .0
+        .iter()
+        .filter_map(|decl| match decl {
+            viper::Declaration::Function(f) if !f.contract.precondition.is_empty() => {
+                Some(f.signature.name.0.id())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Typecheck each axiom against its owning domain's params (in scope as
+    // rigid types), then enforce the no-precondition restriction on any Silver
+    // function it calls.
+    let mut domain_axioms: std::collections::HashMap<lasso::Spur, Vec<typed::Axiom>> =
+        std::collections::HashMap::new();
+    for decl in &mut program.0 {
+        if let viper::Declaration::DomainElement(de) = decl
+            && let viper::DomainElementKind::Axiom(ax) = &mut de.kind
+        {
+            let params = domain_params
+                .get(&de.domain.id())
+                .cloned()
+                .unwrap_or_default();
+            let env = LocalEnv::new(globals, &interner);
+            let result = env.typecheck_axiom(&mut ax.exp.0, &params).and_then(|exp| {
+                check_axiom_function_calls(&exp, &fns_with_precond, &interner)?;
+                Ok(typed::Axiom {
+                    name: ax.name.as_ref().map(|n| Ident(n.0.id())),
+                    exp,
+                })
+            });
+            match result {
+                Ok(a) => domain_axioms.entry(de.domain.id()).or_default().push(a),
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+
     for decl in &mut program.0 {
         let result = match decl {
             viper::Declaration::Field(field) => Ok(Some(typecheck_field(field))),
@@ -1725,9 +1910,9 @@ pub fn typecheck_program(
                     name: Ident(domain.name.0.id()),
                     type_params: domain.params.iter().map(|p| Ident(p.0.id())).collect(),
                     functions,
-                    // TODO: typecheck domain axioms into `TypedPureExp` once a
-                    // consumer (verify) needs them.
-                    axioms: Vec::new(),
+                    axioms: domain_axioms
+                        .remove(&domain.name.0.id())
+                        .unwrap_or_default(),
                 })))
             }
             _ => Ok(None),
@@ -1770,6 +1955,141 @@ mod tests {
         disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
         inline_macros(&mut program, &interner).expect("macro inline failed");
         typecheck_program(&mut program, interner, &globals)
+    }
+
+    #[test]
+    fn axiom_ground_with_domain_function() {
+        let program = run_pipeline(
+            r#"
+domain D { function size(): Int axiom sz { size() == 0 } }
+"#,
+        )
+        .expect("expected Ok");
+        let dom = program
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                typed::Declaration::Domain(dom) => Some(dom),
+                _ => None,
+            })
+            .expect("domain missing");
+        assert_eq!(dom.axioms.len(), 1);
+        assert_eq!(dom.axioms[0].exp.ty, Type::Bool);
+    }
+
+    #[test]
+    fn axiom_generic_defaults_to_domain_param() {
+        // `len(nil())` leaves the instantiation unconstrained; Silver's
+        // `ground()` rule defaults it to the domain's own `T`.
+        let program = run_pipeline(
+            r#"
+domain List[T] {
+    function nil(): List[T]
+    function len(xs: List[T]): Int
+    axiom { len(nil()) == 0 }
+}
+"#,
+        )
+        .expect("expected Ok");
+        let dom = program
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                typed::Declaration::Domain(dom) => Some(dom),
+                _ => None,
+            })
+            .expect("domain missing");
+        assert_eq!(dom.axioms.len(), 1);
+        // The inner `nil()` must have type `List[Generic(T)]`.
+        let exp = &dom.axioms[0].exp;
+        let PureExpKind::Binary(BinOp::Eq, l, _) = exp.exp.as_ref() else {
+            panic!("expected ==, got {:?}", exp.exp);
+        };
+        let PureExpKind::DomainFunctionCall(call) = l.exp.as_ref() else {
+            panic!("expected len call, got {:?}", l.exp);
+        };
+        let nil_ty = &call.args[0].ty;
+        assert!(
+            matches!(nil_ty, Type::Domain(_, args)
+                if matches!(args.as_slice(), [Type::Generic(_)])),
+            "expected List[Generic(T)], got {nil_ty:?}"
+        );
+    }
+
+    #[test]
+    fn axiom_normal_function_without_precond_ok() {
+        let result = run_pipeline(
+            r#"
+function one(): Int ensures result == 1 { 1 }
+domain D { axiom o { one() == 1 } }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn axiom_function_with_precond_rejected() {
+        let result = run_pipeline(
+            r#"
+function pos(x: Int): Int requires x > 0 { x }
+domain D { axiom p { pos(1) == 1 } }
+"#,
+        );
+        assert!(
+            result.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::PreconditionedFunctionInAxiom(_)))),
+            "expected PreconditionedFunctionInAxiom, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn axiom_field_access_rejected() {
+        let result = run_pipeline(
+            r#"
+field f: Int
+domain D { axiom a { null.f == 0 } }
+"#,
+        );
+        assert!(
+            result.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::FieldAccessInAxiom))),
+            "expected FieldAccessInAxiom, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn axiom_quantifier_rejected() {
+        let result = run_pipeline(
+            r#"
+domain D { axiom q { forall x: Int :: x == x } }
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::QuantifierInAxiom))),
+            "expected QuantifierInAxiom, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn axiom_foreign_unconstrained_param_rejected() {
+        // `emp()`'s `U` (from another domain) is never pinned inside `D`'s
+        // axiom — an error, not a silent default.
+        let result = run_pipeline(
+            r#"
+domain Box[U] { function emp(): Box[U] function full(b: Box[U]): Bool }
+domain D { axiom b { full(emp()) } }
+"#,
+        );
+        assert!(
+            result.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::UnconstrainedTypeParamInAxiom(_)))),
+            "expected UnconstrainedTypeParamInAxiom, got: {result:?}"
+        );
     }
 
     #[test]

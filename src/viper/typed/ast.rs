@@ -206,6 +206,15 @@ pub enum HeapExt {
     Heap(HeapNode<HeapExt>),
 }
 
+/// The single extension allowed in a domain axiom: a call to a Silver
+/// `function`. Viper's only restriction on such calls is that the callee has
+/// **no precondition** (checked after lowering), which also makes it heap-free.
+/// Field access, `unfolding`, `old`, `perm`, and `result` remain illegal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AxiomExt {
+    FunctionCall(Call<AxiomExt>),
+}
+
 /// Extensions allowed in function postconditions: heap access + `result`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuncEnsuresExt {
@@ -299,10 +308,15 @@ pub struct Domain {
     pub axioms: Vec<Axiom>,
 }
 
+/// A ground (quantifier-free) domain axiom: a closed boolean expression over
+/// domain functions, ADT operations, and precondition-free Silver `function`s.
+/// Implicitly generic over any of the owning domain's type parameters it
+/// mentions (an unconstrained instantiation defaults to the parameter itself,
+/// mirroring Silver's `ground()` rule).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Axiom {
     pub name: Option<Ident>,
-    pub exp: TypedPureExp<!>,
+    pub exp: TypedPureExp<AxiomExt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

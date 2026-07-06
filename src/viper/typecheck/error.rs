@@ -32,6 +32,18 @@ pub enum TypeError {
     },
     /// A `Generic` type parameter occurred outside a scope that binds it.
     UnboundTypeParam(String),
+    /// A quantifier in a domain axiom (only ground axioms are supported).
+    QuantifierInAxiom,
+    /// A field dereference in a domain axiom.
+    FieldAccessInAxiom,
+    /// An `unfolding` expression in a domain axiom.
+    UnfoldingInAxiom,
+    /// An axiom calls a Silver `function` that has a precondition.
+    PreconditionedFunctionInAxiom(String),
+    /// A call in an axiom left a type parameter of a *foreign* domain's
+    /// function unconstrained (an enclosing-domain parameter would default to
+    /// itself, Silver's `ground()` rule).
+    UnconstrainedTypeParamInAxiom(String),
     Tc(TcErr<ViperTcType>),
     Other(String),
 }
@@ -90,6 +102,27 @@ impl std::fmt::Display for TypeError {
             }
             TypeError::UnboundTypeParam(name) => {
                 write!(f, "unbound type parameter `{name}`")
+            }
+            TypeError::QuantifierInAxiom => {
+                write!(f, "quantifiers are not supported in domain axioms")
+            }
+            TypeError::FieldAccessInAxiom => {
+                write!(f, "field access not allowed in a domain axiom")
+            }
+            TypeError::UnfoldingInAxiom => {
+                write!(f, "`unfolding` not allowed in a domain axiom")
+            }
+            TypeError::PreconditionedFunctionInAxiom(name) => {
+                write!(
+                    f,
+                    "cannot use function `{name}`, which has preconditions, inside a domain axiom"
+                )
+            }
+            TypeError::UnconstrainedTypeParamInAxiom(name) => {
+                write!(
+                    f,
+                    "unconstrained type parameter `{name}` in a domain axiom; annotate the call"
+                )
             }
             TypeError::Tc(e) => write!(f, "Constraint error: {e:?}"),
             TypeError::Other(msg) => write!(f, "{msg}"),

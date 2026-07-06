@@ -15,6 +15,11 @@ pub enum ViperTcType {
     /// (see `arity`/`construct`), so `Option[Int]` and `Option[Bool]` are
     /// distinguished by their child types, not by the variant alone.
     Domain(Ident, usize),
+    /// A **rigid** type parameter (of the enclosing domain, in an axiom): it
+    /// unifies only with itself and constructs to `Type::Generic`. Distinct
+    /// from an *instantiation* variable (a plain unconstrained key), which any
+    /// concrete type may still pin.
+    Generic(Ident),
     Top,
 }
 
@@ -54,6 +59,7 @@ impl Variant for ViperTcType {
             (Int, Int) => Int,
             (Real, Real) => Real,
             (Domain(a, n), Domain(b, m)) if a == b && n == m => Domain(a, n),
+            (Generic(a), Generic(b)) if a == b => Generic(a),
             (t1, t2) => {
                 return Err(TcTypeErr(format!("Cannot unify {:?} and {:?}", t1, t2)));
             }
@@ -84,6 +90,7 @@ impl Constructable for ViperTcType {
             ViperTcType::Real | ViperTcType::Numeric => Type::Real,
             ViperTcType::Ref => Type::Ref,
             ViperTcType::Domain(id, _) => Type::Domain(*id, children.to_vec()),
+            ViperTcType::Generic(id) => Type::Generic(*id),
             ViperTcType::Top => {
                 return Err(TcTypeErr("Cannot construct abstract type".to_string()));
             }

@@ -11,10 +11,11 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::viper::interner::Interner;
 use crate::viper::typed::{
-    AssignLhs, AssignRhs, BinOp, Call, Declaration, Domain, DomainFunction, Field, FuncEnsuresExt,
-    Function, HeapExt, HeapNode, Ident, Literal, Method, MethodBodyExt, MethodEnsuresExt,
-    Predicate, PredicateWithPerm, Program, PureExpKind, ResourceExp, ResourceExpKind, SpatialExp,
-    SpatialExpKind, StarOrFields, Statement, StmtBlock, Type, TypedIdent, TypedPureExp, UnOp,
+    AssignLhs, AssignRhs, AxiomExt, BinOp, Call, Declaration, Domain, DomainFunction, Field,
+    FuncEnsuresExt, Function, HeapExt, HeapNode, Ident, Literal, Method, MethodBodyExt,
+    MethodEnsuresExt, Predicate, PredicateWithPerm, Program, PureExpKind, ResourceExp,
+    ResourceExpKind, SpatialExp, SpatialExpKind, StarOrFields, Statement, StmtBlock, Type,
+    TypedIdent, TypedPureExp, UnOp,
 };
 
 /// Interner-aware formatting wrapper.
@@ -89,6 +90,14 @@ impl ShowExt for HeapExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
             HeapExt::Heap(node) => fmt_heap_node(node, f, interner),
+        }
+    }
+}
+
+impl ShowExt for AxiomExt {
+    fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
+        match self {
+            AxiomExt::FunctionCall(call) => write!(f, "{}", Show::new(call, interner)),
         }
     }
 }
@@ -252,6 +261,13 @@ impl<'a> Display for Show<'a, &'a Domain> {
         writeln!(f, " {{")?;
         for func in &self.item.functions {
             writeln!(f, "  {}", self.with(func))?;
+        }
+        for ax in &self.item.axioms {
+            write!(f, "  axiom")?;
+            if let Some(n) = &ax.name {
+                write!(f, " {}", self.name(*n))?;
+            }
+            writeln!(f, " {{ {} }}", self.with(&ax.exp))?;
         }
         write!(f, "}}")
     }
