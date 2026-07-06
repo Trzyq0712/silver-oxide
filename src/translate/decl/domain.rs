@@ -18,9 +18,50 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
     silver_name: Spur,
     generics: Vec<Spur>,
     slot: DeclSlot<vmir::Domain>,
-    /// One slot per domain function, parallel to `src.functions`.
-    fn_slots: Vec<DeclSlot<vmir::Function>>,
+    /// One entry per domain function, parallel to `src.functions`: its reserved
+    /// `Function` slot and the subset of the domain's type parameters the
+    /// function actually mentions in its signature (order of first appearance).
+    /// A parameter the function never uses is dropped — it is irrelevant to the
+    /// function's meaning and cannot be inferred at a call site — so the lowered
+    /// function's `ty_params` and `Generic(i)` indices count only the used ones.
+    fn_slots: Vec<(DeclSlot<vmir::Function>, Vec<Spur>)>,
     _p: PhantomData<P>,
+}
+
+/// The subset of `generics` that occur anywhere in `params`/`ret`, in order of
+/// first appearance. A domain function is implicitly parameterized by all of
+/// its domain's type parameters, but one it never mentions is dropped so the
+/// lowered function is (correctly) monomorphic in that parameter.
+fn used_generics(generics: &[Spur], params: &[typed::TypedIdent], ret: &typed::Type) -> Vec<Spur> {
+    fn collect(ty: &typed::Type, generics: &[Spur], out: &mut Vec<Spur>) {
+        use typed::BuiltinCollection as C;
+        match ty {
+            typed::Type::Generic(id) => {
+                if generics.contains(&id.0) && !out.contains(&id.0) {
+                    out.push(id.0);
+                }
+            }
+            typed::Type::Domain(_, args) => {
+                for a in args {
+                    collect(a, generics, out);
+                }
+            }
+            typed::Type::Collection(c) => match c {
+                C::Seq(t) | C::Set(t) | C::MultiSet(t) => collect(t, generics, out),
+                C::Map(k, v) => {
+                    collect(k, generics, out);
+                    collect(v, generics, out);
+                }
+            },
+            typed::Type::Bool | typed::Type::Int | typed::Type::Real | typed::Type::Ref => {}
+        }
+    }
+    let mut out = Vec::new();
+    for p in params {
+        collect(&p.ty, generics, &mut out);
+    }
+    collect(ret, generics, &mut out);
+    out
 }
 
 impl<'a> DomainTranslator<'a, Declared> {
@@ -43,23 +84,29 @@ impl<'a> DomainTranslator<'a, Declared> {
             let fn_name = ctx.interner.resolve(&df.name.0).to_string();
             let (fid, fslot) = decl.alloc_slot::<vmir::Function>(&fn_name);
             ctx.name_map.insert(df.name.0, fid);
+            // Only the type parameters the function actually mentions survive;
+            // an unused one is irrelevant to the function and cannot be inferred
+            // at a call site.
+            let used = used_generics(&generics, &df.params, &df.ret);
             // Record the declared generic signature so a call site can recover
-            // its full type-argument instantiation (in this domain's
-            // type-parameter order). Only generic functions need it; a
-            // monomorphic one carries no type args.
-            if !generics.is_empty() {
+            // its type-argument instantiation (in this function's *used*
+            // type-parameter order). A function using no type parameter needs
+            // none — leaving it out of `fn_generic_sigs` also keeps
+            // `call_type_args` from trying (and failing) to resolve a parameter
+            // that never occurs in its signature.
+            if !used.is_empty() {
                 let typed_params: Vec<typed::Type> =
                     df.params.iter().map(|p| p.ty.clone()).collect();
                 ctx.fn_generic_sigs.insert(
                     df.name.0,
                     GenericSig {
-                        ty_params: generics.clone(),
+                        ty_params: used.clone(),
                         params: typed_params,
                         ret: df.ret.clone(),
                     },
                 );
             }
-            fn_slots.push(fslot);
+            fn_slots.push((fslot, used));
         }
 
         DomainTranslator {
@@ -99,19 +146,22 @@ impl DomainTranslator<'_, Metaed> {
                 ty_params: self.generics.len().into(),
             },
         );
-        for (df, fslot) in self.src.functions.iter().zip(self.fn_slots) {
+        for (df, (fslot, used)) in self.src.functions.iter().zip(self.fn_slots) {
+            // Lower against the function's *used* type parameters, so each
+            // `Generic(i)` indexes into `used` (0..used.len()) and unused domain
+            // parameters neither appear nor inflate `ty_params`.
             let params: Vec<vmir::Type> = df
                 .params
                 .iter()
-                .map(|p| lower_type(&ctx.name_map, &self.generics, &p.ty))
+                .map(|p| lower_type(&ctx.name_map, &used, &p.ty))
                 .collect();
-            let ret = lower_type(&ctx.name_map, &self.generics, &df.ret);
+            let ret = lower_type(&ctx.name_map, &used, &df.ret);
             let fn_name = definer.intern_name(ctx.interner.resolve(&df.name.0));
             definer.define_function(
                 fslot,
                 vmir::Function {
                     name: fn_name,
-                    ty_params: self.generics.len().into(),
+                    ty_params: used.len().into(),
                     params: params.into(),
                     ret,
                     body: None,

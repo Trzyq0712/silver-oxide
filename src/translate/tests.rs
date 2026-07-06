@@ -390,6 +390,59 @@ function len(l: List[Int]): Int
 /// A heapless obligation (`assert`, division) carries the current check-in heap
 /// on its `Inst`; `assume` (no verification) and a heap-embedding `Deref` do not.
 #[test]
+fn domain_fn_drops_unused_type_params() {
+    // A domain function is implicitly parameterized by the domain's type
+    // parameters, but a parameter it never mentions in its signature is
+    // irrelevant to the function's meaning and cannot be inferred at a call
+    // site. The desired lowering therefore drops the unused parameters: the
+    // translated `vmir::Function` keeps only the type parameters that actually
+    // occur in its params/ret, re-indexed `Generic(0..k)` in order of first
+    // appearance. A function using *none* of them lowers to `ty_params = 0`.
+    let input = r#"
+domain Box[T] {
+    function empty(): Int
+    function wrap(x: T): T
+}
+"#;
+    let p = run(input);
+
+    let box_id = p.id("Box").expect("missing Box domain");
+    let vmir::Declaration::Domain(dom) = &p.decls[box_id] else {
+        panic!("Box must be a Domain");
+    };
+    // The domain itself still records all its declared type parameters.
+    assert_eq!(dom.ty_params, 1.into(), "Box declares one type parameter T");
+
+    // `empty(): Int` mentions no type parameter — it must lower to a
+    // monomorphic function (`ty_params = 0`), not carry the domain's unused T.
+    let empty_id = p.id("empty").expect("missing empty");
+    let vmir::Declaration::Function(empty) = &p.decls[empty_id] else {
+        panic!("empty must be a Function");
+    };
+    assert_eq!(
+        empty.ty_params,
+        0.into(),
+        "empty uses no type parameter, so its unused T must be dropped"
+    );
+    assert_eq!(empty.params, Vec::<vmir::Type>::new().into());
+    assert_eq!(empty.ret, vmir::Type::Int);
+
+    // `wrap(x: T): T` mentions T — it keeps exactly that one parameter,
+    // re-indexed to `Generic(0)`.
+    let wrap_id = p.id("wrap").expect("missing wrap");
+    let vmir::Declaration::Function(wrap) = &p.decls[wrap_id] else {
+        panic!("wrap must be a Function");
+    };
+    assert_eq!(
+        wrap.ty_params,
+        1.into(),
+        "wrap uses its one type parameter T"
+    );
+    assert_eq!(wrap.params, vec![vmir::Type::Generic(0)].into());
+    assert_eq!(wrap.ret, vmir::Type::Generic(0));
+}
+
+#[test]
 fn obligations_carry_check_in_heap() {
     use vmir::{BinOp, InstKind, PureInst};
     let input = r#"
