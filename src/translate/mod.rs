@@ -19,7 +19,8 @@
 //! Phase order is enforced by the type system — a translator changes type
 //! (`FooTranslator<'a, Declared>` → `<'a, Metaed>`), and `define` exists only
 //! on the `Metaed` state. This is a second typestate axis, orthogonal to the
-//! [`DeclSlot`] fill-obligation drop-bomb.
+//! [`DeclSlot`] write capability (every reserved slot is filled exactly once;
+//! checked in `Builder::finalize`).
 
 use crate::viper::typed;
 use crate::vmir;

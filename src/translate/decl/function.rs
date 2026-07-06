@@ -19,15 +19,6 @@ pub(crate) enum RequiresSlot {
     HeapDep(DeclSlot<vmir::Resource>),
 }
 
-impl RequiresSlot {
-    fn abandon(self) {
-        match self {
-            RequiresSlot::HeapFree(h) => h.abandon(),
-            RequiresSlot::HeapDep(h) => h.abandon(),
-        }
-    }
-}
-
 pub(crate) struct FunctionTranslator<'a, P = Declared> {
     src: &'a typed::Function,
     silver_name: Spur,
@@ -121,25 +112,6 @@ impl<'a> FunctionTranslator<'a, Declared> {
 }
 
 impl FunctionTranslator<'_, Metaed> {
-    /// Abandon every `DeclSlot` this translator still owns — called on an error
-    /// path so the drop bomb doesn't panic on top of the `TranslationError`
-    /// being propagated.
-    fn abandon(
-        fn_slot: Option<DeclSlot<vmir::Function>>,
-        requires_slot: Option<RequiresSlot>,
-        ensures_slot: Option<DeclSlot<vmir::Function>>,
-    ) {
-        if let Some(h) = fn_slot {
-            h.abandon();
-        }
-        if let Some(h) = requires_slot {
-            h.abandon();
-        }
-        if let Some(h) = ensures_slot {
-            h.abandon();
-        }
-    }
-
     /// Fill this function's reserved slots (see [`Self::declare`]): the main
     /// function decl, plus `#requires` / `#ensures` contracts when present.
     ///
@@ -182,9 +154,6 @@ impl FunctionTranslator<'_, Metaed> {
             heap_dep,
             _p,
         } = self;
-        let mut fn_slot = Some(fn_slot);
-        let mut requires_slot = requires_slot;
-        let mut ensures_slot = ensures_slot;
 
         let fname = ctx.interner.resolve(&silver_name).to_string();
         let n_params = f.params.len();
@@ -201,26 +170,16 @@ impl FunctionTranslator<'_, Metaed> {
         // heap-dependent → a self-framed Resource (footprint + bool).
         if let Some(requires) = f.requires.as_ref() {
             let name = definer.intern_name(&format!("{fname}#requires"));
-            match requires_slot
-                .take()
-                .expect("declared when f.requires is Some")
-            {
+            match requires_slot.expect("declared when f.requires is Some") {
                 RequiresSlot::HeapDep(slot) => {
-                    let body = match spatial::lower_spatial_never(
+                    let body = spatial::lower_spatial_never(
                         ctx,
                         &env,
                         requires,
                         n_params,
                         vmir::HeapVal::Empty,
                         0,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            slot.abandon();
-                            Self::abandon(fn_slot.take(), None, ensures_slot.take());
-                            return Err(e);
-                        }
-                    };
+                    )?;
                     definer.define_resource(
                         slot,
                         vmir::Resource {
@@ -232,15 +191,7 @@ impl FunctionTranslator<'_, Metaed> {
                     );
                 }
                 RequiresSlot::HeapFree(slot) => {
-                    let body = match spatial::lower_pure_precond_body(ctx, &env, requires, n_params)
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            slot.abandon();
-                            Self::abandon(fn_slot.take(), None, ensures_slot.take());
-                            return Err(e);
-                        }
-                    };
+                    let body = spatial::lower_pure_precond_body(ctx, &env, requires, n_params)?;
                     definer.define_function(
                         slot,
                         vmir::Function {
@@ -268,9 +219,7 @@ impl FunctionTranslator<'_, Metaed> {
         // `Val::Temp(n_params)`, the snapshot (if any) `Temp(n_params + 1)`;
         // body temps start after them.
         if let Some(ensures) = &f.ensures {
-            let slot = ensures_slot
-                .take()
-                .expect("declared when f.ensures is Some");
+            let slot = ensures_slot.expect("declared when f.ensures is Some");
             let mut ens_params = params.clone();
             ens_params.push(ret.clone());
             let result = vmir::Val::Temp(n_params);
@@ -288,7 +237,7 @@ impl FunctionTranslator<'_, Metaed> {
                 });
                 val_base += 1;
             }
-            let body = match pure_exp::lower_function_body(
+            let body = pure_exp::lower_function_body(
                 ctx,
                 &env,
                 ensures,
@@ -297,14 +246,7 @@ impl FunctionTranslator<'_, Metaed> {
                 Some(result),
                 None,
                 snap_entry,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    slot.abandon();
-                    Self::abandon(fn_slot.take(), None, None);
-                    return Err(e);
-                }
-            };
+            )?;
             let name = definer.intern_name(&format!("{fname}#ensures"));
             definer.define_function(
                 slot,
@@ -349,10 +291,9 @@ impl FunctionTranslator<'_, Metaed> {
             params: param_vals,
             snap: contract_snap,
         };
-        let fn_slot = fn_slot.take().expect("not yet consumed");
         let body = match &f.body {
             None => None,
-            Some(body_exp) => match pure_exp::lower_function_body(
+            Some(body_exp) => Some(pure_exp::lower_function_body(
                 ctx,
                 &env,
                 body_exp,
@@ -361,13 +302,7 @@ impl FunctionTranslator<'_, Metaed> {
                 None,
                 Some(contract),
                 snap_entry,
-            ) {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    fn_slot.abandon();
-                    return Err(e);
-                }
-            },
+            )?),
         };
         let name = definer.intern_name(&fname);
         definer.define_function(

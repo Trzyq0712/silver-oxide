@@ -66,23 +66,16 @@ impl PredicateTranslator<'_, Metaed> {
                 for (i, param) in p.params.iter().enumerate() {
                     env.insert(param.name.0, vmir::Val::Temp(i));
                 }
-                match spatial::lower_spatial_never(
+                // On error the unfilled `self.slot` is simply dropped (no cleanup
+                // needed) and the whole `Builder` discarded up the stack.
+                Some(spatial::lower_spatial_never(
                     ctx,
                     &env,
                     body_exp,
                     params.len(),
                     vmir::HeapVal::Empty,
                     0,
-                ) {
-                    Ok(body) => Some(body),
-                    Err(e) => {
-                        // The Slot is still unfilled on this error path — abandon
-                        // it explicitly so the drop bomb doesn't panic on top of
-                        // the `TranslationError` we're about to propagate.
-                        self.slot.abandon();
-                        return Err(e);
-                    }
-                }
+                )?)
             }
         };
         let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));

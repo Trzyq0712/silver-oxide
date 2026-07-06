@@ -109,8 +109,8 @@ impl MethodTranslator<'_, Metaed> {
             src: m,
             silver_name,
             requires_slot,
-            mut ensures_slot,
-            mut body_slot,
+            ensures_slot,
+            body_slot,
             requires: meta_requires,
             _p,
         } = self;
@@ -124,26 +124,14 @@ impl MethodTranslator<'_, Metaed> {
                 env.insert(p.name.0, vmir::Val::Temp(i));
             }
             // Self-framed: accumulate from `Empty`, heaps start at `HeapVal::Temp(0)`.
-            let body = match spatial::lower_spatial_never(
+            let body = spatial::lower_spatial_never(
                 ctx,
                 &env,
                 requires,
                 params.len(),
                 vmir::HeapVal::Empty,
                 0,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    slot.abandon();
-                    if let Some(h) = ensures_slot.take() {
-                        h.abandon();
-                    }
-                    if let Some(h) = body_slot.take() {
-                        h.abandon();
-                    }
-                    return Err(e);
-                }
-            };
+            )?;
             let name =
                 definer.intern_name(&format!("{}#requires", ctx.interner.resolve(&silver_name)));
             definer.define_resource(
@@ -159,9 +147,7 @@ impl MethodTranslator<'_, Metaed> {
 
         // #ensures: a Resource, two-state (`Ctx`) when the method has a requires.
         if let Some(ensures) = &m.ensures {
-            let slot = ensures_slot
-                .take()
-                .expect("declared when m.ensures is Some");
+            let slot = ensures_slot.expect("declared when m.ensures is Some");
             let mut params: Vec<vmir::Type> =
                 m.params.iter().map(|p| ctx.lower_type(&p.ty)).collect();
             params.extend(m.rets.iter().map(|r| ctx.lower_type(&r.ty)));
@@ -197,23 +183,14 @@ impl MethodTranslator<'_, Metaed> {
                 }
                 vmir::Precond::SelfFramed => None,
             };
-            let body = match spatial::lower_spatial_ensures(
+            let body = spatial::lower_spatial_ensures(
                 ctx,
                 &env,
                 ensures,
                 params.len(),
                 vmir::HeapVal::Empty,
                 snap_entry,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    slot.abandon();
-                    if let Some(h) = body_slot.take() {
-                        h.abandon();
-                    }
-                    return Err(e);
-                }
-            };
+            )?;
             let name =
                 definer.intern_name(&format!("{}#ensures", ctx.interner.resolve(&silver_name)));
             definer.define_resource(
@@ -231,13 +208,7 @@ impl MethodTranslator<'_, Metaed> {
         if let Some(slot) = body_slot {
             let body = m.body.as_ref().expect("slot implies a body");
             let name = definer.intern_name(ctx.interner.resolve(&silver_name));
-            let method = match lower_method(ctx, m, name, body) {
-                Ok(mm) => mm,
-                Err(e) => {
-                    slot.abandon();
-                    return Err(e);
-                }
-            };
+            let method = lower_method(ctx, m, name, body)?;
             definer.define_method(slot, method);
         }
 

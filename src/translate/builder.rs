@@ -10,18 +10,22 @@
 //! ## `DeclSlot` — an unforgeable, affine write capability
 //!
 //! A [`DeclSlot<T>`] is a write-capability token for exactly one declaration
-//! slot. It replaces the informal "don't forget to fill every slot" discipline
-//! with a compile-time-enforced one: `#[must_use]`, non-`Clone`, and panics on
-//! drop if never filled (a "drop bomb"). `Definer::define_*` consumes a
-//! `DeclSlot<T>` by value, so "filled twice" is unrepresentable.
+//! slot, tagged with the payload type `T` it will hold. It is `#[must_use]`,
+//! non-`Clone`, and consumed by value: `Definer::define_*` takes a
+//! `DeclSlot<T>` by move, so a slot can be filled **at most once** (a second
+//! fill is a move error). That every reserved slot is filled **at least once**
+//! is checked in one place — [`Builder::finalize`], which panics (naming the
+//! member) on any slot left empty. On a translation *error* an unfilled slot is
+//! simply dropped and the whole `Builder` discarded, so no per-slot cleanup is
+//! needed.
 //!
 //! **Unforgeable.** `DeclSlot::new` and `DeclSlot::fill` are private to *this*
 //! module, and `Builder` (the only `Declarator`/`Definer` impl) lives here too.
 //! The translator submodules (`decl::field`, `decl::adt`, …) are *not*
 //! descendants of this module, so they cannot reach the private constructor or
-//! filler: a translator can hold a slot, hand it to `define_*`, or `abandon` it
-//! — but can neither fabricate nor fill one. This is what makes
-//! `Builder::alloc_slot` the single source of every slot.
+//! filler: a translator can only receive a slot and hand it to `define_*` — it
+//! can neither fabricate nor fill one. This makes `Builder::alloc_slot` the
+//! single source of every slot.
 
 use std::marker::PhantomData;
 
@@ -34,53 +38,28 @@ use crate::vmir;
 /// declaration payload type the slot will hold (`vmir::Function`,
 /// `vmir::Resource`, `vmir::Method`, `vmir::Adt`, `vmir::Domain`) — a phantom
 /// marker only, never constructed.
-#[must_use = "A DeclSlot represents an obligation to define a member. It must be filled."]
+#[must_use = "a DeclSlot must be handed to a Definer::define_* to fill its member"]
 pub(crate) struct DeclSlot<T> {
     id: vmir::MemberId,
-    filled: bool,
     _marker: PhantomData<T>,
 }
 
 impl<T> DeclSlot<T> {
-    /// Mint a fresh, unfilled slot for `id`. **Private to `builder`** — only
+    /// Mint a fresh slot for `id`. **Private to `builder`** — only
     /// [`Builder::alloc_slot`] calls it, which is what makes a slot unforgeable
     /// outside this module.
     fn new(id: vmir::MemberId) -> Self {
         Self {
             id,
-            filled: false,
             _marker: PhantomData,
         }
     }
 
-    /// Consume the slot, marking it filled, and hand back its id so the
-    /// `Definer` impl can write the actual `Declaration` there. **Private to
-    /// `builder`** — only `Builder`'s `Definer` impl fills a slot.
-    fn fill(mut self) -> vmir::MemberId {
-        self.filled = true;
+    /// Consume the slot, handing back its id so the `Definer` impl can write the
+    /// actual `Declaration` there. By-value, so a slot fills at most once.
+    /// **Private to `builder`** — only `Builder`'s `Definer` impl fills a slot.
+    fn fill(self) -> vmir::MemberId {
         self.id
-    }
-
-    /// Mark this slot filled **without** writing a decl. Used on an error path
-    /// where a fallible `Translator::define` bails out before the point that
-    /// would normally fill it — without this, the drop bomb would panic on top
-    /// of the original `TranslationError`, turning a clean error return into a
-    /// crash. Crate-visible: translators legitimately abandon their *own*
-    /// slots, but still cannot forge or fill one.
-    pub(crate) fn abandon(mut self) {
-        self.filled = true;
-    }
-}
-
-impl<T> Drop for DeclSlot<T> {
-    fn drop(&mut self) {
-        if !self.filled {
-            panic!(
-                "DeclSlot<{}> for {:?} dropped unfilled",
-                std::any::type_name::<T>(),
-                self.id
-            );
-        }
     }
 }
 
@@ -162,10 +141,19 @@ impl Builder {
     }
 
     pub(crate) fn finalize(self) -> vmir::Program {
+        // The single "every reserved slot was filled" check (replaces the old
+        // per-slot drop-bomb). A `None` here means a translator declared a
+        // member but never defined it — a bug; name it for a useful panic.
         let decls: TiVec<vmir::MemberId, vmir::Declaration> = self
             .decls
             .into_iter()
-            .map(|o| o.expect("declaration slot left empty"))
+            .enumerate()
+            .map(|(i, o)| {
+                o.unwrap_or_else(|| {
+                    let name = self.vmir_interner.resolve(&self.decl_names[i]);
+                    panic!("declaration slot for `{name}` (MemberId {i}) left unfilled");
+                })
+            })
             .collect();
         vmir::Program {
             decls,
