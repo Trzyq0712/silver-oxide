@@ -538,7 +538,6 @@ fn fmt_pure_kind<'a, Ext: ShowExt>(
             show.with(value),
             show.with(exp)
         ),
-        PureExpKind::Ascribe(e, ty) => write!(f, "{}: {}", show.with(e), show.with(ty)),
         PureExpKind::AdtDestructor(e, field) => {
             write!(f, "{}.{}", show.with(e), show.name(*field))
         }

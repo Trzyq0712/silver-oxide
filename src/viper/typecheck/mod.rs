@@ -1019,9 +1019,11 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                 Ok(PureExpKind::Ext(ext))
             }
 
-            ExpKind::Ascribe(inner, ascribed_ty) => {
+            // Ascription only guides inference; the typed AST carries the
+            // resolved type on every node, so the wrapper is erased here.
+            ExpKind::Ascribe(inner, _ascribed_ty) => {
                 let inner_exp = self.lower_pure::<Ext>(inner)?;
-                Ok(PureExpKind::Ascribe(inner_exp, Type::from(ascribed_ty)))
+                Ok(*inner_exp.exp)
             }
 
             ExpKind::UnOp(op, inner) => self.lower_unop::<Ext>(op, inner),
@@ -1781,7 +1783,7 @@ fn check_axiom_function_calls(
     };
     match exp.exp.as_ref() {
         P::Ident(_) | P::Const(_) => Ok(()),
-        P::Unary(_, e) | P::Ascribe(e, _) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
+        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
             check_axiom_function_calls(e, fns_with_precond, interner)
         }
         P::Binary(_, l, r) => {
@@ -2551,6 +2553,33 @@ method test(a: Int)
   var y: Int
   x, y := m(a)
 }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn ascription_pins_unconstrained_type_argument() {
+        // Without ascription, `nil()`'s type argument is unconstrained.
+        let result = run_pipeline(
+            r#"
+domain List[T] {
+    function nil(): List[T]
+    function len(xs: List[T]): Int
+}
+method client() { assert len(nil()) == 0 }
+"#,
+        );
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+
+        // Ascribing the call pins the instantiation.
+        let result = run_pipeline(
+            r#"
+domain List[T] {
+    function nil(): List[T]
+    function len(xs: List[T]): Int
+}
+method client() { assert len((nil(): List[Int])) == 0 }
 "#,
         );
         assert!(result.is_ok(), "expected Ok, got: {result:?}");

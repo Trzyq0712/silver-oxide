@@ -133,7 +133,6 @@ pub enum PureExpKind<Ext> {
         value: TypedPureExp<Ext>,
         exp: TypedPureExp<Ext>,
     },
-    Ascribe(TypedPureExp<Ext>, Type),
     /// Call to a domain function (pure).
     DomainFunctionCall(Call<Ext>),
     /// Constructor call of an ADT variant.

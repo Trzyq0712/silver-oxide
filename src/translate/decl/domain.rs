@@ -95,10 +95,6 @@ fn used_generics_in_exp(
         P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
             used_generics_in_exp(e, generics, out)
         }
-        P::Ascribe(e, ty) => {
-            collect_generics(ty, generics, out);
-            used_generics_in_exp(e, generics, out);
-        }
         P::Binary(_, l, r) => {
             used_generics_in_exp(l, generics, out);
             used_generics_in_exp(r, generics, out);

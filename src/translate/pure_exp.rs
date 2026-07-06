@@ -169,7 +169,6 @@ pub(crate) fn lower<Ext: PureExt>(
             ))
         }
         P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
-        P::Ascribe(_, _) => Err(TranslationError::Unsupported("ascribe")),
         P::AdtDestructor(base, field) => {
             // `e.f` ⇒ `AdtProj{adt, variant, field}(e)`. The verifier's
             // projection reduction folds it when `e` is a known constructor.
