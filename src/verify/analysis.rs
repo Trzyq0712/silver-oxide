@@ -68,7 +68,7 @@ impl Analysis<Symbolic> for ConstFold {
 
             Symbolic::Binary(op, [l, r]) => match (&egraph[*l].data, &egraph[*r].data) {
                 (Inconsistent, _) | (_, Inconsistent) => Inconsistent,
-                (Known(lv), Known(rv)) => Known(eval_binary(*op, lv, rv)),
+                (Known(lv), Known(rv)) => eval_binary(*op, lv, rv).map_or(Unknown, Known),
                 _ => Unknown,
             },
 
@@ -122,9 +122,13 @@ impl Analysis<Symbolic> for ConstFold {
 /// Fold a binary op over two literals. Operands are **homogeneous** (the
 /// frontend inserts `real(..)` casts), so each arithmetic op dispatches on the
 /// shared literal variant and the division mode follows the operand type.
-pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Literal {
+/// `None` for a literal division by zero: the term is unspecified (an
+/// uninterpreted value, matching SMT semantics), not a fold-time panic —
+/// well-definedness is a separate obligation, and never checked at all inside
+/// an axiom body.
+pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Option<Literal> {
     use Literal::{Int, Real};
-    match op {
+    Some(match op {
         BinOp::Plus => match (l, r) {
             (Int(a), Int(b)) => Int(a + b),
             (Real(a), Real(b)) => Real(a + b),
@@ -141,8 +145,9 @@ pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Literal {
             _ => unreachable!("non-homogeneous operands for Mult: {l:?}, {r:?}"),
         },
         BinOp::Div => match (l, r) {
-            (Int(a), Int(b)) => Int(a / b),
-            (Real(a), Real(b)) => Real(a / b),
+            (Int(a), Int(b)) if *b != num::BigInt::ZERO => Int(a / b),
+            (Real(a), Real(b)) if *b != num::BigRational::from(num::BigInt::ZERO) => Real(a / b),
+            (Int(_) | Real(_), Int(_) | Real(_)) => return None,
             _ => unreachable!("non-homogeneous operands for Div: {l:?}, {r:?}"),
         },
         BinOp::Eq => Literal::Bool(l == r),
@@ -152,5 +157,5 @@ pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Literal {
             _ => unreachable!("non-homogeneous operands for Lt: {l:?}, {r:?}"),
         },
         _ => unimplemented!("Operator {op:?} is not implemented yet"),
-    }
+    })
 }
