@@ -28,7 +28,7 @@ pub struct DomainAxiom {
 
 /// A pure `forall` occurrence, lowered from an axiom body. The enclosing axiom
 /// body references it as an opaque nullary boolean `FunctionCall` to this
-/// declaration's own id (`{axiom}@quant{j}`); this declaration carries the
+/// declaration's own id (`{axiom}#quant{j}`); this declaration carries the
 /// quantifier's body + trigger so the verifier can instantiate it lazily.
 ///
 /// The `body` is a pure, heap-free inst stream whose `res` is the quantified
@@ -141,17 +141,26 @@ impl<'a> Display for VmirDisplay<'a, &'a Quantifier> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = self.interner.resolve(&self.item.name);
         let trigger_fn = self.member(self.item.trigger.function);
-        write!(f, "quantifier {name} forall<{}>", self.item.bound.len())?;
-        write!(f, " {{{}(", trigger_fn)?;
+        // Binders occupy `Val::Temp(0..bound.len())`, i.e. `e0..e{n-1}` — the
+        // same variable syntax the body uses to reference them; their types are
+        // written out.
+        write!(f, "quantifier {name} forall ")?;
+        for (k, ty) in self.item.bound.iter().enumerate() {
+            if k > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "e{k}: {}", self.with(ty))?;
+        }
+        write!(f, " :: {{{}(", trigger_fn)?;
         for (k, b) in self.item.trigger.binders.iter().enumerate() {
             if k > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "?{b}")?;
+            write!(f, "e{b}")?;
         }
         writeln!(f, ")}} {{")?;
-        // The binders occupy `Val::Temp(0..bound.len())`, so the body's own
-        // temps (and the display counter) start there.
+        // The body's own temps (and the display counter) start after the
+        // binders.
         write!(
             f,
             "{}",

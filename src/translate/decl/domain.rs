@@ -33,7 +33,7 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
     axiom_slots: Vec<DeclSlot<vmir::DomainAxiom>>,
     /// One inner `Vec` per axiom (parallel to `src.axioms`), holding the
     /// pre-allocated occurrence slots for that axiom's top-level `forall`s, in
-    /// preorder. Each is registered as `{axiom}@quant{j}`; not callable, so no
+    /// preorder. Each is registered as `{axiom}#quant{j}`; not callable, so no
     /// `name_map` entry — the occurrence call carries the `MemberId` directly.
     quant_slots: Vec<Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>>,
     _p: PhantomData<P>,
@@ -217,7 +217,7 @@ impl<'a> DomainTranslator<'a, Declared> {
             let mut slots = Vec::with_capacity(n_foralls);
             for j in 0..n_foralls {
                 let (id, qslot) =
-                    decl.alloc_slot::<vmir::Quantifier>(&format!("{ax_name}@quant{j}"));
+                    decl.alloc_slot::<vmir::Quantifier>(&format!("{ax_name}#quant{j}"));
                 slots.push((id, qslot));
             }
             quant_slots.push(slots);
@@ -320,13 +320,13 @@ impl DomainTranslator<'_, Metaed> {
             };
             // Fill each quantifier slot with its built declaration, in the same
             // (preorder) order they were allocated and lowered. Set the name to
-            // match the slot registration `{axiom}@quant{j}`.
+            // match the slot registration `{axiom}#quant{j}`.
             debug_assert_eq!(qslots.len(), quant_built.len());
             for (j, ((slot_id, qslot), (built_id, mut quant))) in
                 qslots.into_iter().zip(quant_built).enumerate()
             {
                 debug_assert_eq!(slot_id, built_id);
-                quant.name = definer.intern_name(&format!("{ax_name}@quant{j}"));
+                quant.name = definer.intern_name(&format!("{ax_name}#quant{j}"));
                 definer.define_quantifier(qslot, quant);
             }
             let name = definer.intern_name(&ax_name);

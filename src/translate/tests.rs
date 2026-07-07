@@ -1019,9 +1019,9 @@ domain D {
 }
 "#;
     let p = run(input);
-    let q_id = p.id("basic@quant0").expect("missing quantifier slot");
+    let q_id = p.id("basic#quant0").expect("missing quantifier slot");
     let vmir::Declaration::Quantifier(q) = &p.decls[q_id] else {
-        panic!("basic@quant0 must be a Quantifier");
+        panic!("basic#quant0 must be a Quantifier");
     };
     assert_eq!(q.bound.len(), 1, "one binder");
     let foo_id = p.id("foo").expect("missing foo");
@@ -1044,7 +1044,7 @@ domain D {
 
     // Display path must not panic and should name the quantifier.
     let s = format!("{p}");
-    assert!(s.contains("quantifier basic@quant0"), "rendered:\n{s}");
+    assert!(s.contains("quantifier basic#quant0"), "rendered:\n{s}");
 }
 
 #[test]
