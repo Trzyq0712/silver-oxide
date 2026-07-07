@@ -18,7 +18,7 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
-pub use domain::{Domain, Axiom, QuantTrigger, Quantifier, TyParams};
+pub use domain::{Axiom, Domain, QuantTrigger, Quantifier, TrigArg, TyParams};
 pub use function::{Args, Function, FunctionBody, FunctionCall, Params};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;

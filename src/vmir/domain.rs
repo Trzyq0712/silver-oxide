@@ -28,34 +28,50 @@ pub struct Axiom {
     pub body: FunctionBody,
 }
 
-/// A pure `forall` occurrence, lowered from an axiom body. The enclosing axiom
-/// body references it as an opaque nullary boolean `FunctionCall` to this
-/// declaration's own id (`{axiom}#quant{j}`); this declaration carries the
-/// quantifier's body + trigger so the verifier can instantiate it lazily.
+/// A pure `forall` occurrence, lowered from an axiom body. The enclosing body
+/// (the axiom's, or an outer quantifier's) references it as an opaque boolean
+/// `FunctionCall` to this declaration's own id (`{axiom}#quant{j}`) whose
+/// arguments are the **captured** enclosing values, one per entry in `params`;
+/// this declaration carries the quantifier's body + trigger so the verifier can
+/// instantiate it lazily.
 ///
 /// The `body` is a pure, heap-free inst stream whose `res` is the quantified
-/// boolean, with the bound variables occupying `Val::Temp(0..bound.len())`
-/// (closed — v1 forbids free value variables, so there are no leading capture
-/// params yet). Like an axiom, a quantifier body is **never verified**; it only
-/// contributes a lazy-instantiation rule. Instantiation at a ground trigger
-/// application `f(t)` adds the guarded clause `Ite(occurrence, res[σ], true)`.
+/// boolean. Its leading temps are the capture params (`Val::Temp(0..n_caps)`)
+/// followed by the bound variables (`Temp(n_caps..n_caps + bound.len())`); the
+/// body's own temps count from there. Like an axiom, a quantifier body is
+/// **never verified**; it only contributes a lazy-instantiation rule.
+/// Instantiation of a ground occurrence `Q(c..)` at a ground trigger
+/// application `f(t..)` adds the guarded clause `Ite(Q(c..), res[c,σ], true)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Quantifier {
     pub name: Spur,
-    /// The binder types; body params are `Val::Temp(0..bound.len())`.
+    /// The capture-parameter types; they occupy `Val::Temp(0..params.len())`.
+    pub params: Box<[crate::vmir::Type]>,
+    /// The binder types; they occupy `Val::Temp(params.len()..)` after the
+    /// captures.
     pub bound: Box<[crate::vmir::Type]>,
     pub trigger: QuantTrigger,
     pub body: FunctionBody,
 }
 
-/// A quantifier's trigger: one function application whose arguments are exactly
-/// the bound variables (each occurring once or repeated), jointly covering all
-/// binders. Argument `k` of the application binds bound variable `binders[k]`,
-/// so a ground application `f(t0, t1, ..)` determines σ = { binders[k] ↦ tk }.
+/// A quantifier's trigger: one function application whose arguments are each a
+/// bound variable or a captured param, with the bound positions jointly
+/// covering all binders (repeats allowed). At a ground occurrence `Q(c..)` and
+/// a ground application `f(t0, t1, ..)`: an `args[k] = Bound(i)` position
+/// determines σ(i) = tk, an `args[k] = Capture(j)` position requires tk = cj.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuantTrigger {
     pub function: crate::vmir::MemberId,
-    pub binders: Box<[usize]>,
+    pub args: Box<[TrigArg]>,
+}
+
+/// One argument position of a quantifier's trigger application: either a bound
+/// variable (defines σ at that binder) or a capture param (must equal the
+/// occurrence's capture argument).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrigArg {
+    Bound(usize),
+    Capture(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -143,32 +159,46 @@ impl<'a> Display for VmirDisplay<'a, &'a Quantifier> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = self.interner.resolve(&self.item.name);
         let trigger_fn = self.member(self.item.trigger.function);
-        // The occurrence is a callable nullary boolean — `()` marks it (and is
-        // where captured value parameters would appear once captures land).
-        // Binders occupy `Val::Temp(0..bound.len())`, i.e. `e0..e{n-1}` — the
-        // same variable syntax the body uses to reference them; their types are
-        // written out.
-        write!(f, "quantifier {name}() forall ")?;
-        for (k, ty) in self.item.bound.iter().enumerate() {
+        let n_caps = self.item.params.len();
+        // The occurrence is a callable boolean; the parens carry the capture
+        // params. Captures occupy `Val::Temp(0..n_caps)` (`e0..`), binders
+        // continue at `e{n_caps}` — the same variable syntax the body uses to
+        // reference them; their types are written out.
+        write!(f, "quantifier {name}(")?;
+        for (k, ty) in self.item.params.iter().enumerate() {
             if k > 0 {
                 write!(f, ", ")?;
             }
             write!(f, "e{k}: {}", self.with(ty))?;
         }
-        write!(f, " :: {{{}(", trigger_fn)?;
-        for (k, b) in self.item.trigger.binders.iter().enumerate() {
+        write!(f, ") forall ")?;
+        for (k, ty) in self.item.bound.iter().enumerate() {
             if k > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "e{b}")?;
+            write!(f, "e{}: {}", n_caps + k, self.with(ty))?;
+        }
+        write!(f, " :: {{{}(", trigger_fn)?;
+        for (k, a) in self.item.trigger.args.iter().enumerate() {
+            if k > 0 {
+                write!(f, ", ")?;
+            }
+            match a {
+                crate::vmir::TrigArg::Bound(i) => write!(f, "e{}", n_caps + i)?,
+                crate::vmir::TrigArg::Capture(c) => write!(f, "e{c}")?,
+            }
         }
         writeln!(f, ")}} {{")?;
         // The body's own temps (and the display counter) start after the
-        // binders.
+        // captures and binders.
         write!(
             f,
             "{}",
-            self.with((self.item.bound.len(), 0usize, &self.item.body.insts[..]))
+            self.with((
+                n_caps + self.item.bound.len(),
+                0usize,
+                &self.item.body.insts[..]
+            ))
         )?;
         writeln!(f, "  result: {}", self.item.body.res)?;
         write!(f, "}}")

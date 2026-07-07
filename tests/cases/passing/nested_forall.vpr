@@ -1,0 +1,15 @@
+// Nested `forall`: the inner quantifier captures the outer binder. Proving the
+// assertion needs the instantiation cascade — `f(1)` triggers the outer
+// quantifier at i := 1, materializing the inner occurrence, and `g(1, 2)` then
+// triggers the inner one (capture position must match 1).
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int, j: Int): Bool
+
+    axiom nest { forall i: Int :: {f(i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+}
+
+method client() {
+    inhale f(1)
+    assert g(1, 2)
+}

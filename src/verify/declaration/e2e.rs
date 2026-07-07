@@ -2348,3 +2348,75 @@ method m() {
          goal-directed ITE case-splitting landed — flip to assert Ok"
     );
 }
+
+#[test]
+fn nested_quantifier_cascade() {
+    // Nested `forall`: mentioning `f(1)` instantiates the outer quantifier at
+    // i := 1, which materializes the inner occurrence `Q_inner(1)` (and merges
+    // it `true` via the collapsed outer guard); the ground `g(1, 2)` then
+    // matches the inner trigger `{g(i, j)}` — capture position 0 equals the
+    // occurrence's capture 1 — releasing `g(1, 2) == true`.
+    let input = r#"
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int, j: Int): Bool
+    axiom nest { forall i: Int :: {f(i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+}
+method m() {
+    inhale f(1)
+    assert g(1, 2)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn nested_quantifier_outer_untriggered_fails() {
+    // Without any `f(..)` application the outer quantifier never instantiates,
+    // so the inner occurrence is never materialized — `g(1, 2)` stays unknown
+    // even though its own trigger is ground. (Soundness: no instantiation
+    // without an occurrence.)
+    let input = r#"
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int, j: Int): Bool
+    axiom nest { forall i: Int :: {f(i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+}
+method m() {
+    assert g(1, 2)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn nested_quantifier_capture_mismatch_fails() {
+    // The only materialized inner occurrence is `Q_inner(1)` (from `f(1)`), but
+    // `g(2, 3)`'s capture position carries 2 ≠ 1 — the pair must be skipped, so
+    // nothing is learned about `g(2, 3)`. (Soundness: capture positions must
+    // e-match the occurrence's capture args.)
+    let input = r#"
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int, j: Int): Bool
+    axiom nest { forall i: Int :: {f(i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+}
+method m() {
+    inhale f(1)
+    assert g(2, 3)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}

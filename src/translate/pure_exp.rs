@@ -530,93 +530,230 @@ impl PureExt for typed::AxiomExt {
     ) -> Result<Val, TranslationError> {
         match ext {
             typed::AxiomExt::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
-            typed::AxiomExt::Forall(q) => lower_forall(b, sink, q),
+            typed::AxiomExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
 }
 
-/// Lower a pure `forall` into its opaque nullary occurrence call, defining the
-/// [`vmir::Quantifier`] (body + trigger) into `sink.quant_out` for the caller to
-/// slot. The occurrence id is the next pre-allocated one in `sink.quant_ids`
-/// (empty ⇒ an unexpected nested `forall`). The body is lowered in a fresh sink
-/// with the bound variables as `Val::Temp(0..n)`.
+/// Lower a pure `forall` into its opaque boolean occurrence call (arguments =
+/// the captured enclosing values), defining the [`vmir::Quantifier`] (params +
+/// body + trigger) into `sink.quant_out` for the caller to slot. The occurrence
+/// id is the next pre-allocated one in `sink.quant_ids`. The body is lowered in
+/// an inner sink with the captures as `Val::Temp(0..n_caps)` and the bound
+/// variables as `Temp(n_caps..n_caps + n)`; the inner sink inherits the
+/// occurrence-id queue, so nested `forall`s consume ids in flat preorder and
+/// their built quantifiers bubble up through `quant_out`.
 fn lower_forall(
     b: &TranslationContext<'_>,
+    env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     q: &typed::Forall,
 ) -> Result<Val, TranslationError> {
-    // v1 excludes `forall` inside a generic axiom (no type-σ + value-σ mix).
+    // v2 still excludes `forall` inside a generic axiom (no type-σ + value-σ
+    // mix).
     if !b.decl_generics.is_empty() {
         return Err(TranslationError::GenericForallUnsupported);
     }
     let quant_id = sink
         .quant_ids
         .pop_front()
-        .ok_or(TranslationError::NestedForallUnsupported)?;
+        .expect("forall occurrence under-allocated");
 
     let n = q.bound.len();
-    let mut env: HashMap<Spur, Val> = HashMap::new();
     let mut bound = Vec::with_capacity(n);
     let mut binder_idx: HashMap<Spur, usize> = HashMap::new();
     for (k, bv) in q.bound.iter().enumerate() {
-        env.insert(bv.name.0, Val::Temp(k));
         binder_idx.insert(bv.name.0, k);
         bound.push(b.lower_type(&bv.ty));
     }
 
-    let trigger = validate_trigger(b, &q.triggers, &binder_idx, n)?;
+    // Select the trigger group before capture discovery: its arguments lead the
+    // capture order, so trigger captures get the smallest indices.
+    let trig_call = select_trigger(&q.triggers, &binder_idx, env, n)?;
 
-    // Lower the body in a fresh sink; its params (the binders) occupy
-    // `Val::Temp(0..n)`, so the body's own temps count from `n`. A fresh sink
-    // has an empty `quant_ids`, so a nested `forall` in the body errors.
-    let body = lower_function_body(b, &env, &q.body, n, HeapVal::Empty, None, None, None)?;
+    // Capture discovery: the free identifiers of the chosen trigger's arguments
+    // and the body, in first-appearance order. A doubly-nested `forall`'s
+    // captures of *this* level's variables surface here too (they are free in
+    // this body), so every level captures exactly what its subtree needs.
+    let mut captures: Vec<(Spur, vmir::Type)> = Vec::new();
+    let mut cap_idx: HashMap<Spur, usize> = HashMap::new();
+    {
+        let mut scope: Vec<Spur> = binder_idx.keys().copied().collect();
+        for a in &trig_call.args {
+            collect_captures(b, a, &mut scope, &mut captures, &mut cap_idx);
+        }
+        collect_captures(b, &q.body, &mut scope, &mut captures, &mut cap_idx);
+    }
+    let n_caps = captures.len();
+
+    // The occurrence call's arguments: each capture resolved in the enclosing
+    // environment.
+    let mut occ_args = Vec::with_capacity(n_caps);
+    for (name, _) in &captures {
+        let v = env
+            .get(name)
+            .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(name).to_string()))?;
+        occ_args.push(v.clone());
+    }
+
+    let function = *b.name_map.get(&trig_call.name.0).ok_or_else(|| {
+        TranslationError::UnknownIdent(b.interner.resolve(&trig_call.name.0).to_string())
+    })?;
+    let trig_args: Vec<vmir::TrigArg> = trig_call
+        .args
+        .iter()
+        .map(|a| {
+            let typed::PureExpKind::Ident(id) = a.exp.as_ref() else {
+                unreachable!("select_trigger admits only identifier arguments");
+            };
+            match binder_idx.get(&id.0) {
+                Some(&i) => vmir::TrigArg::Bound(i),
+                // Scanned first above, so every non-binder trigger arg is a
+                // capture with an assigned index.
+                None => vmir::TrigArg::Capture(cap_idx[&id.0]),
+            }
+        })
+        .collect();
+    let trigger = vmir::QuantTrigger {
+        function,
+        args: trig_args.into(),
+    };
+
+    // The quantifier body's environment: captures then binders.
+    let mut inner_env: HashMap<Spur, Val> = HashMap::new();
+    for (c, (name, _)) in captures.iter().enumerate() {
+        inner_env.insert(*name, Val::Temp(c));
+    }
+    for (k, bv) in q.bound.iter().enumerate() {
+        inner_env.insert(bv.name.0, Val::Temp(n_caps + k));
+    }
+
+    // Lower the body in an inner sink whose params (captures ++ binders) occupy
+    // `Val::Temp(0..n_caps + n)`. The occurrence-id queue is threaded through
+    // so nested `forall`s pop from the same flat preorder queue.
+    let mut inner = Sink::new(n_caps + n, 0);
+    inner.quant_ids = std::mem::take(&mut sink.quant_ids);
+    let hctx = HeapCtx {
+        value: HeapVal::Empty,
+        perm: HeapVal::Empty,
+        old: None,
+        result: None,
+    };
+    let res = lower(b, &inner_env, &mut inner, hctx, &q.body);
+    sink.quant_ids = std::mem::take(&mut inner.quant_ids);
+    sink.quant_out.append(&mut inner.quant_out);
+    let body = vmir::FunctionBody {
+        insts: inner.insts,
+        res: res?,
+    };
 
     sink.quant_out.push((
         quant_id,
         vmir::Quantifier {
             name: Default::default(),
+            params: captures.into_iter().map(|(_, ty)| ty).collect(),
             bound: bound.into(),
             trigger,
             body,
         },
     ));
 
-    // Emit the opaque nullary boolean occurrence call.
+    // Emit the opaque boolean occurrence call carrying the captured values.
     Ok(sink.emit_pure(
         vmir::Type::Bool,
         PureInst::FunctionCall(vmir::FunctionCall {
             function: quant_id,
             type_args: Vec::new(),
-            args: Vec::new().into(),
+            args: occ_args.into(),
         }),
     ))
 }
 
-/// Validate a `forall`'s trigger set against the v1 rule: some trigger group is
-/// exactly one function application whose arguments are each an identifier of a
-/// bound variable, jointly covering all `n` binders. Returns the resolved
-/// [`vmir::QuantTrigger`]; a repeated binder is allowed as long as coverage
-/// holds.
-fn validate_trigger(
+/// Collect the free identifiers of `exp` — those bound neither in `scope` nor
+/// by any construct on the path to their occurrence — into `captures`/`cap_idx`
+/// in first-appearance order, with their lowered types. Descends nested
+/// `forall`s (extending the scope with their binders; their triggers and body
+/// may reference this level's variables) and `let` bindings.
+fn collect_captures(
     b: &TranslationContext<'_>,
-    triggers: &[Vec<typed::TypedPureExp<typed::AxiomExt>>],
+    exp: &typed::TypedPureExp<typed::AxiomExt>,
+    scope: &mut Vec<Spur>,
+    captures: &mut Vec<(Spur, vmir::Type)>,
+    cap_idx: &mut HashMap<Spur, usize>,
+) {
+    use typed::PureExpKind as P;
+    match exp.exp.as_ref() {
+        P::Ident(id) => {
+            if !scope.contains(&id.0) && !cap_idx.contains_key(&id.0) {
+                cap_idx.insert(id.0, captures.len());
+                captures.push((id.0, b.lower_type(&exp.ty)));
+            }
+        }
+        P::Const(_) => {}
+        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
+            collect_captures(b, e, scope, captures, cap_idx)
+        }
+        P::Binary(_, l, r) => {
+            collect_captures(b, l, scope, captures, cap_idx);
+            collect_captures(b, r, scope, captures, cap_idx);
+        }
+        P::Ternary { if_, then, else_ } => {
+            collect_captures(b, if_, scope, captures, cap_idx);
+            collect_captures(b, then, scope, captures, cap_idx);
+            collect_captures(b, else_, scope, captures, cap_idx);
+        }
+        P::LetIn { binder, value, exp } => {
+            collect_captures(b, value, scope, captures, cap_idx);
+            scope.push(binder.0);
+            collect_captures(b, exp, scope, captures, cap_idx);
+            scope.pop();
+        }
+        P::DomainFunctionCall(call) | P::AdtConstructor(call) => {
+            for a in &call.args {
+                collect_captures(b, a, scope, captures, cap_idx);
+            }
+        }
+        P::Ext(typed::AxiomExt::FunctionCall(call)) => {
+            for a in &call.args {
+                collect_captures(b, a, scope, captures, cap_idx);
+            }
+        }
+        P::Ext(typed::AxiomExt::Forall(inner)) => {
+            let depth = scope.len();
+            scope.extend(inner.bound.iter().map(|bv| bv.name.0));
+            for group in &inner.triggers {
+                for t in group {
+                    collect_captures(b, t, scope, captures, cap_idx);
+                }
+            }
+            collect_captures(b, &inner.body, scope, captures, cap_idx);
+            scope.truncate(depth);
+        }
+    }
+}
+
+/// Select a `forall`'s trigger group: some group must be exactly one function
+/// application (domain function or Silver function) whose arguments are each an
+/// identifier of a bound variable or of an enclosing-environment value (a
+/// capture), with the bound positions jointly covering all `n` binders (a
+/// repeated binder is allowed as long as coverage holds). Returns the chosen
+/// call; the caller assigns capture indices after capture discovery.
+fn select_trigger<'t>(
+    triggers: &'t [Vec<typed::TypedPureExp<typed::AxiomExt>>],
     binder_idx: &HashMap<Spur, usize>,
+    env: &HashMap<Spur, Val>,
     n: usize,
-) -> Result<vmir::QuantTrigger, TranslationError> {
+) -> Result<&'t typed::Call<typed::AxiomExt>, TranslationError> {
     use typed::PureExpKind as P;
     for group in triggers {
         let [term] = &group[..] else {
             continue;
         };
-        // The trigger term must be a single call (domain function or Silver
-        // function) — extract its callee name and argument list.
         let call: &typed::Call<typed::AxiomExt> = match term.exp.as_ref() {
             P::DomainFunctionCall(c) => c,
             P::Ext(typed::AxiomExt::FunctionCall(c)) => c,
             _ => continue,
         };
-        // Every argument must be exactly a bound variable.
-        let mut binders = Vec::with_capacity(call.args.len());
         let mut covered = vec![false; n];
         let mut ok = true;
         for a in &call.args {
@@ -624,23 +761,18 @@ fn validate_trigger(
                 ok = false;
                 break;
             };
-            let Some(&idx) = binder_idx.get(&id.0) else {
-                ok = false;
-                break;
-            };
-            covered[idx] = true;
-            binders.push(idx);
+            match binder_idx.get(&id.0) {
+                Some(&idx) => covered[idx] = true,
+                None if env.contains_key(&id.0) => {}
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
         }
-        if !ok || !covered.iter().all(|&c| c) {
-            continue;
+        if ok && covered.iter().all(|&c| c) {
+            return Ok(call);
         }
-        let function = *b.name_map.get(&call.name.0).ok_or_else(|| {
-            TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
-        })?;
-        return Ok(vmir::QuantTrigger {
-            function,
-            binders: binders.into(),
-        });
     }
     Err(TranslationError::TriggerNotCovering)
 }
@@ -867,10 +999,11 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
 }
 
 /// Lower a domain-axiom body (heap-free, no contract), seeding the sink with the
-/// pre-allocated occurrence ids for the axiom's top-level `forall`s. Returns the
-/// lowered body plus every [`vmir::Quantifier`] built for those `forall`s,
-/// paired with its occurrence id, for the caller to slot. A body with no
-/// `forall`s passes an empty `quant_ids` and yields no quantifiers.
+/// pre-allocated occurrence ids for **all** the axiom's `forall`s (nested
+/// included, flat preorder). Returns the lowered body plus every
+/// [`vmir::Quantifier`] built for those `forall`s, paired with its occurrence
+/// id, for the caller to slot. A body with no `forall`s passes an empty
+/// `quant_ids` and yields no quantifiers.
 pub(crate) fn lower_axiom_body(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,

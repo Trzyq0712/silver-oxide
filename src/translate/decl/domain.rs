@@ -126,34 +126,26 @@ fn used_generics_in_exp(
     }
 }
 
-/// The number of **top-level** `forall`s in an axiom expression — those not
-/// nested inside another `forall`'s body (a nested `forall` is rejected at
-/// lowering and gets no occurrence slot). Each contributes one occurrence.
-fn count_top_level_foralls(exp: &typed::TypedPureExp<typed::AxiomExt>) -> usize {
+/// The number of `forall`s in an axiom expression, **including** those nested
+/// inside another `forall`'s body. Each contributes one occurrence slot; the
+/// preorder here matches the order lowering consumes ids (a `forall`'s own id
+/// precedes its body's). Triggers are not descended — they are validated, never
+/// lowered, so they consume no ids.
+fn count_foralls(exp: &typed::TypedPureExp<typed::AxiomExt>) -> usize {
     use typed::PureExpKind as P;
     match exp.exp.as_ref() {
         P::Ident(_) | P::Const(_) => 0,
-        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
-            count_top_level_foralls(e)
-        }
-        P::Binary(_, l, r) => count_top_level_foralls(l) + count_top_level_foralls(r),
+        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => count_foralls(e),
+        P::Binary(_, l, r) => count_foralls(l) + count_foralls(r),
         P::Ternary { if_, then, else_ } => {
-            count_top_level_foralls(if_)
-                + count_top_level_foralls(then)
-                + count_top_level_foralls(else_)
+            count_foralls(if_) + count_foralls(then) + count_foralls(else_)
         }
-        P::LetIn { value, exp, .. } => {
-            count_top_level_foralls(value) + count_top_level_foralls(exp)
-        }
+        P::LetIn { value, exp, .. } => count_foralls(value) + count_foralls(exp),
         P::DomainFunctionCall(call) | P::AdtConstructor(call) => {
-            call.args.iter().map(count_top_level_foralls).sum()
+            call.args.iter().map(count_foralls).sum()
         }
-        P::Ext(typed::AxiomExt::FunctionCall(call)) => {
-            call.args.iter().map(count_top_level_foralls).sum()
-        }
-        // A `forall` is one occurrence; its body is not descended into (a nested
-        // `forall` is rejected at lowering, not slotted here).
-        P::Ext(typed::AxiomExt::Forall(_)) => 1,
+        P::Ext(typed::AxiomExt::FunctionCall(call)) => call.args.iter().map(count_foralls).sum(),
+        P::Ext(typed::AxiomExt::Forall(q)) => 1 + count_foralls(&q.body),
     }
 }
 
@@ -211,9 +203,9 @@ impl<'a> DomainTranslator<'a, Declared> {
             };
             let (_, aslot) = decl.alloc_slot::<vmir::Axiom>(&ax_name);
             axiom_slots.push(aslot);
-            // Pre-allocate one occurrence slot per top-level `forall`, in the
-            // preorder the body lowering will encounter them.
-            let n_foralls = count_top_level_foralls(&ax.exp);
+            // Pre-allocate one occurrence slot per `forall` (nested included),
+            // in the preorder the body lowering will encounter them.
+            let n_foralls = count_foralls(&ax.exp);
             let mut slots = Vec::with_capacity(n_foralls);
             for j in 0..n_foralls {
                 let (id, qslot) =
@@ -318,14 +310,15 @@ impl DomainTranslator<'_, Metaed> {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
                 None => format!("{}#axiom{i}", ctx.interner.resolve(&self.silver_name)),
             };
-            // Fill each quantifier slot with its built declaration, in the same
-            // (preorder) order they were allocated and lowered. Set the name to
-            // match the slot registration `{axiom}#quant{j}`.
+            // Fill each quantifier slot with its built declaration. Built order
+            // is innermost-first (an inner `forall` finishes lowering before its
+            // encloser pushes), so slots are matched by id, not position. Set
+            // the name to match the slot registration `{axiom}#quant{j}`.
             debug_assert_eq!(qslots.len(), quant_built.len());
-            for (j, ((slot_id, qslot), (built_id, mut quant))) in
-                qslots.into_iter().zip(quant_built).enumerate()
-            {
-                debug_assert_eq!(slot_id, built_id);
+            let mut by_id: HashMap<vmir::MemberId, vmir::Quantifier> =
+                quant_built.into_iter().collect();
+            for (j, (slot_id, qslot)) in qslots.into_iter().enumerate() {
+                let mut quant = by_id.remove(&slot_id).expect("forall slot never filled");
                 quant.name = definer.intern_name(&format!("{ax_name}#quant{j}"));
                 definer.define_quantifier(qslot, quant);
             }

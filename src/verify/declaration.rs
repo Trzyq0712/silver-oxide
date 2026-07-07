@@ -1237,6 +1237,12 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
 /// into this context's saturations, firing on each ground application of its
 /// trigger. Axiom bodies are trusted — no obligations (div-by-zero, deref
 /// permission) are checked on them.
+///
+/// Invariant: the eager ground-axiom evaluation below only ever sees **nullary**
+/// quantifier occurrences — axioms are closed and `let` is rejected in pure
+/// lowering, so top-level `forall`s capture nothing. Occurrences with capture
+/// arguments enter the e-graph solely when an outer quantifier instance's body
+/// is built (`rewrite::build_instance`).
 fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
     for (id, decl) in program.decls.iter_enumerated() {
         // A pure `forall` becomes a value-σ lazy-instantiation rule, chained
@@ -1315,9 +1321,10 @@ fn prepare_axiom(
 }
 
 /// Resolve a pure `forall` into a [`PreparedQuantifier`]: its body as
-/// registry-level pure steps, its boolean result, its opaque nullary occurrence
-/// id, and its trigger (function + positional binder map). Instantiation reads
-/// the bound-variable σ off ground applications of the trigger.
+/// registry-level pure steps, its boolean result, its occurrence id and
+/// capture-parameter arity, and its trigger (function + positional
+/// bound/capture map). Instantiation pairs each ground occurrence with the
+/// bound-variable σ read off ground applications of the trigger.
 fn prepare_quantifier(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     id: vmir::MemberId,
@@ -1327,9 +1334,10 @@ fn prepare_quantifier(
     let insts = prepare_body(alloc, &q.body.insts)?;
     Ok(PreparedQuantifier {
         quant_func: crate::verify::func_registry::func_id_for_member(id),
+        n_caps: q.params.len(),
         n_bound: q.bound.len(),
         trigger_func: crate::verify::func_registry::func_id_for_member(q.trigger.function),
-        binders: q.trigger.binders.clone(),
+        trig_args: q.trigger.args.clone(),
         insts,
         res: q.body.res.clone(),
     })

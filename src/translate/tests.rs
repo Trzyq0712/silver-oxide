@@ -1024,9 +1024,14 @@ domain D {
         panic!("basic#quant0 must be a Quantifier");
     };
     assert_eq!(q.bound.len(), 1, "one binder");
+    assert!(q.params.is_empty(), "top-level forall captures nothing");
     let foo_id = p.id("foo").expect("missing foo");
     assert_eq!(q.trigger.function, foo_id, "trigger is foo");
-    assert_eq!(&*q.trigger.binders, &[0], "arg 0 binds bound var 0");
+    assert_eq!(
+        &*q.trigger.args,
+        &[vmir::TrigArg::Bound(0)],
+        "arg 0 binds bound var 0"
+    );
 
     // The axiom body references the occurrence via a nullary call to `q_id`.
     let ax_id = p.id("basic").expect("missing axiom basic");
@@ -1075,16 +1080,124 @@ domain D {
 }
 
 #[test]
-fn nested_forall_rejected() {
+fn nested_forall_lowers() {
+    // An inner `forall` captures the outer binder: it lowers to a second
+    // quantifier with one capture param, whose occurrence call inside the outer
+    // body passes the outer binder.
+    let input = r#"
+domain D {
+    function g(i: Int, j: Int): Bool
+    axiom nest { forall i: Int :: {g(i, i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+}
+"#;
+    let p = run(input);
+    let outer_id = p.id("nest#quant0").expect("missing outer quantifier");
+    let inner_id = p.id("nest#quant1").expect("missing inner quantifier");
+    let vmir::Declaration::Quantifier(outer) = &p.decls[outer_id] else {
+        panic!("nest#quant0 must be a Quantifier");
+    };
+    let vmir::Declaration::Quantifier(inner) = &p.decls[inner_id] else {
+        panic!("nest#quant1 must be a Quantifier");
+    };
+
+    // Outer: no captures, one binder, trigger g(i, i).
+    assert!(outer.params.is_empty(), "outer captures nothing");
+    assert_eq!(outer.bound.len(), 1);
+    assert_eq!(
+        &*outer.trigger.args,
+        &[vmir::TrigArg::Bound(0), vmir::TrigArg::Bound(0)]
+    );
+    // The outer body calls the inner occurrence with the outer binder
+    // (`Temp(0)`) as its capture argument.
+    assert!(
+        outer.body.insts.iter().any(|i| matches!(
+            &i.kind,
+            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
+                if fc.function == inner_id && fc.args.iter().eq(&[vmir::Val::Temp(0)])
+        )),
+        "outer body must call the inner occurrence with the outer binder"
+    );
+
+    // Inner: one capture (i: Int), one binder (j), mixed trigger g(i, j) =
+    // [Capture(0), Bound(0)].
+    assert_eq!(&*inner.params, &[vmir::Type::Int], "inner captures i");
+    assert_eq!(inner.bound.len(), 1);
+    assert_eq!(
+        &*inner.trigger.args,
+        &[vmir::TrigArg::Capture(0), vmir::TrigArg::Bound(0)]
+    );
+
+    // The axiom body still references the outer occurrence via a nullary call.
+    let ax_id = p.id("nest").expect("missing axiom nest");
+    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
+        panic!("nest must be a Axiom");
+    };
+    assert!(
+        ax.body.insts.iter().any(|i| matches!(
+            &i.kind,
+            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
+                if fc.function == outer_id && fc.args.iter().next().is_none()
+        )),
+        "axiom body must call the nullary outer occurrence"
+    );
+
+    // Display path must not panic and should render the capture param.
+    let s = format!("{p}");
+    assert!(
+        s.contains("quantifier nest#quant1(e0: Int)"),
+        "rendered:\n{s}"
+    );
+}
+
+#[test]
+fn nested_forall_slot_order() {
+    // Flat preorder ids across nesting: a nested `forall` takes the slot after
+    // its encloser; a later sibling top-level `forall` takes the next one. The
+    // id-keyed slot fill must pair each declaration correctly even though the
+    // inner quantifier finishes building before the outer.
+    let input = r#"
+domain D {
+    function g(i: Int, j: Int): Bool
+    function h(k: Int): Bool
+    axiom ord {
+        (forall i: Int :: {g(i, i)} (forall j: Int :: {g(i, j)} g(i, j)))
+        && (forall k: Int :: {h(k)} h(k))
+    }
+}
+"#;
+    let p = run(input);
+    let g_id = p.id("g").expect("missing g");
+    let h_id = p.id("h").expect("missing h");
+    let quant = |name: &str| {
+        let id = p.id(name).unwrap_or_else(|| panic!("missing {name}"));
+        match &p.decls[id] {
+            vmir::Declaration::Quantifier(q) => q,
+            _ => panic!("{name} must be a Quantifier"),
+        }
+    };
+    // #quant0 = outer (trigger g, no captures), #quant1 = inner (trigger g,
+    // one capture), #quant2 = sibling (trigger h).
+    assert_eq!(quant("ord#quant0").trigger.function, g_id);
+    assert!(quant("ord#quant0").params.is_empty());
+    assert_eq!(quant("ord#quant1").trigger.function, g_id);
+    assert_eq!(quant("ord#quant1").params.len(), 1);
+    assert_eq!(quant("ord#quant2").trigger.function, h_id);
+    assert!(quant("ord#quant2").params.is_empty());
+}
+
+#[test]
+fn nested_forall_uncovered_inner_trigger_rejected() {
+    // The inner trigger `g(i, i)` mentions only the captured `i` — the inner
+    // binder `j` is never covered.
     let err = run_err(
         r#"
 domain D {
     function g(i: Int, j: Int): Bool
-    axiom bad { forall i: Int :: {g(i, i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+    axiom bad { forall i: Int :: {g(i, i)} (forall j: Int :: {g(i, i)} g(i, j)) }
 }
 "#,
     );
-    assert_eq!(err, TranslationError::NestedForallUnsupported);
+    assert_eq!(err, TranslationError::TriggerNotCovering);
 }
 
 #[test]

@@ -43,8 +43,9 @@ pub(crate) struct Sink {
     pub heap: Option<HeapVal>,
     /// Pre-allocated occurrence ids for the `forall`s in this lowering region,
     /// in encounter (preorder) order. Each `forall` pops the next id to emit its
-    /// nullary occurrence call; an empty queue means an unexpected (nested)
-    /// `forall`. Empty in every Sink except an axiom body's.
+    /// occurrence call; a quantifier body's inner sink inherits the remaining
+    /// queue, so nested `forall`s consume the same flat preorder allocation.
+    /// Empty in every Sink outside an axiom (or quantifier-body) lowering.
     pub quant_ids: VecDeque<MemberId>,
     /// Quantifier declarations built while lowering this region's `forall`s,
     /// paired with their occurrence id, for the caller to fill their slots.

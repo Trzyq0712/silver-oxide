@@ -10,7 +10,7 @@ use egg::{
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
-use crate::vmir::{BinOp, Literal, Type, Val};
+use crate::vmir::{BinOp, Literal, TrigArg, Type, Val};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 
@@ -615,29 +615,38 @@ pub(crate) fn axiom_rule(name: &str, axiom: PreparedAxiom) -> Rule {
 
 // ---- Pure `forall` quantifiers (value-σ triggered) -------------------------
 
-/// A pure `forall` prepared for lazy instantiation: its opaque nullary
-/// occurrence (`quant_func`), the bound-variable arity (`n_bound`), the trigger
+/// A pure `forall` prepared for lazy instantiation: its opaque occurrence
+/// function (`quant_func`), the capture and bound-variable arities, the trigger
 /// function whose ground applications drive instantiation, the positional
-/// binder map (`binders[k]` = the bound variable that trigger argument `k`
-/// binds), and the body (registry-resolved pure steps + boolean `res`). Unlike
-/// a generic axiom, σ is over *values* (e-class ids read off the trigger's
-/// arguments), not types.
+/// trigger-argument map (`trig_args[k]` = the bound variable that trigger
+/// argument `k` binds, or the capture param it must equal), and the body
+/// (registry-resolved pure steps + boolean `res`, with temps `0..n_caps` the
+/// captures and `n_caps..n_caps+n_bound` the binders). Unlike a generic axiom,
+/// σ is over *values* (e-class ids read off the trigger's arguments), not
+/// types.
 pub(crate) struct PreparedQuantifier {
     pub quant_func: FuncId,
+    pub n_caps: usize,
     pub n_bound: usize,
     pub trigger_func: FuncId,
-    pub binders: Box<[usize]>,
+    pub trig_args: Box<[TrigArg]>,
     pub insts: Vec<AxiomInst>,
     pub res: Val,
 }
 
-/// Applier: for each ground application of the trigger in the matched e-class,
-/// read the bound-variable σ off its arguments, instantiate the body at σ, and
-/// add the **guarded** clause `Ite(occurrence, res[σ], true) == true`. The
-/// instance is released only once the occurrence merges `true` (existing
+/// Applier: pair every ground occurrence `Q(c..)` in the e-graph with every
+/// ground application of the trigger in the matched e-class whose capture
+/// positions match the occurrence's capture args; read the bound-variable σ off
+/// the binder positions, instantiate the body at `caps ++ σ`, and add the
+/// **guarded** clause `Ite(Q(c..), res[c,σ], true) == true`. The instance is
+/// released only once that ground occurrence merges `true` (existing
 /// `ite(true, t, e) = t` rule), so instantiation is sound regardless of the
-/// quantifier's truth. Memoized per (occurrence, σ) — a saturation-cost guard,
-/// since instantiation is idempotent.
+/// quantifier's truth. Occurrences are never created here — a top-level
+/// (nullary) occurrence is added by the eager ground-axiom evaluation, a nested
+/// one by an outer instance's `build_instance`; an unmaterialized quantifier is
+/// correctly never instantiated (its guard could never fire). Memoized per
+/// `caps ++ σ` (canonicalized at insert) — a saturation-cost guard, since
+/// instantiation is idempotent.
 struct QuantApplier {
     quant: PreparedQuantifier,
     memo: Mutex<HashSet<Vec<Id>>>,
@@ -652,65 +661,87 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
         _searcher_ast: Option<&PatternAst<Symbolic>>,
         _rule_name: Symbol,
     ) -> Vec<Id> {
-        // The opaque nullary occurrence class (added if absent), needed to build
-        // the guard.
-        let q_id = egraph.add(Symbolic::FuncApp(
-            self.quant.quant_func,
-            Box::new([]),
-            Box::new([]),
-        ));
-        // Extract every distinct bound-variable σ from the e-class's trigger
-        // applications. Collected first: `build_instance` needs `&mut egraph`.
-        let mut sigmas: Vec<Vec<Id>> = Vec::new();
+        // Enumerate the ground occurrences of this quantifier currently in the
+        // e-graph. Distinct capture tuples in one e-class are distinct
+        // occurrences (each yields its own instance); the guard condition is
+        // the occurrence's e-class either way.
+        let mut occurrences: Vec<(Id, Box<[Id]>)> = Vec::new();
+        if let Some(classes) = egraph.classes_for_op(&Discriminant::FuncApp(self.quant.quant_func))
+        {
+            for occ_class in classes {
+                for node in &egraph[occ_class].nodes {
+                    let Symbolic::FuncApp(f, _, caps) = node else {
+                        continue;
+                    };
+                    if *f == self.quant.quant_func && caps.len() == self.quant.n_caps {
+                        occurrences.push((occ_class, caps.clone()));
+                    }
+                }
+            }
+        }
+        // Pair each trigger application in the matched e-class with each
+        // occurrence. Collected first: `build_instance` needs `&mut egraph`.
+        let mut instances: Vec<(Id, Vec<Id>)> = Vec::new();
         for node in &egraph[eclass].nodes {
             let Symbolic::FuncApp(f, _, args) = node else {
                 continue;
             };
-            if *f != self.quant.trigger_func || args.len() != self.quant.binders.len() {
+            if *f != self.quant.trigger_func || args.len() != self.quant.trig_args.len() {
                 continue;
             }
-            // Positional σ: trigger arg `k` binds bound var `binders[k]`. A
-            // repeated binder must land on the same e-class.
-            let mut sigma: Vec<Option<Id>> = vec![None; self.quant.n_bound];
-            let mut ok = true;
-            for (k, &arg) in args.iter().enumerate() {
-                let slot = &mut sigma[self.quant.binders[k]];
-                match slot {
-                    Some(prev) if egraph.find(*prev) != egraph.find(arg) => {
-                        ok = false;
-                        break;
+            for (occ_id, caps) in &occurrences {
+                // Positional match: a `Bound(i)` argument defines σ(i) (a
+                // repeated binder must land on the same e-class); a
+                // `Capture(c)` argument must equal the occurrence's capture.
+                let mut sigma: Vec<Option<Id>> = vec![None; self.quant.n_bound];
+                let mut ok = true;
+                for (k, &arg) in args.iter().enumerate() {
+                    match self.quant.trig_args[k] {
+                        TrigArg::Bound(i) => match &mut sigma[i] {
+                            Some(prev) if egraph.find(*prev) != egraph.find(arg) => {
+                                ok = false;
+                                break;
+                            }
+                            slot => *slot = Some(egraph.find(arg)),
+                        },
+                        TrigArg::Capture(c) => {
+                            if egraph.find(caps[c]) != egraph.find(arg) {
+                                ok = false;
+                                break;
+                            }
+                        }
                     }
-                    _ => *slot = Some(egraph.find(arg)),
                 }
-            }
-            if !ok {
-                continue;
-            }
-            let Some(sigma): Option<Vec<Id>> = sigma.into_iter().collect() else {
-                continue;
-            };
-            let mut memo = self.memo.lock().unwrap();
-            // Key includes the (canonical) occurrence so distinct quantifiers
-            // sharing a trigger don't collide.
-            let mut key = Vec::with_capacity(sigma.len() + 1);
-            key.push(egraph.find(q_id));
-            key.extend(sigma.iter().copied());
-            if memo.insert(key) {
-                sigmas.push(sigma);
+                if !ok {
+                    continue;
+                }
+                let Some(sigma): Option<Vec<Id>> = sigma.into_iter().collect() else {
+                    continue;
+                };
+                // The seed is the body's leading temps: captures then binders.
+                let mut vals: Vec<Id> = caps.iter().map(|&c| egraph.find(c)).collect();
+                vals.extend(sigma);
+                // The capture tuple determines the instance, so the memo key
+                // needs no occurrence-class component (the memo is per
+                // quantifier already).
+                let mut memo = self.memo.lock().unwrap();
+                if memo.insert(vals.clone()) {
+                    instances.push((*occ_id, vals));
+                }
             }
         }
         let mut changed = Vec::new();
-        for sigma in sigmas {
+        for (occ_id, vals) in instances {
             let res = build_instance(
                 egraph,
                 &self.quant.insts,
                 &self.quant.res,
-                &sigma,
+                &vals,
                 &[],
                 &mut changed,
             );
             let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-            let guard = egraph.add(Symbolic::Ite([q_id, res, true_]));
+            let guard = egraph.add(Symbolic::Ite([occ_id, res, true_]));
             if egraph.union(guard, true_) {
                 changed.push(egraph.find(guard));
             }
