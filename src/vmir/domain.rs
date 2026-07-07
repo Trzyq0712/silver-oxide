@@ -141,10 +141,12 @@ impl<'a> Display for VmirDisplay<'a, &'a Quantifier> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = self.interner.resolve(&self.item.name);
         let trigger_fn = self.member(self.item.trigger.function);
+        // The occurrence is a callable nullary boolean — `()` marks it (and is
+        // where captured value parameters would appear once captures land).
         // Binders occupy `Val::Temp(0..bound.len())`, i.e. `e0..e{n-1}` — the
         // same variable syntax the body uses to reference them; their types are
         // written out.
-        write!(f, "quantifier {name} forall ")?;
+        write!(f, "quantifier {name}() forall ")?;
         for (k, ty) in self.item.bound.iter().enumerate() {
             if k > 0 {
                 write!(f, ", ")?;
