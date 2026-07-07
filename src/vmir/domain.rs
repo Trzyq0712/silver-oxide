@@ -10,17 +10,19 @@ pub struct Domain {
     pub ty_params: TyParams,
 }
 
-/// A ground (quantifier-free) domain axiom: a closed boolean fact the verifier
-/// **assumes** in every verification unit. The body is a pure, heap-free inst
-/// stream (`Pure` + the `Assume`s stitched from a callee's `#ensures`; no
-/// params, so `Val::Temp` counts from 0) whose `res` is the axiom's boolean —
-/// merged with `true` before verification. Axiom bodies are **never verified**:
-/// no well-definedness obligations (div-by-zero etc.) are checked on them. A
-/// generic axiom (`ty_params > 0`) holds for every ground instantiation of its
-/// type parameters ("forall over types"); the verifier instantiates it lazily,
+/// A ground (quantifier-free) axiom: a closed boolean fact the verifier
+/// **assumes** in every verification unit. In VMIR an axiom is a free-standing
+/// declaration, not bound to a domain (Silver domains only supply the source
+/// syntax). The body is a pure, heap-free inst stream (`Pure` + the `Assume`s
+/// stitched from a callee's `#ensures`; no params, so `Val::Temp` counts from
+/// 0) whose `res` is the axiom's boolean — merged with `true` before
+/// verification. Axiom bodies are **never verified**: no well-definedness
+/// obligations (div-by-zero etc.) are checked on them. A generic axiom
+/// (`ty_params > 0`) holds for every ground instantiation of its type
+/// parameters ("forall over types"); the verifier instantiates it lazily,
 /// triggered by ground applications of the functions it mentions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DomainAxiom {
+pub struct Axiom {
     pub name: Option<Spur>,
     pub ty_params: TyParams,
     pub body: FunctionBody,
@@ -72,7 +74,7 @@ impl TyParams {
     }
 }
 
-impl DomainAxiom {
+impl Axiom {
     /// The axiom's **trigger**: the first `FunctionCall` in the body whose
     /// `type_args` mention all of the axiom's type parameters. A ground
     /// instantiation of that one application determines the instantiation of
@@ -119,7 +121,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Domain> {
     }
 }
 
-impl<'a> Display for VmirDisplay<'a, &'a DomainAxiom> {
+impl<'a> Display for VmirDisplay<'a, &'a Axiom> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "axiom")?;
         if let Some(n) = &self.item.name {

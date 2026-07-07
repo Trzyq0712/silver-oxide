@@ -1249,7 +1249,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 .push(crate::verify::rewrite::quantifier_rule(&name, prepared));
             continue;
         }
-        let vmir::Declaration::DomainAxiom(ax) = decl else {
+        let vmir::Declaration::Axiom(ax) = decl else {
             continue;
         };
         if ax.ty_params.count() == 0 {
@@ -1295,7 +1295,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
 /// which has no registry access at rule-application time.
 fn prepare_axiom(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-    ax: &vmir::DomainAxiom,
+    ax: &vmir::Axiom,
 ) -> Result<crate::verify::rewrite::PreparedAxiom, VerifyError> {
     use crate::verify::rewrite::PreparedAxiom;
     let trigger = ax

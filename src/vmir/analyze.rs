@@ -160,7 +160,7 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
                 inst_deps(&body.insts, out);
             }
         }
-        Declaration::DomainAxiom(ax) => inst_deps(&ax.body.insts, out),
+        Declaration::Axiom(ax) => inst_deps(&ax.body.insts, out),
         Declaration::Quantifier(q) => {
             inst_deps(&q.body.insts, out);
             out.push(q.trigger.function);
@@ -262,7 +262,7 @@ mod tests {
                     Declaration::Function(f) => f.name = n,
                     Declaration::Adt(a) => a.name = n,
                     Declaration::Domain(do_) => do_.name = n,
-                    Declaration::DomainAxiom(a) => a.name = Some(n),
+                    Declaration::Axiom(a) => a.name = Some(n),
                     Declaration::Quantifier(q) => q.name = n,
                 }
             }

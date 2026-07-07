@@ -1,6 +1,6 @@
 //! Lower a Silver `domain` declaration to its `vmir::Domain` stub, each of
 //! its (bodyless) domain functions to a `vmir::Function`, and each of its
-//! axioms to a `vmir::DomainAxiom`. One `DomainTranslator` owns the domain
+//! axioms to a `vmir::Axiom`. One `DomainTranslator` owns the domain
 //! stub *and* every function/axiom slot the domain declares.
 
 use std::collections::HashMap;
@@ -28,9 +28,9 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
     /// function's `ty_params` and `Generic(i)` indices count only the used ones.
     fn_slots: Vec<(DeclSlot<vmir::Function>, Vec<Spur>)>,
     /// One slot per axiom, parallel to `src.axioms`. An anonymous axiom's slot
-    /// is registered under the generated name `{domain}@axiom{i}` (`@` marks a
+    /// is registered under the generated name `{domain}#axiom{i}` (`#` marks a
     /// generated member); axioms are not callable, so no `name_map` entry.
-    axiom_slots: Vec<DeclSlot<vmir::DomainAxiom>>,
+    axiom_slots: Vec<DeclSlot<vmir::Axiom>>,
     /// One inner `Vec` per axiom (parallel to `src.axioms`), holding the
     /// pre-allocated occurrence slots for that axiom's top-level `forall`s, in
     /// preorder. Each is registered as `{axiom}#quant{j}`; not callable, so no
@@ -207,9 +207,9 @@ impl<'a> DomainTranslator<'a, Declared> {
         for (i, ax) in d.axioms.iter().enumerate() {
             let ax_name = match &ax.name {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
-                None => format!("{name_str}@axiom{i}"),
+                None => format!("{name_str}#axiom{i}"),
             };
-            let (_, aslot) = decl.alloc_slot::<vmir::DomainAxiom>(&ax_name);
+            let (_, aslot) = decl.alloc_slot::<vmir::Axiom>(&ax_name);
             axiom_slots.push(aslot);
             // Pre-allocate one occurrence slot per top-level `forall`, in the
             // preorder the body lowering will encounter them.
@@ -312,11 +312,11 @@ impl DomainTranslator<'_, Metaed> {
             ctx.decl_generics = Vec::new();
             let (body, quant_built) = lowered?;
             // The axiom's carried name matches its slot registration: the
-            // Silver name when given, the generated `{domain}@axiom{i}` slot
+            // Silver name when given, the generated `{domain}#axiom{i}` slot
             // name otherwise.
             let ax_name = match &ax.name {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
-                None => format!("{}@axiom{i}", ctx.interner.resolve(&self.silver_name)),
+                None => format!("{}#axiom{i}", ctx.interner.resolve(&self.silver_name)),
             };
             // Fill each quantifier slot with its built declaration, in the same
             // (preorder) order they were allocated and lowered. Set the name to
@@ -330,7 +330,7 @@ impl DomainTranslator<'_, Metaed> {
                 definer.define_quantifier(qslot, quant);
             }
             let name = definer.intern_name(&ax_name);
-            let axiom = vmir::DomainAxiom {
+            let axiom = vmir::Axiom {
                 name: Some(name),
                 ty_params: used.len().into(),
                 body,

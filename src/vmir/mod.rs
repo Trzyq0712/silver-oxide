@@ -18,7 +18,7 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
-pub use domain::{Domain, DomainAxiom, QuantTrigger, Quantifier, TyParams};
+pub use domain::{Domain, Axiom, QuantTrigger, Quantifier, TyParams};
 pub use function::{Args, Function, FunctionBody, FunctionCall, Params};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;
@@ -65,7 +65,7 @@ impl Program {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Declaration {
     Domain(Domain),
-    DomainAxiom(DomainAxiom),
+    Axiom(Axiom),
     Quantifier(Quantifier),
     Function(Function),
     Method(Method),
@@ -77,7 +77,7 @@ impl Declaration {
     pub fn name(&self) -> Spur {
         match self {
             Self::Domain(d) => d.name,
-            Self::DomainAxiom(a) => a.name.unwrap_or_default(),
+            Self::Axiom(a) => a.name.unwrap_or_default(),
             Self::Quantifier(q) => q.name,
             Self::Function(f) => f.name,
             Self::Method(m) => m.name,

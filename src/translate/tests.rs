@@ -904,8 +904,8 @@ domain D {
 
     // Named axiom: registered under its own name, monomorphic.
     let sz_id = p.id("sz").expect("missing axiom sz");
-    let vmir::Declaration::DomainAxiom(sz) = &p.decls[sz_id] else {
-        panic!("sz must be a DomainAxiom");
+    let vmir::Declaration::Axiom(sz) = &p.decls[sz_id] else {
+        panic!("sz must be a Axiom");
     };
     assert_eq!(sz.ty_params, 0.into());
     let size_id = p.id("size").expect("missing size");
@@ -919,9 +919,9 @@ domain D {
 
     // Anonymous axiom: generated slot name, and the callee's #ensures is
     // stitched as an Assume (`one` is a normal, precondition-free function).
-    let anon_id = p.id("D@axiom1").expect("missing anonymous axiom slot");
-    let vmir::Declaration::DomainAxiom(anon) = &p.decls[anon_id] else {
-        panic!("D@axiom1 must be a DomainAxiom");
+    let anon_id = p.id("D#axiom1").expect("missing anonymous axiom slot");
+    let vmir::Declaration::Axiom(anon) = &p.decls[anon_id] else {
+        panic!("D#axiom1 must be a Axiom");
     };
     let one_id = p.id("one").expect("missing one");
     assert!(
@@ -951,9 +951,9 @@ domain List[T] {
 "#;
     let p = run(input);
 
-    let ax_id = p.id("List@axiom0").expect("missing axiom slot");
-    let vmir::Declaration::DomainAxiom(ax) = &p.decls[ax_id] else {
-        panic!("List@axiom0 must be a DomainAxiom");
+    let ax_id = p.id("List#axiom0").expect("missing axiom slot");
+    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
+        panic!("List#axiom0 must be a Axiom");
     };
     assert_eq!(ax.ty_params, 1.into(), "axiom is generic over T");
 
@@ -997,9 +997,9 @@ domain D[T] {
 }
 "#;
     let p = run(input);
-    let ax_id = p.id("D@axiom0").expect("missing axiom slot");
-    let vmir::Declaration::DomainAxiom(ax) = &p.decls[ax_id] else {
-        panic!("D@axiom0 must be a DomainAxiom");
+    let ax_id = p.id("D#axiom0").expect("missing axiom slot");
+    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
+        panic!("D#axiom0 must be a Axiom");
     };
     assert_eq!(
         ax.ty_params,
@@ -1030,8 +1030,8 @@ domain D {
 
     // The axiom body references the occurrence via a nullary call to `q_id`.
     let ax_id = p.id("basic").expect("missing axiom basic");
-    let vmir::Declaration::DomainAxiom(ax) = &p.decls[ax_id] else {
-        panic!("basic must be a DomainAxiom");
+    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
+        panic!("basic must be a Axiom");
     };
     assert!(
         ax.body.insts.iter().any(|i| matches!(

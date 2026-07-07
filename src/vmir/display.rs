@@ -123,7 +123,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Declaration> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
             Declaration::Domain(domain) => write!(f, "{}", self.with(domain)),
-            Declaration::DomainAxiom(ax) => write!(f, "{}", self.with(ax)),
+            Declaration::Axiom(ax) => write!(f, "{}", self.with(ax)),
             Declaration::Quantifier(q) => write!(f, "{}", self.with(q)),
             Declaration::Function(function) => write!(f, "{}", self.with(function)),
             Declaration::Method(method) => write!(f, "{}", self.with(method)),
