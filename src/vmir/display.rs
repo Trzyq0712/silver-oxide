@@ -124,6 +124,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Declaration> {
         match self.item {
             Declaration::Domain(domain) => write!(f, "{}", self.with(domain)),
             Declaration::DomainAxiom(ax) => write!(f, "{}", self.with(ax)),
+            Declaration::Quantifier(q) => write!(f, "{}", self.with(q)),
             Declaration::Function(function) => write!(f, "{}", self.with(function)),
             Declaration::Method(method) => write!(f, "{}", self.with(method)),
             Declaration::Resource(resource) => write!(f, "{}", self.with(resource)),

@@ -8,6 +8,14 @@ pub enum TranslationError {
     /// cover all of the axiom's type parameters — the verifier would have no
     /// trigger from which to read a ground instantiation.
     AxiomGenericsNotInferable(String),
+    /// A `forall` nested inside another `forall` — not supported in v1 (the
+    /// inner quantifier would capture the outer's bound variables).
+    NestedForallUnsupported,
+    /// A `forall` whose trigger is not a single function application whose
+    /// arguments are exactly the bound variables, jointly covering all of them.
+    TriggerNotCovering,
+    /// A `forall` inside a generic axiom — not supported in v1.
+    GenericForallUnsupported,
 }
 
 impl fmt::Display for TranslationError {
@@ -19,6 +27,16 @@ impl fmt::Display for TranslationError {
                 f,
                 "axiom `{name}`: no function application instantiates all of the axiom's type parameters"
             ),
+            TranslationError::NestedForallUnsupported => {
+                write!(f, "nested `forall` is not supported")
+            }
+            TranslationError::TriggerNotCovering => write!(
+                f,
+                "`forall` trigger must be a single application of the bound variables covering all of them"
+            ),
+            TranslationError::GenericForallUnsupported => {
+                write!(f, "`forall` inside a generic axiom is not supported")
+            }
         }
     }
 }

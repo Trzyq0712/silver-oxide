@@ -1238,7 +1238,17 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
 /// trigger. Axiom bodies are trusted — no obligations (div-by-zero, deref
 /// permission) are checked on them.
 fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
-    for decl in program.decls.iter() {
+    for (id, decl) in program.decls.iter_enumerated() {
+        // A pure `forall` becomes a value-σ lazy-instantiation rule, chained
+        // into every saturation (like generic axioms). Its body is never
+        // verified; instantiation adds a guarded clause per ground trigger.
+        if let vmir::Declaration::Quantifier(q) = decl {
+            let prepared = prepare_quantifier(ctx.alloc, id, q)?;
+            let name = ctx.interner.resolve(&q.name).to_string();
+            ctx.axiom_rules
+                .push(crate::verify::rewrite::quantifier_rule(&name, prepared));
+            continue;
+        }
         let vmir::Declaration::DomainAxiom(ax) = decl else {
             continue;
         };
@@ -1287,15 +1297,55 @@ fn prepare_axiom(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     ax: &vmir::DomainAxiom,
 ) -> Result<crate::verify::rewrite::PreparedAxiom, VerifyError> {
-    use crate::verify::rewrite::{AxiomInst, AxiomPure, PreparedAxiom};
+    use crate::verify::rewrite::PreparedAxiom;
     let trigger = ax
         .covering_trigger()
         .ok_or(VerifyError::Unimplemented("generic axiom without trigger"))?;
     let trigger_func = crate::verify::func_registry::func_id_for_member(trigger.function);
     let trigger_type_args = trigger.type_args.clone();
 
-    let mut insts = Vec::with_capacity(ax.body.insts.len());
-    for inst in &ax.body.insts {
+    let insts = prepare_body(alloc, &ax.body.insts)?;
+    Ok(PreparedAxiom {
+        n_params: ax.ty_params.count(),
+        trigger_func,
+        trigger_type_args,
+        insts,
+        res: ax.body.res.clone(),
+    })
+}
+
+/// Resolve a pure `forall` into a [`PreparedQuantifier`]: its body as
+/// registry-level pure steps, its boolean result, its opaque nullary occurrence
+/// id, and its trigger (function + positional binder map). Instantiation reads
+/// the bound-variable σ off ground applications of the trigger.
+fn prepare_quantifier(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+    id: vmir::MemberId,
+    q: &vmir::Quantifier,
+) -> Result<crate::verify::rewrite::PreparedQuantifier, VerifyError> {
+    use crate::verify::rewrite::PreparedQuantifier;
+    let insts = prepare_body(alloc, &q.body.insts)?;
+    Ok(PreparedQuantifier {
+        quant_func: crate::verify::func_registry::func_id_for_member(id),
+        n_bound: q.bound.len(),
+        trigger_func: crate::verify::func_registry::func_id_for_member(q.trigger.function),
+        binders: q.trigger.binders.clone(),
+        insts,
+        res: q.body.res.clone(),
+    })
+}
+
+/// Lower an axiom/quantifier body's inst stream into registry-resolved pure
+/// steps (every callee down to its verifier `FuncId`), ready for the applier —
+/// which has no registry access at rule-application time. Shared by
+/// [`prepare_axiom`] and [`prepare_quantifier`].
+fn prepare_body(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+    insts: &[vmir::Inst],
+) -> Result<Vec<crate::verify::rewrite::AxiomInst>, VerifyError> {
+    use crate::verify::rewrite::{AxiomInst, AxiomPure};
+    let mut out = Vec::with_capacity(insts.len());
+    for inst in insts {
         let prepared = match &inst.kind {
             InstKind::Pure(_, pi) => AxiomInst::Val(match pi {
                 PureInst::Binary(op, l, r) => AxiomPure::Binary(*op, l.clone(), r.clone()),
@@ -1348,15 +1398,9 @@ fn prepare_axiom(
             InstKind::Assert(_) => continue,
             _ => return Err(VerifyError::Unimplemented("non-pure inst in axiom body")),
         };
-        insts.push(prepared);
+        out.push(prepared);
     }
-    Ok(PreparedAxiom {
-        n_params: ax.ty_params.count(),
-        trigger_func,
-        trigger_type_args,
-        insts,
-        res: ax.body.res.clone(),
-    })
+    Ok(out)
 }
 
 pub fn verify_method(

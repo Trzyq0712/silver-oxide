@@ -98,6 +98,27 @@ impl ShowExt for AxiomExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
             AxiomExt::FunctionCall(call) => write!(f, "{}", Show::new(call, interner)),
+            AxiomExt::Forall(q) => {
+                write!(f, "forall ")?;
+                for (i, bv) in q.bound.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", Show::new(bv, interner))?;
+                }
+                write!(f, " :: ")?;
+                for group in &q.triggers {
+                    write!(f, "{{")?;
+                    for (i, t) in group.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", Show::new(t, interner))?;
+                    }
+                    write!(f, "}}")?;
+                }
+                write!(f, " {}", Show::new(&q.body, interner))
+            }
         }
     }
 }

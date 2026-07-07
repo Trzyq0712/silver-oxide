@@ -205,13 +205,26 @@ pub enum HeapExt {
     Heap(HeapNode<HeapExt>),
 }
 
-/// The single extension allowed in a domain axiom: a call to a Silver
-/// `function`. Viper's only restriction on such calls is that the callee has
-/// **no precondition** (checked after lowering), which also makes it heap-free.
-/// Field access, `unfolding`, `old`, `perm`, and `result` remain illegal.
+/// The extensions allowed in a domain axiom: a call to a Silver `function`
+/// (Viper's only restriction on such calls is that the callee has **no
+/// precondition** — checked after lowering — which also makes it heap-free),
+/// and a pure `forall` quantifier. Field access, `unfolding`, `old`, `perm`,
+/// and `result` remain illegal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AxiomExt {
     FunctionCall(Call<AxiomExt>),
+    Forall(Box<Forall>),
+}
+
+/// A pure universal quantifier: `forall x: T, ... :: { trig } body`. The `body`
+/// is boolean; `triggers` is a disjunction of trigger *groups*, each a
+/// conjunction of trigger terms (Silver's `{ .. }{ .. }` syntax). Only
+/// `forall` reaches here — `exists` is rejected at typechecking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Forall {
+    pub bound: Vec<TypedIdent>,
+    pub triggers: Vec<Vec<TypedPureExp<AxiomExt>>>,
+    pub body: TypedPureExp<AxiomExt>,
 }
 
 /// Extensions allowed in function postconditions: heap access + `result`.

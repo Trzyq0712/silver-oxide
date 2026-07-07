@@ -20,6 +20,26 @@ fn run(input: &str) -> vmir::Program {
     translate(&typed).expect("translation failed")
 }
 
+/// Run the pipeline through translation, expecting it to fail, and return the
+/// first `TranslationError`.
+fn run_err(input: &str) -> TranslationError {
+    let mut program = viper_parser::vpr_program(input).expect("parse failed");
+    let mut ident_collector = IdentCollector::default();
+    program.walk_mut(&mut ident_collector);
+    let interner = ident_collector.finalize();
+    let mut globals_collector = GlobalsCollector::new(&interner);
+    program.walk(&mut globals_collector);
+    let globals = globals_collector.finalize().expect("globals error");
+    disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
+    inline_macros(&mut program, &interner).expect("macro inlining failed");
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck failed");
+    translate(&typed)
+        .expect_err("expected translation to fail")
+        .into_iter()
+        .next()
+        .expect("expected at least one error")
+}
+
 #[test]
 fn translates_number_pred_simpler() {
     let input = r#"
@@ -986,4 +1006,98 @@ domain D[T] {
         0.into(),
         "axiom not mentioning T is monomorphic"
     );
+}
+
+#[test]
+fn forall_axiom_lowers_to_quantifier() {
+    // A `forall` axiom lowers to a `Declaration::Quantifier` (occurrence body +
+    // trigger) plus a ground axiom whose body is the nullary occurrence call.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    axiom basic { forall i: Int :: {foo(i)} foo(i) }
+}
+"#;
+    let p = run(input);
+    let q_id = p.id("basic@quant0").expect("missing quantifier slot");
+    let vmir::Declaration::Quantifier(q) = &p.decls[q_id] else {
+        panic!("basic@quant0 must be a Quantifier");
+    };
+    assert_eq!(q.bound.len(), 1, "one binder");
+    let foo_id = p.id("foo").expect("missing foo");
+    assert_eq!(q.trigger.function, foo_id, "trigger is foo");
+    assert_eq!(&*q.trigger.binders, &[0], "arg 0 binds bound var 0");
+
+    // The axiom body references the occurrence via a nullary call to `q_id`.
+    let ax_id = p.id("basic").expect("missing axiom basic");
+    let vmir::Declaration::DomainAxiom(ax) = &p.decls[ax_id] else {
+        panic!("basic must be a DomainAxiom");
+    };
+    assert!(
+        ax.body.insts.iter().any(|i| matches!(
+            &i.kind,
+            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
+                if fc.function == q_id && fc.args.iter().next().is_none()
+        )),
+        "axiom body must call the nullary occurrence"
+    );
+
+    // Display path must not panic and should name the quantifier.
+    let s = format!("{p}");
+    assert!(s.contains("quantifier basic@quant0"), "rendered:\n{s}");
+}
+
+#[test]
+fn forall_missing_trigger_rejected() {
+    let err = run_err(
+        r#"
+domain D {
+    function foo(i: Int): Bool
+    axiom bad { forall i: Int :: foo(i) }
+}
+"#,
+    );
+    assert_eq!(err, TranslationError::TriggerNotCovering);
+}
+
+#[test]
+fn forall_non_covering_trigger_rejected() {
+    // Trigger `foo(0)` — argument is not a bound variable.
+    let err = run_err(
+        r#"
+domain D {
+    function foo(i: Int): Bool
+    axiom bad { forall i: Int :: {foo(0)} foo(i) }
+}
+"#,
+    );
+    assert_eq!(err, TranslationError::TriggerNotCovering);
+}
+
+#[test]
+fn nested_forall_rejected() {
+    let err = run_err(
+        r#"
+domain D {
+    function g(i: Int, j: Int): Bool
+    axiom bad { forall i: Int :: {g(i, i)} (forall j: Int :: {g(i, j)} g(i, j)) }
+}
+"#,
+    );
+    assert_eq!(err, TranslationError::NestedForallUnsupported);
+}
+
+#[test]
+fn generic_forall_rejected() {
+    // A `forall` inside a generic axiom (D[T] makes the axiom generic via mk).
+    let err = run_err(
+        r#"
+domain D[T] {
+    function mk(): D[T]
+    function p(x: D[T]): Bool
+    axiom bad { p(mk()) ? (forall i: Int :: {p(mk())} p(mk())) : true }
+}
+"#,
+    );
+    assert_eq!(err, TranslationError::GenericForallUnsupported);
 }

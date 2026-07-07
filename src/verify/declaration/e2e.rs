@@ -2219,3 +2219,132 @@ method client() {
          splitting (or equivalent) landed — update this test to assert Ok"
     );
 }
+
+// ---- Pure `forall` quantifiers (v1: domain axioms, no Tier-4) --------------
+
+#[test]
+fn quantifier_basic() {
+    // A bare `forall` axiom: the occurrence is unioned `true` directly, so the
+    // trigger application `foo(7)` releases `foo(7) == true`.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    axiom basic { forall i: Int :: {foo(i)} foo(i) }
+}
+method m() {
+    assert foo(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn quantifier_multivar() {
+    // Two binders, positional σ read off the two-argument trigger.
+    let input = r#"
+domain D {
+    function bar(i: Int, j: Int): Bool
+    axiom mv { forall i: Int, j: Int :: {bar(i, j)} bar(i, j) }
+}
+method m() {
+    assert bar(3, 4)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn quantifier_guarded_concrete() {
+    // Guarded `forall`: with `b()` concretely true, const-fold collapses the
+    // guard `Ite(b(), Q, true)` to `Q = true`, releasing the instance. No
+    // Tier-4 case-split needed.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    function b(): Bool
+    axiom g { b() ? (forall i: Int :: {foo(i)} foo(i)) : true }
+}
+method m() {
+    inhale b()
+    assert foo(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn quantifier_guard_stuck_fails() {
+    // Guarded `forall` with `b()` unknown: the guard never collapses, so the
+    // instance stays gated and `foo(0)` is unprovable. (Soundness: the guard
+    // must not leak.)
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    function b(): Bool
+    axiom g { b() ? (forall i: Int :: {foo(i)} foo(i)) : true }
+}
+method m() {
+    assert foo(0)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn quantifier_wrong_instance_fails() {
+    // The body is `i > 0 ==> foo(i)`. At the instance i := 0 it is
+    // `Ite(false, foo(0), true) = true` — vacuously true, yielding nothing
+    // about `foo(0)`. (Soundness: σ must be exact.)
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    axiom w { forall i: Int :: {foo(i)} i > 0 ==> foo(i) }
+}
+method m() {
+    assert foo(0)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn quantifier_guarded_implication_not_yet() {
+    // KNOWN LIMITATION (no Tier-4): proving `b() ==> foo(7)` needs a
+    // goal-directed case-split on `b()` to collapse the guard `Ite(b(), Q,
+    // true)` and then `Ite(Q, foo(7), true)`. Without Tier-4 neither guard
+    // collapses (nothing concrete), so this fails. Flip to `is_ok` when Tier-4
+    // lands.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    function b(): Bool
+    axiom g { b() ? (forall i: Int :: {foo(i)} foo(i)) : true }
+}
+method m() {
+    assert b() ==> foo(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "documents the no-Tier-4 limitation; if this starts passing, \
+         goal-directed ITE case-splitting landed — flip to assert Ok"
+    );
+}

@@ -247,11 +247,22 @@ trait PureExt: Sized {
     /// Lift a heap-reading construct (`e.f`, `function` call, `unfolding`) into
     /// this context's extension. A pure context (`!`) rejects it.
     fn lower_heap(node: typed::HeapNode<Self>) -> Result<Self, TypeError>;
-    /// Whether a quantifier may appear in this context. Axioms (ground-only)
-    /// reject it; everywhere else it currently lowers to `true` until proper
-    /// quantifier support lands.
-    fn check_quantifier() -> Result<(), TypeError> {
-        Ok(())
+    /// Whether this context lowers a `forall` into a first-class quantifier
+    /// term. Only axioms do (`true`); everywhere else a quantifier is still
+    /// erased to `true` (see the dispatch in `lower_pure_kind`) — so the body
+    /// is **not** recursed into, preserving the silent-erase for quantified
+    /// permissions and other unsupported forms in method/function contexts.
+    const LOWER_FORALL: bool = false;
+    /// Assemble a lowered `forall` into this context's extension. Only invoked
+    /// when [`Self::LOWER_FORALL`] is `true`; the default is therefore
+    /// unreachable. `exists` is rejected here.
+    fn build_forall(
+        _kind: viper::QuantifierKind,
+        _bound: Vec<typed::TypedIdent>,
+        _triggers: Vec<Vec<TypedPureExp<Self>>>,
+        _body: TypedPureExp<Self>,
+    ) -> Result<PureExpKind<Self>, TypeError> {
+        unreachable!("build_forall on a context with LOWER_FORALL = false")
     }
 }
 
@@ -280,8 +291,23 @@ impl PureExt for typed::AxiomExt {
             typed::HeapNode::Unfolding(..) => Err(TypeError::UnfoldingInAxiom),
         }
     }
-    fn check_quantifier() -> Result<(), TypeError> {
-        Err(TypeError::QuantifierInAxiom)
+    const LOWER_FORALL: bool = true;
+    fn build_forall(
+        kind: viper::QuantifierKind,
+        bound: Vec<typed::TypedIdent>,
+        triggers: Vec<Vec<TypedPureExp<Self>>>,
+        body: TypedPureExp<Self>,
+    ) -> Result<PureExpKind<Self>, TypeError> {
+        match kind {
+            viper::QuantifierKind::Forall => Ok(PureExpKind::Ext(typed::AxiomExt::Forall(
+                Box::new(typed::Forall {
+                    bound,
+                    triggers,
+                    body,
+                }),
+            ))),
+            viper::QuantifierKind::Exists => Err(TypeError::ExistsUnsupported),
+        }
     }
 }
 
@@ -617,7 +643,7 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                     .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
 
-            ExpKind::Quantifier(_, bound_vars, _triggers, body) => {
+            ExpKind::Quantifier(_, bound_vars, triggers, body) => {
                 // Treat quantifier binders like let-binders: impose their declared type,
                 // restore the previous bindings afterwards.
                 let mut prev_bindings = Vec::with_capacity(bound_vars.len());
@@ -627,6 +653,14 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                     self.tc.impose(bk.concretizes_explicit(type_to_tc(&ty)))?;
                     let prev = self.let_bindings.insert(bv.idn.0.id(), bk);
                     prev_bindings.push((bv.idn.0.id(), prev));
+                }
+                // Constrain every trigger term inside the binder scope, so each
+                // gets a resolved type for later lowering (a dropped trigger
+                // would panic `resolved_ty`).
+                for trig in triggers.iter_mut() {
+                    for e in trig.exp.iter_mut() {
+                        self.constrain_pure(e)?;
+                    }
                 }
                 let body_key = self.constrain_pure(body)?;
                 for (spur, prev) in prev_bindings {
@@ -1079,11 +1113,32 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                 Ok(PureExpKind::AdtDiscriminator(base_exp, Ident(variant.id())))
             }
 
-            // Quantifiers emitted as bool constant (proper typed support later).
-            // Contexts assumed verbatim (axioms) reject them instead.
-            ExpKind::Quantifier(..) => {
-                Ext::check_quantifier()?;
-                Ok(PureExpKind::Const(Literal::Bool(true)))
+            // A quantifier is a first-class term only in a `LOWER_FORALL`
+            // context (axioms); everywhere else it is erased to `true` without
+            // recursing into the body (so unsupported forms like quantified
+            // permissions stay silently erased).
+            ExpKind::Quantifier(kind, bound_vars, triggers, body) => {
+                if !Ext::LOWER_FORALL {
+                    return Ok(PureExpKind::Const(Literal::Bool(true)));
+                }
+                let bound: Vec<TypedIdent> = bound_vars
+                    .iter()
+                    .map(|bv| TypedIdent {
+                        name: Ident(bv.idn.0.id()),
+                        ty: Type::from(&bv.ty),
+                    })
+                    .collect();
+                let lowered_triggers: Vec<Vec<TypedPureExp<Ext>>> = triggers
+                    .iter()
+                    .map(|trig| {
+                        trig.exp
+                            .iter()
+                            .map(|e| self.lower_pure::<Ext>(e))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lowered_body = self.lower_pure::<Ext>(body)?;
+                Ext::build_forall(*kind, bound, lowered_triggers, lowered_body)
             }
 
             _ => Err(TypeError::Other(format!(
@@ -1808,6 +1863,14 @@ fn check_axiom_function_calls(
             }
             check_call(call)
         }
+        P::Ext(typed::AxiomExt::Forall(q)) => {
+            for group in &q.triggers {
+                for t in group {
+                    check_axiom_function_calls(t, fns_with_precond, interner)?;
+                }
+            }
+            check_axiom_function_calls(&q.body, fns_with_precond, interner)
+        }
     }
 }
 
@@ -2062,17 +2125,29 @@ domain D { axiom a { null.f == 0 } }
     }
 
     #[test]
-    fn axiom_quantifier_rejected() {
+    fn axiom_forall_typechecks() {
+        // A pure `forall` is now a first-class term in an axiom (trigger
+        // validity is checked later, at translation).
         let result = run_pipeline(
             r#"
-domain D { axiom q { forall x: Int :: x == x } }
+domain D { axiom q { forall x: Int :: {x == x} x == x } }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn axiom_exists_rejected() {
+        let result = run_pipeline(
+            r#"
+domain D { axiom e { exists x: Int :: x == x } }
 "#,
         );
         assert!(
             result
                 .as_ref()
-                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::QuantifierInAxiom))),
-            "expected QuantifierInAxiom, got: {result:?}"
+                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::ExistsUnsupported))),
+            "expected ExistsUnsupported, got: {result:?}"
         );
     }
 

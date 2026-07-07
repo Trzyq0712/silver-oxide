@@ -32,8 +32,8 @@ pub enum TypeError {
     },
     /// A `Generic` type parameter occurred outside a scope that binds it.
     UnboundTypeParam(String),
-    /// A quantifier in a domain axiom (only ground axioms are supported).
-    QuantifierInAxiom,
+    /// An `exists` quantifier (only pure `forall` is supported so far).
+    ExistsUnsupported,
     /// A field dereference in a domain axiom.
     FieldAccessInAxiom,
     /// An `unfolding` expression in a domain axiom.
@@ -103,8 +103,8 @@ impl std::fmt::Display for TypeError {
             TypeError::UnboundTypeParam(name) => {
                 write!(f, "unbound type parameter `{name}`")
             }
-            TypeError::QuantifierInAxiom => {
-                write!(f, "quantifiers are not supported in domain axioms")
+            TypeError::ExistsUnsupported => {
+                write!(f, "`exists` quantifiers are not supported yet")
             }
             TypeError::FieldAccessInAxiom => {
                 write!(f, "field access not allowed in a domain axiom")

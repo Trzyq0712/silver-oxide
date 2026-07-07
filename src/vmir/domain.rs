@@ -26,6 +26,36 @@ pub struct DomainAxiom {
     pub body: FunctionBody,
 }
 
+/// A pure `forall` occurrence, lowered from an axiom body. The enclosing axiom
+/// body references it as an opaque nullary boolean `FunctionCall` to this
+/// declaration's own id (`{axiom}@quant{j}`); this declaration carries the
+/// quantifier's body + trigger so the verifier can instantiate it lazily.
+///
+/// The `body` is a pure, heap-free inst stream whose `res` is the quantified
+/// boolean, with the bound variables occupying `Val::Temp(0..bound.len())`
+/// (closed — v1 forbids free value variables, so there are no leading capture
+/// params yet). Like an axiom, a quantifier body is **never verified**; it only
+/// contributes a lazy-instantiation rule. Instantiation at a ground trigger
+/// application `f(t)` adds the guarded clause `Ite(occurrence, res[σ], true)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Quantifier {
+    pub name: Spur,
+    /// The binder types; body params are `Val::Temp(0..bound.len())`.
+    pub bound: Box<[crate::vmir::Type]>,
+    pub trigger: QuantTrigger,
+    pub body: FunctionBody,
+}
+
+/// A quantifier's trigger: one function application whose arguments are exactly
+/// the bound variables (each occurring once or repeated), jointly covering all
+/// binders. Argument `k` of the application binds bound variable `binders[k]`,
+/// so a ground application `f(t0, t1, ..)` determines σ = { binders[k] ↦ tk }.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QuantTrigger {
+    pub function: crate::vmir::MemberId,
+    pub binders: Box<[usize]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TyParams(usize);
 
@@ -101,6 +131,31 @@ impl<'a> Display for VmirDisplay<'a, &'a DomainAxiom> {
             f,
             "{}",
             self.with((0usize, 0usize, &self.item.body.insts[..]))
+        )?;
+        writeln!(f, "  result: {}", self.item.body.res)?;
+        write!(f, "}}")
+    }
+}
+
+impl<'a> Display for VmirDisplay<'a, &'a Quantifier> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let name = self.interner.resolve(&self.item.name);
+        let trigger_fn = self.member(self.item.trigger.function);
+        write!(f, "quantifier {name} forall<{}>", self.item.bound.len())?;
+        write!(f, " {{{}(", trigger_fn)?;
+        for (k, b) in self.item.trigger.binders.iter().enumerate() {
+            if k > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "?{b}")?;
+        }
+        writeln!(f, ")}} {{")?;
+        // The binders occupy `Val::Temp(0..bound.len())`, so the body's own
+        // temps (and the display counter) start there.
+        write!(
+            f,
+            "{}",
+            self.with((self.item.bound.len(), 0usize, &self.item.body.insts[..]))
         )?;
         writeln!(f, "  result: {}", self.item.body.res)?;
         write!(f, "}}")

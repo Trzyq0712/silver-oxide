@@ -530,8 +530,119 @@ impl PureExt for typed::AxiomExt {
     ) -> Result<Val, TranslationError> {
         match ext {
             typed::AxiomExt::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
+            typed::AxiomExt::Forall(q) => lower_forall(b, sink, q),
         }
     }
+}
+
+/// Lower a pure `forall` into its opaque nullary occurrence call, defining the
+/// [`vmir::Quantifier`] (body + trigger) into `sink.quant_out` for the caller to
+/// slot. The occurrence id is the next pre-allocated one in `sink.quant_ids`
+/// (empty ⇒ an unexpected nested `forall`). The body is lowered in a fresh sink
+/// with the bound variables as `Val::Temp(0..n)`.
+fn lower_forall(
+    b: &TranslationContext<'_>,
+    sink: &mut Sink,
+    q: &typed::Forall,
+) -> Result<Val, TranslationError> {
+    // v1 excludes `forall` inside a generic axiom (no type-σ + value-σ mix).
+    if !b.decl_generics.is_empty() {
+        return Err(TranslationError::GenericForallUnsupported);
+    }
+    let quant_id = sink
+        .quant_ids
+        .pop_front()
+        .ok_or(TranslationError::NestedForallUnsupported)?;
+
+    let n = q.bound.len();
+    let mut env: HashMap<Spur, Val> = HashMap::new();
+    let mut bound = Vec::with_capacity(n);
+    let mut binder_idx: HashMap<Spur, usize> = HashMap::new();
+    for (k, bv) in q.bound.iter().enumerate() {
+        env.insert(bv.name.0, Val::Temp(k));
+        binder_idx.insert(bv.name.0, k);
+        bound.push(b.lower_type(&bv.ty));
+    }
+
+    let trigger = validate_trigger(b, &q.triggers, &binder_idx, n)?;
+
+    // Lower the body in a fresh sink; its params (the binders) occupy
+    // `Val::Temp(0..n)`, so the body's own temps count from `n`. A fresh sink
+    // has an empty `quant_ids`, so a nested `forall` in the body errors.
+    let body = lower_function_body(b, &env, &q.body, n, HeapVal::Empty, None, None, None)?;
+
+    sink.quant_out.push((
+        quant_id,
+        vmir::Quantifier {
+            name: Default::default(),
+            bound: bound.into(),
+            trigger,
+            body,
+        },
+    ));
+
+    // Emit the opaque nullary boolean occurrence call.
+    Ok(sink.emit_pure(
+        vmir::Type::Bool,
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: quant_id,
+            type_args: Vec::new(),
+            args: Vec::new().into(),
+        }),
+    ))
+}
+
+/// Validate a `forall`'s trigger set against the v1 rule: some trigger group is
+/// exactly one function application whose arguments are each an identifier of a
+/// bound variable, jointly covering all `n` binders. Returns the resolved
+/// [`vmir::QuantTrigger`]; a repeated binder is allowed as long as coverage
+/// holds.
+fn validate_trigger(
+    b: &TranslationContext<'_>,
+    triggers: &[Vec<typed::TypedPureExp<typed::AxiomExt>>],
+    binder_idx: &HashMap<Spur, usize>,
+    n: usize,
+) -> Result<vmir::QuantTrigger, TranslationError> {
+    use typed::PureExpKind as P;
+    for group in triggers {
+        let [term] = &group[..] else {
+            continue;
+        };
+        // The trigger term must be a single call (domain function or Silver
+        // function) — extract its callee name and argument list.
+        let call: &typed::Call<typed::AxiomExt> = match term.exp.as_ref() {
+            P::DomainFunctionCall(c) => c,
+            P::Ext(typed::AxiomExt::FunctionCall(c)) => c,
+            _ => continue,
+        };
+        // Every argument must be exactly a bound variable.
+        let mut binders = Vec::with_capacity(call.args.len());
+        let mut covered = vec![false; n];
+        let mut ok = true;
+        for a in &call.args {
+            let P::Ident(id) = a.exp.as_ref() else {
+                ok = false;
+                break;
+            };
+            let Some(&idx) = binder_idx.get(&id.0) else {
+                ok = false;
+                break;
+            };
+            covered[idx] = true;
+            binders.push(idx);
+        }
+        if !ok || !covered.iter().all(|&c| c) {
+            continue;
+        }
+        let function = *b.name_map.get(&call.name.0).ok_or_else(|| {
+            TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+        })?;
+        return Ok(vmir::QuantTrigger {
+            function,
+            binders: binders.into(),
+        });
+    }
+    Err(TranslationError::TriggerNotCovering)
 }
 
 impl PureExt for typed::MethodEnsuresExt {
@@ -753,4 +864,37 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         insts: sink.insts,
         res,
     })
+}
+
+/// Lower a domain-axiom body (heap-free, no contract), seeding the sink with the
+/// pre-allocated occurrence ids for the axiom's top-level `forall`s. Returns the
+/// lowered body plus every [`vmir::Quantifier`] built for those `forall`s,
+/// paired with its occurrence id, for the caller to slot. A body with no
+/// `forall`s passes an empty `quant_ids` and yields no quantifiers.
+pub(crate) fn lower_axiom_body(
+    b: &TranslationContext<'_>,
+    env: &HashMap<Spur, Val>,
+    exp: &typed::TypedPureExp<typed::AxiomExt>,
+    quant_ids: std::collections::VecDeque<vmir::MemberId>,
+) -> Result<(vmir::FunctionBody, Vec<(vmir::MemberId, vmir::Quantifier)>), TranslationError> {
+    let mut sink = Sink::new(0, 0);
+    sink.quant_ids = quant_ids;
+    let hctx = HeapCtx {
+        value: HeapVal::Empty,
+        perm: HeapVal::Empty,
+        old: None,
+        result: None,
+    };
+    let res = lower(b, env, &mut sink, hctx, exp)?;
+    debug_assert!(
+        sink.quant_ids.is_empty(),
+        "axiom body lowered fewer `forall`s than were pre-allocated"
+    );
+    Ok((
+        vmir::FunctionBody {
+            insts: sink.insts,
+            res,
+        },
+        sink.quant_out,
+    ))
 }

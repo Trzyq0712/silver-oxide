@@ -456,6 +456,76 @@ impl Searcher<Symbolic, ConstFold> for AxiomTriggerSearcher {
 /// merge its boolean with `true`. Memoized per σ (instantiation is idempotent —
 /// re-adding hash-conses and re-unioning no-ops — so the memo is purely a
 /// saturation-cost guard). Axiom bodies are never verified: no obligations.
+/// Add a prepared body (of an axiom or a quantifier) to the e-graph, seeding
+/// the value slots with `vals_seed` (the bound-variable σ for a quantifier;
+/// empty for a closed axiom) and substituting `type_sigma` into every type
+/// argument (the type-parameter σ for a generic axiom; empty for a quantifier).
+/// Runs the body's `Assume`s (merging each with `true`) and returns the changed
+/// e-classes together with the body's `res` e-class id. The caller decides how
+/// to discharge `res` (an axiom merges it with `true`; a quantifier guards it).
+fn build_instance(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    insts: &[AxiomInst],
+    res: &Val,
+    vals_seed: &[Id],
+    type_sigma: &[Type],
+    changed: &mut Vec<Id>,
+) -> Id {
+    let mut vals: Vec<Id> = vals_seed.to_vec();
+    fn get(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
+        match v {
+            Val::Temp(n) => vals[*n],
+            Val::Literal(lit) => egraph.add(Symbolic::Lit(lit.clone())),
+        }
+    }
+    let true_of =
+        |egraph: &mut EGraph<Symbolic, ConstFold>| egraph.add(Symbolic::Lit(Literal::Bool(true)));
+    for inst in insts {
+        match inst {
+            AxiomInst::Val(p) => {
+                let id = match p {
+                    AxiomPure::Binary(op, l, r) => {
+                        let l = get(egraph, &vals, l);
+                        let r = get(egraph, &vals, r);
+                        egraph.add(Symbolic::Binary(*op, [l, r]))
+                    }
+                    AxiomPure::Ternary(c, t, e) => {
+                        let c = get(egraph, &vals, c);
+                        let t = get(egraph, &vals, t);
+                        let e = get(egraph, &vals, e);
+                        egraph.add(Symbolic::Ite([c, t, e]))
+                    }
+                    AxiomPure::RealCast(v) => {
+                        let v = get(egraph, &vals, v);
+                        egraph.add(Symbolic::RealCast(v))
+                    }
+                    AxiomPure::App {
+                        func,
+                        type_args,
+                        args,
+                    } => {
+                        let tys: Box<[Type]> = type_args
+                            .iter()
+                            .map(|t| t.subst_generics(type_sigma))
+                            .collect();
+                        let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
+                        egraph.add(Symbolic::FuncApp(*func, tys, args))
+                    }
+                };
+                vals.push(id);
+            }
+            AxiomInst::Assume(v) => {
+                let id = get(egraph, &vals, v);
+                let t = true_of(egraph);
+                if egraph.union(id, t) {
+                    changed.push(egraph.find(id));
+                }
+            }
+        }
+    }
+    get(egraph, &vals, res)
+}
+
 struct AxiomApplier {
     axiom: PreparedAxiom,
     memo: Mutex<HashSet<Vec<Type>>>,
@@ -465,62 +535,17 @@ impl AxiomApplier {
     /// Add the axiom body instantiated at `sigma` and merge `res` with `true`.
     /// Returns the e-classes changed by the unions.
     fn instantiate(&self, egraph: &mut EGraph<Symbolic, ConstFold>, sigma: &[Type]) -> Vec<Id> {
-        let mut vals: Vec<Id> = Vec::new();
         let mut changed = Vec::new();
-        fn get(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
-            match v {
-                Val::Temp(n) => vals[*n],
-                Val::Literal(lit) => egraph.add(Symbolic::Lit(lit.clone())),
-            }
-        }
-        let true_of = |egraph: &mut EGraph<Symbolic, ConstFold>| {
-            egraph.add(Symbolic::Lit(Literal::Bool(true)))
-        };
-        for inst in &self.axiom.insts {
-            match inst {
-                AxiomInst::Val(p) => {
-                    let id = match p {
-                        AxiomPure::Binary(op, l, r) => {
-                            let l = get(egraph, &vals, l);
-                            let r = get(egraph, &vals, r);
-                            egraph.add(Symbolic::Binary(*op, [l, r]))
-                        }
-                        AxiomPure::Ternary(c, t, e) => {
-                            let c = get(egraph, &vals, c);
-                            let t = get(egraph, &vals, t);
-                            let e = get(egraph, &vals, e);
-                            egraph.add(Symbolic::Ite([c, t, e]))
-                        }
-                        AxiomPure::RealCast(v) => {
-                            let v = get(egraph, &vals, v);
-                            egraph.add(Symbolic::RealCast(v))
-                        }
-                        AxiomPure::App {
-                            func,
-                            type_args,
-                            args,
-                        } => {
-                            let tys: Box<[Type]> =
-                                type_args.iter().map(|t| t.subst_generics(sigma)).collect();
-                            let args: Box<[Id]> =
-                                args.iter().map(|v| get(egraph, &vals, v)).collect();
-                            egraph.add(Symbolic::FuncApp(*func, tys, args))
-                        }
-                    };
-                    vals.push(id);
-                }
-                AxiomInst::Assume(v) => {
-                    let id = get(egraph, &vals, v);
-                    let t = true_of(egraph);
-                    if egraph.union(id, t) {
-                        changed.push(egraph.find(id));
-                    }
-                }
-            }
-        }
-        let res = get(egraph, &vals, &self.axiom.res);
-        let t = true_of(egraph);
-        if egraph.union(res, t) {
+        let res = build_instance(
+            egraph,
+            &self.axiom.insts,
+            &self.axiom.res,
+            &[],
+            sigma,
+            &mut changed,
+        );
+        let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+        if egraph.union(res, true_) {
             changed.push(egraph.find(res));
         }
         changed
@@ -586,6 +611,128 @@ pub(crate) fn axiom_rule(name: &str, axiom: PreparedAxiom) -> Rule {
         memo: Mutex::new(HashSet::new()),
     };
     Rewrite::new(format!("axiom-{name}"), searcher, applier).expect("axiom rule")
+}
+
+// ---- Pure `forall` quantifiers (value-σ triggered) -------------------------
+
+/// A pure `forall` prepared for lazy instantiation: its opaque nullary
+/// occurrence (`quant_func`), the bound-variable arity (`n_bound`), the trigger
+/// function whose ground applications drive instantiation, the positional
+/// binder map (`binders[k]` = the bound variable that trigger argument `k`
+/// binds), and the body (registry-resolved pure steps + boolean `res`). Unlike
+/// a generic axiom, σ is over *values* (e-class ids read off the trigger's
+/// arguments), not types.
+pub(crate) struct PreparedQuantifier {
+    pub quant_func: FuncId,
+    pub n_bound: usize,
+    pub trigger_func: FuncId,
+    pub binders: Box<[usize]>,
+    pub insts: Vec<AxiomInst>,
+    pub res: Val,
+}
+
+/// Applier: for each ground application of the trigger in the matched e-class,
+/// read the bound-variable σ off its arguments, instantiate the body at σ, and
+/// add the **guarded** clause `Ite(occurrence, res[σ], true) == true`. The
+/// instance is released only once the occurrence merges `true` (existing
+/// `ite(true, t, e) = t` rule), so instantiation is sound regardless of the
+/// quantifier's truth. Memoized per (occurrence, σ) — a saturation-cost guard,
+/// since instantiation is idempotent.
+struct QuantApplier {
+    quant: PreparedQuantifier,
+    memo: Mutex<HashSet<Vec<Id>>>,
+}
+
+impl Applier<Symbolic, ConstFold> for QuantApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        // The opaque nullary occurrence class (added if absent), needed to build
+        // the guard.
+        let q_id = egraph.add(Symbolic::FuncApp(
+            self.quant.quant_func,
+            Box::new([]),
+            Box::new([]),
+        ));
+        // Extract every distinct bound-variable σ from the e-class's trigger
+        // applications. Collected first: `build_instance` needs `&mut egraph`.
+        let mut sigmas: Vec<Vec<Id>> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::FuncApp(f, _, args) = node else {
+                continue;
+            };
+            if *f != self.quant.trigger_func || args.len() != self.quant.binders.len() {
+                continue;
+            }
+            // Positional σ: trigger arg `k` binds bound var `binders[k]`. A
+            // repeated binder must land on the same e-class.
+            let mut sigma: Vec<Option<Id>> = vec![None; self.quant.n_bound];
+            let mut ok = true;
+            for (k, &arg) in args.iter().enumerate() {
+                let slot = &mut sigma[self.quant.binders[k]];
+                match slot {
+                    Some(prev) if egraph.find(*prev) != egraph.find(arg) => {
+                        ok = false;
+                        break;
+                    }
+                    _ => *slot = Some(egraph.find(arg)),
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let Some(sigma): Option<Vec<Id>> = sigma.into_iter().collect() else {
+                continue;
+            };
+            let mut memo = self.memo.lock().unwrap();
+            // Key includes the (canonical) occurrence so distinct quantifiers
+            // sharing a trigger don't collide.
+            let mut key = Vec::with_capacity(sigma.len() + 1);
+            key.push(egraph.find(q_id));
+            key.extend(sigma.iter().copied());
+            if memo.insert(key) {
+                sigmas.push(sigma);
+            }
+        }
+        let mut changed = Vec::new();
+        for sigma in sigmas {
+            let res = build_instance(
+                egraph,
+                &self.quant.insts,
+                &self.quant.res,
+                &sigma,
+                &[],
+                &mut changed,
+            );
+            let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+            let guard = egraph.add(Symbolic::Ite([q_id, res, true_]));
+            if egraph.union(guard, true_) {
+                changed.push(egraph.find(guard));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Mint the lazy-instantiation rule for one prepared pure `forall`.
+pub(crate) fn quantifier_rule(name: &str, quant: PreparedQuantifier) -> Rule {
+    let searcher = AxiomTriggerSearcher {
+        func: quant.trigger_func,
+    };
+    let applier = QuantApplier {
+        quant,
+        memo: Mutex::new(HashSet::new()),
+    };
+    Rewrite::new(format!("quantifier-{name}"), searcher, applier).expect("quantifier rule")
 }
 
 #[cfg(test)]

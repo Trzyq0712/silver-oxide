@@ -31,6 +31,11 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
     /// is registered under the generated name `{domain}@axiom{i}` (`@` marks a
     /// generated member); axioms are not callable, so no `name_map` entry.
     axiom_slots: Vec<DeclSlot<vmir::DomainAxiom>>,
+    /// One inner `Vec` per axiom (parallel to `src.axioms`), holding the
+    /// pre-allocated occurrence slots for that axiom's top-level `forall`s, in
+    /// preorder. Each is registered as `{axiom}@quant{j}`; not callable, so no
+    /// `name_map` entry — the occurrence call carries the `MemberId` directly.
+    quant_slots: Vec<Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>>,
     _p: PhantomData<P>,
 }
 
@@ -110,6 +115,45 @@ fn used_generics_in_exp(
         }
         P::DomainFunctionCall(call) | P::AdtConstructor(call) => walk_call(call),
         P::Ext(typed::AxiomExt::FunctionCall(call)) => walk_call(call),
+        P::Ext(typed::AxiomExt::Forall(q)) => {
+            for group in &q.triggers {
+                for t in group {
+                    used_generics_in_exp(t, generics, out);
+                }
+            }
+            used_generics_in_exp(&q.body, generics, out);
+        }
+    }
+}
+
+/// The number of **top-level** `forall`s in an axiom expression — those not
+/// nested inside another `forall`'s body (a nested `forall` is rejected at
+/// lowering and gets no occurrence slot). Each contributes one occurrence.
+fn count_top_level_foralls(exp: &typed::TypedPureExp<typed::AxiomExt>) -> usize {
+    use typed::PureExpKind as P;
+    match exp.exp.as_ref() {
+        P::Ident(_) | P::Const(_) => 0,
+        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
+            count_top_level_foralls(e)
+        }
+        P::Binary(_, l, r) => count_top_level_foralls(l) + count_top_level_foralls(r),
+        P::Ternary { if_, then, else_ } => {
+            count_top_level_foralls(if_)
+                + count_top_level_foralls(then)
+                + count_top_level_foralls(else_)
+        }
+        P::LetIn { value, exp, .. } => {
+            count_top_level_foralls(value) + count_top_level_foralls(exp)
+        }
+        P::DomainFunctionCall(call) | P::AdtConstructor(call) => {
+            call.args.iter().map(count_top_level_foralls).sum()
+        }
+        P::Ext(typed::AxiomExt::FunctionCall(call)) => {
+            call.args.iter().map(count_top_level_foralls).sum()
+        }
+        // A `forall` is one occurrence; its body is not descended into (a nested
+        // `forall` is rejected at lowering, not slotted here).
+        P::Ext(typed::AxiomExt::Forall(_)) => 1,
     }
 }
 
@@ -159,6 +203,7 @@ impl<'a> DomainTranslator<'a, Declared> {
         }
 
         let mut axiom_slots = Vec::with_capacity(d.axioms.len());
+        let mut quant_slots = Vec::with_capacity(d.axioms.len());
         for (i, ax) in d.axioms.iter().enumerate() {
             let ax_name = match &ax.name {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
@@ -166,6 +211,16 @@ impl<'a> DomainTranslator<'a, Declared> {
             };
             let (_, aslot) = decl.alloc_slot::<vmir::DomainAxiom>(&ax_name);
             axiom_slots.push(aslot);
+            // Pre-allocate one occurrence slot per top-level `forall`, in the
+            // preorder the body lowering will encounter them.
+            let n_foralls = count_top_level_foralls(&ax.exp);
+            let mut slots = Vec::with_capacity(n_foralls);
+            for j in 0..n_foralls {
+                let (id, qslot) =
+                    decl.alloc_slot::<vmir::Quantifier>(&format!("{ax_name}@quant{j}"));
+                slots.push((id, qslot));
+            }
+            quant_slots.push(slots);
         }
 
         DomainTranslator {
@@ -175,6 +230,7 @@ impl<'a> DomainTranslator<'a, Declared> {
             slot,
             fn_slots,
             axiom_slots,
+            quant_slots,
             _p: PhantomData,
         }
     }
@@ -188,6 +244,7 @@ impl<'a> DomainTranslator<'a, Declared> {
             slot: self.slot,
             fn_slots: self.fn_slots,
             axiom_slots: self.axiom_slots,
+            quant_slots: self.quant_slots,
             _p: PhantomData,
         }
     }
@@ -235,25 +292,25 @@ impl DomainTranslator<'_, Metaed> {
         // Silver function (typecheck-enforced), so the inert `Empty` heap is
         // never read. Axiom bodies are never verified, only assumed.
         let env = HashMap::new();
-        for (i, (ax, aslot)) in self.src.axioms.iter().zip(self.axiom_slots).enumerate() {
+        for (i, ((ax, aslot), qslots)) in self
+            .src
+            .axioms
+            .iter()
+            .zip(self.axiom_slots)
+            .zip(self.quant_slots)
+            .enumerate()
+        {
             let mut used = Vec::new();
             used_generics_in_exp(&ax.exp, &self.generics, &mut used);
             ctx.decl_generics = used.clone();
-            let lowered = pure_exp::lower_function_body(
-                ctx,
-                &env,
-                &ax.exp,
-                0,
-                vmir::HeapVal::Empty,
-                None,
-                None,
-                None,
-            );
+            // Seed the occurrence ids for this axiom's `forall`s (preorder), so
+            // each lowers to its nullary occurrence call and yields a built
+            // quantifier back in `quant_built`.
+            let quant_ids: std::collections::VecDeque<vmir::MemberId> =
+                qslots.iter().map(|(id, _)| *id).collect();
+            let lowered = pure_exp::lower_axiom_body(ctx, &env, &ax.exp, quant_ids);
             ctx.decl_generics = Vec::new();
-            let body = lowered?;
-            // A generic axiom must contain a trigger: one function application
-            // instantiating all its type parameters, from which the verifier
-            // reads each ground instantiation.
+            let (body, quant_built) = lowered?;
             // The axiom's carried name matches its slot registration: the
             // Silver name when given, the generated `{domain}@axiom{i}` slot
             // name otherwise.
@@ -261,6 +318,17 @@ impl DomainTranslator<'_, Metaed> {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
                 None => format!("{}@axiom{i}", ctx.interner.resolve(&self.silver_name)),
             };
+            // Fill each quantifier slot with its built declaration, in the same
+            // (preorder) order they were allocated and lowered. Set the name to
+            // match the slot registration `{axiom}@quant{j}`.
+            debug_assert_eq!(qslots.len(), quant_built.len());
+            for (j, ((slot_id, qslot), (built_id, mut quant))) in
+                qslots.into_iter().zip(quant_built).enumerate()
+            {
+                debug_assert_eq!(slot_id, built_id);
+                quant.name = definer.intern_name(&format!("{ax_name}@quant{j}"));
+                definer.define_quantifier(qslot, quant);
+            }
             let name = definer.intern_name(&ax_name);
             let axiom = vmir::DomainAxiom {
                 name: Some(name),

@@ -85,6 +85,7 @@ pub(crate) trait Definer {
     fn define_adt(&mut self, slot: DeclSlot<vmir::Adt>, decl: vmir::Adt);
     fn define_domain(&mut self, slot: DeclSlot<vmir::Domain>, decl: vmir::Domain);
     fn define_axiom(&mut self, slot: DeclSlot<vmir::DomainAxiom>, decl: vmir::DomainAxiom);
+    fn define_quantifier(&mut self, slot: DeclSlot<vmir::Quantifier>, decl: vmir::Quantifier);
 
     fn intern_name(&mut self, s: &str) -> Spur;
 }
@@ -204,6 +205,11 @@ impl Definer for Builder {
     fn define_axiom(&mut self, slot: DeclSlot<vmir::DomainAxiom>, decl: vmir::DomainAxiom) {
         let id = slot.fill();
         self.set_decl(id, vmir::Declaration::DomainAxiom(decl));
+    }
+
+    fn define_quantifier(&mut self, slot: DeclSlot<vmir::Quantifier>, decl: vmir::Quantifier) {
+        let id = slot.fill();
+        self.set_decl(id, vmir::Declaration::Quantifier(decl));
     }
 
     fn intern_name(&mut self, s: &str) -> Spur {

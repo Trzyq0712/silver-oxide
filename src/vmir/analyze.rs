@@ -161,6 +161,10 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             }
         }
         Declaration::DomainAxiom(ax) => inst_deps(&ax.body.insts, out),
+        Declaration::Quantifier(q) => {
+            inst_deps(&q.body.insts, out);
+            out.push(q.trigger.function);
+        }
         // Leaf declarations: nothing to depend on.
         Declaration::Domain(_) | Declaration::Adt(_) => {}
     }
@@ -259,6 +263,7 @@ mod tests {
                     Declaration::Adt(a) => a.name = n,
                     Declaration::Domain(do_) => do_.name = n,
                     Declaration::DomainAxiom(a) => a.name = Some(n),
+                    Declaration::Quantifier(q) => q.name = n,
                 }
             }
         }
