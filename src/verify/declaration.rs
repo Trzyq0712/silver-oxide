@@ -809,69 +809,27 @@ fn eval_method_inst(
         // (`cons`) of the consumed field values.
         InstKind::Heap(HeapInst::Fold { base, call, perm }) => {
             let base_h = get_heap(state, base);
-            let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
-                return Err(VerifyError::DependencyFailed);
-            };
-            let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
-                return Err(VerifyError::Unimplemented("fold of abstract predicate"));
-            };
-            let (snap_head, addr_fn) = (call.resource, call.resource);
-            let field_types = snap.variants.into_iter().next().unwrap().field_types;
-            let cert = certs
-                .get(&call.resource)
-                .ok_or(VerifyError::DependencyFailed)?;
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-            let mut out = base_h.clone();
-            let mut values = Vec::with_capacity(cert.footprint.len());
-            let mut members = Vec::with_capacity(cert.footprint.len());
-
-            // Grow `subst` slot-by-slot so a value-dependent address (e.g. an
-            // inner predicate `P(this.next)`) resolves against the actual field
-            // value read for an earlier slot.
-            let mut subst = ctx.footprint_param_subst(cert, &args);
-            for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
-                let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
-                let p = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
-                // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
-                let elem = field_types[i]
-                    .option_inner()
-                    .unwrap_or(&field_types[i])
-                    .clone();
-                let v = base_h
-                    .entries()
-                    .find_map(|(_, c)| {
-                        (ctx.egraph.find(c.addr) == ctx.egraph.find(addr)).then(|| c.value)
-                    })
-                    .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone()));
-                out = heap_subtract(ctx, &out, kind, Chunk::new(addr, p, v), &pc_lits)?;
-                let present = ctx.perm_positive(bperm);
-                members.push(ctx.option_member(elem, present, v));
-                subst.insert(cert.egraph.find(*c_val), v);
-                values.push(v);
-            }
-            let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-            if !ctx.prove_under_pc(bool_id, &pc_lits) {
-                return Err(VerifyError::AssertionFailed);
-            }
-            // The snapshot is a single-variant ADT (head = the `@snap` Domain).
-            let cons_args: Box<[egg::Id]> = members.into_iter().collect();
-            let snap_cons = ctx.alloc.cons(snap_head, 0);
-            let snap_ty = Type::Snap(snap_head);
-            // Predicate snapshots are non-generic — empty type instantiation.
-            let snap = ctx.add_func_app_id(snap_cons, Box::new([]), snap_ty, cons_args);
-            let addr_ty = pred_addr_type(program, addr_fn);
-            let pred_kind = LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
-            // The predicate's address is an ordinary call to its address function
-            // (the predicate's own id); the `Addr` type is the recorded return type.
-            let pred_addr = ctx.add_func_app_id(
-                crate::verify::func_registry::func_id_for_member(addr_fn),
-                Box::new([]),
-                addr_ty,
-                args.into(),
-            );
+            // Consume the footprint from the current heap (reading its values),
+            // asserting the predicate body; then place the predicate chunk holding
+            // the snapshot of the consumed values.
+            let FootprintResult { heap: out, members } = walk_footprint(
+                ctx,
+                program,
+                certs,
+                call.resource,
+                &args,
+                base_h.clone(),
+                ValueSource::ReadHeap(base_h),
+                Direction::Consume,
+                Some(perm_id),
+                &pc_lits,
+            )?;
+            let snap = build_snapshot(ctx, call.resource, members);
+            let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
             let out = heap_union(
                 ctx,
                 &out,
@@ -935,6 +893,160 @@ fn eval_method_inst(
     Ok(())
 }
 
+/// Where a footprint slot's value comes from (see [`walk_footprint`]).
+enum ValueSource {
+    /// Read the chunk value at the slot's address from this heap (fresh if
+    /// absent). Used by `fold`/`snap`, which read a heap they already hold.
+    ReadHeap(Heap),
+    /// Recover it from the snapshot `s` as `unwrap(proj_i(s))`. Used by
+    /// `unfold`/`from_snap`, which reconstruct the footprint from a snapshot.
+    ProjectSnap(egg::Id),
+}
+
+/// The direction of a footprint walk: consume a held footprint and **assert** the
+/// resource's boolean (`fold`/`snap`), or produce one and **assume** it
+/// (`unfold`/`from_snap`).
+enum Direction {
+    Consume,
+    Produce,
+}
+
+/// The result of a footprint walk: the accumulator heap after all slot effects,
+/// and — for a `Consume` walk — the snapshot members `present ? Some(v) : None`
+/// per slot (empty for `Produce`, which builds no snapshot).
+struct FootprintResult {
+    heap: Heap,
+    members: Vec<egg::Id>,
+}
+
+/// The single per-slot footprint loop behind `fold`, `unfold`, `snap` and
+/// `from_snap`. For each footprint slot of `resource(args)`: graft the slot's
+/// `(addr, perm)`, obtain the slot value from `source`, apply the slot's heap
+/// effect to the `base` accumulator (subtract for `Consume`, union for
+/// `Produce`; permission scaled by `scale` when `Some`), and thread the actual
+/// value through `subst` so a value-dependent inner address (e.g. `P(this.next)`)
+/// resolves. Finally graft the body boolean and discharge it per `direction`
+/// (`Consume` asserts under `pc_lits`, `Produce` assumes it guarded by them).
+///
+/// The caller owns everything *around* the slots: the predicate-chunk add/remove
+/// (bracketing differs — `fold` adds after, `unfold` removes before) and what to
+/// do with `heap` (`snap` discards it — functions frame, they don't consume).
+#[allow(clippy::too_many_arguments)]
+fn walk_footprint(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    certs: &HashMap<MemberId, ResourceCertificate>,
+    resource: MemberId,
+    args: &[egg::Id],
+    base: Heap,
+    source: ValueSource,
+    direction: Direction,
+    scale: Option<egg::Id>,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Result<FootprintResult, VerifyError> {
+    let vmir::Declaration::Resource(r) = &program.decls[resource] else {
+        return Err(VerifyError::DependencyFailed);
+    };
+    let Some(vmir::Snapshot::Concrete(snap_adt)) = r.derive_snapshot() else {
+        return Err(VerifyError::Unimplemented("footprint of abstract resource"));
+    };
+    let field_types = snap_adt.variants.into_iter().next().unwrap().field_types;
+    let cert = certs.get(&resource).ok_or(VerifyError::DependencyFailed)?;
+
+    let mut heap = base;
+    let mut values = Vec::with_capacity(cert.footprint.len());
+    let mut members = Vec::with_capacity(cert.footprint.len());
+    let mut subst = ctx.footprint_param_subst(cert, args);
+    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
+        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
+        // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
+        let elem = field_types[i]
+            .option_inner()
+            .unwrap_or(&field_types[i])
+            .clone();
+        let value = match &source {
+            // Values are read from the *original* heap (aliased slots agree).
+            ValueSource::ReadHeap(h) => h
+                .entries()
+                .find_map(|(_, c)| {
+                    (ctx.egraph.find(c.addr) == ctx.egraph.find(addr)).then_some(c.value)
+                })
+                .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone())),
+            // `proj_i(s)` recovers the optional member (collapsing to the `cons`
+            // argument when `s` is concrete); `unwrap` peels to the field value.
+            ValueSource::ProjectSnap(s) => {
+                let proj_id = ctx.alloc.proj(resource, 0, i);
+                let opt_ty = ctx.alloc.option_type(elem.clone());
+                let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([*s]));
+                ctx.option_unwrap(elem.clone(), opt)
+            }
+        };
+        // The heap effect uses the (optionally scaled) permission; the snapshot
+        // membership discriminant uses the *unscaled* cert perm.
+        let p = match scale {
+            Some(pm) => ctx.add(Symbolic::Binary(BinOp::Mult, [pm, bperm])),
+            None => bperm,
+        };
+        let chunk = Chunk::new(addr, p, value);
+        heap = match direction {
+            Direction::Consume => heap_subtract(ctx, &heap, kind, chunk, pc_lits)?,
+            Direction::Produce => heap_union(ctx, &heap, kind, chunk, pc_lits),
+        };
+        if let Direction::Consume = direction {
+            let present = ctx.perm_positive(bperm);
+            members.push(ctx.option_member(elem, present, value));
+        }
+        subst.insert(cert.egraph.find(*c_val), value);
+        values.push(value);
+    }
+    let bool_id = ctx.graft_pred_bool(cert, args, &values);
+    match direction {
+        // The precondition/predicate body must hold over the consumed values.
+        Direction::Consume => {
+            if !ctx.prove_under_pc(bool_id, pc_lits) {
+                return Err(VerifyError::AssertionFailed);
+            }
+        }
+        // The reconstructed body facts hold only where this walk is reached.
+        Direction::Produce => {
+            ctx.assume_guarded(bool_id, pc_lits.iter().rev().copied());
+        }
+    }
+    Ok(FootprintResult { heap, members })
+}
+
+/// The `cons` of a resource's snapshot from its per-slot `members`
+/// (`present ? Some(v) : None`). Predicate snapshots are single-variant,
+/// non-generic ADTs headed by the resource id.
+fn build_snapshot(
+    ctx: &mut VerifyContext<'_>,
+    resource: MemberId,
+    members: Vec<egg::Id>,
+) -> egg::Id {
+    let cons = ctx.alloc.cons(resource, 0);
+    ctx.add_func_app_id(cons, Box::new([]), Type::Snap(resource), members.into())
+}
+
+/// A predicate's location kind and address e-class for `args`: the address is an
+/// ordinary `FuncApp` to the predicate's own id (its `@addr` function), typed by
+/// its recorded `Addr{..}` return type. Shared by `fold` and `unfold`.
+fn predicate_address(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    pred: MemberId,
+    args: &[egg::Id],
+) -> (LocationKind, egg::Id) {
+    let addr_ty = pred_addr_type(program, pred);
+    let kind = LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
+    let addr = ctx.add_func_app_id(
+        crate::verify::func_registry::func_id_for_member(pred),
+        Box::new([]),
+        addr_ty,
+        args.into(),
+    );
+    (kind, addr)
+}
+
 /// Evaluate an `unfold`: consume the predicate chunk, reproduce the footprint
 /// (fields recovered by projecting the snapshot), assume the body's pure facts.
 /// Shared by method bodies and resource bodies; grafts the unfolded predicate's
@@ -951,37 +1063,18 @@ fn eval_unfold(
         unreachable!("eval_unfold called on a non-Unfold instruction");
     };
     let base_h = get_heap(state, base);
-    let vmir::Declaration::Resource(r) = &program.decls[call.resource] else {
-        return Err(VerifyError::DependencyFailed);
-    };
-    let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
-        return Err(VerifyError::Unimplemented("unfold of abstract predicate"));
-    };
-    let (snap_head, addr_fn) = (call.resource, call.resource);
-    let field_types = snap.variants.into_iter().next().unwrap().field_types;
-    let cert = certs
-        .get(&call.resource)
-        .ok_or(VerifyError::DependencyFailed)?;
     let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
     let perm_id = state.get_val(ctx, perm);
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-    let addr_ty = pred_addr_type(program, addr_fn);
-    let pred_kind = LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
-    // The predicate's address is an ordinary call to its address function (the
-    // predicate's own id); the `Addr` type is the recorded return type.
-    let pred_addr = ctx.add_func_app_id(
-        crate::verify::func_registry::func_id_for_member(addr_fn),
-        Box::new([]),
-        addr_ty,
-        args.clone().into(),
-    );
+    // Consume the predicate chunk, recovering the snapshot `s` it holds.
+    let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
     let a = ctx.egraph.find(pred_addr);
     let s = base_h
         .entries()
-        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then(|| c.value))
+        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then_some(c.value))
         .ok_or(VerifyError::InsufficientPermission)?;
-    let mut out = heap_subtract(
+    let out = heap_subtract(
         ctx,
         &base_h,
         &pred_kind,
@@ -989,38 +1082,22 @@ fn eval_unfold(
         &pc_lits,
     )?;
 
-    let mut values = Vec::with_capacity(cert.footprint.len());
-    // As in fold, grow `subst` with each recovered slot value so a
-    // value-dependent address (an inner predicate `P(this.next)`) resolves
-    // against the projected field value.
-    let mut subst = ctx.footprint_param_subst(cert, &args);
-    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
-        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
-        // `proj_i(s)` recovers the optional snapshot member; `reduce()`
-        // collapses it to the constructor's i-th member when `s` is a
-        // concrete `cons` (so repeated fold/unfold doesn't grow the
-        // snapshot tower), and leaves it uninterpreted for an opaque
-        // snapshot. `unwrap` then peels the `Option` to the field value.
-        // The snapshot's i-th field is `Option[T]`; the projection yields
-        // it, then `option_unwrap` peels to the inner `T`.
-        let elem = field_types[i]
-            .option_inner()
-            .unwrap_or(&field_types[i])
-            .clone();
-        let proj_id = ctx.alloc.proj(snap_head, 0, i);
-        let opt_ty = ctx.alloc.option_type(elem.clone());
-        let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([s]));
-        let pv = ctx.option_unwrap(elem, opt);
-        let need = ctx.add(Symbolic::Binary(BinOp::Mult, [perm_id, bperm]));
-        out = heap_union(ctx, &out, kind, Chunk::new(addr, need, pv), &pc_lits);
-        subst.insert(cert.egraph.find(*c_val), pv);
-        values.push(pv);
-    }
-    let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-    // The unfolded predicate's body facts hold only where the unfold is reached.
-    ctx.assume_guarded(bool_id, pc_lits.iter().rev().copied());
+    // Reproduce the footprint from `s` (`unwrap(proj_i(s))` per slot), assuming
+    // the predicate body. `reduce()` afterward collapses any snapshot tower a
+    // repeated fold/unfold round-trip created.
+    let FootprintResult { heap: out, .. } = walk_footprint(
+        ctx,
+        program,
+        certs,
+        call.resource,
+        &args,
+        out,
+        ValueSource::ProjectSnap(s),
+        Direction::Produce,
+        Some(perm_id),
+        &pc_lits,
+    )?;
     state.push_heap(out);
-    // Collapse any snapshot tower created by repeated fold/unfold.
     ctx.reduce();
     Ok(())
 }
@@ -1053,52 +1130,26 @@ fn eval_snap(
         unreachable!("eval_snap called on a non-Snap instruction");
     };
     let h = get_heap(state, heap);
-    let vmir::Declaration::Resource(r) = &program.decls[*resource] else {
-        return Err(VerifyError::DependencyFailed);
-    };
-    let Some(vmir::Snapshot::Concrete(snap_adt)) = r.derive_snapshot() else {
-        return Err(VerifyError::Unimplemented("snapshot of abstract resource"));
-    };
-    let snap_head = *resource;
-    let field_types = snap_adt.variants.into_iter().next().unwrap().field_types;
-    let cert = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
     let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-    let mut scratch = h.clone();
-    let mut values = Vec::with_capacity(cert.footprint.len());
-    let mut members = Vec::with_capacity(cert.footprint.len());
-    // As in fold, grow `subst` slot-by-slot so a value-dependent address (an
-    // inner predicate `P(this.next)`) resolves against the actual value read
-    // for an earlier slot.
-    let mut subst = ctx.footprint_param_subst(cert, &args);
-    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
-        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
-        // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
-        let elem = field_types[i]
-            .option_inner()
-            .unwrap_or(&field_types[i])
-            .clone();
-        // Values are read from the *original* heap (aliased slots agree);
-        // only the sufficiency accounting runs on the scratch chain.
-        let v = h
-            .entries()
-            .find_map(|(_, c)| (ctx.egraph.find(c.addr) == ctx.egraph.find(addr)).then(|| c.value))
-            .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone()));
-        scratch = heap_subtract(ctx, &scratch, kind, Chunk::new(addr, bperm, v), &pc_lits)?;
-        let present = ctx.perm_positive(bperm);
-        members.push(ctx.option_member(elem, present, v));
-        subst.insert(cert.egraph.find(*c_val), v);
-        values.push(v);
-    }
-    // Assert the precondition's pure facts over the read values.
-    let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-    if !ctx.prove_under_pc(bool_id, &pc_lits) {
-        return Err(VerifyError::AssertionFailed);
-    }
-    let cons_args: Box<[egg::Id]> = members.into_iter().collect();
-    let snap_cons = ctx.alloc.cons(snap_head, 0);
-    let s = ctx.add_func_app_id(snap_cons, Box::new([]), Type::Snap(snap_head), cons_args);
+    // Non-consuming: the sufficiency subtraction runs on a scratch clone of `h`
+    // (so aliased slots require their sum) whose resulting heap is discarded —
+    // functions frame, they don't consume. Values are read from `h`; the body
+    // boolean is asserted. The snapshot is the `cons` of the per-slot members.
+    let FootprintResult { members, .. } = walk_footprint(
+        ctx,
+        program,
+        certs,
+        *resource,
+        &args,
+        h.clone(),
+        ValueSource::ReadHeap(h),
+        Direction::Consume,
+        None,
+        &pc_lits,
+    )?;
+    let s = build_snapshot(ctx, *resource, members);
     ctx.reduce();
     Ok(s)
 }
@@ -1130,9 +1181,7 @@ fn snap_of_footprint(
         let present = ctx.perm_positive(*perm);
         members.push(ctx.option_member(elem, present, *value));
     }
-    let cons = ctx.alloc.cons(resource, 0);
-    let cons_args: Box<[egg::Id]> = members.into_iter().collect();
-    let s = ctx.add_func_app_id(cons, Box::new([]), Type::Snap(resource), cons_args);
+    let s = build_snapshot(ctx, resource, members);
     ctx.reduce();
     Ok(s)
 }
@@ -1158,43 +1207,25 @@ fn eval_from_snap(
     else {
         unreachable!("eval_from_snap called on a non-FromSnap instruction");
     };
-    let vmir::Declaration::Resource(r) = &program.decls[*resource] else {
-        return Err(VerifyError::DependencyFailed);
-    };
-    let Some(vmir::Snapshot::Concrete(snap_adt)) = r.derive_snapshot() else {
-        return Err(VerifyError::Unimplemented("snapshot of abstract resource"));
-    };
-    let snap_head = *resource;
-    let field_types = snap_adt.variants.into_iter().next().unwrap().field_types;
-    let cert = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
     let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
     let s = state.get_val(ctx, snap);
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-    let mut out = Heap::empty();
-    let mut values = Vec::with_capacity(cert.footprint.len());
-    let mut subst = ctx.footprint_param_subst(cert, &args);
-    for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
-        let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
-        // `proj_i(s)` recovers the optional member (collapsing to the `cons`
-        // argument when `s` is concrete, staying uninterpreted when opaque);
-        // `unwrap` peels the `Option` to the field value.
-        let elem = field_types[i]
-            .option_inner()
-            .unwrap_or(&field_types[i])
-            .clone();
-        let proj_id = ctx.alloc.proj(snap_head, 0, i);
-        let opt_ty = ctx.alloc.option_type(elem.clone());
-        let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([s]));
-        let pv = ctx.option_unwrap(elem, opt);
-        out = heap_union(ctx, &out, kind, Chunk::new(addr, bperm, pv), &pc_lits);
-        subst.insert(cert.egraph.find(*c_val), pv);
-        values.push(pv);
-    }
-    // Assume the precondition's pure facts over the projected values, guarded by
-    // the path condition (a `FromSnap` may sit under a branch).
-    let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-    ctx.assume_guarded(bool_id, pc_lits.iter().rev().copied());
+    // Reconstruct the precondition heap: produce one chunk per footprint slot
+    // valued `unwrap(proj_i(s))` into the empty heap, assuming the resource body
+    // (guarded by the path condition — a `FromSnap` may sit under a branch).
+    let FootprintResult { heap: out, .. } = walk_footprint(
+        ctx,
+        program,
+        certs,
+        *resource,
+        &args,
+        Heap::empty(),
+        ValueSource::ProjectSnap(s),
+        Direction::Produce,
+        None,
+        &pc_lits,
+    )?;
     ctx.reduce();
     Ok(out)
 }
