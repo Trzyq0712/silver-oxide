@@ -6,7 +6,10 @@ use std::marker::PhantomData;
 use lasso::Spur;
 
 use crate::translate::{DeclSlot, Declarator, Definer};
-use crate::translate::{Declared, Metaed, TranslationContext, TranslationError, spatial};
+use crate::translate::{
+    Declared, Metaed, QuantScope, TranslationContext, TranslationError, alloc_quant_slots,
+    fill_quant_slots, pure_exp, spatial,
+};
 use crate::viper::typed;
 use crate::vmir;
 
@@ -14,6 +17,9 @@ pub(crate) struct PredicateTranslator<'a, P = Declared> {
     src: &'a typed::Predicate,
     silver_name: Spur,
     slot: DeclSlot<vmir::Resource>,
+    /// One pre-allocated occurrence slot per `forall` in the body, registered
+    /// `{predicate}#quant{j}` (see `alloc_quant_slots`).
+    quant_slots: Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>,
     _p: PhantomData<P>,
 }
 
@@ -30,10 +36,13 @@ impl<'a> PredicateTranslator<'a, Declared> {
         d.intern_group(&name_str);
         let (id, slot) = d.alloc_slot::<vmir::Resource>(&name_str);
         ctx.name_map.insert(p.name.0, id);
+        let n_foralls = p.body.as_ref().map_or(0, pure_exp::count_foralls_spatial);
+        let quant_slots = alloc_quant_slots(d, &name_str, n_foralls);
         PredicateTranslator {
             src: p,
             silver_name: p.name.0,
             slot,
+            quant_slots,
             _p: PhantomData,
         }
     }
@@ -44,6 +53,7 @@ impl<'a> PredicateTranslator<'a, Declared> {
             src: self.src,
             silver_name: self.silver_name,
             slot: self.slot,
+            quant_slots: self.quant_slots,
             _p: PhantomData,
         }
     }
@@ -57,6 +67,7 @@ impl PredicateTranslator<'_, Metaed> {
     ) -> Result<(), TranslationError> {
         let p = self.src;
         let params: Vec<vmir::Type> = p.params.iter().map(|pp| ctx.lower_type(&pp.ty)).collect();
+        let mut quants = QuantScope::new(&self.quant_slots);
         // Self-framed: params occupy `Val::Temp(0..n)`, heaps accumulate from
         // `Empty` starting at `HeapVal::Temp(0)`.
         let body = match &p.body {
@@ -75,6 +86,7 @@ impl PredicateTranslator<'_, Metaed> {
                     params.len(),
                     vmir::HeapVal::Empty,
                     0,
+                    &mut quants,
                 )?)
             }
         };
@@ -87,6 +99,12 @@ impl PredicateTranslator<'_, Metaed> {
                 precond: vmir::Precond::SelfFramed,
                 body,
             },
+        );
+        fill_quant_slots(
+            definer,
+            ctx.interner.resolve(&self.silver_name),
+            self.quant_slots,
+            quants.finish(),
         );
         Ok(())
     }

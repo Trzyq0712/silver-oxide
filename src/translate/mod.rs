@@ -43,7 +43,9 @@ mod types;
 
 pub use errors::TranslationError;
 
-pub(crate) use builder::{Builder, DeclSlot, Declarator, Definer};
+pub(crate) use builder::{
+    Builder, DeclSlot, Declarator, Definer, QuantScope, alloc_quant_slots, fill_quant_slots,
+};
 pub(crate) use context::{GenericSig, MethodContracts, TranslationContext};
 
 /// Build a `vmir::Program` from a typed `typed::Program`.

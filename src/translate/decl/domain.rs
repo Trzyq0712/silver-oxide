@@ -183,13 +183,9 @@ impl<'a> DomainTranslator<'a, Declared> {
             // Pre-allocate one occurrence slot per `forall` (nested included),
             // in the preorder the body lowering will encounter them.
             let n_foralls = pure_exp::count_foralls(&ax.exp);
-            let mut slots = Vec::with_capacity(n_foralls);
-            for j in 0..n_foralls {
-                let (id, qslot) =
-                    decl.alloc_slot::<vmir::Quantifier>(&format!("{ax_name}#quant{j}"));
-                slots.push((id, qslot));
-            }
-            quant_slots.push(slots);
+            quant_slots.push(crate::translate::alloc_quant_slots(
+                decl, &ax_name, n_foralls,
+            ));
         }
 
         DomainTranslator {
@@ -287,18 +283,7 @@ impl DomainTranslator<'_, Metaed> {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
                 None => format!("{}#axiom{i}", ctx.interner.resolve(&self.silver_name)),
             };
-            // Fill each quantifier slot with its built declaration. Built order
-            // is innermost-first (an inner `forall` finishes lowering before its
-            // encloser pushes), so slots are matched by id, not position. Set
-            // the name to match the slot registration `{axiom}#quant{j}`.
-            debug_assert_eq!(qslots.len(), quant_built.len());
-            let mut by_id: HashMap<vmir::MemberId, vmir::Quantifier> =
-                quant_built.into_iter().collect();
-            for (j, (slot_id, qslot)) in qslots.into_iter().enumerate() {
-                let mut quant = by_id.remove(&slot_id).expect("forall slot never filled");
-                quant.name = definer.intern_name(&format!("{ax_name}#quant{j}"));
-                definer.define_quantifier(qslot, quant);
-            }
+            crate::translate::fill_quant_slots(definer, &ax_name, qslots, quant_built);
             let name = definer.intern_name(&ax_name);
             let axiom = vmir::Axiom {
                 name: Some(name),

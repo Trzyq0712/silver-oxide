@@ -90,6 +90,79 @@ pub(crate) trait Definer {
     fn intern_name(&mut self, s: &str) -> Spur;
 }
 
+/// Reserve `n` quantifier occurrence slots named `{base}#quant{j}` — one per
+/// `forall` counted in the hosting declaration (nested included), in the
+/// preorder its lowerings will consume them.
+pub(crate) fn alloc_quant_slots(
+    d: &mut impl Declarator,
+    base: &str,
+    n: usize,
+) -> Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)> {
+    (0..n)
+        .map(|j| d.alloc_slot::<vmir::Quantifier>(&format!("{base}#quant{j}")))
+        .collect()
+}
+
+/// Fill each pre-allocated quantifier slot with its built declaration. Built
+/// order is innermost-first (an inner `forall` finishes lowering before its
+/// encloser pushes), so slots are matched by occurrence id, not position. Each
+/// quantifier's name is set to match its slot registration `{base}#quant{j}`.
+pub(crate) fn fill_quant_slots(
+    definer: &mut impl Definer,
+    base: &str,
+    slots: Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>,
+    built: Vec<(vmir::MemberId, vmir::Quantifier)>,
+) {
+    debug_assert_eq!(slots.len(), built.len());
+    let mut by_id: std::collections::HashMap<vmir::MemberId, vmir::Quantifier> =
+        built.into_iter().collect();
+    for (j, (slot_id, qslot)) in slots.into_iter().enumerate() {
+        let mut quant = by_id.remove(&slot_id).expect("forall slot never filled");
+        quant.name = definer.intern_name(&format!("{base}#quant{j}"));
+        definer.define_quantifier(qslot, quant);
+    }
+}
+
+/// Occurrence-id budget plus built-quantifier collector for one hosting
+/// declaration, threaded (in counting order) through each of its body/contract
+/// lowerings — every internal `Sink` seeds from and reaps back into the same
+/// scope, so `forall`s across a method's requires, ensures, and body consume
+/// one flat pre-allocated id sequence.
+pub(crate) struct QuantScope {
+    ids: std::collections::VecDeque<vmir::MemberId>,
+    out: Vec<(vmir::MemberId, vmir::Quantifier)>,
+}
+
+impl QuantScope {
+    pub(crate) fn new(slots: &[(vmir::MemberId, DeclSlot<vmir::Quantifier>)]) -> Self {
+        QuantScope {
+            ids: slots.iter().map(|(id, _)| *id).collect(),
+            out: Vec::new(),
+        }
+    }
+
+    /// Hand the remaining occurrence ids to a fresh sink.
+    pub(crate) fn seed(&mut self, sink: &mut crate::translate::sink::Sink) {
+        sink.quant_ids = std::mem::take(&mut self.ids);
+    }
+
+    /// Take back the unconsumed ids and collect the quantifiers the sink built.
+    pub(crate) fn reap(&mut self, sink: &mut crate::translate::sink::Sink) {
+        self.ids = std::mem::take(&mut sink.quant_ids);
+        self.out.append(&mut sink.quant_out);
+    }
+
+    /// All built quantifiers; panics if any pre-allocated id was never consumed
+    /// (the declare-phase count and the lowering disagree).
+    pub(crate) fn finish(self) -> Vec<(vmir::MemberId, vmir::Quantifier)> {
+        assert!(
+            self.ids.is_empty(),
+            "forall occurrence slots over-allocated"
+        );
+        self.out
+    }
+}
+
 /// The write side of translation: allocates and fills `Declaration` slots.
 /// Holds no shared read state (`name_map`, `contracts`, ...) — that lives in the
 /// coordinator's `TranslationContext`, a value entirely independent of

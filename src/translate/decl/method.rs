@@ -69,17 +69,20 @@ impl<'a> MethodTranslator<'a, Declared> {
         } else {
             None
         };
-        // Pre-allocate one occurrence slot per `forall` in the body (nested
-        // included), in the preorder body lowering consumes them. Each block is
-        // lowered exactly once (CFG topo walk), so a static source count is
-        // exact; the id-keyed slot fill makes the walk order irrelevant.
-        let mut quant_slots = Vec::new();
-        if let Some(body) = &m.body {
-            for j in 0..count_foralls_stmts(&body.0) {
-                let (id, qslot) = d.alloc_slot::<vmir::Quantifier>(&format!("{name}#quant{j}"));
-                quant_slots.push((id, qslot));
-            }
-        }
+        // Pre-allocate one occurrence slot per `forall` in the contracts and
+        // body (nested included), in the order define lowers them: requires,
+        // ensures, body statements. Each block is lowered exactly once (CFG
+        // topo walk), so a static source count is exact; the id-keyed slot
+        // fill makes the walk order irrelevant.
+        let n_foralls = m
+            .requires
+            .as_ref()
+            .map_or(0, pure_exp::count_foralls_spatial)
+            + m.ensures
+                .as_ref()
+                .map_or(0, pure_exp::count_foralls_spatial)
+            + m.body.as_ref().map_or(0, |b| count_foralls_stmts(&b.0));
+        let quant_slots = crate::translate::alloc_quant_slots(d, &name, n_foralls);
         ctx.contracts.insert(
             m.name.0,
             MethodContracts {
@@ -133,6 +136,10 @@ impl MethodTranslator<'_, Metaed> {
             _p,
         } = self;
 
+        // One flat occurrence-id budget across requires, ensures, and body —
+        // consumed in that (counting) order.
+        let mut quants = crate::translate::QuantScope::new(&quant_slots);
+
         // #requires: a self-framed Resource.
         if let Some(requires) = &m.requires {
             let slot = requires_slot.expect("declared when m.requires is Some");
@@ -149,6 +156,7 @@ impl MethodTranslator<'_, Metaed> {
                 params.len(),
                 vmir::HeapVal::Empty,
                 0,
+                &mut quants,
             )?;
             let name =
                 definer.intern_name(&format!("{}#requires", ctx.interner.resolve(&silver_name)));
@@ -208,6 +216,7 @@ impl MethodTranslator<'_, Metaed> {
                 params.len(),
                 vmir::HeapVal::Empty,
                 snap_entry,
+                &mut quants,
             )?;
             let name =
                 definer.intern_name(&format!("{}#ensures", ctx.interner.resolve(&silver_name)));
@@ -226,26 +235,16 @@ impl MethodTranslator<'_, Metaed> {
         if let Some(slot) = body_slot {
             let body = m.body.as_ref().expect("slot implies a body");
             let name = definer.intern_name(ctx.interner.resolve(&silver_name));
-            // Seed the occurrence ids for the body's `forall`s (preorder); each
-            // lowers to its boolean occurrence call and yields a built
-            // quantifier back.
-            let quant_ids: std::collections::VecDeque<vmir::MemberId> =
-                quant_slots.iter().map(|(id, _)| *id).collect();
-            let (method, quant_built) = lower_method(ctx, m, name, body, quant_ids)?;
-            // Fill each quantifier slot with its built declaration. Built order
-            // is innermost-first, so slots are matched by id, not position. Set
-            // the name to match the slot registration `{method}#quant{j}`.
-            debug_assert_eq!(quant_slots.len(), quant_built.len());
-            let mut by_id: HashMap<vmir::MemberId, vmir::Quantifier> =
-                quant_built.into_iter().collect();
-            for (j, (slot_id, qslot)) in quant_slots.into_iter().enumerate() {
-                let mut quant = by_id.remove(&slot_id).expect("forall slot never filled");
-                quant.name = definer
-                    .intern_name(&format!("{}#quant{j}", ctx.interner.resolve(&silver_name)));
-                definer.define_quantifier(qslot, quant);
-            }
+            let method = lower_method(ctx, m, name, body, &mut quants)?;
             definer.define_method(slot, method);
         }
+
+        crate::translate::fill_quant_slots(
+            definer,
+            ctx.interner.resolve(&silver_name),
+            quant_slots,
+            quants.finish(),
+        );
 
         Ok(())
     }
@@ -256,8 +255,8 @@ pub(crate) fn lower_method(
     m: &typed::Method,
     name: Spur,
     body: &typed::StmtBlock,
-    quant_ids: std::collections::VecDeque<vmir::MemberId>,
-) -> Result<(vmir::Method, Vec<(vmir::MemberId, vmir::Quantifier)>), TranslationError> {
+    quants: &mut crate::translate::QuantScope,
+) -> Result<vmir::Method, TranslationError> {
     // Control flow is linearized through the basic-block CFG: blocks are walked
     // in topological order, each lowered under its reaching path condition, with
     // phi (`ite`) nodes reconciling variables at joins. The heap is *not* phi'd —
@@ -271,7 +270,7 @@ pub(crate) fn lower_method(
     // Occurrence ids for the body's `forall`s (see `count_foralls_stmts`);
     // each `lower_forall` pops the next and pushes its built quantifier onto
     // `sink.quant_out`.
-    sink.quant_ids = quant_ids;
+    quants.seed(&mut sink);
 
     // Initial environment: fresh values for params and rets. The method has no
     // signature on the VMIR side — params/rets are just initial Fresh insts.
@@ -446,17 +445,11 @@ pub(crate) fn lower_method(
         exit_env.insert(bid, env);
     }
 
-    assert!(
-        sink.quant_ids.is_empty(),
-        "forall occurrence slots over-allocated"
-    );
-    Ok((
-        vmir::Method {
-            name,
-            insts: sink.insts,
-        },
-        sink.quant_out,
-    ))
+    quants.reap(&mut sink);
+    Ok(vmir::Method {
+        name,
+        insts: sink.insts,
+    })
 }
 
 /// The number of `forall`s in the statements (nested included), one occurrence

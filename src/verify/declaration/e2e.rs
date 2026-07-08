@@ -2525,3 +2525,145 @@ method client() {
     let result = verify_named_method(&program, "client");
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
+
+// ---- Pure `forall` quantifiers (v3: contracts + predicate bodies) ----------
+
+#[test]
+fn method_requires_forall_usable_in_body() {
+    // The entry inhale of `m#requires` assumes the resource bool — the
+    // occurrence — so the body can instantiate it.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+method m(x: Int)
+    requires forall i: Int :: {g(x, i)} g(x, i)
+{
+    assert g(x, 42)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn callee_ensures_forall_inhaled_at_call_site() {
+    // The call inhales `producer#ensures`, assuming its occurrence; the caller
+    // then instantiates it.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method producer()
+    ensures forall i: Int :: {foo(i)} foo(i)
+method client() {
+    producer()
+    assert foo(5)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn method_ensures_forall_not_provable_from_requires_twin() {
+    // KNOWN LIMITATION: the same syntactic `forall` in requires and ensures
+    // lowers to two distinct Quantifier decls; the exit exhale must prove the
+    // *ensures* occurrence, which nothing merges `true`. Proving foralls is
+    // out of scope — this documents the graceful failure.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method m()
+    requires forall i: Int :: {foo(i)} foo(i)
+    ensures forall i: Int :: {foo(i)} foo(i)
+{
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (proving foralls unsupported), got {result:?}"
+    );
+}
+
+#[test]
+fn predicate_body_forall_released_by_unfold() {
+    // Unfolding the predicate assumes its body bool — the conjunction of the
+    // guard and the occurrence — releasing both.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+predicate P(i: Int) { i != 0 && (forall x: Int :: {g(i, x)} g(i, x)) }
+method m(i: Int)
+    requires P(i)
+{
+    unfold P(i)
+    assert g(i, 3) && i != 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn function_requires_forall_usable_in_body() {
+    // Heap-free function: the body assumes `f#requires(params)`; the contract
+    // function's grafted definition equates that with the occurrence, so the
+    // body can instantiate the quantifier to discharge the ensures.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+function f(x: Int): Bool
+    requires forall i: Int :: {g(x, i)} g(x, i)
+    ensures result
+{
+    g(x, 1)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "f");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn function_requires_forall_call_site_unprovable() {
+    // KNOWN LIMITATION (twin decls): the caller's inhaled `forall` and the
+    // callee's `#requires` occurrence are distinct Quantifier decls, so the
+    // call-site `assert f#requires(args)` cannot be discharged. Graceful
+    // failure, same as any forall-proving goal.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+function f(x: Int): Bool
+    requires forall i: Int :: {g(x, i)} g(x, i)
+{
+    g(x, 1)
+}
+method m(x: Int) {
+    inhale forall i: Int :: {g(x, i)} g(x, i)
+    inhale f(x)
+    assert g(x, 1)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (twin-decl limitation), got {result:?}"
+    );
+}
+
+#[test]
+fn function_ensures_forall_assumed_at_call_site() {
+    // The call site assumes `f#ensures(args, ret)`; its grafted definition
+    // exposes the occurrence, which the caller then instantiates.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+function f(): Int
+    ensures forall i: Int :: {foo(i)} foo(i)
+method m() {
+    var r: Int := f()
+    assert foo(9)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}

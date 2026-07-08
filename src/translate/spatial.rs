@@ -8,7 +8,7 @@ use lasso::Spur;
 use crate::translate::pure_exp::{self, HeapCtx, OldHeaps, PureExt};
 use crate::translate::resource::lower_resource_addr;
 use crate::translate::sink::{PcKind, Sink};
-use crate::translate::{TranslationContext, TranslationError};
+use crate::translate::{QuantScope, TranslationContext, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{self, FALSE, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val};
 
@@ -61,8 +61,10 @@ pub(crate) fn lower_spatial_never(
     val_base: usize,
     initial_heap: HeapVal,
     heap_base: usize,
+    quants: &mut QuantScope,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, heap_base);
+    quants.seed(&mut sink);
     let (h, bv) = lower_spatial(
         b,
         env,
@@ -72,6 +74,7 @@ pub(crate) fn lower_spatial_never(
         None,
         exp,
     )?;
+    quants.reap(&mut sink);
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),
@@ -101,9 +104,12 @@ pub(crate) fn lower_pure_precond_body(
     env: &HashMap<Spur, Val>,
     exp: &typed::SpatialExp<typed::HeapExt>,
     val_base: usize,
+    quants: &mut QuantScope,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
+    quants.seed(&mut sink);
     let bv = lower_assertion_bool(b, env, &mut sink, HeapVal::Empty, None, exp)?;
+    quants.reap(&mut sink);
     Ok(vmir::FunctionBody {
         insts: sink.insts,
         res: bv.unwrap_or(TRUE),
@@ -117,8 +123,10 @@ pub(crate) fn lower_spatial_ensures(
     val_base: usize,
     initial_heap: HeapVal,
     snap_entry: Option<pure_exp::SnapEntry>,
+    quants: &mut QuantScope,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
+    quants.seed(&mut sink);
     // A two-state ensures opens with `heap_of req(args), s` (`FromSnap`):
     // reconstruct the method pre-state from the trailing snapshot parameter.
     // That heap is the (unlabeled) `old` baseline `old(e)` reads. A self-framed
@@ -151,6 +159,7 @@ pub(crate) fn lower_spatial_ensures(
         old.as_ref(),
         exp,
     )?;
+    quants.reap(&mut sink);
     Ok(vmir::ResourceBody {
         insts: sink.insts,
         res: (h, bv.unwrap_or(TRUE)),

@@ -578,9 +578,7 @@ impl PureExt for typed::HeapExt {
     ) -> Result<Val, TranslationError> {
         match ext {
             typed::HeapExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
-            typed::HeapExt::Forall(_) => Err(TranslationError::Unsupported(
-                "`forall` in method preconditions, function contracts, and predicate bodies",
-            )),
+            typed::HeapExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
 
@@ -896,9 +894,7 @@ impl PureExt for typed::MethodEnsuresExt {
                     inner,
                 )
             }
-            typed::MethodEnsuresExt::Forall(_) => Err(TranslationError::Unsupported(
-                "`forall` in method postconditions",
-            )),
+            typed::MethodEnsuresExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
 
@@ -988,9 +984,7 @@ impl PureExt for typed::FuncEnsuresExt {
             // postcondition is framed by, so it re-reads `e` against the current
             // context.
             typed::FuncEnsuresExt::Old(inner) => lower(b, env, sink, hctx, inner),
-            typed::FuncEnsuresExt::Forall(_) => Err(TranslationError::Unsupported(
-                "`forall` in function postconditions",
-            )),
+            typed::FuncEnsuresExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
 
@@ -1060,8 +1054,10 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     result: Option<Val>,
     contract: Option<FnContract>,
     snap_entry: Option<SnapEntry>,
+    quants: &mut crate::translate::QuantScope,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
+    quants.seed(&mut sink);
     // A heap-dependent body reads the heap reconstructed from its snapshot
     // parameter; a heap-free body reads the inert `heap` (`Empty`).
     let heap = match snap_entry {
@@ -1109,6 +1105,7 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         let check = call_contract(&mut sink, *ens, args);
         sink.emit_assert(check);
     }
+    quants.reap(&mut sink);
     Ok(vmir::FunctionBody {
         insts: sink.insts,
         res,

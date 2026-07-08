@@ -1,0 +1,23 @@
+// `forall` in contracts and predicate bodies (v3). A requires-forall is
+// assumed at the method's entry inhale; a callee's ensures-forall is assumed
+// at the call-site inhale; a predicate-body forall is released by unfold.
+domain D {
+    function foo(i: Int): Bool
+    function g(a: Int, i: Int): Bool
+}
+
+predicate P(i: Int) { i != 0 && (forall x: Int :: {g(i, x)} g(i, x)) }
+
+method producer()
+    ensures forall i: Int :: {foo(i)} foo(i)
+
+method client(x: Int)
+    requires forall i: Int :: {g(x, i)} g(x, i)
+    requires P(x + 1)
+{
+    assert g(x, 42)
+    producer()
+    assert foo(5)
+    unfold P(x + 1)
+    assert g(x + 1, 3) && x + 1 != 0
+}
