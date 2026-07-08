@@ -1240,9 +1240,12 @@ fn scale_heap_perm(ctx: &mut VerifyContext<'_>, h: &Heap, scale: egg::Id) -> Hea
 ///
 /// Invariant: the eager ground-axiom evaluation below only ever sees **nullary**
 /// quantifier occurrences — axioms are closed and `let` is rejected in pure
-/// lowering, so top-level `forall`s capture nothing. Occurrences with capture
-/// arguments enter the e-graph solely when an outer quantifier instance's body
-/// is built (`rewrite::build_instance`).
+/// lowering, so an axiom's top-level `forall`s capture nothing. Occurrences
+/// *with* capture arguments enter the e-graph when an outer quantifier
+/// instance's body is built (`rewrite::build_instance`), or as ordinary
+/// `FuncApp` evaluation of a hosting method/resource body (v3: `forall`s in
+/// method statements and contracts capture enclosing params/locals; those
+/// bodies are evaluated per unit, never eagerly here).
 fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
     for (id, decl) in program.decls.iter_enumerated() {
         // A pure `forall` becomes a value-σ lazy-instantiation rule, chained

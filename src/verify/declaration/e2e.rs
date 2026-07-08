@@ -2420,3 +2420,108 @@ method m() {
         "expected AssertionFailed, got {result:?}"
     );
 }
+
+// ---- Pure `forall` quantifiers (v3: method bodies) --------------------------
+
+#[test]
+fn method_inhale_forall_instantiates() {
+    // A `forall` inhaled in a method body: the occurrence is assumed true, so
+    // the ground `foo(7)` triggers an instance and the assert discharges.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method client() {
+    inhale forall i: Int :: {foo(i)} foo(i)
+    assert foo(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn method_inhale_forall_captures_local() {
+    // The quantifier captures a method local; instantiation must match the
+    // occurrence's capture argument.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+method client(x: Int) {
+    var l: Int := x
+    inhale forall i: Int :: {g(l, i)} g(l, i)
+    assert g(x, 3)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn method_inhale_forall_capture_mismatch_fails() {
+    // Only `Q(x)` is inhaled — `g(y, 3)` has capture y ≠ x, so nothing is
+    // learned about it. (Soundness: captures gate instantiation.)
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+method client(x: Int, y: Int) {
+    inhale forall i: Int :: {g(x, i)} g(x, i)
+    assert g(y, 3)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn method_inhale_forall_under_conjunction() {
+    // The occurrence sits under a spatial `&&`: inhale-truth must decompose
+    // down to the occurrence (and the pure left conjunct).
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method client(x: Int) {
+    inhale x > 0 && (forall i: Int :: {foo(i)} foo(i))
+    assert foo(2) && x > 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn method_assert_forall_fails_gracefully() {
+    // Proving a `forall` goal is out of scope: the occurrence never merges
+    // `true`, so the assert fails cleanly (no crash, no unsound success).
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method client() {
+    inhale foo(1)
+    assert forall i: Int :: {foo(i)} foo(i)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn method_inhale_forall_two_instantiations() {
+    // One inhaled quantifier feeds two distinct ground instances in the same
+    // unit.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method client() {
+    inhale forall i: Int :: {foo(i)} foo(i)
+    assert foo(1) && foo(2)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}

@@ -485,6 +485,69 @@ pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
         ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError>;
+
+    /// The number of `forall` occurrence slots this extension node consumes,
+    /// **including** `forall`s nested inside another's body (see
+    /// [`count_foralls`]).
+    fn count_foralls_ext(ext: &Self) -> usize;
+}
+
+/// The number of `forall`s in a pure expression, **including** those nested
+/// inside another `forall`'s body. Each contributes one occurrence slot; the
+/// preorder here matches the order lowering consumes ids (a `forall`'s own id
+/// precedes its body's). Triggers are not descended — they are validated, never
+/// lowered, so they consume no ids.
+pub(crate) fn count_foralls<Ext: PureExt>(exp: &typed::TypedPureExp<Ext>) -> usize {
+    use typed::PureExpKind as P;
+    match exp.exp.as_ref() {
+        P::Ident(_) | P::Const(_) => 0,
+        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => count_foralls(e),
+        P::Binary(_, l, r) => count_foralls(l) + count_foralls(r),
+        P::Ternary { if_, then, else_ } => {
+            count_foralls(if_) + count_foralls(then) + count_foralls(else_)
+        }
+        P::LetIn { value, exp, .. } => count_foralls(value) + count_foralls(exp),
+        P::DomainFunctionCall(call) | P::AdtConstructor(call) => count_foralls_call(call),
+        P::Ext(ext) => Ext::count_foralls_ext(ext),
+    }
+}
+
+pub(crate) fn count_foralls_call<Ext: PureExt>(call: &typed::Call<Ext>) -> usize {
+    call.args.iter().map(count_foralls).sum()
+}
+
+fn count_foralls_heap_node<Ext: PureExt>(node: &typed::HeapNode<Ext>) -> usize {
+    match node {
+        typed::HeapNode::Field(e, _) => count_foralls(e),
+        typed::HeapNode::FunctionCall(call) => count_foralls_call(call),
+        typed::HeapNode::Unfolding(pwp, e) => count_foralls_pred_with_perm(pwp) + count_foralls(e),
+    }
+}
+
+pub(crate) fn count_foralls_pred_with_perm<Ext: PureExt>(
+    pwp: &typed::PredicateWithPerm<Ext>,
+) -> usize {
+    count_foralls_call(&pwp.pred_call) + count_foralls(&pwp.perm)
+}
+
+fn count_foralls_resource<Ext: PureExt>(res: &typed::ResourceExp<Ext>) -> usize {
+    match res.0.as_ref() {
+        typed::ResourceExpKind::Field(e, _) => count_foralls(e),
+        typed::ResourceExpKind::PredicateCall(call) => count_foralls_call(call),
+    }
+}
+
+pub(crate) fn count_foralls_spatial<Ext: PureExt>(s: &typed::SpatialExp<Ext>) -> usize {
+    use typed::SpatialExpKind as SK;
+    match s.0.as_ref() {
+        SK::Implies(c, body) => count_foralls(c) + count_foralls_spatial(body),
+        SK::Conj(l, r) => count_foralls_spatial(l) + count_foralls_spatial(r),
+        SK::Ternary { if_, then, else_ } => {
+            count_foralls(if_) + count_foralls_spatial(then) + count_foralls_spatial(else_)
+        }
+        SK::Acc(res, perm) => count_foralls_resource(res) + count_foralls(perm),
+        SK::Pure(e) => count_foralls(e),
+    }
 }
 
 impl PureExt for ! {
@@ -496,6 +559,10 @@ impl PureExt for ! {
         _ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError> {
+        match *ext {}
+    }
+
+    fn count_foralls_ext(ext: &Self) -> usize {
         match *ext {}
     }
 }
@@ -516,6 +583,13 @@ impl PureExt for typed::HeapExt {
             )),
         }
     }
+
+    fn count_foralls_ext(ext: &Self) -> usize {
+        match ext {
+            typed::HeapExt::Heap(node) => count_foralls_heap_node(node),
+            typed::HeapExt::Forall(q) => 1 + count_foralls(&q.body),
+        }
+    }
 }
 
 /// Domain axioms: the only extension is a call to a precondition-free Silver
@@ -534,6 +608,13 @@ impl PureExt for typed::AxiomExt {
         match ext {
             typed::AxiomExt::FunctionCall(call) => lower_func_app(b, env, sink, hctx, ty, call),
             typed::AxiomExt::Forall(q) => lower_forall(b, env, sink, q),
+        }
+    }
+
+    fn count_foralls_ext(ext: &Self) -> usize {
+        match ext {
+            typed::AxiomExt::FunctionCall(call) => count_foralls_call(call),
+            typed::AxiomExt::Forall(q) => 1 + count_foralls(&q.body),
         }
     }
 }
@@ -820,6 +901,14 @@ impl PureExt for typed::MethodEnsuresExt {
             )),
         }
     }
+
+    fn count_foralls_ext(ext: &Self) -> usize {
+        match ext {
+            typed::MethodEnsuresExt::Heap(node) => count_foralls_heap_node(node),
+            typed::MethodEnsuresExt::Old(e) => count_foralls(e),
+            typed::MethodEnsuresExt::Forall(q) => 1 + count_foralls(&q.body),
+        }
+    }
 }
 
 impl PureExt for typed::MethodBodyExt {
@@ -865,9 +954,16 @@ impl PureExt for typed::MethodBodyExt {
                     crate::translate::resource::lower_resource_addr(b, env, sink, hctx, res)?;
                 Ok(sink.emit_pure(ty, PureInst::Perm(hctx.perm, addr)))
             }
-            typed::MethodBodyExt::Forall(_) => Err(TranslationError::Unsupported(
-                "`forall` in method bodies",
-            )),
+            typed::MethodBodyExt::Forall(q) => lower_forall(b, env, sink, q),
+        }
+    }
+
+    fn count_foralls_ext(ext: &Self) -> usize {
+        match ext {
+            typed::MethodBodyExt::Heap(node) => count_foralls_heap_node(node),
+            typed::MethodBodyExt::Old(_, e) => count_foralls(e),
+            typed::MethodBodyExt::Perm(res) => count_foralls_resource(res),
+            typed::MethodBodyExt::Forall(q) => 1 + count_foralls(&q.body),
         }
     }
 }
@@ -895,6 +991,15 @@ impl PureExt for typed::FuncEnsuresExt {
             typed::FuncEnsuresExt::Forall(_) => Err(TranslationError::Unsupported(
                 "`forall` in function postconditions",
             )),
+        }
+    }
+
+    fn count_foralls_ext(ext: &Self) -> usize {
+        match ext {
+            typed::FuncEnsuresExt::Heap(node) => count_foralls_heap_node(node),
+            typed::FuncEnsuresExt::Result => 0,
+            typed::FuncEnsuresExt::Old(e) => count_foralls(e),
+            typed::FuncEnsuresExt::Forall(q) => 1 + count_foralls(&q.body),
         }
     }
 }

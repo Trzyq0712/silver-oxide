@@ -126,29 +126,6 @@ fn used_generics_in_exp(
     }
 }
 
-/// The number of `forall`s in an axiom expression, **including** those nested
-/// inside another `forall`'s body. Each contributes one occurrence slot; the
-/// preorder here matches the order lowering consumes ids (a `forall`'s own id
-/// precedes its body's). Triggers are not descended — they are validated, never
-/// lowered, so they consume no ids.
-fn count_foralls(exp: &typed::TypedPureExp<typed::AxiomExt>) -> usize {
-    use typed::PureExpKind as P;
-    match exp.exp.as_ref() {
-        P::Ident(_) | P::Const(_) => 0,
-        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => count_foralls(e),
-        P::Binary(_, l, r) => count_foralls(l) + count_foralls(r),
-        P::Ternary { if_, then, else_ } => {
-            count_foralls(if_) + count_foralls(then) + count_foralls(else_)
-        }
-        P::LetIn { value, exp, .. } => count_foralls(value) + count_foralls(exp),
-        P::DomainFunctionCall(call) | P::AdtConstructor(call) => {
-            call.args.iter().map(count_foralls).sum()
-        }
-        P::Ext(typed::AxiomExt::FunctionCall(call)) => call.args.iter().map(count_foralls).sum(),
-        P::Ext(typed::AxiomExt::Forall(q)) => 1 + count_foralls(&q.body),
-    }
-}
-
 impl<'a> DomainTranslator<'a, Declared> {
     /// Reserve the domain stub + a `Function` slot per domain function, and
     /// publish every `name_map` entry (and each generic function's declared
@@ -205,7 +182,7 @@ impl<'a> DomainTranslator<'a, Declared> {
             axiom_slots.push(aslot);
             // Pre-allocate one occurrence slot per `forall` (nested included),
             // in the preorder the body lowering will encounter them.
-            let n_foralls = count_foralls(&ax.exp);
+            let n_foralls = pure_exp::count_foralls(&ax.exp);
             let mut slots = Vec::with_capacity(n_foralls);
             for j in 0..n_foralls {
                 let (id, qslot) =

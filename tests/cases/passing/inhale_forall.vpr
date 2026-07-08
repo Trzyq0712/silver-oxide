@@ -1,0 +1,15 @@
+// `forall` in a method body (v3): inhaling a quantifier that captures a
+// method-scoped value. The occurrence `Q(l)` is assumed true; the ground
+// `g(l, 3)` (congruent to `g(x, 3)`) triggers an instance whose capture
+// position matches the occurrence's argument.
+domain D {
+    function foo(i: Int): Bool
+    function g(a: Int, i: Int): Bool
+}
+
+method client(x: Int) {
+    var l: Int := x
+    inhale forall i: Int :: {foo(i)} foo(i)
+    inhale forall i: Int :: {g(l, i)} g(l, i)
+    assert foo(7) && g(x, 3)
+}

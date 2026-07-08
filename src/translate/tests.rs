@@ -1053,6 +1053,47 @@ domain D {
 }
 
 #[test]
+fn forall_in_method_inhale_lowers_to_quantifier() {
+    // A `forall` in a method-body `inhale` lowers to a `{method}#quant{j}`
+    // declaration; the free method param becomes a capture, passed as the
+    // occurrence call's argument in the method body.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+method m(x: Int) {
+    inhale forall i: Int :: {g(x, i)} g(x, i)
+}
+"#;
+    let p = run(input);
+    let q_id = p.id("m#quant0").expect("missing quantifier slot");
+    let vmir::Declaration::Quantifier(q) = &p.decls[q_id] else {
+        panic!("m#quant0 must be a Quantifier");
+    };
+    assert_eq!(q.params.len(), 1, "captures the method param x");
+    assert_eq!(q.bound.len(), 1, "one binder");
+    let g_id = p.id("g").expect("missing g");
+    assert_eq!(q.trigger.function, g_id);
+    assert_eq!(
+        &*q.trigger.args,
+        &[vmir::TrigArg::Capture(0), vmir::TrigArg::Bound(0)],
+        "trigger is g(capture x, bound i)"
+    );
+
+    // The method body calls the occurrence with one argument (the captured x).
+    let m_id = p.id("m").expect("missing method m");
+    let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+        panic!("m must be a Method");
+    };
+    assert!(
+        m.insts.iter().any(|i| matches!(
+            &i.kind,
+            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
+                if fc.function == q_id && fc.args.iter().count() == 1
+        )),
+        "method body must call the occurrence with the captured value"
+    );
+}
+
+#[test]
 fn forall_missing_trigger_rejected() {
     let err = run_err(
         r#"

@@ -440,9 +440,9 @@ impl PureExt for MethodEnsuresExt {
         triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
         body: TypedPureExp<typed::AxiomExt>,
     ) -> Result<PureExpKind<Self>, TypeError> {
-        Ok(PureExpKind::Ext(MethodEnsuresExt::Forall(
-            assemble_forall(kind, bound, triggers, body)?,
-        )))
+        Ok(PureExpKind::Ext(MethodEnsuresExt::Forall(assemble_forall(
+            kind, bound, triggers, body,
+        )?)))
     }
 }
 
