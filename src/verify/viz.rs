@@ -156,7 +156,7 @@ impl Snapshotter {
         // (cluster-scope `label` is the cluster's own, so no leakage).
         let mut type_memo: HashMap<egg::Id, Option<Type>> = HashMap::new();
         for class in ctx.egraph.classes() {
-            let ty = crate::verify::context::infer_type(
+            let ty = crate::verify::types::infer_type(
                 &ctx.egraph,
                 &ctx.fresh_types,
                 &ctx.func_ret_types,

@@ -9,7 +9,7 @@ use egg::{
 };
 
 use crate::verify::analysis::ConstFold;
-use crate::verify::context::{FunctionCertificate, TransplantSink, Transplanted, transplant};
+use crate::verify::cert::{FunctionCertificate, TransplantSink, Transplanted, transplant};
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
 use crate::vmir::{BinOp, Literal, TrigArg, Type, Val};
 

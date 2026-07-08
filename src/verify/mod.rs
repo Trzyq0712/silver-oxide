@@ -1,16 +1,19 @@
 use crate::vmir;
 
 mod analysis;
+mod cert;
 mod context;
 mod declaration;
+mod error;
 mod func_registry;
 mod heap;
 pub mod lang;
 mod rewrite;
 mod stats;
+mod types;
 mod viz;
 
-pub use declaration::VerifyError;
+pub use error::VerifyError;
 pub use stats::VerifyStats;
 
 /// Result for one verification unit (method or resource): its name and whether
@@ -49,7 +52,7 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // Resources are verified before the methods that use them (dependency
     // order), so each resource's proof certificate is cached and grafted at
     // call sites rather than re-walking the body.
-    let mut certs: std::collections::HashMap<vmir::MemberId, context::ResourceCertificate> =
+    let mut certs: std::collections::HashMap<vmir::MemberId, cert::ResourceCertificate> =
         std::collections::HashMap::new();
     // Verified function bodies, cached in dependency order (callees before
     // callers). Each unit's `assume_axioms` installs one lazy unfold rule per
@@ -58,7 +61,7 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // occurrence is seen during that unit's own saturation.
     let mut fn_certs: std::collections::HashMap<
         vmir::MemberId,
-        std::sync::Arc<context::FunctionCertificate>,
+        std::sync::Arc<cert::FunctionCertificate>,
     > = std::collections::HashMap::new();
     // Shared function-id registry: one per run so ADT/builtin ids stay
     // consistent across certificate grafts. Threaded `&mut` into each unit.
