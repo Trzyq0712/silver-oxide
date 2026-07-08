@@ -1413,6 +1413,7 @@ type EvalFn = fn(
 /// `footprint_ops`, when `Some`, collects each `acc`'s `(loc, perm)` operand in
 /// body order — the resource driver's one extra responsibility (drives the
 /// fold/unfold snapshot layout); `None` for method and function bodies.
+#[allow(clippy::too_many_arguments)]
 fn walk_body(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,

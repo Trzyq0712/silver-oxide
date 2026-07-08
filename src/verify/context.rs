@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use egg::{EGraph, Id};
+use egg::Id;
 
 use crate::{
     verify::{
@@ -9,7 +9,7 @@ use crate::{
             FunctionCertificate, ResourceCertificate, TransplantSink, Transplanted, transplant,
         },
         func_registry::FuncRegistry,
-        heap::{Chunk, Heap, LocationKind},
+        heap::{Chunk, Heap},
         lang::{FuncId, Symbolic},
         rewrite,
     },
