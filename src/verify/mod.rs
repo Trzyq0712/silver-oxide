@@ -10,7 +10,7 @@ mod rewrite;
 mod stats;
 mod viz;
 
-pub use declaration::{VerifyError, verify_function, verify_resource};
+pub use declaration::VerifyError;
 pub use stats::VerifyStats;
 
 /// Result for one verification unit (method or resource): its name and whether

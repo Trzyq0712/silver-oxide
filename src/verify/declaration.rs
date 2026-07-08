@@ -1419,7 +1419,71 @@ fn prepare_body(
     Ok(out)
 }
 
-pub fn verify_method(
+/// Per-instruction evaluator: the shared signature of [`eval_method_inst`] and
+/// [`eval_resource_body_inst`], so [`walk_body`] can be parameterized by which
+/// one the body kind uses.
+type EvalFn = fn(
+    &mut VerifyContext<'_>,
+    &vmir::Program,
+    &mut EvalState,
+    &Inst,
+    &HashMap<MemberId, ResourceCertificate>,
+) -> Result<(), VerifyError>;
+
+/// The single body-walk shared by all three drivers: for each instruction,
+/// discharge its side-condition [`inst_obligations`] under the path condition,
+/// then evaluate it, snapshotting for the visualizer throughout. Keeping this in
+/// one place is what makes an obligation added to `inst_obligations` impossible
+/// to skip in one driver (the `5aad7bc` division-check bug: the check existed but
+/// was wired into only one of three near-identical copies of this loop).
+///
+/// `eval` selects the per-inst semantics (method/function vs resource body).
+/// `footprint_ops`, when `Some`, collects each `acc`'s `(loc, perm)` operand in
+/// body order — the resource driver's one extra responsibility (drives the
+/// fold/unfold snapshot layout); `None` for method and function bodies.
+fn walk_body(
+    ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
+    state: &mut EvalState,
+    snap: &mut Snapshotter,
+    insts: &[Inst],
+    certs: &HashMap<MemberId, ResourceCertificate>,
+    eval: EvalFn,
+    mut footprint_ops: Option<&mut Vec<(Val, Val)>>,
+) -> Result<(), VerifyError> {
+    for inst in insts {
+        if let (Some(ops), InstKind::Heap(HeapInst::Combine { loc, perm, .. })) =
+            (&mut footprint_ops, &inst.kind)
+        {
+            ops.push((loc.clone(), perm.clone()));
+        }
+        let vals_before = state.vals.len();
+        let heaps_before = state.heaps.len();
+        let inst_text = format_inst(
+            inst,
+            &program.decls,
+            &program.interner,
+            &program.groups,
+            vals_before,
+            heaps_before,
+        );
+        let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+        for (goal, err) in inst_obligations(ctx, state, &inst.kind) {
+            if !ctx.prove_under_pc(goal, &pc_lits) {
+                return Err(err.with_inst(inst_text.clone()));
+            }
+        }
+        if let Err(err) = eval(ctx, program, state, inst, certs) {
+            return Err(err.with_inst(inst_text));
+        }
+        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
+        let heaps = display_heaps(state, &inst.kind, heaps_before);
+        snap.snapshot(ctx, &heaps, &inst_text, highlight);
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_method(
     program: &vmir::Program,
     method_name: &str,
     method: &Method,
@@ -1434,32 +1498,16 @@ pub fn verify_method(
     let mut snap = Snapshotter::from_env(method_name);
 
     snap.snapshot(&ctx, &[], "init", None);
-    for inst in &method.insts {
-        let vals_before = state.vals.len();
-        let heaps_before = state.heaps.len();
-        let inst_text = format_inst(
-            inst,
-            &program.decls,
-            &program.interner,
-            &program.groups,
-            vals_before,
-            heaps_before,
-        );
-        let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
-        for (goal, err) in inst_obligations(&mut ctx, &state, &inst.kind) {
-            if !ctx.prove_under_pc(goal, &pc_lits) {
-                return Err(err.with_inst(inst_text.clone()));
-            }
-        }
-        if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst, certs) {
-            return Err(err.with_inst(inst_text));
-        }
-        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
-        let heaps = display_heaps(&state, &inst.kind, heaps_before);
-        snap.snapshot(&ctx, &heaps, &inst_text, highlight);
-    }
-
-    Ok(())
+    walk_body(
+        &mut ctx,
+        program,
+        &mut state,
+        &mut snap,
+        &method.insts,
+        certs,
+        eval_method_inst,
+        None,
+    )
 }
 
 /// Verify a resource self-contained: run its body in a fresh egraph with fresh
@@ -1468,7 +1516,7 @@ pub fn verify_method(
 /// under its path condition. Abstract resources have nothing to check. This
 /// establishes well-formedness **once**; method call sites reuse it without
 /// re-checking (see [`eval_resource_call`]).
-pub fn verify_resource(
+pub(crate) fn verify_resource(
     program: &vmir::Program,
     resource_name: &str,
     resource: &Resource,
@@ -1500,37 +1548,20 @@ pub fn verify_resource(
 
     // Ordered per-acc footprint operands `(loc, perm)`, in body order — one per
     // syntactic `acc` (location target), kept unmerged for the fold/unfold
-    // snapshot layout (the merged `delta` below is for inhale/exhale).
+    // snapshot layout (the merged `delta` below is for inhale/exhale). Collected
+    // by `walk_body` as it passes each `Combine`.
     let mut footprint_ops: Vec<(Val, Val)> = Vec::new();
 
-    for inst in &body.insts {
-        if let InstKind::Heap(HeapInst::Combine { loc, perm, .. }) = &inst.kind {
-            footprint_ops.push((loc.clone(), perm.clone()));
-        }
-        let vals_before = state.vals.len();
-        let heaps_before = state.heaps.len();
-        let inst_text = format_inst(
-            inst,
-            &program.decls,
-            &program.interner,
-            &program.groups,
-            vals_before,
-            heaps_before,
-        );
-        let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
-        for (goal, err) in inst_obligations(&mut ctx, &state, &inst.kind) {
-            if !ctx.prove_under_pc(goal, &pc_lits) {
-                return Err(err.with_inst(inst_text.clone()));
-            }
-        }
-
-        if let Err(err) = eval_resource_body_inst(&mut ctx, program, &mut state, inst, certs) {
-            return Err(err.with_inst(inst_text));
-        }
-        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
-        let heaps = display_heaps(&state, &inst.kind, heaps_before);
-        snap.snapshot(&ctx, &heaps, &inst_text, highlight);
-    }
+    walk_body(
+        &mut ctx,
+        program,
+        &mut state,
+        &mut snap,
+        &body.insts,
+        certs,
+        eval_resource_body_inst,
+        Some(&mut footprint_ops),
+    )?;
 
     // Saturate so the certificate carries every proven merge, then snapshot the
     // result roots (canonicalized) for grafting at call sites.
@@ -1616,7 +1647,7 @@ pub fn verify_resource(
 /// (called at the top of this function's own `ctx` setup) has already
 /// installed their unfold rules — saturation (triggered constantly via
 /// `prove_under_pc`) discharges the contract obligations lazily as needed.
-pub fn verify_function(
+pub(crate) fn verify_function(
     program: &vmir::Program,
     function_name: &str,
     function: &Function,
@@ -1643,32 +1674,19 @@ pub fn verify_function(
 
     let mut snap = Snapshotter::from_env(function_name);
     snap.snapshot(&ctx, &[], "init", None);
-    for inst in &body.insts {
-        let vals_before = state.vals.len();
-        let heaps_before = state.heaps.len();
-        let inst_text = format_inst(
-            inst,
-            &program.decls,
-            &program.interner,
-            &program.groups,
-            vals_before,
-            heaps_before,
-        );
-        let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
-        for (goal, err) in inst_obligations(&mut ctx, &state, &inst.kind) {
-            if !ctx.prove_under_pc(goal, &pc_lits) {
-                return Err(err.with_inst(inst_text.clone()));
-            }
-        }
-        // The method-body eval path handles every inst (pure ops, the entry/exit
-        // `assume`/`assert`, and `Snap`/`FromSnap` for heap-dependent functions).
-        if let Err(err) = eval_method_inst(&mut ctx, program, &mut state, inst, certs) {
-            return Err(err.with_inst(inst_text));
-        }
-        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
-        let heaps = display_heaps(&state, &inst.kind, heaps_before);
-        snap.snapshot(&ctx, &heaps, &inst_text, highlight);
-    }
+    // The method-body eval path handles every inst a function body can contain
+    // (pure ops, the entry/exit `assume`/`assert`, and `Snap`/`FromSnap` for
+    // heap-dependent functions).
+    walk_body(
+        &mut ctx,
+        program,
+        &mut state,
+        &mut snap,
+        &body.insts,
+        certs,
+        eval_method_inst,
+        None,
+    )?;
 
     // No extra saturation here (see the doc comment above) — snapshot the
     // canonicalized result/param roots as they stand after the ordinary walk.
