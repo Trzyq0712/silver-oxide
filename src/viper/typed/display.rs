@@ -12,7 +12,7 @@ use std::fmt::{self, Display, Formatter};
 use crate::viper::interner::Interner;
 use crate::viper::typed::{
     AssignLhs, AssignRhs, AxiomExt, BinOp, Call, Declaration, Domain, DomainFunction, Field,
-    FuncEnsuresExt, Function, HeapExt, HeapNode, Ident, Literal, Method, MethodBodyExt,
+    Forall, FuncEnsuresExt, Function, HeapExt, HeapNode, Ident, Literal, Method, MethodBodyExt,
     MethodEnsuresExt, Predicate, PredicateWithPerm, Program, PureExpKind, ResourceExp,
     ResourceExpKind, SpatialExp, SpatialExpKind, StarOrFields, Statement, StmtBlock, Type,
     TypedIdent, TypedPureExp, UnOp,
@@ -86,10 +86,34 @@ fn fmt_heap_node<Ext: ShowExt>(
     }
 }
 
+/// Render a `forall` quantifier (binders, trigger groups, body).
+fn fmt_forall(q: &Forall, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
+    write!(f, "forall ")?;
+    for (i, bv) in q.bound.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{}", Show::new(bv, interner))?;
+    }
+    write!(f, " :: ")?;
+    for group in &q.triggers {
+        write!(f, "{{")?;
+        for (i, t) in group.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", Show::new(t, interner))?;
+        }
+        write!(f, "}}")?;
+    }
+    write!(f, " {}", Show::new(&q.body, interner))
+}
+
 impl ShowExt for HeapExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
             HeapExt::Heap(node) => fmt_heap_node(node, f, interner),
+            HeapExt::Forall(q) => fmt_forall(q, f, interner),
         }
     }
 }
@@ -98,27 +122,7 @@ impl ShowExt for AxiomExt {
     fn fmt_ext(&self, f: &mut Formatter<'_>, interner: &Interner) -> fmt::Result {
         match self {
             AxiomExt::FunctionCall(call) => write!(f, "{}", Show::new(call, interner)),
-            AxiomExt::Forall(q) => {
-                write!(f, "forall ")?;
-                for (i, bv) in q.bound.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", Show::new(bv, interner))?;
-                }
-                write!(f, " :: ")?;
-                for group in &q.triggers {
-                    write!(f, "{{")?;
-                    for (i, t) in group.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{}", Show::new(t, interner))?;
-                    }
-                    write!(f, "}}")?;
-                }
-                write!(f, " {}", Show::new(&q.body, interner))
-            }
+            AxiomExt::Forall(q) => fmt_forall(q, f, interner),
         }
     }
 }
@@ -129,6 +133,7 @@ impl ShowExt for FuncEnsuresExt {
             FuncEnsuresExt::Heap(node) => fmt_heap_node(node, f, interner),
             FuncEnsuresExt::Result => write!(f, "result"),
             FuncEnsuresExt::Old(e) => write!(f, "old({})", Show::new(e, interner)),
+            FuncEnsuresExt::Forall(q) => fmt_forall(q, f, interner),
         }
     }
 }
@@ -138,6 +143,7 @@ impl ShowExt for MethodEnsuresExt {
         match self {
             MethodEnsuresExt::Heap(node) => fmt_heap_node(node, f, interner),
             MethodEnsuresExt::Old(e) => write!(f, "old({})", Show::new(e, interner)),
+            MethodEnsuresExt::Forall(q) => fmt_forall(q, f, interner),
         }
     }
 }
@@ -156,6 +162,7 @@ impl ShowExt for MethodBodyExt {
                 )
             }
             MethodBodyExt::Perm(res) => write!(f, "perm({})", Show::new(res, interner)),
+            MethodBodyExt::Forall(q) => fmt_forall(q, f, interner),
         }
     }
 }

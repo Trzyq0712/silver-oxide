@@ -248,27 +248,48 @@ trait PureExt: Sized {
     /// this context's extension. A pure context (`!`) rejects it.
     fn lower_heap(node: typed::HeapNode<Self>) -> Result<Self, TypeError>;
     /// Whether this context lowers a `forall` into a first-class quantifier
-    /// term. Only axioms do (`true`); everywhere else a quantifier is still
+    /// term. Axioms, contracts, predicate bodies, and method statements do
+    /// (`true`); in the remaining pure contexts (`!`) a quantifier is still
     /// erased to `true` (see the dispatch in `lower_pure_kind`) — so the body
     /// is **not** recursed into, preserving the silent-erase for quantified
-    /// permissions and other unsupported forms in method/function contexts.
+    /// permissions and other unsupported forms there.
     const LOWER_FORALL: bool = false;
-    /// Assemble a lowered `forall` into this context's extension. Only invoked
-    /// when [`Self::LOWER_FORALL`] is `true`; the default is therefore
-    /// unreachable. `exists` is rejected here.
+    /// Assemble a lowered `forall` into this context's extension. The innards
+    /// are always [`typed::AxiomExt`]-typed — quantifier bodies are pure and
+    /// heap-free in every host position. Only invoked when
+    /// [`Self::LOWER_FORALL`] is `true`; the default is therefore unreachable.
+    /// `exists` is rejected here.
     fn build_forall(
         _kind: viper::QuantifierKind,
         _bound: Vec<typed::TypedIdent>,
-        _triggers: Vec<Vec<TypedPureExp<Self>>>,
-        _body: TypedPureExp<Self>,
+        _triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+        _body: TypedPureExp<typed::AxiomExt>,
     ) -> Result<PureExpKind<Self>, TypeError> {
         unreachable!("build_forall on a context with LOWER_FORALL = false")
     }
 }
 
+/// Shared `build_forall` body: assemble the [`typed::Forall`] node, rejecting
+/// `exists`. Each `LOWER_FORALL` host wraps the result in its own variant.
+fn assemble_forall(
+    kind: viper::QuantifierKind,
+    bound: Vec<typed::TypedIdent>,
+    triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+    body: TypedPureExp<typed::AxiomExt>,
+) -> Result<Box<typed::Forall>, TypeError> {
+    match kind {
+        viper::QuantifierKind::Forall => Ok(Box::new(typed::Forall {
+            bound,
+            triggers,
+            body,
+        })),
+        viper::QuantifierKind::Exists => Err(TypeError::ExistsUnsupported),
+    }
+}
+
 /// Domain axioms: Silver `function` calls allowed (the no-precondition check
 /// happens after lowering, in `typecheck_program`), everything else
-/// heap-flavoured rejected. Ground only — quantifiers rejected.
+/// heap-flavoured rejected. Pure `forall` quantifiers allowed.
 impl PureExt for typed::AxiomExt {
     fn lower_old(
         _label: Option<Spur>,
@@ -295,19 +316,12 @@ impl PureExt for typed::AxiomExt {
     fn build_forall(
         kind: viper::QuantifierKind,
         bound: Vec<typed::TypedIdent>,
-        triggers: Vec<Vec<TypedPureExp<Self>>>,
-        body: TypedPureExp<Self>,
+        triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+        body: TypedPureExp<typed::AxiomExt>,
     ) -> Result<PureExpKind<Self>, TypeError> {
-        match kind {
-            viper::QuantifierKind::Forall => Ok(PureExpKind::Ext(typed::AxiomExt::Forall(
-                Box::new(typed::Forall {
-                    bound,
-                    triggers,
-                    body,
-                }),
-            ))),
-            viper::QuantifierKind::Exists => Err(TypeError::ExistsUnsupported),
-        }
+        Ok(PureExpKind::Ext(typed::AxiomExt::Forall(assemble_forall(
+            kind, bound, triggers, body,
+        )?)))
     }
 }
 
@@ -351,6 +365,17 @@ impl PureExt for typed::HeapExt {
     fn lower_heap(node: typed::HeapNode<typed::HeapExt>) -> Result<typed::HeapExt, TypeError> {
         Ok(typed::HeapExt::Heap(node))
     }
+    const LOWER_FORALL: bool = true;
+    fn build_forall(
+        kind: viper::QuantifierKind,
+        bound: Vec<typed::TypedIdent>,
+        triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+        body: TypedPureExp<typed::AxiomExt>,
+    ) -> Result<PureExpKind<Self>, TypeError> {
+        Ok(PureExpKind::Ext(typed::HeapExt::Forall(assemble_forall(
+            kind, bound, triggers, body,
+        )?)))
+    }
 }
 
 impl PureExt for FuncEnsuresExt {
@@ -374,6 +399,17 @@ impl PureExt for FuncEnsuresExt {
     fn lower_heap(node: typed::HeapNode<FuncEnsuresExt>) -> Result<FuncEnsuresExt, TypeError> {
         Ok(FuncEnsuresExt::Heap(node))
     }
+    const LOWER_FORALL: bool = true;
+    fn build_forall(
+        kind: viper::QuantifierKind,
+        bound: Vec<typed::TypedIdent>,
+        triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+        body: TypedPureExp<typed::AxiomExt>,
+    ) -> Result<PureExpKind<Self>, TypeError> {
+        Ok(PureExpKind::Ext(FuncEnsuresExt::Forall(assemble_forall(
+            kind, bound, triggers, body,
+        )?)))
+    }
 }
 
 impl PureExt for MethodEnsuresExt {
@@ -396,6 +432,17 @@ impl PureExt for MethodEnsuresExt {
     }
     fn lower_heap(node: typed::HeapNode<MethodEnsuresExt>) -> Result<MethodEnsuresExt, TypeError> {
         Ok(MethodEnsuresExt::Heap(node))
+    }
+    const LOWER_FORALL: bool = true;
+    fn build_forall(
+        kind: viper::QuantifierKind,
+        bound: Vec<typed::TypedIdent>,
+        triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+        body: TypedPureExp<typed::AxiomExt>,
+    ) -> Result<PureExpKind<Self>, TypeError> {
+        Ok(PureExpKind::Ext(MethodEnsuresExt::Forall(
+            assemble_forall(kind, bound, triggers, body)?,
+        )))
     }
 }
 
@@ -423,6 +470,17 @@ impl PureExt for MethodBodyExt {
     }
     fn lower_heap(node: typed::HeapNode<MethodBodyExt>) -> Result<MethodBodyExt, TypeError> {
         Ok(MethodBodyExt::Heap(node))
+    }
+    const LOWER_FORALL: bool = true;
+    fn build_forall(
+        kind: viper::QuantifierKind,
+        bound: Vec<typed::TypedIdent>,
+        triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>>,
+        body: TypedPureExp<typed::AxiomExt>,
+    ) -> Result<PureExpKind<Self>, TypeError> {
+        Ok(PureExpKind::Ext(MethodBodyExt::Forall(assemble_forall(
+            kind, bound, triggers, body,
+        )?)))
     }
 }
 
@@ -1114,9 +1172,13 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
             }
 
             // A quantifier is a first-class term only in a `LOWER_FORALL`
-            // context (axioms); everywhere else it is erased to `true` without
-            // recursing into the body (so unsupported forms like quantified
-            // permissions stay silently erased).
+            // context (axioms, contracts, predicate bodies, method statements);
+            // elsewhere (`!`) it is erased to `true` without recursing into the
+            // body (so unsupported forms like quantified permissions stay
+            // silently erased). Triggers and body are lowered as `AxiomExt`
+            // regardless of host — quantifier bodies are pure and heap-free, so
+            // `AxiomExt`'s rules reject heap derefs, `unfolding`, `old`,
+            // `result`, and `perm` inside a `forall`.
             ExpKind::Quantifier(kind, bound_vars, triggers, body) => {
                 if !Ext::LOWER_FORALL {
                     return Ok(PureExpKind::Const(Literal::Bool(true)));
@@ -1128,16 +1190,16 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                         ty: Type::from(&bv.ty),
                     })
                     .collect();
-                let lowered_triggers: Vec<Vec<TypedPureExp<Ext>>> = triggers
+                let lowered_triggers: Vec<Vec<TypedPureExp<typed::AxiomExt>>> = triggers
                     .iter()
                     .map(|trig| {
                         trig.exp
                             .iter()
-                            .map(|e| self.lower_pure::<Ext>(e))
+                            .map(|e| self.lower_pure::<typed::AxiomExt>(e))
                             .collect::<Result<Vec<_>, _>>()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let lowered_body = self.lower_pure::<Ext>(body)?;
+                let lowered_body = self.lower_pure::<typed::AxiomExt>(body)?;
                 Ext::build_forall(*kind, bound, lowered_triggers, lowered_body)
             }
 
@@ -2141,6 +2203,90 @@ domain D { axiom q { forall x: Int :: {x == x} x == x } }
         let result = run_pipeline(
             r#"
 domain D { axiom e { exists x: Int :: x == x } }
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::ExistsUnsupported))),
+            "expected ExistsUnsupported, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forall_typechecks_in_all_host_positions() {
+        // v3: `forall` is a first-class term in contracts, predicate bodies,
+        // and method statements — with captures of enclosing params/locals.
+        let result = run_pipeline(
+            r#"
+domain D { function f(i: Int): Bool }
+predicate P(i: Int) { i != 0 && forall x: Int :: {f(x)} f(x) == (i > 0) }
+function g(i: Int): Int
+    requires forall x: Int :: {f(x)} f(x)
+    ensures forall x: Int :: {f(x)} f(x)
+{ i }
+method m(i: Int) returns (r: Int)
+    requires forall x: Int :: {f(x)} f(x)
+    ensures forall x: Int :: {f(x)} f(x)
+{
+    var l: Int := i
+    inhale forall x: Int :: {f(x)} f(x) == (l > 0)
+    assert forall x: Int :: {f(x)} f(x)
+    exhale forall x: Int :: {f(x)} f(x)
+    r := i
+}
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn forall_body_rejects_heap_old_result() {
+        // Quantifier innards are AxiomExt-typed in every host: heap derefs,
+        // `old`, and `result` inside a forall body are errors, not silently
+        // erased.
+        let field = run_pipeline(
+            r#"
+field f: Int
+method m(r: Ref) requires acc(r.f, write) { inhale forall x: Int :: x == 0 ? true : r.f == 0 }
+"#,
+        );
+        assert!(
+            field.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::FieldAccessInAxiom))),
+            "expected FieldAccessInAxiom, got: {field:?}"
+        );
+
+        let old = run_pipeline(
+            r#"
+method m(i: Int) ensures forall x: Int :: old(i) == x { }
+"#,
+        );
+        assert!(
+            old.as_ref()
+                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::IllegalOldUsage))),
+            "expected IllegalOldUsage, got: {old:?}"
+        );
+
+        let res = run_pipeline(
+            r#"
+function g(i: Int): Int ensures forall x: Int :: result == x { i }
+"#,
+        );
+        assert!(
+            res.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::IllegalResultUsage))),
+            "expected IllegalResultUsage, got: {res:?}"
+        );
+    }
+
+    #[test]
+    fn exists_rejected_in_method_body() {
+        let result = run_pipeline(
+            r#"
+method m() { inhale exists x: Int :: x == 0 }
 "#,
         );
         assert!(

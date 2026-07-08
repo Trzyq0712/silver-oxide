@@ -511,6 +511,9 @@ impl PureExt for typed::HeapExt {
     ) -> Result<Val, TranslationError> {
         match ext {
             typed::HeapExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
+            typed::HeapExt::Forall(_) => Err(TranslationError::Unsupported(
+                "`forall` in method preconditions, function contracts, and predicate bodies",
+            )),
         }
     }
 }
@@ -812,6 +815,9 @@ impl PureExt for typed::MethodEnsuresExt {
                     inner,
                 )
             }
+            typed::MethodEnsuresExt::Forall(_) => Err(TranslationError::Unsupported(
+                "`forall` in method postconditions",
+            )),
         }
     }
 }
@@ -859,6 +865,9 @@ impl PureExt for typed::MethodBodyExt {
                     crate::translate::resource::lower_resource_addr(b, env, sink, hctx, res)?;
                 Ok(sink.emit_pure(ty, PureInst::Perm(hctx.perm, addr)))
             }
+            typed::MethodBodyExt::Forall(_) => Err(TranslationError::Unsupported(
+                "`forall` in method bodies",
+            )),
         }
     }
 }
@@ -883,6 +892,9 @@ impl PureExt for typed::FuncEnsuresExt {
             // postcondition is framed by, so it re-reads `e` against the current
             // context.
             typed::FuncEnsuresExt::Old(inner) => lower(b, env, sink, hctx, inner),
+            typed::FuncEnsuresExt::Forall(_) => Err(TranslationError::Unsupported(
+                "`forall` in function postconditions",
+            )),
         }
     }
 }
