@@ -79,42 +79,23 @@ impl Snapshotter {
             .with_config_line("newrank=true")
             .to_string();
 
-        // Rewrite each `FuncApp` node's label from the type-free `fn<id>[tys]`
-        // that `Symbolic`'s `Display` emits to the **instantiated signature**
-        // `name(<arg types>): <ret type>` — names and types live in the
-        // viz/context oracles, so the e-graph itself need not carry them. The
-        // rewrite is per *node* (egg labels each as `<eclass>.<idx>`), since the
-        // argument types come from the node's own child e-classes. `Fresh<id>`
-        // nodes are likewise annotated with their type below.
-        let mut type_memo: HashMap<egg::Id, Option<Type>> = HashMap::new();
-        let infer = |memo: &mut HashMap<egg::Id, Option<Type>>, id: egg::Id| {
-            crate::verify::context::infer_type(
-                &ctx.egraph,
-                &ctx.fresh_types,
-                &ctx.func_ret_types,
-                id,
-                memo,
-            )
-        };
-        let type_label = |ty: &Option<Type>| match ty {
-            Some(t) => ctx.type_name(t),
-            None => "?".to_string(),
-        };
+        // Rewrite each `FuncApp` node's label from the `fn<id>[tys]`
+        // that `Symbolic`'s `Display` emits to the actual source function name
+        // with type arguments (e.g. `name<tys>`). The rewrite is per *node*
+        // (egg labels each as `<eclass>.<idx>`).
         let mut fresh: HashSet<u32> = HashSet::new();
         for class in ctx.egraph.classes() {
             for (idx, node) in class.nodes.iter().enumerate() {
                 match node {
-                    Symbolic::FuncApp(m, _, args) => {
+                    Symbolic::FuncApp(m, type_args, _) => {
                         let name = ctx.func_name(*m);
-                        let arg_tys: Vec<String> = args
-                            .iter()
-                            .map(|&a| {
-                                let ty = infer(&mut type_memo, a);
-                                type_label(&ty)
-                            })
-                            .collect();
-                        let ret = type_label(&infer(&mut type_memo, class.id));
-                        let label = format!("{name}({}): {ret}", arg_tys.join(", "));
+                        let label = if type_args.is_empty() {
+                            name.to_string()
+                        } else {
+                            let args: Vec<String> =
+                                type_args.iter().map(|t| ctx.type_name(t)).collect();
+                            format!("{}<{}>", name, args.join(", "))
+                        };
                         // egg renders the node as `<eclass>.<idx>[label = "<raw>"]`
                         // where `<raw>` is the node's `Display` (`fn<id>[tys]`).
                         let raw = node.to_string();
