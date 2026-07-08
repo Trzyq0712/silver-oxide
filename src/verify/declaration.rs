@@ -778,9 +778,15 @@ fn eval_method_inst(
                 for (kind, ch) in scaled.entries() {
                     h = heap_union(ctx, &h, kind, ch.clone(), &pc_lits);
                 }
-                let true_ = ctx.true_();
-                ctx.egraph.union(bool_id, true_);
-                ctx.egraph.rebuild();
+                // Guard the assumed bool by `0 < scale`: the resource is inhaled
+                // exactly where its scaled permission is positive. An inhale
+                // carries no path condition (it is lowered "total", the branch
+                // living only in the `c ? 1/1 : 0/1` permission scale), so the
+                // permission — not `inst.pc` — is the guard. On the off-branch
+                // `scale` folds to `0/1`, `0 < 0` to `false`, and the bool is
+                // asserted nowhere.
+                let pos = ctx.perm_positive(scale);
+                ctx.assume_guarded(bool_id, std::iter::once((pos, Polarity::Positive)));
                 h
             } else {
                 let mut h = base_h.clone();
@@ -892,9 +898,10 @@ fn eval_method_inst(
         }
         InstKind::Assume(val) => {
             let id = state.get_val(ctx, val);
-            let true_ = ctx.true_();
-            ctx.egraph.union(id, true_);
-            ctx.egraph.rebuild();
+            // Guard by the path condition: an `assume` inside a branch holds only
+            // on that branch (rev to match `implication`'s innermost-first fold).
+            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+            ctx.assume_guarded(id, pc_lits.iter().rev().copied());
         }
         InstKind::Assert(val) => {
             // TODO(heap-consolidation): `inst.heap` carries the heap this obligation
@@ -1010,9 +1017,8 @@ fn eval_unfold(
         values.push(pv);
     }
     let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-    let true_ = ctx.true_();
-    ctx.egraph.union(bool_id, true_);
-    ctx.egraph.rebuild();
+    // The unfolded predicate's body facts hold only where the unfold is reached.
+    ctx.assume_guarded(bool_id, pc_lits.iter().rev().copied());
     state.push_heap(out);
     // Collapse any snapshot tower created by repeated fold/unfold.
     ctx.reduce();
@@ -1185,11 +1191,10 @@ fn eval_from_snap(
         subst.insert(cert.egraph.find(*c_val), pv);
         values.push(pv);
     }
-    // Assume the precondition's pure facts over the projected values.
+    // Assume the precondition's pure facts over the projected values, guarded by
+    // the path condition (a `FromSnap` may sit under a branch).
     let bool_id = ctx.graft_pred_bool(cert, &args, &values);
-    let true_ = ctx.true_();
-    ctx.egraph.union(bool_id, true_);
-    ctx.egraph.rebuild();
+    ctx.assume_guarded(bool_id, pc_lits.iter().rev().copied());
     ctx.reduce();
     Ok(out)
 }

@@ -565,6 +565,28 @@ impl<'a> VerifyContext<'a> {
         imp
     }
 
+    /// Assume `fact` holds under `guards` — the **only** sanctioned way to record
+    /// an assumption in the live e-graph. Merges `guards ==> fact` with `true`
+    /// (via [`Self::implication`]), never `fact` itself: a raw `union(fact,
+    /// true)` would assert `fact` on *every* path, including those where its
+    /// guards do not hold, letting the verifier assume what it must prove (a
+    /// resource inhaled only inside an `if` arm, an `assume` under a branch, a
+    /// predicate `unfold`ed conditionally). With empty `guards` this degenerates
+    /// to an unconditional assumption, which is correct only when the fact truly
+    /// holds on all paths (e.g. a domain axiom).
+    ///
+    /// `guards` are in innermost-first fold order, matching [`Self::implication`].
+    pub(crate) fn assume_guarded(
+        &mut self,
+        fact: egg::Id,
+        guards: impl Iterator<Item = (egg::Id, Polarity)>,
+    ) {
+        let imp = self.implication(fact, guards);
+        let true_ = self.true_();
+        self.egraph.union(imp, true_);
+        self.egraph.rebuild();
+    }
+
     /// Prove `goal == true` under the hypotheses `pc_lits`, using a throwaway
     /// clone of the e-graph so the assumptions never touch live state. On
     /// success, commit the proven implication `pc ==> goal` into the live graph

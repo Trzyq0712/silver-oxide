@@ -2776,3 +2776,88 @@ method m(c: Bool, this: Ref)
     let result = verify_named_method(&program, "m");
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
+
+// --- Phase 1: assumes are guarded by the path condition (Finding A) ----------
+
+#[test]
+fn conditional_inhale_bool_does_not_leak_past_its_branch() {
+    // `give`'s `ensures x > 0` is inhaled only on the `c` arm, so `x > 0` must
+    // NOT hold at the unconditional `assert` after the `if`. Before guarding the
+    // inhaled bool (by `0 < perm`), the bool was unioned with `true`
+    // unconditionally and this verified unsoundly.
+    let input = r#"
+method give(x: Int) ensures x > 0
+method m(c: Bool, x: Int) {
+    if (c) { give(x) }
+    assert x > 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (inhaled bool must not leak past its branch), got {result:?}"
+    );
+}
+
+#[test]
+fn conditional_assume_does_not_leak_past_its_branch() {
+    // The same, one level down: a bare `assume` inside a branch holds only on
+    // that branch. `InstKind::Assume` used to ignore `inst.pc`.
+    let input = r#"
+method n(c: Bool, x: Int) {
+    if (c) { assume x > 0 }
+    assert x > 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "n");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (assume must not leak past its branch), got {result:?}"
+    );
+}
+
+#[test]
+fn unconditional_inhale_bool_is_still_assumed() {
+    // Guarding must not break the common case: a straight-line inhale (perm
+    // `1/1`, guard `0 < 1` folds to `true`) still assumes its bool.
+    let input = r#"
+method give(x: Int) ensures x > 0
+method p1(x: Int) { give(x)  assert x > 0 }
+"#;
+    let program = lower(input);
+    assert!(verify_named_method(&program, "p1").is_ok());
+}
+
+#[test]
+fn assert_under_the_same_guard_that_assumed_it_holds() {
+    // `assume` and `assert` under the same branch guard: the implication
+    // `c ⇒ x>0` discharges the goal `x>0` under pc `c` (both share the literal).
+    let input = r#"
+method p3(c: Bool, x: Int) { if (c) { assume x > 0  assert x > 0 } }
+"#;
+    let program = lower(input);
+    assert!(verify_named_method(&program, "p3").is_ok());
+}
+
+#[test]
+fn both_arms_establishing_a_fact_needs_a_case_split_we_lack() {
+    // KNOWN INCOMPLETENESS (not unsoundness). Both arms inhale `x > 0`, so it
+    // genuinely holds at the merge — Silicon proves this. We record `c ⇒ x>0`
+    // and `¬c ⇒ x>0`; recombining them into `x>0` needs a `c ∨ ¬c` case split
+    // the e-graph does not perform. Before Phase 1 this verified, but only via
+    // the same unsound unconditional union that made the leak tests pass. Flip
+    // this assertion once branch joins or the Z3 fallback land.
+    let input = r#"
+method give(x: Int) ensures x > 0
+method p2(c: Bool, x: Int) { if (c) { give(x) } else { give(x) }  assert x > 0 }
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "p2");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (case-split incompleteness); if this now verifies, \
+         branch joins improved — flip the assertion. Got {result:?}"
+    );
+}
