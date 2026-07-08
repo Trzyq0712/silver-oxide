@@ -3,6 +3,8 @@
 //! specific `VerifyError` variants. The e-graph unit tests stay in `super`'s
 //! `mod tests`.
 
+use std::sync::Arc;
+
 use super::*;
 use crate::translate;
 use crate::viper::{
@@ -403,7 +405,7 @@ fn build_fn_certs_except(
     program: &vmir::Program,
     skip: Option<MemberId>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> HashMap<MemberId, FunctionCertificate> {
+) -> HashMap<MemberId, Arc<FunctionCertificate>> {
     let no_certs = HashMap::new();
     let mut fn_certs = HashMap::new();
     loop {
@@ -433,7 +435,7 @@ fn build_fn_certs_except(
 fn build_fn_certs(
     program: &vmir::Program,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> HashMap<MemberId, FunctionCertificate> {
+) -> HashMap<MemberId, Arc<FunctionCertificate>> {
     build_fn_certs_except(program, None, alloc)
 }
 
@@ -441,7 +443,7 @@ fn build_fn_certs(
 /// `alloc` so certificate ids match the method's later use.
 fn build_certs(
     program: &vmir::Program,
-    fn_certs: &HashMap<MemberId, FunctionCertificate>,
+    fn_certs: &HashMap<MemberId, Arc<FunctionCertificate>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> HashMap<MemberId, ResourceCertificate> {
     let mut certs = HashMap::new();
@@ -515,7 +517,7 @@ fn build_all_certs(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> (
     HashMap<MemberId, ResourceCertificate>,
-    HashMap<MemberId, FunctionCertificate>,
+    HashMap<MemberId, Arc<FunctionCertificate>>,
 ) {
     let mut certs = HashMap::new();
     let mut fn_certs = HashMap::new();
@@ -2029,10 +2031,13 @@ method m(y: Ref)
 
 #[test]
 fn heap_dep_heap_reading_ensures_consumed_at_call_site() {
-    // The postcondition itself reads the heap (`result == x.f`). With an
-    // abstract (bodyless) heap-dep function the call site's only knowledge is
-    // the assumed `get#ensures(y, ret, s)` — whose `FromSnap` projects the same
-    // snapshot the call's `Snap` built, so `ret == y.f` follows.
+    // KNOWN LIMITATION (postconditions disabled): the postcondition itself
+    // reads the heap (`result == x.f`). With an abstract (bodyless) heap-dep
+    // function, `get#ensures` was previously the call site's *only* source of
+    // information about the result — but postcondition stitching (both the
+    // use-side assume and the body's own exit assert) is disabled for now
+    // (see `translate::pure_exp::lower_func_app`/`lower_function_body`), so
+    // the call site no longer learns `ret == y.f` and the assert fails.
     let input = r#"
 field f: Int
 
@@ -2049,7 +2054,10 @@ method m(y: Ref)
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (postconditions disabled), got {result:?}"
+    );
 }
 
 // ---- Domain axioms ---------------------------------------------------------
@@ -2440,6 +2448,29 @@ method client() {
 }
 
 #[test]
+fn function_unfold_exposes_trigger_for_quantifier() {
+    // `wrap`'s body is a bare `foo(x)` call — its certificate is captured raw
+    // (unsaturated) and consumed lazily by its own `function_rule`, so
+    // unfolding `wrap(7)` must expose a *literal* `foo(7)` occurrence for the
+    // quantifier rule (also chained into the same saturation) to key off of,
+    // in the same pass, not something a pre-emptive simplification erased.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+function wrap(x: Int): Bool
+{
+    foo(x)
+}
+method client() {
+    inhale forall i: Int :: {foo(i)} foo(i)
+    assert wrap(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
 fn method_inhale_forall_captures_local() {
     // The quantifier captures a method local; instantiation must match the
     // occurrence's capture argument.
@@ -2652,8 +2683,11 @@ method m(x: Int) {
 
 #[test]
 fn function_ensures_forall_assumed_at_call_site() {
-    // The call site assumes `f#ensures(args, ret)`; its grafted definition
-    // exposes the occurrence, which the caller then instantiates.
+    // KNOWN LIMITATION (postconditions disabled): `f` is abstract (no body),
+    // so `f#ensures(args, ret)` was previously the call site's only source of
+    // the quantified fact. Postcondition stitching is disabled for now (see
+    // `translate::pure_exp::lower_func_app`), so the call site no longer
+    // assumes it and the assert fails.
     let input = r#"
 domain D { function foo(i: Int): Bool }
 function f(): Int
@@ -2665,5 +2699,8 @@ method m() {
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (postconditions disabled), got {result:?}"
+    );
 }

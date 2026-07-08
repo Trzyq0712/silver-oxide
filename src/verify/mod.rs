@@ -52,10 +52,14 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     let mut certs: std::collections::HashMap<vmir::MemberId, context::ResourceCertificate> =
         std::collections::HashMap::new();
     // Verified function bodies, cached in dependency order (callees before
-    // callers) and inlined at call sites (see `eval_pure_inst`'s `FunctionCall`
-    // arm) to install the definitional equality `f(args) == body`.
-    let mut fn_certs: std::collections::HashMap<vmir::MemberId, context::FunctionCertificate> =
-        std::collections::HashMap::new();
+    // callers). Each unit's `assume_axioms` installs one lazy unfold rule per
+    // entry here (see `rewrite::function_rule`), which installs the
+    // definitional equality `f(args) == body` the moment a `FuncApp(f, ..)`
+    // occurrence is seen during that unit's own saturation.
+    let mut fn_certs: std::collections::HashMap<
+        vmir::MemberId,
+        std::sync::Arc<context::FunctionCertificate>,
+    > = std::collections::HashMap::new();
     // Shared function-id registry: one per run so ADT/builtin ids stay
     // consistent across certificate grafts. Threaded `&mut` into each unit.
     let mut alloc = func_registry::FuncRegistry::new(program);

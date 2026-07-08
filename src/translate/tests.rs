@@ -519,8 +519,8 @@ method m(x: Ref, y: Int)
 #[test]
 fn function_lowers_requires_ensures_and_body() {
     // Heap-free function: `#requires` / `#ensures` are boolean Functions; the
-    // body assumes the precondition at entry and asserts the postcondition
-    // (applied to the body result) at exit.
+    // body assumes the precondition at entry. Postcondition stitching is
+    // disabled for now — `#ensures` is still declared but never asserted.
     let input = r#"
 function get(x: Int): Int
     requires x > 0
@@ -572,11 +572,20 @@ function get(x: Int): Int
         matches!(&body.insts[1].kind, vmir::InstKind::Assume(_)),
         "entry must assume the precondition"
     );
-    let n = body.insts.len();
-    assert!(is_call(n - 2, ens_id), "exit must call get#ensures");
+    // No exit stitching: the body ends with its own (raw) result, no
+    // `get#ensures` call and no exit assert.
     assert!(
-        matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)),
-        "exit must assert the postcondition"
+        !body
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
+        "postconditions are disabled: no exit assert"
+    );
+    assert!(
+        !body.insts.iter().any(
+            |i| matches!(&i.kind, vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id)
+        ),
+        "postconditions are disabled: get#ensures is never called from the body"
     );
 }
 
@@ -606,7 +615,8 @@ function inc(x: Int): Int
     let vmir::Declaration::Function(inc) = &p.decls[inc_id] else {
         panic!("inc must be a Function");
     };
-    // No precondition ⟹ no entry assume; body ends with the #ensures assert.
+    // No precondition ⟹ no entry assume. Postconditions are disabled: no exit
+    // assert and no call to `inc#ensures` from the body at all.
     let body = inc.body.as_ref().expect("body");
     assert!(
         !body
@@ -615,13 +625,19 @@ function inc(x: Int): Int
             .any(|i| matches!(i.kind, vmir::InstKind::Assume(_))),
         "no requires ⟹ no entry assume"
     );
-    let n = body.insts.len();
-    assert!(matches!(
-        &body.insts[n - 2].kind,
-        vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-            if fc.function == ens_id
-    ));
-    assert!(matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)));
+    assert!(
+        !body
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
+        "postconditions are disabled: no exit assert"
+    );
+    assert!(
+        !body.insts.iter().any(
+            |i| matches!(&i.kind, vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id)
+        ),
+        "postconditions are disabled: inc#ensures is never called from the body"
+    );
 }
 
 #[test]
@@ -629,10 +645,11 @@ fn heap_dependent_function_lowers_to_snapshot_passing() {
     // A function whose precondition grants permission (`acc`) is heap-dependent:
     // - `get#requires` is a self-framed Resource (footprint + bool);
     // - `get` gains a trailing snapshot parameter `Snap(get#requires)` and its
-    //   body opens with `FromSnap` (no boolean entry assume) and exits with an
-    //   `assert get#ensures(params, result, snap)`;
-    // - `get#ensures` is a boolean Function over (params ++ [result, snap])
-    //   whose body also opens with `FromSnap`.
+    //   body opens with `FromSnap` (no boolean entry assume); postcondition
+    //   stitching is disabled for now, so there's no exit assert;
+    // - `get#ensures` is still declared — a boolean Function over (params ++
+    //   [result, snap]) whose body also opens with `FromSnap` — just never
+    //   called from `get`'s own body.
     let input = r#"
 field f: Int
 function get(x: Ref): Int
@@ -684,20 +701,21 @@ function get(x: Ref): Int
             .any(|i| matches!(i.kind, vmir::InstKind::Assume(_))),
         "heap-dep body has no boolean entry assume"
     );
-    // Exit: assert get#ensures(params, result, snap).
+    // No exit stitching: no assert, and get#ensures is never called from the body.
     let ens_id = p.id("get#ensures").expect("missing get#ensures");
-    let n = body.insts.len();
     assert!(
-        matches!(
-            &body.insts[n - 2].kind,
-            vmir::InstKind::Pure(vmir::Type::Bool, vmir::PureInst::FunctionCall(fc))
-                if fc.function == ens_id
-                    && fc.args.iter().cloned().collect::<Vec<_>>()
-                        == vec![vmir::Val::Temp(0), body.res.clone(), vmir::Val::Temp(1)]
-        ),
-        "exit must call get#ensures(params, result, snap)"
+        !body
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
+        "postconditions are disabled: no exit assert"
     );
-    assert!(matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)));
+    assert!(
+        !body.insts.iter().any(
+            |i| matches!(&i.kind, vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id)
+        ),
+        "postconditions are disabled: get#ensures is never called from the body"
+    );
 
     // #ensures: boolean Function over (params ++ [result, snap]), body opens
     // with the same FromSnap.
@@ -776,9 +794,10 @@ method m(y: Ref)
 
 #[test]
 fn function_call_emits_use_side_contract() {
-    // A method calling a function with contracts must, at the call site, assert
-    // `f#requires(args)` before the call and assume `f#ensures(args, result)`
-    // after. A call to a contract-free function does neither.
+    // A method calling a function with contracts must, at the call site,
+    // assert `f#requires(args)` before the call. A call to a contract-free
+    // function doesn't. Postcondition stitching is disabled for now: the
+    // callee's `f#ensures` is never called or assumed at the use site.
     let input = r#"
 function inc(x: Int): Int
     requires x > 0
@@ -821,21 +840,19 @@ method m() {
         &m.insts[req_pos + 1].kind,
         vmir::InstKind::Assert(_)
     ));
-    // `inc#ensures(..)` call is followed by an assume.
-    let ens_pos = calls(inc_ens).expect("inc#ensures call");
-    assert!(matches!(
-        &m.insts[ens_pos + 1].kind,
-        vmir::InstKind::Assume(_)
-    ));
-    // requires-assert precedes the `inc` value call, which precedes ensures-assume.
+    // `inc#ensures` is declared but never called from `m`'s body — postcondition
+    // stitching is disabled.
+    assert!(calls(inc_ens).is_none(), "inc#ensures is never called");
+    // requires-assert precedes the `inc` value call.
     let inc_pos = calls(p.id("inc").unwrap()).expect("inc call");
-    assert!(req_pos < inc_pos && inc_pos < ens_pos);
+    assert!(req_pos < inc_pos);
 
-    // Exactly one assert and one assume (raw contributes neither).
+    // Exactly one assert (the requires check), no assume (raw contributes
+    // neither, and postconditions aren't assumed).
     let count =
         |pred: fn(&vmir::InstKind) -> bool| m.insts.iter().filter(|i| pred(&i.kind)).count();
     assert_eq!(count(|k| matches!(k, vmir::InstKind::Assert(_))), 1);
-    assert_eq!(count(|k| matches!(k, vmir::InstKind::Assume(_))), 1);
+    assert_eq!(count(|k| matches!(k, vmir::InstKind::Assume(_))), 0);
 }
 
 #[test]
@@ -917,8 +934,9 @@ domain D {
         "axiom body must call size()"
     );
 
-    // Anonymous axiom: generated slot name, and the callee's #ensures is
-    // stitched as an Assume (`one` is a normal, precondition-free function).
+    // Anonymous axiom: generated slot name, and it calls `one()` (a normal,
+    // precondition-free function). Postcondition stitching is disabled for
+    // now, so the callee's `#ensures` is not assumed here.
     let anon_id = p.id("D#axiom1").expect("missing anonymous axiom slot");
     let vmir::Declaration::Axiom(anon) = &p.decls[anon_id] else {
         panic!("D#axiom1 must be a Axiom");
@@ -930,13 +948,6 @@ domain D {
             vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == one_id
         )),
         "axiom body must call one()"
-    );
-    assert!(
-        anon.body
-            .insts
-            .iter()
-            .any(|i| matches!(&i.kind, vmir::InstKind::Assume(_))),
-        "one#ensures must be assumed in the axiom body"
     );
 }
 

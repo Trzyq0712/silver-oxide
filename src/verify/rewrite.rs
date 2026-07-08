@@ -1,7 +1,7 @@
 //! Structural egg rewrite rules for the verifier.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use egg::{
     Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
@@ -9,6 +9,7 @@ use egg::{
 };
 
 use crate::verify::analysis::ConstFold;
+use crate::verify::context::{FunctionCertificate, TransplantSink, Transplanted, transplant};
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
 use crate::vmir::{BinOp, Literal, TrigArg, Type, Val};
 
@@ -764,6 +765,98 @@ pub(crate) fn quantifier_rule(name: &str, quant: PreparedQuantifier) -> Rule {
         memo: Mutex::new(HashSet::new()),
     };
     Rewrite::new(format!("quantifier-{name}"), searcher, applier).expect("quantifier rule")
+}
+
+// ---- Function-call unfolding (lazy, rewrite-rule triggered) ---------------
+
+/// Applier: for each ground `FuncApp(self.func, _, args)` node in the matched
+/// e-class, transplant the certificate's (unsaturated) body under `params →
+/// args` and union it with the matched e-class — installing the definitional
+/// equality `f(args) == body` lazily, the moment an occurrence is seen during
+/// saturation, instead of eagerly at translation-walk time. Works uniformly
+/// for a heap-free or heap-dependent `f`: by the time `cert` was captured, its
+/// body's `Deref`/`Snap`/`FromSnap` were already resolved into ordinary
+/// (pure) e-graph terms over the params — the certificate itself carries no
+/// notion of "heap". Memoized per canonicalized arg tuple (a saturation-cost
+/// guard, like `AxiomApplier`/`QuantApplier` — transplanting is idempotent, so
+/// this only prevents re-walking the body every iteration).
+struct FunctionUnfoldApplier {
+    func: FuncId,
+    cert: Arc<FunctionCertificate>,
+    fresh_counter: Arc<Mutex<u32>>,
+    memo: Mutex<HashSet<Vec<Id>>>,
+}
+
+impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        let mut calls: Vec<Vec<Id>> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::FuncApp(f, _, args) = node else {
+                continue;
+            };
+            if *f != self.func {
+                continue;
+            }
+            let args: Vec<Id> = args.iter().map(|&a| egraph.find(a)).collect();
+            let mut memo = self.memo.lock().unwrap();
+            if memo.insert(args.clone()) {
+                calls.push(args);
+            }
+        }
+        let mut changed = Vec::new();
+        for args in calls {
+            let mut subst: HashMap<Id, Id> = HashMap::new();
+            for (p, a) in self.cert.params.iter().zip(&args) {
+                subst.insert(self.cert.egraph.find(*p), *a);
+            }
+            let mut memo: HashMap<Id, Transplanted> = HashMap::new();
+            let src = self.cert.src();
+            let mut sink: Option<&mut TransplantSink<'_>> = None;
+            let result = transplant(
+                egraph,
+                &self.fresh_counter,
+                &mut sink,
+                &src,
+                self.cert.result,
+                &subst,
+                &mut memo,
+            );
+            if egraph.union(eclass, result) {
+                changed.push(egraph.find(eclass));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Mint the lazy-unfolding rule for one verified function's certificate.
+/// Reuses [`AxiomTriggerSearcher`] as-is — it only checks `FuncApp(f, ..)`
+/// presence, independent of arity/type-args, exactly what's needed here too.
+pub(crate) fn function_rule(
+    name: &str,
+    func: FuncId,
+    cert: Arc<FunctionCertificate>,
+    fresh_counter: Arc<Mutex<u32>>,
+) -> Rule {
+    let searcher = AxiomTriggerSearcher { func };
+    let applier = FunctionUnfoldApplier {
+        func,
+        cert,
+        fresh_counter,
+        memo: Mutex::new(HashSet::new()),
+    };
+    Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule")
 }
 
 #[cfg(test)]

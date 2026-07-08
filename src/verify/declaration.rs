@@ -257,22 +257,20 @@ fn eval_pure_inst(
             // result-type vars, part of the `FuncApp` node identity (discriminant);
             // empty for a monomorphic call. Always heap-free: a heap-dependent
             // function receives its precondition snapshot as an ordinary arg.
+            //
+            // Just add the uninterpreted application — for abstract, heap-free,
+            // and heap-dependent callees alike. A verified callee's definitional
+            // equality `f(args) == body` is installed lazily by its own
+            // `rewrite::function_rule` (registered into `ctx.axiom_rules` by
+            // `assume_axioms` from `ctx.fn_certs`) the next time saturation runs
+            // over this occurrence, not eagerly here.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            let app = ctx.add_func_app_id(
+            ctx.add_func_app_id(
                 crate::verify::func_registry::func_id_for_member(fc.function),
                 fc.type_args.clone().into(),
                 ty.clone(),
-                args.clone().into(),
-            );
-            // Inline the callee's verified body: `f(args) == body`. `fn_certs`
-            // carries a cert for every non-recursive function already verified in
-            // dependency order (callees before callers). Abstract/heap-dependent
-            // functions have no cert and stay uninterpreted.
-            if let Some(cert) = ctx.fn_certs.and_then(|m| m.get(&fc.function)) {
-                let def = ctx.graft_function(cert, &args);
-                ctx.egraph.union(app, def);
-            }
-            app
+                args.into(),
+            )
         }
         // `Snap` needs the program + certificates; every inst walker intercepts
         // it and dispatches to `eval_snap` before reaching this function.
@@ -1296,6 +1294,28 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 .push(crate::verify::rewrite::axiom_rule(&name, prepared));
         }
     }
+    // One lazy unfold rule per already-verified function certificate: `analyze`
+    // guarantees a function only ever calls functions verified earlier (it
+    // rejects (mutual) recursion as a dependency cycle), so every function this
+    // unit could reference already has a cert in `fn_certs` by the time its
+    // ctx is set up here — same guarantee the driver's topological order
+    // (`mod.rs`) already relies on. Each rule transplants the cert's raw body
+    // lazily, the moment a `FuncApp(f, ..)` occurrence is seen during
+    // saturation (see `rewrite::function_rule`), instead of eagerly grafting
+    // it once at translation-walk time.
+    if let Some(fn_certs) = ctx.fn_certs {
+        let fresh_counter = ctx.fresh_counter_handle();
+        for (&id, cert) in fn_certs.iter() {
+            let name = ctx.member_name(id);
+            let func = crate::verify::func_registry::func_id_for_member(id);
+            ctx.axiom_rules.push(crate::verify::rewrite::function_rule(
+                &name,
+                func,
+                std::sync::Arc::clone(cert),
+                std::sync::Arc::clone(&fresh_counter),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1419,7 +1439,7 @@ pub fn verify_method(
     method_name: &str,
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    fn_certs: &HashMap<MemberId, FunctionCertificate>,
+    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionCertificate>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
@@ -1468,7 +1488,7 @@ pub fn verify_resource(
     resource_name: &str,
     resource: &Resource,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    fn_certs: &HashMap<MemberId, FunctionCertificate>,
+    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionCertificate>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
@@ -1588,30 +1608,42 @@ pub fn verify_resource(
 
 /// Verify a non-recursive function: walk its body in a fresh egraph with fresh
 /// symbolic params (`Val::Temp(0..n_params)`), discharging the stitched
-/// entry-`assume f#requires` / exit-`assert f#ensures` contract instructions, then
-/// snapshot the (saturated) result e-class into a [`FunctionCertificate`] for
-/// inlining at call sites. Abstract functions (no body) have nothing to verify.
+/// entry-`assume f#requires` contract instruction, then snapshot the
+/// (unsaturated) result e-class into a [`FunctionCertificate`] for other units
+/// to lazily unfold at call sites (see `rewrite::function_rule`). Abstract
+/// functions (no body) have nothing to verify.
+///
+/// The certificate is captured **without** an extra final `ctx.saturate()` —
+/// only the ordinary per-inst walk's own resolution, so the body's literal
+/// shape survives for pattern-triggered rules (quantifier/axiom instantiation,
+/// keyed on `FuncApp` occurrences) to still see at unfold time, rather than
+/// whatever structural simplifications a pre-emptive saturation would have
+/// baked in.
 ///
 /// A **heap-dependent** function's snapshot parameter seeds like any other param
 /// (a fresh symbolic of `Type::Snap(req)`); its entry `FromSnap` reconstructs the
 /// precondition heap `H(s)` and each body `Deref` congruence-resolves against
-/// those chunks (`unwrap(proj_i(s))`) — this *is* the purification: the cert's
-/// result is expressed over the snapshot, so `graft_function` at a call site
-/// (where the argument is a concrete `Snap` cons) collapses to the caller's
-/// chunk values.
+/// those chunks (`unwrap(proj_i(s))`). By the time this walk finishes, the
+/// body's result e-class is already a pure symbolic term over the params
+/// (including the snapshot param) regardless of heap-dependence — there is no
+/// `Heap`/`HeapVal` node in the `Symbolic` e-graph language, only ordinary
+/// `FuncApp`/`Ite`/`Binary` terms — so heap-free and heap-dependent functions
+/// are captured and consumed identically; no special-casing needed here.
 ///
 /// Callees — including the function's own `f#requires`/`f#ensures` contract
-/// functions — are ordinary `Function` decls verified earlier in dependency order,
-/// so their definitions are already grafted into `fn_certs` and inline here (via
-/// [`eval_pure_inst`]'s `FunctionCall` arm) to discharge the contract obligations.
+/// functions — are ordinary `Function` decls verified earlier in dependency
+/// order, so their certificates are already in `fn_certs`, and `assume_axioms`
+/// (called at the top of this function's own `ctx` setup) has already
+/// installed their unfold rules — saturation (triggered constantly via
+/// `prove_under_pc`) discharges the contract obligations lazily as needed.
 pub fn verify_function(
     program: &vmir::Program,
     function_name: &str,
     function: &Function,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    fn_certs: &HashMap<MemberId, FunctionCertificate>,
+    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionCertificate>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> Result<Option<FunctionCertificate>, VerifyError> {
+) -> Result<Option<std::sync::Arc<FunctionCertificate>>, VerifyError> {
     let Some(body) = function.body.as_ref() else {
         // Abstract/uninterpreted function: no body to verify, no certificate.
         return Ok(None);
@@ -1661,19 +1693,18 @@ pub fn verify_function(
         snap.snapshot(&ctx, &heaps, &inst_text, highlight);
     }
 
-    // Saturate so the certificate carries the fully-reduced body expression, then
-    // snapshot the canonicalized result/param roots for grafting at call sites.
-    ctx.saturate();
+    // No extra saturation here (see the doc comment above) — snapshot the
+    // canonicalized result/param roots as they stand after the ordinary walk.
     let result = state.get_val(&mut ctx, &body.res);
     let result = ctx.egraph.find(result);
     let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
-    Ok(Some(FunctionCertificate {
+    Ok(Some(std::sync::Arc::new(FunctionCertificate {
         egraph: ctx.egraph.clone(),
         fresh_types: ctx.fresh_types.clone(),
         func_ret_types: ctx.func_ret_types.clone(),
         params,
         result,
-    }))
+    })))
 }
 
 /// Side-condition obligations implied by an instruction's kind, as

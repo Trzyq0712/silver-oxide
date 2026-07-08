@@ -46,6 +46,7 @@ pub(crate) struct ResourceCertificate {
 /// it. Grafting it (formal params → actual args) yields the e-class of the
 /// function's result expression, which the caller `union`s with the uninterpreted
 /// `FuncApp` node to install the definitional equality `f(args) == body`.
+#[derive(Clone)]
 pub(crate) struct FunctionCertificate {
     pub(crate) egraph: EGraph<Symbolic, ConstFold>,
     pub(crate) fresh_types: HashMap<u32, Type>,
@@ -67,7 +68,10 @@ impl ResourceCertificate {
 }
 
 impl FunctionCertificate {
-    fn src(&self) -> TransplantSrc<'_> {
+    /// Build the transplant source view. `pub(crate)` so the saturation-time
+    /// function-unfold applier (`rewrite::FunctionUnfoldApplier`) can call
+    /// [`transplant`] directly — it has no `VerifyContext` to route through.
+    pub(crate) fn src(&self) -> TransplantSrc<'_> {
         TransplantSrc {
             egraph: &self.egraph,
             fresh_types: &self.fresh_types,
@@ -79,7 +83,7 @@ impl FunctionCertificate {
 /// The read-only slice of a certificate that [`transplant`] copies from: the
 /// source e-graph and its type side-oracles. Lets grafting be shared between
 /// [`ResourceCertificate`] and [`FunctionCertificate`].
-struct TransplantSrc<'a> {
+pub(crate) struct TransplantSrc<'a> {
     egraph: &'a EGraph<Symbolic, ConstFold>,
     fresh_types: &'a HashMap<u32, Type>,
     func_ret_types: &'a HashMap<FuncId, Type>,
@@ -95,10 +99,18 @@ pub(crate) struct VerifyContext<'a> {
     /// normalize (collapse snapshot towers) without a full saturation.
     static_reduce: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     /// Per-unit lazy-instantiation rules for **generic** domain axioms (one per
-    /// axiom, minted by `assume_axioms`; ground axioms are pre-added instead).
+    /// axiom, minted by `assume_axioms`; ground axioms are pre-added instead),
+    /// pure `forall`s (one per quantifier), and verified function bodies (one
+    /// per already-certified `fn_certs` entry — see `rewrite::function_rule`).
     /// Chained into full saturation (incl. the tier-3 probe) but not `reduce`.
     pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
-    fresh_counter: usize,
+    /// Monotonic source of fresh-value ids, shared (not just owned) because a
+    /// saturation-time rewrite applier (the function-unfold rule) also mints
+    /// fresh placeholders via [`transplant`] and must draw from the exact same
+    /// counter as [`Self::fresh_symbolic_value`] — `Symbolic::Fresh(n)` is
+    /// hash-consed, so two independently-minted fresh values that happened to
+    /// reuse the same `n` would silently merge into one e-class.
+    fresh_counter: std::sync::Arc<std::sync::Mutex<u32>>,
     /// Cheap string repr for member/constructor names.
     pub(crate) interner: &'a Rodeo,
     /// Member names indexed by `MemberId` (for `member_name`/`func_name`).
@@ -116,10 +128,11 @@ pub(crate) struct VerifyContext<'a> {
     /// needed — the visualization reads them directly to reconstruct types.
     pub(crate) fresh_types: HashMap<u32, Type>,
     pub(crate) func_ret_types: HashMap<FuncId, Type>,
-    /// Verified non-recursive function bodies, keyed by `MemberId`. Read from the
-    /// shared `eval_pure_inst` to inline (`union`) a call's body definition. `None`
-    /// in isolated contexts (unit tests) that never evaluate a `FunctionCall`.
-    pub(crate) fn_certs: Option<&'a HashMap<MemberId, FunctionCertificate>>,
+    /// Verified non-recursive function bodies, keyed by `MemberId`. `assume_axioms`
+    /// reads this to install one lazy unfold rule per entry into `axiom_rules`
+    /// (see `rewrite::function_rule`). `None` in isolated contexts (unit tests)
+    /// that never evaluate a `FunctionCall`.
+    pub(crate) fn_certs: Option<&'a HashMap<MemberId, std::sync::Arc<FunctionCertificate>>>,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -134,7 +147,7 @@ impl<'a> VerifyContext<'a> {
             static_rules: rewrite::rules(),
             static_reduce: rewrite::reduce_rules(),
             axiom_rules: Vec::new(),
-            fresh_counter: 0,
+            fresh_counter: std::sync::Arc::new(std::sync::Mutex::new(0)),
             interner,
             decls,
             groups,
@@ -337,22 +350,75 @@ impl<'a> VerifyContext<'a> {
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let src = cert.src();
+        let mut sink_val = TransplantSink {
+            fresh_types: &mut self.fresh_types,
+            func_ret_types: &mut self.func_ret_types,
+        };
+        let mut sink = Some(&mut sink_val);
         let mut delta = Heap::empty();
         for (kind, addr, perm, value) in &cert.delta {
-            let a = transplant(self, &src, *addr, &subst, &mut memo);
-            let p = transplant(self, &src, *perm, &subst, &mut memo);
-            let v = transplant(self, &src, *value, &subst, &mut memo);
+            let a = transplant(
+                &mut self.egraph,
+                &self.fresh_counter,
+                &mut sink,
+                &src,
+                *addr,
+                &subst,
+                &mut memo,
+            );
+            let p = transplant(
+                &mut self.egraph,
+                &self.fresh_counter,
+                &mut sink,
+                &src,
+                *perm,
+                &subst,
+                &mut memo,
+            );
+            let v = transplant(
+                &mut self.egraph,
+                &self.fresh_counter,
+                &mut sink,
+                &src,
+                *value,
+                &subst,
+                &mut memo,
+            );
             delta = delta.with_chunk(kind, Chunk::new(a, p, v));
         }
-        let bool_id = transplant(self, &src, cert.bool_id, &subst, &mut memo);
+        let bool_id = transplant(
+            &mut self.egraph,
+            &self.fresh_counter,
+            &mut sink,
+            &src,
+            cert.bool_id,
+            &subst,
+            &mut memo,
+        );
         // The memo is shared, so a footprint value lands in the same caller
         // e-class as its delta chunk value.
         let footprint: Vec<(Id, Id)> = cert
             .footprint
             .iter()
             .map(|(_, _, perm, value)| {
-                let p = transplant(self, &src, *perm, &subst, &mut memo);
-                let v = transplant(self, &src, *value, &subst, &mut memo);
+                let p = transplant(
+                    &mut self.egraph,
+                    &self.fresh_counter,
+                    &mut sink,
+                    &src,
+                    *perm,
+                    &subst,
+                    &mut memo,
+                );
+                let v = transplant(
+                    &mut self.egraph,
+                    &self.fresh_counter,
+                    &mut sink,
+                    &src,
+                    *value,
+                    &subst,
+                    &mut memo,
+                );
                 (p, v)
             })
             .collect();
@@ -391,8 +457,29 @@ impl<'a> VerifyContext<'a> {
     ) -> (Id, Id) {
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let src = cert.src();
-        let a = transplant(self, &src, addr, subst, &mut memo);
-        let p = transplant(self, &src, perm, subst, &mut memo);
+        let mut sink_val = TransplantSink {
+            fresh_types: &mut self.fresh_types,
+            func_ret_types: &mut self.func_ret_types,
+        };
+        let mut sink = Some(&mut sink_val);
+        let a = transplant(
+            &mut self.egraph,
+            &self.fresh_counter,
+            &mut sink,
+            &src,
+            addr,
+            subst,
+            &mut memo,
+        );
+        let p = transplant(
+            &mut self.egraph,
+            &self.fresh_counter,
+            &mut sink,
+            &src,
+            perm,
+            subst,
+            &mut memo,
+        );
         self.egraph.rebuild();
         (a, p)
     }
@@ -419,33 +506,42 @@ impl<'a> VerifyContext<'a> {
         }
         let mut memo: HashMap<Id, Transplanted> = HashMap::new();
         let src = cert.src();
-        let b = transplant(self, &src, cert.bool_id, &subst, &mut memo);
+        let mut sink_val = TransplantSink {
+            fresh_types: &mut self.fresh_types,
+            func_ret_types: &mut self.func_ret_types,
+        };
+        let mut sink = Some(&mut sink_val);
+        let b = transplant(
+            &mut self.egraph,
+            &self.fresh_counter,
+            &mut sink,
+            &src,
+            cert.bool_id,
+            &subst,
+            &mut memo,
+        );
         self.egraph.rebuild();
         b
     }
 
-    /// Inline a verified function body at a call site: transplant the cert's
-    /// result e-class under `params → args`, yielding the caller-space e-class of
-    /// the function's body expression. The caller `union`s this with the
-    /// uninterpreted `FuncApp(f, args)` node to install `f(args) == body`.
-    pub(crate) fn graft_function(&mut self, cert: &FunctionCertificate, args: &[Id]) -> Id {
-        self.alloc.stats.cert_grafts += 1;
-        let mut subst: HashMap<Id, Id> = HashMap::new();
-        for (p, a) in cert.params.iter().zip(args) {
-            subst.insert(cert.egraph.find(*p), *a);
-        }
-        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        let src = cert.src();
-        let result = transplant(self, &src, cert.result, &subst, &mut memo);
-        self.egraph.rebuild();
-        result
-    }
-
     pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
-        let id = self.fresh_counter as u32;
-        self.fresh_counter += 1;
+        let id = {
+            let mut c = self.fresh_counter.lock().unwrap();
+            let v = *c;
+            *c += 1;
+            v
+        };
         self.fresh_types.insert(id, ty);
         self.egraph.add(Symbolic::Fresh(id))
+    }
+
+    /// A handle to the shared fresh-value counter, for threading into a
+    /// saturation-time rewrite applier (the function-unfold rule) that needs
+    /// to mint ids from the exact same monotonic source as
+    /// [`Self::fresh_symbolic_value`]. See the field's doc comment for why
+    /// this must be shared rather than copied.
+    pub(crate) fn fresh_counter_handle(&self) -> std::sync::Arc<std::sync::Mutex<u32>> {
+        std::sync::Arc::clone(&self.fresh_counter)
     }
 
     /// Build `antecedents ==> consequent` as a right-associative chain of `Ite`
@@ -562,7 +658,7 @@ impl<'a> VerifyContext<'a> {
     }
 }
 
-/// Copy a certificate e-class (and everything it reaches) into `caller`,
+/// Copy a certificate e-class (and everything it reaches) into `egraph`,
 /// substituting formal params per `subst`, memoized by certificate e-class.
 /// Two-phase per e-class (reserve a placeholder, then union every rebuilt node
 /// into it) so cycles terminate and **all merges in the e-class collapse to one
@@ -570,13 +666,50 @@ impl<'a> VerifyContext<'a> {
 /// Per-e-class transplant state: `InProgress` while its nodes are being rebuilt
 /// (carrying a lazily-minted back-edge placeholder iff a cycle is hit), then
 /// `Done` with the resulting caller e-class.
-enum Transplanted {
+pub(crate) enum Transplanted {
     InProgress(Option<Id>),
     Done(Id),
 }
 
-fn transplant(
-    caller: &mut VerifyContext<'_>,
+/// The destination-side side-oracles [`transplant`] updates as it mints fresh
+/// values and copies `FuncApp` nodes — mirrors [`TransplantSrc`] but for the
+/// write side. `None` (passed by the saturation-time function-unfold applier,
+/// which has no `VerifyContext` access) means freshly-minted ids simply don't
+/// get a recorded display type; `infer_type`'s existing best-effort fallback
+/// (`unwrap_or(Type::Int)`) absorbs the gap. A `Symbolic::FuncApp` enode itself
+/// carries no return-type field, so this is purely a display/`infer_type`
+/// side-table, never a correctness concern.
+pub(crate) struct TransplantSink<'a> {
+    pub(crate) fresh_types: &'a mut HashMap<u32, Type>,
+    pub(crate) func_ret_types: &'a mut HashMap<FuncId, Type>,
+}
+
+/// Mint a fresh placeholder value shared-counter-side (see
+/// [`VerifyContext::fresh_counter`]'s doc comment for why this must be a
+/// single monotonic counter across the whole unit, including any rewrite
+/// applier that transplants during saturation).
+fn mint_fresh(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    fresh_counter: &std::sync::Arc<std::sync::Mutex<u32>>,
+    sink: &mut Option<&mut TransplantSink<'_>>,
+    ty: Type,
+) -> Id {
+    let id = {
+        let mut c = fresh_counter.lock().unwrap();
+        let v = *c;
+        *c += 1;
+        v
+    };
+    if let Some(sink) = sink {
+        sink.fresh_types.insert(id, ty);
+    }
+    egraph.add(Symbolic::Fresh(id))
+}
+
+pub(crate) fn transplant(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    fresh_counter: &std::sync::Arc<std::sync::Mutex<u32>>,
+    sink: &mut Option<&mut TransplantSink<'_>>,
     src: &TransplantSrc<'_>,
     id: Id,
     subst: &HashMap<Id, Id>,
@@ -602,7 +735,7 @@ fn transplant(
         // (once) for the cycle to point at; it's unioned with the result below.
         Some(Transplanted::InProgress(Some(ph))) => return *ph,
         Some(Transplanted::InProgress(None)) => {
-            let ph = caller.fresh_symbolic_value(cc_ty());
+            let ph = mint_fresh(egraph, fresh_counter, sink, cc_ty());
             memo.insert(cc, Transplanted::InProgress(Some(ph)));
             return ph;
         }
@@ -616,31 +749,35 @@ fn transplant(
         let b = match node {
             // A fresh value has no structure to rebuild — mint a fresh of the
             // same type. (Acyclic classes thus get NO redundant placeholder.)
-            Symbolic::Fresh(_) => caller.fresh_symbolic_value(cc_ty()),
-            Symbolic::Lit(l) => caller.add(Symbolic::Lit(l.clone())),
+            Symbolic::Fresh(_) => mint_fresh(egraph, fresh_counter, sink, cc_ty()),
+            Symbolic::Lit(l) => egraph.add(Symbolic::Lit(l.clone())),
             Symbolic::Binary(op, [l, r]) => {
-                let l = transplant(caller, src, *l, subst, memo);
-                let r = transplant(caller, src, *r, subst, memo);
-                caller.add(Symbolic::Binary(*op, [l, r]))
+                let l = transplant(egraph, fresh_counter, sink, src, *l, subst, memo);
+                let r = transplant(egraph, fresh_counter, sink, src, *r, subst, memo);
+                egraph.add(Symbolic::Binary(*op, [l, r]))
             }
             Symbolic::Ite([a, b, c]) => {
-                let a = transplant(caller, src, *a, subst, memo);
-                let b = transplant(caller, src, *b, subst, memo);
-                let c = transplant(caller, src, *c, subst, memo);
-                caller.add(Symbolic::Ite([a, b, c]))
+                let a = transplant(egraph, fresh_counter, sink, src, *a, subst, memo);
+                let b = transplant(egraph, fresh_counter, sink, src, *b, subst, memo);
+                let c = transplant(egraph, fresh_counter, sink, src, *c, subst, memo);
+                egraph.add(Symbolic::Ite([a, b, c]))
             }
             Symbolic::RealCast(x) => {
-                let x = transplant(caller, src, *x, subst, memo);
-                caller.add(Symbolic::RealCast(x))
+                let x = transplant(egraph, fresh_counter, sink, src, *x, subst, memo);
+                egraph.add(Symbolic::RealCast(x))
             }
             Symbolic::FuncApp(m, tys, fargs) => {
                 let fargs: Box<[Id]> = fargs
                     .iter()
-                    .map(|a| transplant(caller, src, *a, subst, memo))
+                    .map(|a| transplant(egraph, fresh_counter, sink, src, *a, subst, memo))
                     .collect();
-                let ret = src.func_ret_types.get(m).cloned().unwrap_or(Type::Int);
                 // The ground type instantiation has no e-class — copy it verbatim.
-                caller.add_func_app_id(*m, tys.clone(), ret, fargs)
+                let node = egraph.add(Symbolic::FuncApp(*m, tys.clone(), fargs));
+                if let Some(sink) = sink {
+                    let ret = src.func_ret_types.get(m).cloned().unwrap_or(Type::Int);
+                    sink.func_ret_types.entry(*m).or_insert(ret);
+                }
+                node
             }
         };
         built.push(b);
@@ -650,13 +787,13 @@ fn transplant(
     // placeholder, if a cycle minted one) into a single representative.
     let rep = built[0];
     for &b in &built[1..] {
-        caller.egraph.union(rep, b);
+        egraph.union(rep, b);
     }
     if let Some(Transplanted::InProgress(Some(ph))) = memo.get(&cc) {
         let ph = *ph;
-        caller.egraph.union(rep, ph);
+        egraph.union(rep, ph);
     }
-    let rep = caller.egraph.find(rep);
+    let rep = egraph.find(rep);
     memo.insert(cc, Transplanted::Done(rep));
     rep
 }
