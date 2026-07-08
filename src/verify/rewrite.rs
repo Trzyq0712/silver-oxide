@@ -74,6 +74,15 @@ fn static_rules() -> Vec<Rule> {
         // full permission `write` folds away)
         rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
         rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
+        // (c ? x : y) < z  =>  c ? (x < z) : (y < z)
+        //
+        // Distributes a comparison over a gated value. CFG linearization encodes
+        // a conditional inhale/exhale as a *scaled permission* `c ? p : 0` rather
+        // than a path condition, so the permission ≥ 0 obligation of such an
+        // instruction is a `<` applied to an `ite`. Pushing the `<` inward lets
+        // `ConstFold` decide each branch, after which `ite-same` collapses the
+        // result. Terminating: strictly reduces the `ite` nesting above the `<`.
+        rw!("lt-ite"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
         // x == x => true   (reflexivity; also fires when congruence has already
         // merged the two operands into one e-class, e.g. a return var copied from
         // a param: `ensures r == a` after `r := a`).
@@ -97,7 +106,10 @@ fn static_rules() -> Vec<Rule> {
 /// instruction's path condition) `ite-true`/`ite-false` reduce a gated
 /// permission `b ? p : 0` to `p` (resp. `0`), which is what discharges a
 /// conditional `acc`'s permission ≥ 0 obligation and peels the optional snapshot
-/// member's discriminant — no comparison-over-`ite` distribution needed.
+/// member's discriminant. When no such literal is available (a CFG-linearized
+/// conditional inhale carries its guard in the permission, not the path
+/// condition), the saturation-only `lt-ite` rule distributes the comparison
+/// instead.
 fn terminating_ite_rules() -> Vec<Rule> {
     vec![
         // ite(true, x, y) => x

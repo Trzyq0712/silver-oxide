@@ -2704,3 +2704,75 @@ method m() {
         "expected AssertionFailed (postconditions disabled), got {result:?}"
     );
 }
+
+#[test]
+fn division_by_zero_in_function_body_fails() {
+    // Instruction side conditions (`inst_obligations`) must be discharged in a
+    // *function* body, not just a resource body: a literal zero divisor is a
+    // verification failure, not a silently-accepted term.
+    let input = r#"
+function fdiv(a: Int): Int
+{ a / 0 }
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "fdiv");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::SideCondition("divisor may be zero"))),
+        "expected SideCondition(divisor), got {result:?}"
+    );
+}
+
+#[test]
+fn division_by_zero_in_method_body_fails() {
+    // Same obligation in a method body.
+    let input = r#"
+method mdiv(a: Int) {
+    var x: Int := a / 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "mdiv");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::SideCondition("divisor may be zero"))),
+        "expected SideCondition(divisor), got {result:?}"
+    );
+}
+
+#[test]
+fn division_by_provably_nonzero_divisor_verifies() {
+    // The divisor obligation is discharged from the precondition, and the `1/0`
+    // on the dead ternary arm is discharged by its (false) path condition —
+    // together these pin that the new check is not vacuously failing.
+    let input = r#"
+method mok(a: Int)
+    requires a != 0
+{
+    var x: Int := 10 / a
+    var y: Int := (true ? 1 : 1 / 0)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "mok");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn conditional_inhale_permission_is_nonnegative() {
+    // CFG linearization encodes the guarded `inhale` as a scaled permission
+    // `c ? 1/1 : 0/1`, so the permission ≥ 0 obligation — now also checked in
+    // method bodies — is a `<` over an `ite`. `lt-ite` distributes it.
+    let input = r#"
+predicate number(this: Ref)
+
+method give(this: Ref)
+    ensures number(this)
+
+method m(c: Bool, this: Ref)
+{
+    if (c) { give(this) } else { }
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}

@@ -1,10 +1,10 @@
 saturations=5
 reduces=6
 sat_iterations=13
-egraph_nodes_peak=53
+egraph_nodes_peak=54
 egraph_classes_peak=27
 rule_applications=3
-prove_calls=21
+prove_calls=28
 prove_tier3=0
 cert_grafts=7
 rule.ite-true=3

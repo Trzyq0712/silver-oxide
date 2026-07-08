@@ -22,8 +22,9 @@ pub enum VerifyError {
     /// fails).
     RefuteFailed,
     InsufficientPermission,
-    /// A resource's side condition (e.g. `acc` permission ≥ 0, division divisor
-    /// ≠ 0) could not be discharged. Carries a human-readable description.
+    /// An instruction's side condition (e.g. `acc` permission ≥ 0, division
+    /// divisor ≠ 0) could not be discharged. Carries a human-readable
+    /// description. See [`inst_obligations`].
     SideCondition(&'static str),
     /// Encountered a method-only heap extension (e.g. `Assign`) in a body
     /// the verifier doesn't yet handle structurally. Reserved for
@@ -197,27 +198,6 @@ fn collect_pc_lits(
         .iter()
         .map(|(v, p)| (state.get_val(ctx, v), *p))
         .collect()
-}
-
-fn check_deref_permission(
-    ctx: &mut VerifyContext<'_>,
-    state: &EvalState,
-    pc_lits: &[(egg::Id, Polarity)],
-    heap: &HeapVal,
-    loc: &Val,
-) -> Result<(), VerifyError> {
-    let addr = state.get_val(ctx, loc);
-    let perm = state
-        .loc_kind(loc)
-        .and_then(|k| get_heap(state, heap).perm_at(&k, addr))
-        .unwrap_or_else(|| zero_real(ctx));
-    let zero = zero_real(ctx);
-    let positive = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, perm]));
-    if ctx.prove_under_pc(positive, pc_lits) {
-        Ok(())
-    } else {
-        Err(VerifyError::InsufficientPermission)
-    }
 }
 
 /// Evaluate a `PureInst` into its symbolic e-class id.
@@ -1460,9 +1440,9 @@ pub fn verify_method(
             vals_before,
             heaps_before,
         );
-        if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
-            let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
-            if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
+        let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
+        for (goal, err) in inst_obligations(&mut ctx, &state, &inst.kind) {
+            if !ctx.prove_under_pc(goal, &pc_lits) {
                 return Err(err.with_inst(inst_text.clone()));
             }
         }
@@ -1533,14 +1513,9 @@ pub fn verify_resource(
             heaps_before,
         );
         let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
-        if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
-            if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
-                return Err(err.with_inst(inst_text.clone()));
-            }
-        }
-        for (goal, msg) in inst_obligations(&mut ctx, &state, &inst.kind) {
+        for (goal, err) in inst_obligations(&mut ctx, &state, &inst.kind) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
-                return Err(VerifyError::SideCondition(msg).with_inst(inst_text.clone()));
+                return Err(err.with_inst(inst_text.clone()));
             }
         }
 
@@ -1674,12 +1649,9 @@ pub fn verify_function(
             vals_before,
             heaps_before,
         );
-        // A heap-dependent body reads the heap its entry `FromSnap` reconstructs
-        // from the snapshot parameter: every `Deref` must be framed by that
-        // footprint (this failing = a read outside the precondition).
-        if let InstKind::Pure(_, PureInst::Deref(heap, loc)) = &inst.kind {
-            let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
-            if let Err(err) = check_deref_permission(&mut ctx, &state, &pc_lits, heap, loc) {
+        let pc_lits = collect_pc_lits(&mut ctx, &state, &inst.pc);
+        for (goal, err) in inst_obligations(&mut ctx, &state, &inst.kind) {
+            if !ctx.prove_under_pc(goal, &pc_lits) {
                 return Err(err.with_inst(inst_text.clone()));
             }
         }
@@ -1707,18 +1679,34 @@ pub fn verify_function(
     })))
 }
 
-/// Side-condition obligations implied by an instruction's kind, as
-/// `(goal, description)` pairs that must each be proven `true` under the
-/// instruction's path condition. `acc` requires a non-negative permission;
-/// division requires a non-zero divisor.
+/// Proof obligations implied by an instruction's kind, as `(goal, error)` pairs
+/// that must each be proven `true` under the instruction's path condition. A
+/// `Deref` requires a positive permission for the location it reads; `acc`
+/// requires a non-negative permission; division requires a non-zero divisor.
+///
+/// This is the **single** source of per-instruction obligations: every body
+/// driver (`verify_method`, `verify_resource`, `verify_function`) discharges
+/// exactly this list, so an obligation added here is checked everywhere.
 fn inst_obligations(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     kind: &InstKind,
-) -> Vec<(egg::Id, &'static str)> {
-    let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-    let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
+) -> Vec<(egg::Id, VerifyError)> {
     match kind {
+        // `0 < perm(heap, loc)` — the location must be framed by the heap being
+        // read. In a function body that heap is the one the entry `FromSnap`
+        // reconstructs from the snapshot parameter, so this failing means a read
+        // outside the declared precondition.
+        InstKind::Pure(_, PureInst::Deref(heap, loc)) => {
+            let addr = state.get_val(ctx, loc);
+            let perm = state
+                .loc_kind(loc)
+                .and_then(|k| get_heap(state, heap).perm_at(&k, addr))
+                .unwrap_or_else(|| zero_real(ctx));
+            let zero = zero_real(ctx);
+            let goal = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, perm]));
+            vec![(goal, VerifyError::InsufficientPermission)]
+        }
         // `not(perm < 0)` desugared to an `Ite`. Applies to a location combine
         // and to a resource inhale/exhale (their permission scale must be ≥ 0).
         InstKind::Heap(
@@ -1726,20 +1714,27 @@ fn inst_obligations(
             | HeapInst::Inhale { perm, .. }
             | HeapInst::Exhale { perm, .. },
         ) => {
+            let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let perm = state.get_val(ctx, perm);
             let zero = zero_real(ctx);
             let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));
             let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-            vec![(goal, "permission may be negative")]
+            vec![(
+                goal,
+                VerifyError::SideCondition("permission may be negative"),
+            )]
         }
         // `not(divisor == 0)` desugared to an `Ite`. The divisor is homogeneous
         // with the result (casts), so the VMIR result type gives the zero's type.
         InstKind::Pure(ty, PureInst::Binary(BinOp::Div, _, r)) => {
+            let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
+            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let rv = state.get_val(ctx, r);
             let zero = zero_of(ctx, ty);
             let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [rv, zero]));
             let goal = ctx.add(Symbolic::Ite([eq, false_, true_]));
-            vec![(goal, "divisor may be zero")]
+            vec![(goal, VerifyError::SideCondition("divisor may be zero"))]
         }
         _ => vec![],
     }
