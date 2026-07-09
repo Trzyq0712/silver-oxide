@@ -445,7 +445,7 @@ fn build_certs(
     program: &vmir::Program,
     fn_certs: &HashMap<MemberId, Arc<FunctionDefinition>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> HashMap<MemberId, ResourceCertificate> {
+) -> HashMap<MemberId, ResourceDefinition> {
     let mut certs = HashMap::new();
     for (id, decl) in program.decls.iter_enumerated() {
         if let vmir::Declaration::Resource(r) = decl {
@@ -516,7 +516,7 @@ fn build_all_certs(
     program: &vmir::Program,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> (
-    HashMap<MemberId, ResourceCertificate>,
+    HashMap<MemberId, ResourceDefinition>,
     HashMap<MemberId, Arc<FunctionDefinition>>,
 ) {
     let mut certs = HashMap::new();
@@ -1350,10 +1350,10 @@ predicate number(this: Ref) {
 }
 
 #[test]
-fn graft_reuses_ensures_equality() {
-    // `seteq`'s postcondition establishes `x.f == y.f`. The caller grafts the
-    // certificate, assumes that boolean, and can then discharge the same
-    // equality without re-deriving it.
+fn ensures_equality_is_reusable_at_call_site() {
+    // `seteq`'s postcondition establishes `x.f == y.f`. The caller rebuilds the
+    // ensures recipe, assumes that boolean, and can then discharge the same
+    // equality.
     let input = r#"
 field f: Int
 

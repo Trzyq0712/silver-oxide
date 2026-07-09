@@ -43,8 +43,6 @@ pub struct VerifyStats {
     /// clone+saturate path (the clearest deterioration signal).
     pub prove_calls: u64,
     pub prove_tier3: u64,
-    /// `graft_certificate` calls.
-    pub cert_grafts: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
 }
@@ -78,7 +76,6 @@ impl VerifyStats {
         s.push_str(&format!("rule_applications={}\n", self.rule_applications));
         s.push_str(&format!("prove_calls={}\n", self.prove_calls));
         s.push_str(&format!("prove_tier3={}\n", self.prove_tier3));
-        s.push_str(&format!("cert_grafts={}\n", self.cert_grafts));
         // `per_rule` is a BTreeMap → already sorted, hence deterministic.
         for (rule, n) in &self.per_rule {
             s.push_str(&format!("rule.{rule}={n}\n"));

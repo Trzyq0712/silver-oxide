@@ -1,13 +1,10 @@
 use std::collections::HashMap;
 
-use egg::Id;
-
 use crate::{
     verify::{
         analysis::ConstFold,
-        cert::{FunctionDefinition, ResourceCertificate, TransplantSink, Transplanted, transplant},
+        cert::FunctionDefinition,
         func_registry::FuncRegistry,
-        heap::{Chunk, Heap},
         lang::{FuncId, Symbolic},
         rewrite,
     },
@@ -31,14 +28,11 @@ pub(crate) struct VerifyContext<'a> {
     /// per already-certified `fn_certs` entry — see `rewrite::function_rule`).
     /// Chained into full saturation (incl. the tier-3 probe) but not `reduce`.
     pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
-    /// Monotonic source of fresh-value ids. Still an `Arc<Mutex>` only because the
-    /// resource-grafting [`transplant`] path mints fresh placeholders and its
-    /// signature threads the shared counter (so a placeholder never reuses a live
-    /// `Symbolic::Fresh(n)` and silently merges). The function-unfold rule no
-    /// longer transplants (it rebuilds an add-only recipe), so nothing
-    /// saturation-time draws from this anymore — Phase 4 (deleting `transplant`)
-    /// can collapse it to a plain `u32`.
-    fresh_counter: std::sync::Arc<std::sync::Mutex<u32>>,
+    /// Monotonic source of fresh-value ids (`Symbolic::Fresh(n)`). A plain counter
+    /// now that nothing mints fresh values at saturation time — both certificate
+    /// kinds are add-only recipes, so `transplant` (which threaded a shared
+    /// counter) is gone.
+    fresh_counter: u32,
     /// Cheap string repr for member/constructor names.
     pub(crate) interner: &'a Rodeo,
     /// Member names indexed by `MemberId` (for `member_name`/`func_name`).
@@ -81,7 +75,7 @@ impl<'a> VerifyContext<'a> {
             static_rules: rewrite::rules(),
             static_reduce: rewrite::reduce_rules(),
             axiom_rules: Vec::new(),
-            fresh_counter: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            fresh_counter: 0,
             interner,
             decls,
             groups,
@@ -263,209 +257,9 @@ impl<'a> VerifyContext<'a> {
         self.egraph.add(Symbolic::FuncApp(id, type_args, args))
     }
 
-    /// Graft a resource certificate into this (caller) e-graph, substituting the
-    /// certificate's formal params for `args`. Returns the grafted result heap
-    /// delta, boolean e-class, and the transplanted **footprint** slots
-    /// `(perm, value)` in program order — the snapshot layout a snapshot-yielding
-    /// inhale/exhale builds its `cons` from (the footprint values share e-classes
-    /// with the delta chunk values, so they bind to the caller's heap values
-    /// through the usual union/subtract accounting). Every merge proven in the
-    /// certificate transfers for free (reconstruction is keyed by certificate
-    /// e-class), so the caller never re-derives or re-saturates the resource's
-    /// facts.
-    pub(crate) fn graft_certificate(
-        &mut self,
-        cert: &ResourceCertificate,
-        args: &[egg::Id],
-    ) -> (Heap, egg::Id, Vec<(Id, Id)>) {
-        self.alloc.stats.cert_grafts += 1;
-        let mut subst: HashMap<Id, Id> = HashMap::new();
-        for (p, a) in cert.params.iter().zip(args) {
-            subst.insert(cert.egraph.find(*p), *a);
-        }
-        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        let src = cert.src();
-        let mut sink_val = TransplantSink {
-            fresh_types: &mut self.fresh_types,
-            func_ret_types: &mut self.func_ret_types,
-        };
-        let mut sink = Some(&mut sink_val);
-        let mut delta = Heap::empty();
-        for (kind, addr, perm, value) in &cert.delta {
-            let a = transplant(
-                &mut self.egraph,
-                &self.fresh_counter,
-                &mut sink,
-                &src,
-                *addr,
-                &subst,
-                &mut memo,
-            );
-            let p = transplant(
-                &mut self.egraph,
-                &self.fresh_counter,
-                &mut sink,
-                &src,
-                *perm,
-                &subst,
-                &mut memo,
-            );
-            let v = transplant(
-                &mut self.egraph,
-                &self.fresh_counter,
-                &mut sink,
-                &src,
-                *value,
-                &subst,
-                &mut memo,
-            );
-            delta = delta.with_chunk(kind, Chunk::new(a, p, v));
-        }
-        let bool_id = transplant(
-            &mut self.egraph,
-            &self.fresh_counter,
-            &mut sink,
-            &src,
-            cert.bool_id,
-            &subst,
-            &mut memo,
-        );
-        // The memo is shared, so a footprint value lands in the same caller
-        // e-class as its delta chunk value.
-        let footprint: Vec<(Id, Id)> = cert
-            .footprint
-            .iter()
-            .map(|(_, _, perm, value)| {
-                let p = transplant(
-                    &mut self.egraph,
-                    &self.fresh_counter,
-                    &mut sink,
-                    &src,
-                    *perm,
-                    &subst,
-                    &mut memo,
-                );
-                let v = transplant(
-                    &mut self.egraph,
-                    &self.fresh_counter,
-                    &mut sink,
-                    &src,
-                    *value,
-                    &subst,
-                    &mut memo,
-                );
-                (p, v)
-            })
-            .collect();
-        self.egraph.rebuild();
-        (delta, bool_id, footprint)
-    }
-
-    /// Seed a footprint-graft substitution with the call's `args` bound to the
-    /// cert's formal params (keyed in the cert's id space). `fold`/`unfold` grow
-    /// this map slot-by-slot with each slot's actual value (see
-    /// [`graft_footprint_slot`](Self::graft_footprint_slot)) so that
-    /// value-dependent addresses — e.g. an inner predicate `P(this.f)` whose
-    /// argument is a field read — resolve against the real field values.
-    pub(crate) fn footprint_param_subst(
-        &self,
-        cert: &ResourceCertificate,
-        args: &[Id],
-    ) -> HashMap<Id, Id> {
-        let mut subst: HashMap<Id, Id> = HashMap::new();
-        for (p, a) in cert.params.iter().zip(args) {
-            subst.insert(cert.egraph.find(*p), *a);
-        }
-        subst
-    }
-
-    /// Transplant one footprint slot's `(addr, perm)` into this e-graph under
-    /// `subst` (the call's params plus any already-resolved earlier-slot values).
-    /// The caller binds `cert.egraph.find(slot.value) -> actual` after reading the
-    /// slot, so a later slot's value-dependent address resolves correctly.
-    pub(crate) fn graft_footprint_slot(
-        &mut self,
-        cert: &ResourceCertificate,
-        addr: Id,
-        perm: Id,
-        subst: &HashMap<Id, Id>,
-    ) -> (Id, Id) {
-        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        let src = cert.src();
-        let mut sink_val = TransplantSink {
-            fresh_types: &mut self.fresh_types,
-            func_ret_types: &mut self.func_ret_types,
-        };
-        let mut sink = Some(&mut sink_val);
-        let a = transplant(
-            &mut self.egraph,
-            &self.fresh_counter,
-            &mut sink,
-            &src,
-            addr,
-            subst,
-            &mut memo,
-        );
-        let p = transplant(
-            &mut self.egraph,
-            &self.fresh_counter,
-            &mut sink,
-            &src,
-            perm,
-            subst,
-            &mut memo,
-        );
-        self.egraph.rebuild();
-        (a, p)
-    }
-
-    /// Transplant a predicate cert's body boolean for `args`, substituting each
-    /// footprint slot's cert value with the caller's actual `values` (so the
-    /// body's pure facts are expressed over the fold/unfold-site values).
-    pub(crate) fn graft_pred_bool(
-        &mut self,
-        cert: &ResourceCertificate,
-        args: &[Id],
-        values: &[Id],
-    ) -> Id {
-        let mut subst: HashMap<Id, Id> = HashMap::new();
-        for (p, a) in cert.params.iter().zip(args) {
-            subst.insert(cert.egraph.find(*p), *a);
-        }
-        // Substitute per-acc (layout) slot value with the fold/unfold-site value.
-        // Aliased slots share their cert value, and the caller supplies the same
-        // (per-location) value for each, so the inserts agree.
-        for (slot, &v) in cert.footprint.iter().zip(values) {
-            // `slot.3` is the footprint value e-class (`(kind, addr, perm, value)`).
-            subst.insert(cert.egraph.find(slot.3), v);
-        }
-        let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-        let src = cert.src();
-        let mut sink_val = TransplantSink {
-            fresh_types: &mut self.fresh_types,
-            func_ret_types: &mut self.func_ret_types,
-        };
-        let mut sink = Some(&mut sink_val);
-        let b = transplant(
-            &mut self.egraph,
-            &self.fresh_counter,
-            &mut sink,
-            &src,
-            cert.bool_id,
-            &subst,
-            &mut memo,
-        );
-        self.egraph.rebuild();
-        b
-    }
-
     pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
-        let id = {
-            let mut c = self.fresh_counter.lock().unwrap();
-            let v = *c;
-            *c += 1;
-            v
-        };
+        let id = self.fresh_counter;
+        self.fresh_counter += 1;
         self.fresh_types.insert(id, ty);
         self.egraph.add(Symbolic::Fresh(id))
     }

@@ -52,7 +52,7 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // Resources are verified before the methods that use them (dependency
     // order), so each resource's proof certificate is cached and grafted at
     // call sites rather than re-walking the body.
-    let mut certs: std::collections::HashMap<vmir::MemberId, cert::ResourceCertificate> =
+    let mut certs: std::collections::HashMap<vmir::MemberId, cert::ResourceDefinition> =
         std::collections::HashMap::new();
     // Verified function bodies, cached in dependency order (callees before
     // callers). Each unit's `assume_axioms` installs one lazy unfold rule per
