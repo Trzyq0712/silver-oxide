@@ -1720,10 +1720,42 @@ fn purify_function(
                 ))?;
                 map.push(v);
             }
-            InstKind::Pure(_, PureInst::Perm(..) | PureInst::Snap { .. }) => {
-                return Err(VerifyError::Unimplemented(
-                    "purify: perm/nested-snap in function",
-                ));
+            InstKind::Pure(_, PureInst::Perm(..)) => {
+                return Err(VerifyError::Unimplemented("purify: perm in function"));
+            }
+            // A nested heap-dependent call's `Snap`: the snapshot of the callee's
+            // footprint, `cons(Some(v_i))` over the values read from the current
+            // heap (a self-framed footprint is fully held, so each slot is Some).
+            InstKind::Pure(_, PureInst::Snap { .. }) => {
+                let Some(HeapEvent::Snap { resource, values }) = events.next() else {
+                    unreachable!("Snap inst without a logged Snap event");
+                };
+                let elems = slot_elems(*resource)?;
+                let some_id = ctx.alloc.option_some();
+                let cons_id = ctx.alloc.cons(*resource, 0);
+                let mut members = Vec::with_capacity(values.len());
+                for (i, &value) in values.iter().enumerate() {
+                    let v = at.get(&ctx.egraph.find(value)).cloned().ok_or(
+                        VerifyError::Unimplemented("purify: snap value outside footprint"),
+                    )?;
+                    members.push(emit(
+                        &mut steps,
+                        AxiomPure::App {
+                            func: some_id,
+                            type_args: vec![elems[i].clone()],
+                            args: vec![v],
+                        },
+                    ));
+                }
+                let s = emit(
+                    &mut steps,
+                    AxiomPure::App {
+                        func: cons_id,
+                        type_args: Vec::new(),
+                        args: members,
+                    },
+                );
+                map.push(s);
             }
             InstKind::Pure(_, PureInst::Fresh) => {
                 unreachable!("function body may not contain Fresh (method-only)");
