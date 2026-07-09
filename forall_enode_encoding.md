@@ -9,8 +9,9 @@ adopted.
 Encode each `forall` directly into the e-graph as an ordinary e-node instead of
 registering one dedicated rewrite rule per quantifier. A forall e-node has:
 
-- a **recipe reference** (`RecipeId`) — the compiled body + trigger, interned in
-  a program-level table; the "code" of the quantifier;
+- a **recipe reference** (`RecipeId`) — the compiled body, interned in a
+  program-level table with its associated trigger set (see "Node identity"
+  below); the "code" of the quantifier;
 - **capture children** — ordinary e-class ids for every outer-scope term the
   body/trigger mentions; the "environment";
 - **type args in the payload** — for quantifiers under generic domain axioms,
@@ -69,6 +70,74 @@ A nested forall under a generic domain axiom keeps its recipe generic and takes
 the concrete instantiation through the payload `type_args`, substituted into
 the steps at instantiation time — same solution as polymorphic `FuncApp`.
 
+### Node identity, triggers, and alpha-equivalence
+
+The forall e-node's identity is `(RecipeId, type_args, capture children)` —
+**the trigger is deliberately not part of it**. A trigger is operational, not
+propositional: it controls *when* we instantiate, not what the forall means.
+Two foralls with the same body recipe and captures but different declared
+triggers denote the same proposition; the guarded release
+`Ite(forall, inst, true)` is a tautology of the forall regardless of which
+trigger produced the instance. Putting a `TriggerId` in the payload would make
+hashcons keep semantically equal foralls in separate e-classes — assuming one
+`true` would not release the other's instances. Sound but incomplete, and
+dedup lost.
+
+Instead, triggers hang off the table entry: `RecipeId → (body, Vec<Trigger>)`.
+Interning a forall whose body dedups to an existing entry **unions the trigger
+sets**; the matching rule tries each trigger in the set. Merging trigger sets
+is sound (more instantiation opportunities, all guarded); the only cost is
+that the union may fire more instances than either declaration alone intended
+— a perf concern, not a soundness one.
+
+Alpha-equivalence falls out of recipe interning: binder numbering is already
+positional in the step temps, so recipes are alpha-canonical for free.
+Canonicalizing capture-slot order (by first use in the steps) at intern time
+additionally dedups capture permutations, cheaply. Limits:
+
+- Dedup is syntactic-after-canonicalization, not semantic — `x+1` vs `1+x`
+  bodies do not merge (bodies are inert data; no rewrites reach them). Fine.
+- Recipe dedup does **not** skip WD: Silver well-definedness is
+  per-occurrence, and a second occurrence of a shared recipe may sit under
+  different ambient facts, so the scratch check runs per syntactic
+  occurrence regardless of the shared `RecipeId`.
+
+### Heap-dependent functions in quantifier bodies
+
+The design's hard invariant: **recipes are pure — assert-free and heap-free**.
+Instantiation runs inside `apply_one`, which can only add guarded facts; it
+cannot read the verifier-side symbolic `Heap` (chunk maps are not e-classes)
+and cannot discharge obligations. `PureInst::Snap` violates both — it walks
+the symbolic heap and implicitly *asserts* footprint sufficiency + the
+resource bool — so a live `Snap` step over bound variables is unbuildable in a
+recipe. Consequences:
+
+- **Binder-independent footprints work — freeze the heap at encounter.** If
+  the called function's footprint does not depend on the binders (its args may
+  still mention them in non-footprint positions), evaluate the `Snap` once at
+  quantifier-encounter time against the heap at that program point. The
+  resulting snapshot value `s` is an ordinary e-class → a **capture child**;
+  the body step becomes a plain pure `f(args, s)`. Semantically exact:
+  a heap-dependent forall assumed at a state only constrains `f` at that
+  state's snapshot. Triggers on `f` work — the snapshot position is a
+  `TrigArg::Capture`, and congruence handles "same heap contents, different
+  program point" (equal snapshot values unify, matches fire).
+- **Binder-dependent footprints break down — loudly.** `forall x :: f(x) > 0`
+  with `requires acc(x.f)` needs a snapshot per instance over an
+  `x`-dependent footprint: that is quantified permissions (Phase 4, not
+  designed). Encounter-time evaluation of the `Snap` does a syntactic chunk
+  lookup at `addr(x_fresh)`, finds nothing, and rejects — a translation
+  error, not unsoundness. Same frontier as the rest of the system.
+- **Foralls inside heap-dependent function bodies are free.** Function bodies
+  are purified against `H(s)` (`eval_snap`/`eval_from_snap`): every deref is
+  already a pure term over `proj(s)` when a nested forall is encountered, so
+  its recipe captures `s`-projections like any other outer term. No special
+  case.
+- **WD unaffected**: everything assertive resolves either at encounter (the
+  frozen `Snap`'s footprint check, in the main graph) or in the scratch clone
+  with fresh binders (resource bool, body side conditions). Nothing assertive
+  survives into a recipe, so instantiation stays obligation-free.
+
 ### Recipe table placement
 
 - **Ownership: program level**, owned by `verify::verify` next to
@@ -108,7 +177,8 @@ caches must not be shared between the scratch run and the main run.
 | Instantiation memo | per-rule seen-set, perf-only | still perf-only, not needed for soundness/termination (instances are idempotent; `union` returns `false` on repeats). Can be dropped initially; expect to reintroduce a seen-set keyed (forall class, σ) as the first perf fix |
 | WD checking | deferred entirely | once per syntactic quantifier via graph-clone scratch check |
 | Assert-side foralls | no path (assume-only) | representable: skolemize with fresh consts, union the forall node with `true` if the body proves — future work, but the design has a home for it |
-| Alpha-equivalent duplicates | duplicated rules and work | deduped at recipe interning + hashcons on (recipe, caps, types) |
+| Alpha-equivalent duplicates | duplicated rules and work | deduped at recipe interning + hashcons on (recipe, caps, types); triggers excluded from identity, trigger sets unioned on the recipe entry |
+| Heap-dependent calls in bodies | n/a (pure foralls only) | binder-independent footprints via encounter-time snapshot capture; binder-dependent footprints rejected (need QP, Phase 4) |
 
 ## Wins
 
