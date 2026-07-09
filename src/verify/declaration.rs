@@ -1577,9 +1577,12 @@ pub(crate) fn verify_resource(
         Some(&mut footprint_ops),
     )?;
 
-    // Saturate so the certificate carries every proven merge, then snapshot the
-    // result roots (canonicalized) for grafting at call sites.
-    ctx.saturate();
+    // No pre-capture saturate: the certificate's roots (delta/footprint/bool) are
+    // captured as the ordinary walk left them, and each call site re-derives any
+    // merge it needs via its own saturation (`prove_under_pc`) plus `heap_union`/
+    // `assume_location_axioms`. Measured droppable — identical corpus verdicts and
+    // strictly fewer saturations (Phase 4 diligence, Finding C: a resource does
+    // not depend on saturation-baked merges being transplanted).
     let delta_heap = get_heap(&state, &body.res.0);
     // Each delta chunk keeps its `LocationKind` (VMIR-sourced) so grafting regroups
     // without inference.
