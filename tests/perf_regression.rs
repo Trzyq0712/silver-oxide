@@ -65,7 +65,7 @@ fn verification_cost_matches_baseline() {
     let mut failures = Vec::new();
     for bench in benches {
         let name = bench.file_stem().unwrap().to_str().unwrap().to_string();
-        let (results, _timings, stats) =
+        let (results, _timings, _member_times, stats) =
             pipeline::run_file_timed(&bench).unwrap_or_else(|e| panic!("{name}: pipeline {e}"));
         // A benchmark must verify clean — a failing program has no stable cost.
         for (unit, outcome) in &results {

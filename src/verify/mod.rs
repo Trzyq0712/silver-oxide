@@ -28,11 +28,20 @@ pub fn verify(analyzed: &vmir::AnalyzedProgram) -> Vec<VerifyResult> {
     verify_with_stats(analyzed).0
 }
 
-/// Like [`verify`], but also returns the aggregated [`VerifyStats`] (e-graph
-/// cost metrics) for the whole run — used by the performance regression tests.
-pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>, VerifyStats) {
+/// Like [`verify`], but also returns per-member wall-clock verify times
+/// (name + elapsed, 1:1 with the result rows) and the aggregated
+/// [`VerifyStats`] (e-graph cost metrics) for the whole run — the latter used
+/// by the performance regression tests.
+pub fn verify_with_stats(
+    analyzed: &vmir::AnalyzedProgram,
+) -> (
+    Vec<VerifyResult>,
+    Vec<(String, std::time::Duration)>,
+    VerifyStats,
+) {
     let program = &analyzed.program;
     let mut results = Vec::new();
+    let mut member_times: Vec<(String, std::time::Duration)> = Vec::new();
     // Derive a linear order from the dependency graph; acyclicity was already
     // proven by `analyze`. A future parallel scheduler consumes the graph
     // directly instead.
@@ -68,6 +77,7 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     let mut alloc = func_registry::FuncRegistry::new(program);
     for id in order {
         let name = program.name(id).to_string();
+        let start = std::time::Instant::now();
         let outcome = match &program.decls[id] {
             vmir::Declaration::Resource(r) => {
                 match declaration::verify_resource(program, &name, r, &certs, &fn_certs, &mut alloc)
@@ -98,10 +108,12 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
             )),
             _ => None,
         };
+        let elapsed = start.elapsed();
         if let Some(outcome) = outcome {
+            member_times.push((name.clone(), elapsed));
             results.push((name, outcome));
         }
     }
     let stats = alloc.into_stats();
-    (results, stats)
+    (results, member_times, stats)
 }

@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match pipeline::run_file_timed(Path::new(&file)) {
         Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
-        Ok((results, timings, stats)) => {
+        Ok((results, timings, member_times, stats)) => {
             if results.is_empty() {
                 println!("[INFO] no method bodies to verify");
             } else {
@@ -22,6 +22,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             eprintln!("[TIMING]\n{timings}");
+            let mut breakdown = member_times.clone();
+            breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("[VERIFY-BREAKDOWN] (slowest first)");
+            for (name, dur) in &breakdown {
+                eprintln!("  {name:<24} {dur:>10.3?}");
+            }
             eprintln!("[STATS] {stats:?}");
         }
     }

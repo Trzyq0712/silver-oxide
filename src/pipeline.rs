@@ -49,14 +49,22 @@ impl std::fmt::Display for PhaseTimings {
 /// Run the full pipeline on a `.vpr` file. Returns per-method results on
 /// success, or a `PipelineError` if any pre-verification stage fails.
 pub fn run_file(path: &Path) -> Result<Vec<verify::VerifyResult>, PipelineError> {
-    run_file_timed(path).map(|(results, _, _)| results)
+    run_file_timed(path).map(|(results, _, _, _)| results)
 }
 
 /// Like [`run_file`] but also returns the [`PhaseTimings`] for each phase and the
 /// verifier cost metrics ([`verify::VerifyStats`]) for the run.
 pub fn run_file_timed(
     path: &Path,
-) -> Result<(Vec<verify::VerifyResult>, PhaseTimings, verify::VerifyStats), PipelineError> {
+) -> Result<
+    (
+        Vec<verify::VerifyResult>,
+        PhaseTimings,
+        Vec<(String, Duration)>,
+        verify::VerifyStats,
+    ),
+    PipelineError,
+> {
     let mut timings = PhaseTimings::default();
     let overall = Instant::now();
 
@@ -119,8 +127,9 @@ pub fn run_file_timed(
         vmir::analyze(vmir).map_err(|e| PipelineError::Analyze(e.to_string()))?
     );
 
-    let (results, stats) = phase!("verify", verify::verify_with_stats(&analyzed));
+    let (results, member_times, stats) =
+        phase!("verify", verify::verify_with_stats(&analyzed));
 
     timings.total = overall.elapsed();
-    Ok((results, timings, stats))
+    Ok((results, timings, member_times, stats))
 }
