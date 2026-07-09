@@ -138,6 +138,47 @@ recipe. Consequences:
   with fresh binders (resource bool, body side conditions). Nothing assertive
   survives into a recipe, so instantiation stays obligation-free.
 
+#### The QP boundary: binder-dependence of footprint slots
+
+The binder's *type* is irrelevant to whether a quantifier needs quantified
+permissions — what matters is where the binder flows. `forall i: Int` calling
+`f(i)` with `requires acc(P(i))` is QP (one distinct slot per binding, no
+`Ref` in sight; likewise via indirection, `acc(lookup(a, i).val)`);
+`forall r: Ref` calling an `f` that requires `acc(P())` is not (constant
+footprint, snapshot once).
+
+Precisely: a footprint slot = (address, permission amount) computed by
+evaluating `f#requires` at the call args. The quantifier crosses into QP
+territory iff, after evaluation with binders as fresh values, some slot's
+**address or perm amount** still mentions a binder. Three sharpenings:
+
+1. It is the *slot* that matters, not the call and not the value read —
+   binders in non-footprint argument positions are fine (they flow into the
+   pure `f(args, s)` call, the heap is untouched).
+2. The test is semantic-after-simplification, not syntactic: `acc(P(i - i))`
+   mentions `i` but the e-graph normalizes the address to `P@addr(0)` — the
+   snapshot works. The practical check is whether the address's e-class
+   contains the fresh binder.
+3. A binder-dependent precondition **bool** is *not* QP. With a constant
+   footprint but `f#requires` bool `i > 0`, the heap part snapshots once;
+   the bool cannot be asserted once at encounter (it mentions `i`), so it
+   shifts into the WD obligation — proved in the scratch clone with the
+   fresh binder under ambient facts (e.g. discharged by the body's own
+   guard in `forall i :: i > 0 ==> f(i) > 0`, subject to how
+   implication-guarded WD is threaded — same shape as the deferred-WD
+   plan). Only the *spatial* part draws the QP line.
+
+The boundary is **operationally self-enforcing**: encounter-time `Snap`
+evaluation with fresh binders performs the frontend's syntactic chunk lookup,
+and a binder-dependent address matches no held chunk → translation error. No
+separate classifier is needed; the failure is the detector.
+
+This matches Viper's line: a pure forall calling a heap-dependent function is
+legal without QP exactly when the precondition's permissions are provable for
+all bindings from the currently held, non-quantified chunks — a constant
+footprint qualifies; per-binding distinct slots require a held
+`forall … acc(…)` (a real QP) to frame them.
+
 ### Recipe table placement
 
 - **Ownership: program level**, owned by `verify::verify` next to
