@@ -144,6 +144,11 @@ pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Option<Literal> {
             (Real(a), Real(b)) => Real(a * b),
             _ => unreachable!("non-homogeneous operands for Mult: {l:?}, {r:?}"),
         },
+        BinOp::Mod => match (l, r) {
+            (Int(a), Int(b)) if *b != num::BigInt::ZERO => Int(a % b),
+            (Int(_), Int(_)) => return None,
+            _ => unreachable!("non-homogeneous operands for Mod: {l:?}, {r:?}"),
+        },
         BinOp::Div => match (l, r) {
             (Int(a), Int(b)) if *b != num::BigInt::ZERO => Int(a / b),
             (Real(a), Real(b)) if *b != num::BigRational::from(num::BigInt::ZERO) => Real(a / b),
@@ -156,6 +161,5 @@ pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Option<Literal> {
             (Real(a), Real(b)) => Literal::Bool(a < b),
             _ => unreachable!("non-homogeneous operands for Lt: {l:?}, {r:?}"),
         },
-        _ => unimplemented!("Operator {op:?} is not implemented yet"),
     })
 }

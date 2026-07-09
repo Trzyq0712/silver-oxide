@@ -810,12 +810,20 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                 self.tc
                     .impose(key.concretizes_explicit(ViperTcType::Bool))?;
             }
-            SBinOp::Plus | SBinOp::Minus | SBinOp::Mult | SBinOp::Mod => {
+            SBinOp::Plus | SBinOp::Minus | SBinOp::Mult => {
                 self.tc
                     .impose(lk.concretizes_explicit(ViperTcType::Numeric))?;
                 self.tc
                     .impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
                 self.tc.impose(key.is_sym_meet_of(lk, rk))?;
+            }
+            SBinOp::Mod => {
+                self.tc
+                    .impose(lk.concretizes_explicit(ViperTcType::Int))?;
+                self.tc
+                    .impose(rk.concretizes_explicit(ViperTcType::Int))?;
+                self.tc
+                    .impose(key.concretizes_explicit(ViperTcType::Int))?;
             }
             SBinOp::Div => {
                 self.tc

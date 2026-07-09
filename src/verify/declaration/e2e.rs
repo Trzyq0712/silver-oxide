@@ -2757,6 +2757,36 @@ method mok(a: Int)
 }
 
 #[test]
+fn modulo_by_zero_in_method_body_fails() {
+    let input = r#"
+method mmod(a: Int) {
+    var x: Int := a % 0
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "mmod");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::SideCondition("divisor may be zero"))),
+        "expected SideCondition(divisor), got {result:?}"
+    );
+}
+
+#[test]
+fn modulo_by_provably_nonzero_divisor_verifies() {
+    let input = r#"
+method mok(a: Int)
+    requires a != 0
+{
+    var x: Int := 10 % a
+    var y: Int := (true ? 1 : 1 % 0)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "mok");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
 fn conditional_inhale_permission_is_nonnegative() {
     // CFG linearization encodes the guarded `inhale` as a scaled permission
     // `c ? 1/1 : 0/1`, so the permission ≥ 0 obligation — now also checked in

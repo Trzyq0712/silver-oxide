@@ -2314,7 +2314,7 @@ fn inst_obligations(
         }
         // `not(divisor == 0)` desugared to an `Ite`. The divisor is homogeneous
         // with the result (casts), so the VMIR result type gives the zero's type.
-        InstKind::Pure(ty, PureInst::Binary(BinOp::Div, _, r)) => {
+        InstKind::Pure(ty, PureInst::Binary(BinOp::Div | BinOp::Mod, _, r)) => {
             let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
             let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let rv = state.get_val(ctx, r);
