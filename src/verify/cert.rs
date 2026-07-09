@@ -18,8 +18,9 @@ use egg::{EGraph, Id};
 use crate::verify::analysis::ConstFold;
 use crate::verify::heap::LocationKind;
 use crate::verify::lang::{FuncId, Symbolic};
+use crate::verify::rewrite::AxiomInst;
 use crate::verify::types::infer_type;
-use crate::vmir::Type;
+use crate::vmir::{Type, Val};
 
 /// A resource's well-formedness proof, kept for **reuse at call sites**: the
 /// saturated proof e-graph (carrying every proven merge) plus the root
@@ -47,20 +48,18 @@ pub(crate) struct ResourceCertificate {
     pub(crate) bool_id: Id,
 }
 
-/// A (non-recursive, heap-free) function's verified body, kept for **inlining at
-/// call sites**: the saturated body e-graph plus the roots needed to re-attach
-/// it. Grafting it (formal params → actual args) yields the e-class of the
-/// function's result expression, which the caller `union`s with the uninterpreted
-/// `FuncApp` node to install the definitional equality `f(args) == body`.
+/// A (non-recursive) function's verified body as a **pure term recipe** — the
+/// definition `f(params) == <steps>[res]`, add-only. Unlike a certificate this
+/// imports **no e-classes**: the function unfold rule rebuilds `steps` at each
+/// call site with [`build_instance`](crate::verify::rewrite::build_instance)
+/// (params → args), so precondition-derived merges from the body's verification
+/// never ride along (Finding B). `steps` is in dense recipe-temp space (params at
+/// `Val::Temp(0..n_params)`, one slot per step); `res` is the result Val.
 #[derive(Clone)]
-pub(crate) struct FunctionCertificate {
-    pub(crate) egraph: EGraph<Symbolic, ConstFold>,
-    pub(crate) fresh_types: HashMap<u32, Type>,
-    pub(crate) func_ret_types: HashMap<FuncId, Type>,
-    /// Formal-param e-classes, in order (the call's args substitute these).
-    pub(crate) params: Vec<Id>,
-    /// The body's result e-class.
-    pub(crate) result: Id,
+pub(crate) struct FunctionDefinition {
+    pub(crate) n_params: usize,
+    pub(crate) steps: Vec<AxiomInst>,
+    pub(crate) res: Val,
 }
 
 impl ResourceCertificate {
@@ -73,22 +72,9 @@ impl ResourceCertificate {
     }
 }
 
-impl FunctionCertificate {
-    /// Build the transplant source view. `pub(crate)` so the saturation-time
-    /// function-unfold applier (`rewrite::FunctionUnfoldApplier`) can call
-    /// [`transplant`] directly — it has no `VerifyContext` to route through.
-    pub(crate) fn src(&self) -> TransplantSrc<'_> {
-        TransplantSrc {
-            egraph: &self.egraph,
-            fresh_types: &self.fresh_types,
-            func_ret_types: &self.func_ret_types,
-        }
-    }
-}
-
-/// The read-only slice of a certificate that [`transplant`] copies from: the
-/// source e-graph and its type side-oracles. Lets grafting be shared between
-/// [`ResourceCertificate`] and [`FunctionCertificate`].
+/// The read-only slice of a [`ResourceCertificate`] that [`transplant`] copies
+/// from: the source e-graph and its type side-oracles. (Functions no longer
+/// transplant — they carry a [`FunctionDefinition`] recipe instead.)
 pub(crate) struct TransplantSrc<'a> {
     egraph: &'a EGraph<Symbolic, ConstFold>,
     fresh_types: &'a HashMap<u32, Type>,

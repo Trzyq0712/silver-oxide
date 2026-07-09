@@ -405,7 +405,7 @@ fn build_fn_certs_except(
     program: &vmir::Program,
     skip: Option<MemberId>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> HashMap<MemberId, Arc<FunctionCertificate>> {
+) -> HashMap<MemberId, Arc<FunctionDefinition>> {
     let no_certs = HashMap::new();
     let mut fn_certs = HashMap::new();
     loop {
@@ -435,7 +435,7 @@ fn build_fn_certs_except(
 fn build_fn_certs(
     program: &vmir::Program,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> HashMap<MemberId, Arc<FunctionCertificate>> {
+) -> HashMap<MemberId, Arc<FunctionDefinition>> {
     build_fn_certs_except(program, None, alloc)
 }
 
@@ -443,7 +443,7 @@ fn build_fn_certs(
 /// `alloc` so certificate ids match the method's later use.
 fn build_certs(
     program: &vmir::Program,
-    fn_certs: &HashMap<MemberId, Arc<FunctionCertificate>>,
+    fn_certs: &HashMap<MemberId, Arc<FunctionDefinition>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> HashMap<MemberId, ResourceCertificate> {
     let mut certs = HashMap::new();
@@ -517,7 +517,7 @@ fn build_all_certs(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> (
     HashMap<MemberId, ResourceCertificate>,
-    HashMap<MemberId, Arc<FunctionCertificate>>,
+    HashMap<MemberId, Arc<FunctionDefinition>>,
 ) {
     let mut certs = HashMap::new();
     let mut fn_certs = HashMap::new();
@@ -2859,5 +2859,62 @@ method p2(c: Bool, x: Int) { if (c) { give(x) } else { give(x) }  assert x > 0 }
         matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
         "expected AssertionFailed (case-split incompleteness); if this now verifies, \
          branch joins improved — flip the assertion. Got {result:?}"
+    );
+}
+
+// --- Phase 3: function definitions are purified recipes, not e-graph grafts ---
+
+#[test]
+fn function_definition_does_not_leak_precondition_into_call_site() {
+    // Finding B. `f`'s body has a divisor obligation (`g(x)/g(x)`) discharged from
+    // `requires g(x) == 5`, so verifying `f` saturates `g(x) ≡ 5` into its e-graph.
+    // The OLD certificate cloned that e-graph and `transplant`ed it, installing
+    // `g(3) ≡ 5` unconditionally when `f(3)` unfolds (the rule is pc-blind), so the
+    // empty-pc `assert g(3) == 5` passed even though `m` never establishes it. A
+    // purified recipe imports no e-classes, so the merge cannot ride along.
+    let input = r#"
+function g(x: Int): Int
+function f(x: Int): Int requires g(x) == 5 { g(x) / g(x) }
+method m(b: Bool) {
+  if (b) { assume g(3) == 5  var y: Int := f(3) }
+  assert g(3) == 5
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (precondition must not leak from the function \
+         definition); got {result:?}"
+    );
+}
+
+#[test]
+fn purified_function_definition_still_defines_the_body() {
+    // The recipe must still install `f(a) == body`: `f(x) { x + 1 }` unfolds so
+    // that `assert f(2) == 3` holds. (Guards nothing here — total function.)
+    let input = r#"
+function f(x: Int): Int { x + 1 }
+method m() { assert f(2) == 3 }
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "m").is_ok(),
+        "purified function definition should still discharge f(2) == 3"
+    );
+}
+
+#[test]
+fn heap_dependent_function_purifies_to_snapshot_projection() {
+    // A heap-dependent body (`FromSnap`; `Deref`) purifies to `unwrap(proj_0(s))`.
+    // The function verifies (frames its precondition footprint) end to end.
+    let input = r#"
+field f: Int
+function get(x: Ref): Int requires acc(x.f) { x.f }
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_function(&program, "get").is_ok(),
+        "heap-dependent function should verify with the purified recipe"
     );
 }

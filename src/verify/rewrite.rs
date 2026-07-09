@@ -9,7 +9,7 @@ use egg::{
 };
 
 use crate::verify::analysis::ConstFold;
-use crate::verify::cert::{FunctionCertificate, TransplantSink, Transplanted, transplant};
+use crate::verify::cert::FunctionDefinition;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
 use crate::vmir::{BinOp, Literal, TrigArg, Type, Val};
 
@@ -376,6 +376,7 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
 /// an axiom, with every callee resolved to its verifier `FuncId` up front (the
 /// applier has no registry access) and types still mentioning the axiom's
 /// `Generic(i)` parameters — substituted per instantiation.
+#[derive(Clone)]
 pub(crate) enum AxiomPure {
     Binary(BinOp, Val, Val),
     Ternary(Val, Val, Val),
@@ -389,6 +390,7 @@ pub(crate) enum AxiomPure {
 
 /// One instruction of a prepared axiom body: a value-producing pure step, or an
 /// assumption (stitched from a callee's `#ensures`) merged with `true`.
+#[derive(Clone)]
 pub(crate) enum AxiomInst {
     Val(AxiomPure),
     Assume(Val),
@@ -475,8 +477,9 @@ impl Searcher<Symbolic, ConstFold> for AxiomTriggerSearcher {
 /// argument (the type-parameter σ for a generic axiom; empty for a quantifier).
 /// Runs the body's `Assume`s (merging each with `true`) and returns the changed
 /// e-classes together with the body's `res` e-class id. The caller decides how
-/// to discharge `res` (an axiom merges it with `true`; a quantifier guards it).
-fn build_instance(
+/// to discharge `res` (an axiom merges it with `true`; a quantifier guards it; a
+/// function unfold unions it with the call e-class).
+pub(crate) fn build_instance(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     res: &Val,
@@ -781,22 +784,25 @@ pub(crate) fn quantifier_rule(name: &str, quant: PreparedQuantifier) -> Rule {
 
 // ---- Function-call unfolding (lazy, rewrite-rule triggered) ---------------
 
-/// Applier: for each ground `FuncApp(self.func, _, args)` node in the matched
-/// e-class, transplant the certificate's (unsaturated) body under `params →
-/// args` and union it with the matched e-class — installing the definitional
-/// equality `f(args) == body` lazily, the moment an occurrence is seen during
-/// saturation, instead of eagerly at translation-walk time. Works uniformly
-/// for a heap-free or heap-dependent `f`: by the time `cert` was captured, its
-/// body's `Deref`/`Snap`/`FromSnap` were already resolved into ordinary
-/// (pure) e-graph terms over the params — the certificate itself carries no
-/// notion of "heap". Memoized per canonicalized arg tuple (a saturation-cost
-/// guard, like `AxiomApplier`/`QuantApplier` — transplanting is idempotent, so
-/// this only prevents re-walking the body every iteration).
+/// Applier: for each ground `FuncApp(self.func, tys, args)` node in the matched
+/// e-class, rebuild the function's **definition recipe** with `build_instance`
+/// (params → args, `Generic(i)` → `tys`) and union the result with the matched
+/// e-class — installing `f(args) == body` lazily, the moment an occurrence is
+/// seen during saturation, instead of eagerly at translation-walk time. Unlike
+/// the old certificate graft this is **add-only** (`build_instance` imports no
+/// e-classes), so precondition-derived merges from the body's own verification
+/// never ride along (Finding B). Works uniformly for heap-free and
+/// heap-dependent `f`: the recipe already resolved every `Deref`/`Unfold`/`Snap`
+/// into pure terms over the params + snapshot. Memoized per canonicalized
+/// `(tys, args)` tuple (a saturation-cost guard; rebuilding is idempotent).
+/// A canonicalized call key: the ground `(type_args, value_args)` an occurrence
+/// of the function was applied to. Memoized so the recipe rebuilds once per call.
+type CallKey = (Box<[Type]>, Vec<Id>);
+
 struct FunctionUnfoldApplier {
     func: FuncId,
-    cert: Arc<FunctionCertificate>,
-    fresh_counter: Arc<Mutex<u32>>,
-    memo: Mutex<HashSet<Vec<Id>>>,
+    def: Arc<FunctionDefinition>,
+    memo: Mutex<HashSet<CallKey>>,
 }
 
 impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
@@ -808,37 +814,31 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
         _searcher_ast: Option<&PatternAst<Symbolic>>,
         _rule_name: Symbol,
     ) -> Vec<Id> {
-        let mut calls: Vec<Vec<Id>> = Vec::new();
+        let mut calls: Vec<(Box<[Type]>, Vec<Id>)> = Vec::new();
         for node in &egraph[eclass].nodes {
-            let Symbolic::FuncApp(f, _, args) = node else {
+            let Symbolic::FuncApp(f, tys, args) = node else {
                 continue;
             };
             if *f != self.func {
                 continue;
             }
             let args: Vec<Id> = args.iter().map(|&a| egraph.find(a)).collect();
+            let key = (tys.clone(), args);
             let mut memo = self.memo.lock().unwrap();
-            if memo.insert(args.clone()) {
-                calls.push(args);
+            if memo.insert(key.clone()) {
+                calls.push(key);
             }
         }
         let mut changed = Vec::new();
-        for args in calls {
-            let mut subst: HashMap<Id, Id> = HashMap::new();
-            for (p, a) in self.cert.params.iter().zip(&args) {
-                subst.insert(self.cert.egraph.find(*p), *a);
-            }
-            let mut memo: HashMap<Id, Transplanted> = HashMap::new();
-            let src = self.cert.src();
-            let mut sink: Option<&mut TransplantSink<'_>> = None;
-            let result = transplant(
+        for (tys, args) in calls {
+            debug_assert_eq!(args.len(), self.def.n_params, "function unfold arity");
+            let result = build_instance(
                 egraph,
-                &self.fresh_counter,
-                &mut sink,
-                &src,
-                self.cert.result,
-                &subst,
-                &mut memo,
+                &self.def.steps,
+                &self.def.res,
+                &args,
+                &tys,
+                &mut changed,
             );
             if egraph.union(eclass, result) {
                 changed.push(egraph.find(eclass));
@@ -852,20 +852,14 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
     }
 }
 
-/// Mint the lazy-unfolding rule for one verified function's certificate.
+/// Mint the lazy-unfolding rule for one verified function's definition recipe.
 /// Reuses [`AxiomTriggerSearcher`] as-is — it only checks `FuncApp(f, ..)`
 /// presence, independent of arity/type-args, exactly what's needed here too.
-pub(crate) fn function_rule(
-    name: &str,
-    func: FuncId,
-    cert: Arc<FunctionCertificate>,
-    fresh_counter: Arc<Mutex<u32>>,
-) -> Rule {
+pub(crate) fn function_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>) -> Rule {
     let searcher = AxiomTriggerSearcher { func };
     let applier = FunctionUnfoldApplier {
         func,
-        cert,
-        fresh_counter,
+        def,
         memo: Mutex::new(HashSet::new()),
     };
     Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule")

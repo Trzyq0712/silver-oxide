@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
-        cert::{FunctionCertificate, ResourceCertificate},
+        cert::{FunctionDefinition, ResourceCertificate},
         context::VerifyContext,
         error::VerifyError,
         heap::{Chunk, Heap, LocationKind},
@@ -757,7 +757,9 @@ fn eval_method_inst(
             // Consume the footprint from the current heap (reading its values),
             // asserting the predicate body; then place the predicate chunk holding
             // the snapshot of the consumed values.
-            let FootprintResult { heap: out, members } = walk_footprint(
+            let FootprintResult {
+                heap: out, members, ..
+            } = walk_footprint(
                 ctx,
                 program,
                 certs,
@@ -853,11 +855,24 @@ enum Direction {
 }
 
 /// The result of a footprint walk: the accumulator heap after all slot effects,
-/// and — for a `Consume` walk — the snapshot members `present ? Some(v) : None`
-/// per slot (empty for `Produce`, which builds no snapshot).
+/// the snapshot members `present ? Some(v) : None` per slot (for a `Consume`
+/// walk; empty for `Produce`), and the grafted slot **addresses** in slot order
+/// (for function purification's recipe log — see [`HeapEvent`]).
 struct FootprintResult {
     heap: Heap,
     members: Vec<egg::Id>,
+    slot_addrs: Vec<egg::Id>,
+}
+
+/// A heap-reconstruction event logged during a **function** body walk
+/// (`ctx.heap_events`), in body order, so [`purify_function`] can rebuild each
+/// `Deref`'s value as a pure recipe term. `slots` are the grafted footprint slot
+/// addresses in slot (projection-index) order; `Unfold` also carries the
+/// consumed predicate chunk's address, whose recipe term is the snapshot the new
+/// slots project from.
+pub(crate) enum HeapEvent {
+    FromSnap { slots: Vec<egg::Id> },
+    Unfold { pred: egg::Id, slots: Vec<egg::Id> },
 }
 
 /// The single per-slot footprint loop behind `fold`, `unfold`, `snap` and
@@ -897,9 +912,11 @@ fn walk_footprint(
     let mut heap = base;
     let mut values = Vec::with_capacity(cert.footprint.len());
     let mut members = Vec::with_capacity(cert.footprint.len());
+    let mut slot_addrs = Vec::with_capacity(cert.footprint.len());
     let mut subst = ctx.footprint_param_subst(cert, args);
     for (i, (kind, c_addr, c_perm, c_val)) in cert.footprint.iter().enumerate() {
         let (addr, bperm) = ctx.graft_footprint_slot(cert, *c_addr, *c_perm, &subst);
+        slot_addrs.push(addr);
         // Snapshot fields are `Option[T]`; the slot value has the inner `T`.
         let elem = field_types[i]
             .option_inner()
@@ -953,7 +970,11 @@ fn walk_footprint(
             ctx.assume_guarded(bool_id, pc_lits.iter().rev().copied());
         }
     }
-    Ok(FootprintResult { heap, members })
+    Ok(FootprintResult {
+        heap,
+        members,
+        slot_addrs,
+    })
 }
 
 /// The `cons` of a resource's snapshot from its per-slot `members`
@@ -1026,7 +1047,11 @@ fn eval_unfold(
     // Reproduce the footprint from `s` (`unwrap(proj_i(s))` per slot), assuming
     // the predicate body. `reduce()` afterward collapses any snapshot tower a
     // repeated fold/unfold round-trip created.
-    let FootprintResult { heap: out, .. } = walk_footprint(
+    let FootprintResult {
+        heap: out,
+        slot_addrs,
+        ..
+    } = walk_footprint(
         ctx,
         program,
         certs,
@@ -1038,6 +1063,15 @@ fn eval_unfold(
         Some(perm_id),
         &pc_lits,
     )?;
+    // Log for function purification: the new slots reconstruct as
+    // `unwrap(proj_i(s))` where `s` is the recipe term of the consumed
+    // predicate chunk at `pred_addr`.
+    if let Some(events) = ctx.heap_events.as_mut() {
+        events.push(HeapEvent::Unfold {
+            pred: pred_addr,
+            slots: slot_addrs,
+        });
+    }
     state.push_heap(out);
     ctx.reduce();
     Ok(())
@@ -1155,7 +1189,11 @@ fn eval_from_snap(
     // Reconstruct the precondition heap: produce one chunk per footprint slot
     // valued `unwrap(proj_i(s))` into the empty heap, assuming the resource body
     // (guarded by the path condition — a `FromSnap` may sit under a branch).
-    let FootprintResult { heap: out, .. } = walk_footprint(
+    let FootprintResult {
+        heap: out,
+        slot_addrs,
+        ..
+    } = walk_footprint(
         ctx,
         program,
         certs,
@@ -1167,6 +1205,11 @@ fn eval_from_snap(
         None,
         &pc_lits,
     )?;
+    // Log for function purification: the deref'd values reconstruct as
+    // `unwrap(proj_i(snap))` over these slot addresses.
+    if let Some(events) = ctx.heap_events.as_mut() {
+        events.push(HeapEvent::FromSnap { slots: slot_addrs });
+    }
     ctx.reduce();
     Ok(out)
 }
@@ -1256,20 +1299,18 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
     // rejects (mutual) recursion as a dependency cycle), so every function this
     // unit could reference already has a cert in `fn_certs` by the time its
     // ctx is set up here — same guarantee the driver's topological order
-    // (`mod.rs`) already relies on. Each rule transplants the cert's raw body
-    // lazily, the moment a `FuncApp(f, ..)` occurrence is seen during
-    // saturation (see `rewrite::function_rule`), instead of eagerly grafting
-    // it once at translation-walk time.
+    // (`mod.rs`) already relies on. Each rule rebuilds the recipe's body lazily
+    // (add-only) the moment a `FuncApp(f, ..)` occurrence is seen during
+    // saturation (see `rewrite::function_rule`), instead of eagerly grafting it
+    // once at translation-walk time.
     if let Some(fn_certs) = ctx.fn_certs {
-        let fresh_counter = ctx.fresh_counter_handle();
-        for (&id, cert) in fn_certs.iter() {
+        for (&id, def) in fn_certs.iter() {
             let name = ctx.member_name(id);
             let func = crate::verify::func_registry::func_id_for_member(id);
             ctx.axiom_rules.push(crate::verify::rewrite::function_rule(
                 &name,
                 func,
-                std::sync::Arc::clone(cert),
-                std::sync::Arc::clone(&fresh_counter),
+                std::sync::Arc::clone(def),
             ));
         }
     }
@@ -1461,7 +1502,7 @@ pub(crate) fn verify_method(
     method_name: &str,
     method: &Method,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionCertificate>>,
+    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionDefinition>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<(), VerifyError> {
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
@@ -1494,7 +1535,7 @@ pub(crate) fn verify_resource(
     resource_name: &str,
     resource: &Resource,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionCertificate>>,
+    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionDefinition>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<Option<ResourceCertificate>, VerifyError> {
     let Some(body) = resource.body.as_ref() else {
@@ -1590,44 +1631,37 @@ pub(crate) fn verify_resource(
     }))
 }
 
-/// Verify a non-recursive function: walk its body in a fresh egraph with fresh
-/// symbolic params (`Val::Temp(0..n_params)`), discharging the stitched
-/// entry-`assume f#requires` contract instruction, then snapshot the
-/// (unsaturated) result e-class into a [`FunctionCertificate`] for other units
-/// to lazily unfold at call sites (see `rewrite::function_rule`). Abstract
-/// functions (no body) have nothing to verify.
+/// Verify a non-recursive function and capture its body as a **pure term
+/// recipe** ([`FunctionDefinition`]) for other units to unfold lazily at call
+/// sites (`rewrite::function_rule`). Abstract functions (no body) have nothing
+/// to verify.
 ///
-/// The certificate is captured **without** an extra final `ctx.saturate()` —
-/// only the ordinary per-inst walk's own resolution, so the body's literal
-/// shape survives for pattern-triggered rules (quantifier/axiom instantiation,
-/// keyed on `FuncApp` occurrences) to still see at unfold time, rather than
-/// whatever structural simplifications a pre-emptive saturation would have
-/// baked in.
-///
-/// A **heap-dependent** function's snapshot parameter seeds like any other param
-/// (a fresh symbolic of `Type::Snap(req)`); its entry `FromSnap` reconstructs the
-/// precondition heap `H(s)` and each body `Deref` congruence-resolves against
-/// those chunks (`unwrap(proj_i(s))`). By the time this walk finishes, the
-/// body's result e-class is already a pure symbolic term over the params
-/// (including the snapshot param) regardless of heap-dependence — there is no
-/// `Heap`/`HeapVal` node in the `Symbolic` e-graph language, only ordinary
-/// `FuncApp`/`Ite`/`Binary` terms — so heap-free and heap-dependent functions
-/// are captured and consumed identically; no special-casing needed here.
+/// The walk runs the ordinary live eval (obligations, `FromSnap`/`Unfold` heap
+/// reconstruction, `Deref` values), logging each heap-reconstruction event into
+/// `ctx.heap_events`. Then [`purify_function`] re-walks the body once, turning it
+/// into an add-only recipe over the params (and the snapshot param, for
+/// heap-dependent functions): every `Deref` becomes the pure term the snapshot
+/// projects to (`unwrap(proj_i(snap))`, possibly nested through `unfolding`), and
+/// the entry `assume f#requires` is **dropped**. That drop is the whole point —
+/// the old design cloned the verified e-graph, so a precondition-derived merge
+/// (e.g. `g(x) ≡ 5` from `requires g(x)==5` once a body obligation saturated)
+/// rode into every call site via `transplant`; a recipe imports no e-classes, so
+/// it cannot leak (Finding B).
 ///
 /// Callees — including the function's own `f#requires`/`f#ensures` contract
 /// functions — are ordinary `Function` decls verified earlier in dependency
-/// order, so their certificates are already in `fn_certs`, and `assume_axioms`
-/// (called at the top of this function's own `ctx` setup) has already
-/// installed their unfold rules — saturation (triggered constantly via
-/// `prove_under_pc`) discharges the contract obligations lazily as needed.
+/// order, so their recipes are already in `fn_certs`, and `assume_axioms`
+/// (called at the top of this function's own `ctx` setup) has already installed
+/// their unfold rules — saturation (triggered via `prove_under_pc`) discharges
+/// the contract obligations lazily as needed.
 pub(crate) fn verify_function(
     program: &vmir::Program,
     function_name: &str,
     function: &Function,
     certs: &HashMap<MemberId, ResourceCertificate>,
-    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionCertificate>>,
+    fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionDefinition>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> Result<Option<std::sync::Arc<FunctionCertificate>>, VerifyError> {
+) -> Result<Option<std::sync::Arc<FunctionDefinition>>, VerifyError> {
     let Some(body) = function.body.as_ref() else {
         // Abstract/uninterpreted function: no body to verify, no certificate.
         return Ok(None);
@@ -1635,6 +1669,7 @@ pub(crate) fn verify_function(
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
+    ctx.heap_events = Some(Vec::new()); // record FromSnap/Unfold for purification
     assume_axioms(&mut ctx, program)?;
     // Params seed the initial `Val::Temp(0..n_params)` slots (heap-free: no ctx heap).
     let params: Vec<egg::Id> = function
@@ -1648,8 +1683,8 @@ pub(crate) fn verify_function(
     let mut snap = Snapshotter::from_env(function_name);
     snap.snapshot(&ctx, &[], "init", None);
     // The method-body eval path handles every inst a function body can contain
-    // (pure ops, the entry/exit `assume`/`assert`, and `Snap`/`FromSnap` for
-    // heap-dependent functions).
+    // (pure ops, the entry `assume`, `Snap`/`FromSnap`/`Unfold` for heap-dependent
+    // functions).
     walk_body(
         &mut ctx,
         program,
@@ -1661,18 +1696,257 @@ pub(crate) fn verify_function(
         None,
     )?;
 
-    // No extra saturation here (see the doc comment above) — snapshot the
-    // canonicalized result/param roots as they stand after the ordinary walk.
-    let result = state.get_val(&mut ctx, &body.res);
-    let result = ctx.egraph.find(result);
-    let params = params.iter().map(|&p| ctx.egraph.find(p)).collect();
-    Ok(Some(std::sync::Arc::new(FunctionCertificate {
-        egraph: ctx.egraph.clone(),
-        fresh_types: ctx.fresh_types.clone(),
-        func_ret_types: ctx.func_ret_types.clone(),
-        params,
-        result,
+    // Turn the walked body into a pure, add-only recipe (params → args at call
+    // sites via `build_instance`), using the event log to reconstruct `Deref`
+    // values as `unwrap(proj_i(snap))` terms.
+    let events = ctx.heap_events.take().unwrap_or_default();
+    let (steps, res) = purify_function(&mut ctx, function, body, &state, &events)?;
+    Ok(Some(std::sync::Arc::new(FunctionDefinition {
+        n_params: function.params.len(),
+        steps,
+        res,
     })))
+}
+
+/// Turn a walked function body into a pure recipe `(steps, res)` in dense
+/// recipe-temp space (params `Temp(0..n_params)`, one slot per emitted step).
+/// Re-walks `body.insts` maintaining `map: body-temp → recipe Val` (seeded with
+/// the params) and `at: canonical address → recipe value term`, consuming the
+/// ordered `events` for the `FromSnap`/`Unfold` slot addresses. Reads the live
+/// `state.vals` (finalized after the walk) to resolve each `Deref`'s address to a
+/// footprint slot by congruence.
+fn purify_function(
+    ctx: &mut VerifyContext<'_>,
+    function: &Function,
+    body: &vmir::FunctionBody,
+    state: &EvalState,
+    events: &[HeapEvent],
+) -> Result<(Vec<crate::verify::rewrite::AxiomInst>, Val), VerifyError> {
+    use crate::verify::rewrite::{AxiomInst, AxiomPure};
+
+    let n_params = function.params.len();
+    let mut steps: Vec<AxiomInst> = Vec::new();
+    // body-temp → recipe Val, seeded with the params (identity).
+    let mut map: Vec<Val> = (0..n_params).map(Val::Temp).collect();
+    let mut at: HashMap<egg::Id, Val> = HashMap::new();
+    let mut events = events.iter();
+
+    // Emit a pure step, returning its dense recipe temp.
+    let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
+        let v = Val::Temp(n_params + steps.len());
+        steps.push(AxiomInst::Val(pure));
+        v
+    };
+    // Translate a body-space operand into recipe space.
+    let tr = |map: &[Val], v: &Val| -> Val {
+        match v {
+            Val::Temp(n) => map[*n].clone(),
+            Val::Literal(l) => Val::Literal(l.clone()),
+        }
+    };
+    // The `option_value` accessor (`unwrap`) is monomorphic-per-elem.
+    let project_unwrap = |ctx: &mut VerifyContext<'_>,
+                          steps: &mut Vec<AxiomInst>,
+                          resource: MemberId,
+                          index: usize,
+                          elem: Type,
+                          snap: Val|
+     -> Val {
+        let proj = ctx.alloc.proj(resource, 0, index);
+        let opt = emit(
+            steps,
+            AxiomPure::App {
+                func: proj,
+                type_args: Vec::new(),
+                args: vec![snap],
+            },
+        );
+        let value = ctx.alloc.option_value();
+        emit(
+            steps,
+            AxiomPure::App {
+                func: value,
+                type_args: vec![elem],
+                args: vec![opt],
+            },
+        )
+    };
+
+    // Per-resource footprint element types (`option_inner` of each snapshot field).
+    let slot_elems = |resource: MemberId| -> Result<Vec<Type>, VerifyError> {
+        let vmir::Declaration::Resource(r) = &ctx.decls[resource] else {
+            return Err(VerifyError::DependencyFailed);
+        };
+        let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
+            return Err(VerifyError::Unimplemented(
+                "purify: abstract resource footprint",
+            ));
+        };
+        Ok(snap
+            .variants
+            .into_iter()
+            .next()
+            .unwrap()
+            .field_types
+            .iter()
+            .map(|t| t.option_inner().unwrap_or(t).clone())
+            .collect())
+    };
+
+    for inst in &body.insts {
+        match &inst.kind {
+            InstKind::Pure(_, PureInst::Deref(_, addr)) => {
+                // The deref's address, live e-class, keys the recipe value term.
+                let addr_id = state.get_val(ctx, addr);
+                let ec = ctx.egraph.find(addr_id);
+                let v = at.get(&ec).cloned().ok_or(VerifyError::Unimplemented(
+                    "purify: deref outside footprint",
+                ))?;
+                map.push(v);
+            }
+            InstKind::Pure(_, PureInst::Perm(..) | PureInst::Snap { .. }) => {
+                return Err(VerifyError::Unimplemented(
+                    "purify: perm/nested-snap in function",
+                ));
+            }
+            InstKind::Pure(_, PureInst::Fresh) => {
+                unreachable!("function body may not contain Fresh (method-only)");
+            }
+            InstKind::Pure(_, pi) => {
+                let v = match pi {
+                    PureInst::Binary(op, l, r) => {
+                        emit(&mut steps, AxiomPure::Binary(*op, tr(&map, l), tr(&map, r)))
+                    }
+                    PureInst::Ternary(c, t, e) => emit(
+                        &mut steps,
+                        AxiomPure::Ternary(tr(&map, c), tr(&map, t), tr(&map, e)),
+                    ),
+                    PureInst::RealCast(x) => emit(&mut steps, AxiomPure::RealCast(tr(&map, x))),
+                    PureInst::FunctionCall(fc) => emit(
+                        &mut steps,
+                        AxiomPure::App {
+                            func: crate::verify::func_registry::func_id_for_member(fc.function),
+                            type_args: fc.type_args.clone(),
+                            args: fc.args.iter().map(|a| tr(&map, a)).collect(),
+                        },
+                    ),
+                    PureInst::AdtCons {
+                        adt,
+                        type_args,
+                        variant,
+                        args,
+                    } => {
+                        let func = ctx.alloc.cons(*adt, *variant);
+                        emit(
+                            &mut steps,
+                            AxiomPure::App {
+                                func,
+                                type_args: type_args.clone(),
+                                args: args.iter().map(|a| tr(&map, a)).collect(),
+                            },
+                        )
+                    }
+                    PureInst::AdtProj {
+                        adt,
+                        type_args,
+                        variant,
+                        field,
+                        base,
+                    } => {
+                        let func = ctx.alloc.proj(*adt, *variant, *field);
+                        emit(
+                            &mut steps,
+                            AxiomPure::App {
+                                func,
+                                type_args: type_args.clone(),
+                                args: vec![tr(&map, base)],
+                            },
+                        )
+                    }
+                    PureInst::AdtTag {
+                        adt,
+                        type_args,
+                        base,
+                    } => {
+                        let func = ctx.alloc.tag(*adt);
+                        emit(
+                            &mut steps,
+                            AxiomPure::App {
+                                func,
+                                type_args: type_args.clone(),
+                                args: vec![tr(&map, base)],
+                            },
+                        )
+                    }
+                    PureInst::Fresh
+                    | PureInst::Deref(..)
+                    | PureInst::Perm(..)
+                    | PureInst::Snap { .. } => unreachable!("handled above"),
+                };
+                map.push(v);
+            }
+            // `FromSnap R(args), snap`: each slot value reconstructs as
+            // `unwrap(proj_i(snap))`.
+            InstKind::Heap(HeapInst::FromSnap { resource, snap, .. }) => {
+                let Some(HeapEvent::FromSnap { slots }) = events.next() else {
+                    unreachable!("FromSnap inst without a logged FromSnap event");
+                };
+                let snap_recipe = tr(&map, snap);
+                let elems = slot_elems(*resource)?;
+                for (i, &addr) in slots.iter().enumerate() {
+                    let v = project_unwrap(
+                        ctx,
+                        &mut steps,
+                        *resource,
+                        i,
+                        elems[i].clone(),
+                        snap_recipe.clone(),
+                    );
+                    at.insert(ctx.egraph.find(addr), v);
+                }
+            }
+            // `Unfold P(args)`: the consumed predicate chunk's recipe term `s` is
+            // the snapshot the new footprint slots project from.
+            InstKind::Heap(HeapInst::Unfold { call, .. }) => {
+                let Some(HeapEvent::Unfold { pred, slots }) = events.next() else {
+                    unreachable!("Unfold inst without a logged Unfold event");
+                };
+                let s =
+                    at.get(&ctx.egraph.find(*pred))
+                        .cloned()
+                        .ok_or(VerifyError::Unimplemented(
+                            "purify: unfold of unheld predicate",
+                        ))?;
+                let elems = slot_elems(call.resource)?;
+                for (j, &addr) in slots.iter().enumerate() {
+                    let v = project_unwrap(
+                        ctx,
+                        &mut steps,
+                        call.resource,
+                        j,
+                        elems[j].clone(),
+                        s.clone(),
+                    );
+                    at.insert(ctx.egraph.find(addr), v);
+                }
+            }
+            // A function body may `fold` (via `folding … in …`); not yet purified.
+            InstKind::Heap(HeapInst::Fold { .. }) => {
+                return Err(VerifyError::Unimplemented("purify: fold in function body"));
+            }
+            InstKind::Heap(_) => {
+                unreachable!("function body may not contain inhale/exhale/combine/assign");
+            }
+            // The entry `assume f#requires` (and any asserts) are dropped — that is
+            // what keeps the precondition out of the recipe (Finding B). They
+            // produce no body temp, so `map` stays aligned.
+            InstKind::Assume(_) | InstKind::Assert(_) => {}
+            InstKind::Refute(_) => unreachable!("function body may not contain refute"),
+        }
+    }
+
+    let res = tr(&map, &body.res);
+    Ok((steps, res))
 }
 
 /// Proof obligations implied by an instruction's kind, as `(goal, error)` pairs

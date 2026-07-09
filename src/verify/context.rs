@@ -5,9 +5,7 @@ use egg::Id;
 use crate::{
     verify::{
         analysis::ConstFold,
-        cert::{
-            FunctionCertificate, ResourceCertificate, TransplantSink, Transplanted, transplant,
-        },
+        cert::{FunctionDefinition, ResourceCertificate, TransplantSink, Transplanted, transplant},
         func_registry::FuncRegistry,
         heap::{Chunk, Heap},
         lang::{FuncId, Symbolic},
@@ -33,12 +31,13 @@ pub(crate) struct VerifyContext<'a> {
     /// per already-certified `fn_certs` entry — see `rewrite::function_rule`).
     /// Chained into full saturation (incl. the tier-3 probe) but not `reduce`.
     pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
-    /// Monotonic source of fresh-value ids, shared (not just owned) because a
-    /// saturation-time rewrite applier (the function-unfold rule) also mints
-    /// fresh placeholders via [`transplant`] and must draw from the exact same
-    /// counter as [`Self::fresh_symbolic_value`] — `Symbolic::Fresh(n)` is
-    /// hash-consed, so two independently-minted fresh values that happened to
-    /// reuse the same `n` would silently merge into one e-class.
+    /// Monotonic source of fresh-value ids. Still an `Arc<Mutex>` only because the
+    /// resource-grafting [`transplant`] path mints fresh placeholders and its
+    /// signature threads the shared counter (so a placeholder never reuses a live
+    /// `Symbolic::Fresh(n)` and silently merges). The function-unfold rule no
+    /// longer transplants (it rebuilds an add-only recipe), so nothing
+    /// saturation-time draws from this anymore — Phase 4 (deleting `transplant`)
+    /// can collapse it to a plain `u32`.
     fresh_counter: std::sync::Arc<std::sync::Mutex<u32>>,
     /// Cheap string repr for member/constructor names.
     pub(crate) interner: &'a Rodeo,
@@ -61,7 +60,13 @@ pub(crate) struct VerifyContext<'a> {
     /// reads this to install one lazy unfold rule per entry into `axiom_rules`
     /// (see `rewrite::function_rule`). `None` in isolated contexts (unit tests)
     /// that never evaluate a `FunctionCall`.
-    pub(crate) fn_certs: Option<&'a HashMap<MemberId, std::sync::Arc<FunctionCertificate>>>,
+    pub(crate) fn_certs: Option<&'a HashMap<MemberId, std::sync::Arc<FunctionDefinition>>>,
+    /// Ordered log of heap-reconstruction events (`FromSnap`/`Unfold` slot
+    /// addresses), recorded during a **function** body walk so the post-walk
+    /// purification pass can rebuild each `Deref`'s value as a pure recipe term
+    /// (`unwrap(proj_i(snap))`). `None` for methods and resources — they never
+    /// purify. See `declaration::purify_function`.
+    pub(crate) heap_events: Option<Vec<crate::verify::declaration::HeapEvent>>,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -84,6 +89,7 @@ impl<'a> VerifyContext<'a> {
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
             fn_certs: None,
+            heap_events: None,
         }
     }
 
@@ -462,15 +468,6 @@ impl<'a> VerifyContext<'a> {
         };
         self.fresh_types.insert(id, ty);
         self.egraph.add(Symbolic::Fresh(id))
-    }
-
-    /// A handle to the shared fresh-value counter, for threading into a
-    /// saturation-time rewrite applier (the function-unfold rule) that needs
-    /// to mint ids from the exact same monotonic source as
-    /// [`Self::fresh_symbolic_value`]. See the field's doc comment for why
-    /// this must be shared rather than copied.
-    pub(crate) fn fresh_counter_handle(&self) -> std::sync::Arc<std::sync::Mutex<u32>> {
-        std::sync::Arc::clone(&self.fresh_counter)
     }
 
     /// Build `antecedents ==> consequent` as a right-associative chain of `Ite`

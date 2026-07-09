@@ -61,7 +61,7 @@ pub fn verify_with_stats(analyzed: &vmir::AnalyzedProgram) -> (Vec<VerifyResult>
     // occurrence is seen during that unit's own saturation.
     let mut fn_certs: std::collections::HashMap<
         vmir::MemberId,
-        std::sync::Arc<cert::FunctionCertificate>,
+        std::sync::Arc<cert::FunctionDefinition>,
     > = std::collections::HashMap::new();
     // Shared function-id registry: one per run so ADT/builtin ids stay
     // consistent across certificate grafts. Threaded `&mut` into each unit.
