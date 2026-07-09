@@ -1,12 +1,22 @@
 //! Parse + typecheck + translate + verify.
 //!
-//! Usage: `cargo run --bin verify -- cases/foo.vpr`
+//! Usage: `cargo run --bin verify -- [--breakdown] cases/foo.vpr`
+//!
+//! `--breakdown` (`-b`) prints per-member verify times, slowest first.
 
 use silver_oxide::pipeline;
 use std::{error::Error, path::Path};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let file = std::env::args().nth(1).ok_or("usage: verify <file.vpr>")?;
+    let mut file = None;
+    let mut breakdown = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--breakdown" | "-b" => breakdown = true,
+            _ => file = Some(arg),
+        }
+    }
+    let file = file.ok_or("usage: verify [--breakdown] <file.vpr>")?;
 
     match pipeline::run_file_timed(Path::new(&file)) {
         Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
@@ -22,11 +32,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             eprintln!("[TIMING]\n{timings}");
-            let mut breakdown = member_times.clone();
-            breakdown.sort_by(|a, b| b.1.cmp(&a.1));
-            eprintln!("[VERIFY-BREAKDOWN] (slowest first)");
-            for (name, dur) in &breakdown {
-                eprintln!("  {name:<24} {dur:>10.3?}");
+            if breakdown {
+                let mut rows = member_times.clone();
+                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                eprintln!("[VERIFY-BREAKDOWN] (slowest first)");
+                for (name, dur) in &rows {
+                    eprintln!("  {name:<24} {dur:>10.3?}");
+                }
             }
             eprintln!("[STATS] {stats:?}");
         }
