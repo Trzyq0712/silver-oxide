@@ -155,10 +155,11 @@ territory iff, after evaluation with binders as fresh values, some slot's
 1. It is the *slot* that matters, not the call and not the value read —
    binders in non-footprint argument positions are fine (they flow into the
    pure `f(args, s)` call, the heap is untouched).
-2. The test is semantic-after-simplification, not syntactic: `acc(P(i - i))`
-   mentions `i` but the e-graph normalizes the address to `P@addr(0)` — the
-   snapshot works. The practical check is whether the address's e-class
-   contains the fresh binder.
+2. The *semantic* boundary is after-simplification, not syntactic:
+   `acc(P(i - i))` mentions `i` but the address normalizes to `P@addr(0)` —
+   a snapshot would work. Enforcement, however, is syntactic (see
+   "Translation-time detection" below), so such cases are conservatively
+   rejected.
 3. A binder-dependent precondition **bool** is *not* QP. With a constant
    footprint but `f#requires` bool `i > 0`, the heap part snapshots once;
    the bool cannot be asserted once at encounter (it mentions `i`), so it
@@ -168,10 +169,38 @@ territory iff, after evaluation with binders as fresh values, some slot's
    implication-guarded WD is threaded — same shape as the deferred-WD
    plan). Only the *spatial* part draws the QP line.
 
-The boundary is **operationally self-enforcing**: encounter-time `Snap`
-evaluation with fresh binders performs the frontend's syntactic chunk lookup,
-and a binder-dependent address matches no held chunk → translation error. No
-separate classifier is needed; the failure is the detector.
+##### Translation-time detection
+
+The boundary is enforceable at **translation time by construction**, because
+framing already lives there: footprint sufficiency is decided by the
+frontend's syntactic state tracker (Pillar 1 — `HashSet` of available
+resource instances, syntactic-equality lookup, compile error on miss).
+Translating a forall body with binders as opaque locals, emitting the `Snap`
+requires finding `f`'s footprint chunks in the tracker; an address mentioning
+a binder matches nothing ever held → `TranslationError`. The failure is the
+detector — no separate classifier is needed for *soundness*.
+
+Note this check is purely syntactic (translation has no e-graph), hence
+strictly more conservative than the semantic boundary above: `acc(P(i - i))`
+is rejected even though semantically constant. Acceptable while QP is
+unsupported — every rejection is of something unsupported anyway, so no
+completeness is lost until QP lands.
+
+For a *good error message*, add a targeted classifier: a per-function
+**footprint-dependency summary**, computed once when lowering `f#requires` —
+the set of parameters that (transitively) reach an `Acc` address argument or
+a perm expression. At forall lowering, binder dataflow into a call arg whose
+parameter is footprint-relevant → a dedicated "this quantifier needs
+quantified permissions" error instead of a generic missing-permission framing
+error. Covers indirection (`lookup(a, i)` — the arg contains the binder) and
+perm-amount dependence (the summary includes perm exprs). Pure syntactic
+dataflow, one pass, decidable.
+
+Caveat for later: the translation-time line is stricter than what
+Viper/Silicon accept — they check WD semantically and can admit a
+binder-dependent-looking footprint that is provably framed (by a held QP, or
+a provably constant address). When QP support lands, the check either moves
+partly to verify time or the conservative line is kept deliberately.
 
 This matches Viper's line: a pure forall calling a heap-dependent function is
 legal without QP exactly when the precondition's permissions are provable for
