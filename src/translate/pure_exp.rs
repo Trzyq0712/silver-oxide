@@ -168,7 +168,12 @@ pub(crate) fn lower<Ext: PureExt>(
                 },
             ))
         }
-        P::LetIn { .. } => Err(TranslationError::Unsupported("let-in")),
+        P::LetIn { binder, value, exp } => {
+            let val = lower(b, env, sink, hctx, value)?;
+            let mut inner_env = env.clone();
+            inner_env.insert(binder.0, val);
+            lower(b, &inner_env, sink, hctx, exp)
+        }
         P::AdtDestructor(base, field) => {
             // `e.f` ⇒ `AdtProj{adt, variant, field}(e)`. The verifier's
             // projection reduction folds it when `e` is a known constructor.
