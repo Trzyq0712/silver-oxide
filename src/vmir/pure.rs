@@ -173,7 +173,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
             PureInst::AdtCons {
                 adt, variant, args, ..
             } => {
-                write!(f, "{}::#{variant}(", self.member(*adt))?;
+                write!(f, "{}(", self.adt_variant(*adt, *variant))?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -188,7 +188,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 field,
                 base,
                 ..
-            } => write!(f, "{}::#{variant}.{field}({base})", self.member(*adt)),
+            } => write!(f, "{}.{field}({base})", self.adt_variant(*adt, *variant)),
             PureInst::AdtTag { adt, base, .. } => {
                 write!(f, "{}@tag({base})", self.member(*adt))
             }

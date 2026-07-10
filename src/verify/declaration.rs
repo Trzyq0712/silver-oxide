@@ -1627,7 +1627,10 @@ pub(crate) fn verify_function(
     // A recursive function records its limited twin so the unfold rule frames
     // `f(x) == f'(x)`. Minted here (not in the recipe) so the id exists even if
     // the body has no reachable recursive call under some path.
-    let limited = recursive_scc.map(|_| ctx.alloc.limited(self_id));
+    let limited = recursive_scc.map(|_| {
+        let name = ctx.member_name(self_id);
+        ctx.alloc.limited(self_id, &name)
+    });
     Ok(Some(std::sync::Arc::new(FunctionDefinition {
         n_params: function.params.len(),
         steps,
@@ -1792,7 +1795,8 @@ fn purify_function(
                         // recipe at a call site stops after one level. Every other
                         // callee keeps its full id and unfolds normally.
                         let func = if recursive_scc.is_some_and(|s| s.contains(&fc.function)) {
-                            ctx.alloc.limited(fc.function)
+                            let name = ctx.member_name(fc.function);
+                            ctx.alloc.limited(fc.function, &name)
                         } else {
                             crate::verify::func_registry::func_id_for_member(fc.function)
                         };

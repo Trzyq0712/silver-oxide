@@ -50,6 +50,21 @@ impl<'a, T> VmirDisplay<'a, T> {
     pub(super) fn member(&self, id: MemberId) -> &'a str {
         self.interner.resolve(&self.decls[id].name())
     }
+
+    /// The qualified constructor label of variant `variant` of ADT `adt`, e.g.
+    /// `Nat::Succ` for a named constructor, or `Nat::#1` when the variant is
+    /// anonymous (a synthetic snapshot variant). Mirrors the verifier's minted-id
+    /// naming (`func_registry`).
+    pub(super) fn adt_variant(&self, adt: MemberId, variant: usize) -> String {
+        let base = self.member(adt);
+        match &self.decls[adt] {
+            Declaration::Adt(a) => match a.variants.get(variant).and_then(|v| v.name) {
+                Some(name) => format!("{base}::{}", self.interner.resolve(&name)),
+                None => format!("{base}::#{variant}"),
+            },
+            _ => format!("{base}::#{variant}"),
+        }
+    }
 }
 
 impl Program {

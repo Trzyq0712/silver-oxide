@@ -199,13 +199,14 @@ impl FuncRegistry {
     /// further, bounding saturation. A full `f`'s unfold rule additionally frames
     /// `f(x) == f'(x)` so a materialized `f(x)` value flows to its twin. Distinct
     /// `classes_by_op` bucket from `f`, and from every ADT concept id, since it is
-    /// minted from the same monotonic counter.
-    pub fn limited(&mut self, func: MemberId) -> FuncId {
+    /// minted from the same monotonic counter. `name` is the function's source
+    /// name (the registry holds no interner), used only for the display label
+    /// `name#lim`.
+    pub fn limited(&mut self, func: MemberId, name: &str) -> FuncId {
         if let Some(&id) = self.limited.get(&func) {
             return id;
         }
-        let name = self.label(func);
-        let id = self.mint(format!("{name}#limited"));
+        let id = self.mint(format!("{name}#lim"));
         self.limited.insert(func, id);
         id
     }
