@@ -1,0 +1,16 @@
+// The limited-function encoding is fuel-free: proving double(Succ(Zero())) needs
+// double(Zero()) to be materialized first (so double'(Zero()) == Zero() is known
+// via framing). Without that seed, double(Succ(Zero())) only reduces to
+// Succ(Succ(double'(Zero()))) with double'(Zero()) uninterpreted, so the assert
+// must FAIL — guarding against accidental unbounded/over-unfolding.
+adt Nat {
+    Zero()
+    Succ(pred: Nat)
+}
+
+function double(n: Nat): Nat
+{ n.isZero ? Zero() : Succ(Succ(double(n.pred))) }
+
+method client() {
+    assert double(Succ(Zero())) == Succ(Succ(Zero()))
+}

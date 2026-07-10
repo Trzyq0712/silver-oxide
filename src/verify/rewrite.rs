@@ -843,6 +843,17 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             if egraph.union(eclass, result) {
                 changed.push(egraph.find(eclass));
             }
+            // Recursive function: frame the full occurrence to its limited twin
+            // `f(args) == f'(args)`. `f'` has no unfold rule, so a limited call
+            // produced by unfolding `f`'s body never re-unfolds (bounding
+            // saturation); the frame lets a materialized `f(args)` value flow to
+            // any `f'(args)` a sibling unfold produced.
+            if let Some(lim) = self.def.limited {
+                let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.into()));
+                if egraph.union(eclass, twin) {
+                    changed.push(egraph.find(eclass));
+                }
+            }
         }
         changed
     }

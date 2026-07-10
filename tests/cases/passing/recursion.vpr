@@ -1,0 +1,24 @@
+// Recursive function via the limited-function encoding, on a Peano-nat ADT so
+// the recursion is exercised through tag/constructor reductions with no integer
+// arithmetic. `double` unfolds once to `Succ(Succ(double'(n.pred)))`; the limited
+// twin `double'` never re-unfolds, bounding saturation. Framing `double(x) ==
+// double'(x)` lets a materialized full value flow to its twin.
+adt Nat {
+    Zero()
+    Succ(pred: Nat)
+}
+
+function double(n: Nat): Nat
+{ n.isZero ? Zero() : Succ(Succ(double(n.pred))) }
+
+method client() {
+    // Not provable yet: only double(Succ(Zero())) is materialized, unfolding to
+    // Succ(Succ(double'(Zero()))) with double'(Zero()) still uninterpreted.
+    refute double(Succ(Zero())) == Succ(Succ(Zero()))
+
+    // Materialize double(Zero()) == Zero(); framing gives double'(Zero()) == Zero().
+    assert double(Zero()) == Zero()
+
+    // Now provable by congruence: Succ(Succ(double'(Zero()))) == Succ(Succ(Zero())).
+    assert double(Succ(Zero())) == Succ(Succ(Zero()))
+}

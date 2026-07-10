@@ -1,0 +1,29 @@
+// Mutual recursion: `is_even` and `is_odd` form one function SCC, verified as a
+// batch. Each body calls the *limited* twin of the other (`is_odd'` / `is_even'`,
+// uninterpreted), so unfolding halts after one level; framing `f(x) == f'(x)`
+// links a materialized full value to its twin. Peano-nat ADT keeps it arithmetic-
+// free — the branch is a tag check, no `Int` reasoning.
+adt Nat {
+    Zero()
+    Succ(pred: Nat)
+}
+
+function is_even(n: Nat): Bool
+{ n.isZero ? true : is_odd(n.pred) }
+
+function is_odd(n: Nat): Bool
+{ n.isZero ? false : is_even(n.pred) }
+
+method client() {
+    // True-valued (2 is even) but not provable yet: is_even(2) reduces to
+    // is_odd'(1) with is_odd'(1) still uninterpreted.
+    refute is_even(Succ(Succ(Zero()))) == true
+
+    // Seed bottom-up. Each assert materializes a full application whose framing
+    // then defines the limited twin the next level needs.
+    assert is_even(Zero()) == true                 // is_even'(0) := true
+    assert is_odd(Succ(Zero())) == true            // uses is_even'(0); is_odd'(1) := true
+
+    // Now provable by congruence through the twins: is_even(2) == is_odd'(1) == true.
+    assert is_even(Succ(Succ(Zero()))) == true
+}

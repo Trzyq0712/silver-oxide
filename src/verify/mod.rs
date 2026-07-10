@@ -42,22 +42,17 @@ pub fn verify_with_stats(
     let program = &analyzed.program;
     let mut results = Vec::new();
     let mut member_times: Vec<(String, std::time::Duration)> = Vec::new();
-    // Derive a linear order from the dependency graph; acyclicity was already
-    // proven by `analyze`. A future parallel scheduler consumes the graph
-    // directly instead.
-    let order = petgraph::algo::toposort(&analyzed.dep_graph, None)
-        .expect("dep_graph proven acyclic by analyze");
-    // Refine the order: all functions/resources before any method (valid —
-    // nothing ever depends on a method). Domain axioms are assumed in every
-    // unit and may call Silver functions; verifying methods last guarantees
-    // every function certificate exists by the time the main assertion-bearing
-    // units (methods) assume the axioms. (Inside the function/resource passes
-    // an axiom mentioning a not-yet-verified function stays sound — the call
-    // is merely uninterpreted, i.e. weaker.)
-    let (early, methods): (Vec<_>, Vec<_>) = order
-        .into_iter()
-        .partition(|&id| !matches!(program.decls[id], vmir::Declaration::Method(_)));
-    let order = early.into_iter().chain(methods);
+    // The dependency graph's SCCs in dependency-first order (from `analyze`; may
+    // contain recursive function groups). Refine: all function/resource groups
+    // before any method group (valid — nothing ever depends on a method).
+    // Method groups are always singletons, so this never splits a recursive SCC.
+    // Verifying methods last guarantees every function certificate exists by the
+    // time the assertion-bearing methods assume the axioms.
+    let (early, methods): (Vec<_>, Vec<_>) = analyzed.scc_order.iter().cloned().partition(|g| {
+        !g.iter()
+            .any(|&id| matches!(program.decls[id], vmir::Declaration::Method(_)))
+    });
+    let groups = early.into_iter().chain(methods);
     // Resources are verified before the methods that use them (dependency
     // order), so each resource's proof certificate is cached and grafted at
     // call sites rather than re-walking the body.
@@ -75,7 +70,52 @@ pub fn verify_with_stats(
     // Shared function-id registry: one per run so ADT/builtin ids stay
     // consistent across certificate grafts. Threaded `&mut` into each unit.
     let mut alloc = func_registry::FuncRegistry::new(program);
-    for id in order {
+    for group in groups {
+        // A recursion cycle (multi-member SCC, or a self-looping singleton) is a
+        // batch of functions verified together: each with its in-SCC calls routed
+        // to limited twins (uninterpreted during the batch), and all their
+        // certificates inserted into `fn_certs` only after the whole batch is
+        // verified — so no member sees another's (or its own) unfold rule while
+        // being verified, which is what makes recursion terminate.
+        let recursive = group.len() > 1 || analyzed.dep_graph.contains_edge(group[0], group[0]);
+        if recursive {
+            let scc: std::collections::HashSet<vmir::MemberId> = group.iter().copied().collect();
+            let mut batch_defs = Vec::new();
+            for &id in &group {
+                let name = program.name(id).to_string();
+                let vmir::Declaration::Function(f) = &program.decls[id] else {
+                    unreachable!("analyze guarantees a recursive SCC contains only functions");
+                };
+                let start = std::time::Instant::now();
+                let outcome = match declaration::verify_function(
+                    program,
+                    &name,
+                    id,
+                    f,
+                    &certs,
+                    &fn_certs,
+                    Some(&scc),
+                    &mut alloc,
+                ) {
+                    Ok(None) => None,
+                    Ok(Some(cert)) => {
+                        batch_defs.push((id, cert));
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(e)),
+                };
+                let elapsed = start.elapsed();
+                if let Some(outcome) = outcome {
+                    member_times.push((name.clone(), elapsed));
+                    results.push((name, outcome));
+                }
+            }
+            for (id, cert) in batch_defs {
+                fn_certs.insert(id, cert);
+            }
+            continue;
+        }
+        let id = group[0];
         let name = program.name(id).to_string();
         let start = std::time::Instant::now();
         let outcome = match &program.decls[id] {
@@ -92,8 +132,9 @@ pub fn verify_with_stats(
                 }
             }
             vmir::Declaration::Function(f) => {
-                match declaration::verify_function(program, &name, f, &certs, &fn_certs, &mut alloc)
-                {
+                match declaration::verify_function(
+                    program, &name, id, f, &certs, &fn_certs, None, &mut alloc,
+                ) {
                     // Abstract functions produce no certificate and no result row.
                     Ok(None) => None,
                     Ok(Some(cert)) => {

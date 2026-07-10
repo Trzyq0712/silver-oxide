@@ -25,6 +25,12 @@ pub(crate) struct FunctionDefinition {
     pub(crate) n_params: usize,
     pub(crate) steps: Vec<AxiomInst>,
     pub(crate) res: Val,
+    /// The function's limited-twin id `f'`, `Some` iff the function is
+    /// (mutually) recursive. When set, its unfold rule additionally frames
+    /// `f(x) == f'(x)` at every full occurrence, and the recipe's own in-SCC
+    /// recursive calls already target `f'` (uninterpreted) so unfolding halts
+    /// after one level. `None` for a non-recursive function (unchanged behavior).
+    pub(crate) limited: Option<crate::verify::lang::FuncId>,
 }
 
 /// One seed slot of a [`BodyRecipe`]: resolved at graft time to an actual arg or

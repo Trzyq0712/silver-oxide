@@ -1,11 +1,14 @@
 //! Static analyses over a raw `vmir::Program`, producing an
 //! [`AnalyzedProgram`].
 //!
-//! Currently the only analysis is the verification order: dependencies are
-//! scheduled before dependents, and methods (always sinks) fall out last.
-//! Programs whose resources depend on each other circularly are rejected.
+//! The main analysis is the verification order: dependencies are scheduled
+//! before dependents, and methods (always sinks) fall out last. Strongly
+//! connected components (SCCs) of the dependency graph are computed so that
+//! (mutually) recursive **functions** can be verified as a group via the
+//! limited-function encoding. A cyclic SCC containing anything other than
+//! functions (a recursive resource/method) is still rejected.
 
-use petgraph::algo::{tarjan_scc, toposort};
+use petgraph::algo::tarjan_scc;
 use petgraph::prelude::DiGraphMap;
 
 use crate::vmir::{
@@ -14,7 +17,8 @@ use crate::vmir::{
 };
 
 /// Dependency graph: node = schedulable `MemberId`, edge dependency ->
-/// dependent. Acyclic once produced by [`analyze`].
+/// dependent. May contain cycles among functions (recursion); those are grouped
+/// into SCCs rather than rejected.
 pub type DepGraph = DiGraphMap<MemberId, ()>;
 
 /// A `Program` augmented with the results of static analyses. Extend with
@@ -22,17 +26,37 @@ pub type DepGraph = DiGraphMap<MemberId, ()>;
 #[derive(Debug, Clone)]
 pub struct AnalyzedProgram {
     pub program: Program,
-    /// Acyclic dependency graph over schedulable members. The single source
-    /// of truth for verification scheduling: a linear order is obtained by
-    /// toposorting on demand; a parallel scheduler dispatches a node once all
-    /// its dependencies are done.
+    /// Dependency graph over schedulable members. Edge dependency -> dependent.
+    /// May contain function recursion cycles (see [`AnalyzedProgram::scc_order`]).
     pub dep_graph: DepGraph,
+    /// The dependency graph's SCCs in **dependency-first** order: each inner
+    /// `Vec` is one SCC (a singleton for a non-recursive member; a multi-member
+    /// group or a self-looping singleton for (mutual) recursion). Verifying the
+    /// groups in this order schedules every dependency before its dependents; a
+    /// recursive group is verified as a unit (all members' certificates become
+    /// available together). The single source of truth for scheduling.
+    pub scc_order: Vec<Vec<MemberId>>,
+}
+
+impl AnalyzedProgram {
+    /// The set of members co-recursive with `m` (the members of `m`'s SCC),
+    /// **only if** that SCC is a genuine recursion cycle (multi-member, or a
+    /// self-looping singleton); `None` for an ordinary non-recursive member.
+    /// Call sites within a recursive function retarget in-set callees to their
+    /// limited twin.
+    pub fn recursive_scc(&self, m: MemberId) -> Option<std::collections::HashSet<MemberId>> {
+        let scc = self.scc_order.iter().find(|scc| scc.contains(&m))?;
+        let recursive = scc.len() > 1 || self.dep_graph.contains_edge(m, m);
+        recursive.then(|| scc.iter().copied().collect())
+    }
 }
 
 #[derive(Debug)]
 pub enum AnalysisError {
-    /// Resources depend on each other circularly and cannot be ordered for
-    /// verification. Carries the names of the members in the cycle.
+    /// A cyclic dependency that cannot be ordered for verification: either a
+    /// resource/method recursion, or a function recursion that drags in a
+    /// non-function member. (Function-only cycles are permitted — the
+    /// limited-function encoding handles them.) Carries the member names.
     CircularDependency(Vec<String>),
 }
 
@@ -49,13 +73,31 @@ impl std::fmt::Display for AnalysisError {
 /// Run all analyses over `program`, producing an [`AnalyzedProgram`].
 pub fn analyze(program: Program) -> Result<AnalyzedProgram, AnalysisError> {
     let dep_graph = build_dep_graph(&program);
-    // Toposort purely to validate acyclicity; the order itself is discarded
-    // (consumers derive their own on demand).
-    if toposort(&dep_graph, None).is_err() {
-        return Err(cycle_error(&program, &dep_graph));
+    // SCCs in reverse-topological order (petgraph's `tarjan_scc` contract);
+    // reversing yields dependency-first order for scheduling.
+    let mut scc_order: Vec<Vec<MemberId>> = tarjan_scc(&dep_graph);
+    scc_order.reverse();
+    // A genuine recursion cycle (multi-member SCC, or a self-looping singleton)
+    // is permitted only if every member is a function — the limited-function
+    // encoding handles those. Anything else (recursive resource/method, or a
+    // function cycle dragging in a non-function) is rejected.
+    for scc in &scc_order {
+        let cyclic = scc.len() > 1 || dep_graph.contains_edge(scc[0], scc[0]);
+        if cyclic
+            && !scc
+                .iter()
+                .all(|&id| matches!(program.decls[id], Declaration::Function(_)))
+        {
+            let names = scc.iter().map(|&id| program.name(id).to_string()).collect();
+            return Err(AnalysisError::CircularDependency(names));
+        }
     }
     dump_callgraph(&dep_graph, &program);
-    Ok(AnalyzedProgram { program, dep_graph })
+    Ok(AnalyzedProgram {
+        program,
+        dep_graph,
+        scc_order,
+    })
 }
 
 /// Build the dependency graph over `program`'s schedulable members
@@ -114,20 +156,6 @@ fn dump_callgraph(graph: &DepGraph, program: &Program) {
     {
         eprintln!("failed to write {path}: {e}");
     }
-}
-
-/// Build a `CircularDependency` error naming the members of a cycle.
-fn cycle_error(program: &Program, graph: &DepGraph) -> AnalysisError {
-    let mut names = Vec::new();
-    for scc in tarjan_scc(graph) {
-        let cyclic = scc.len() > 1 || graph.contains_edge(scc[0], scc[0]);
-        if cyclic {
-            for id in scc {
-                names.push(program.name(id).to_string());
-            }
-        }
-    }
-    AnalysisError::CircularDependency(names)
 }
 
 fn is_schedulable(decl: &Declaration) -> bool {
@@ -212,11 +240,38 @@ fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
 mod tests {
     use super::*;
     use crate::vmir::{
-        HeapInst, HeapVal, Inst, InstKind, PathConds, Precond, Resource, ResourceCall, write,
+        Function, FunctionBody, FunctionCall, HeapInst, HeapVal, Inst, InstKind, PathConds,
+        Precond, Resource, ResourceCall, Val, write,
     };
     use lasso::{Key, Rodeo};
     use std::collections::HashSet;
     use typed_index_collections::TiVec;
+
+    /// A function whose body calls `callee` (a plain, non-address `FunctionCall`),
+    /// creating a dependency edge `callee -> this`. `callee == self` yields a
+    /// self-recursive function.
+    fn function_calling(callee: MemberId) -> Declaration {
+        let call = FunctionCall {
+            function: callee,
+            type_args: vec![],
+            args: vec![].into(),
+        };
+        let inst = Inst {
+            pc: PathConds::default(),
+            heap: None,
+            kind: InstKind::Pure(Type::Int, PureInst::FunctionCall(call)),
+        };
+        Declaration::Function(Function {
+            name: lasso::Spur::try_from_usize(0).unwrap(),
+            ty_params: 0.into(),
+            params: vec![].into(),
+            ret: Type::Int,
+            body: Some(FunctionBody {
+                insts: vec![inst],
+                res: Val::Temp(0),
+            }),
+        })
+    }
 
     fn resource_requiring(req: Option<MemberId>) -> Declaration {
         Declaration::Resource(Resource {
@@ -309,13 +364,55 @@ mod tests {
         );
         let analyzed = analyze(prog).expect("acyclic");
         let m = MemberId(3);
-        // Linear chain → unique topo order.
-        let order = toposort(&analyzed.dep_graph, None).expect("acyclic");
+        // Linear chain → unique dependency-first SCC order (all singletons).
+        let order: Vec<MemberId> = analyzed.scc_order.iter().map(|scc| scc[0]).collect();
         assert_eq!(order, vec![c, b, a, m]);
         // Stored graph carries the dependency edges.
         assert!(analyzed.dep_graph.contains_edge(c, b));
         assert!(analyzed.dep_graph.contains_edge(b, a));
         assert!(analyzed.dep_graph.contains_edge(a, m));
+        // None of these are recursive.
+        assert!(analyzed.recursive_scc(a).is_none());
+    }
+
+    #[test]
+    fn self_recursive_function_accepted() {
+        // A function whose body calls itself: a self-looping singleton SCC —
+        // permitted (limited-function encoding), grouped as a recursive SCC.
+        let f = MemberId(0);
+        let prog = program(&["f"], vec![function_calling(f)]);
+        let analyzed = analyze(prog).expect("function recursion is accepted");
+        assert!(analyzed.dep_graph.contains_edge(f, f));
+        let scc = analyzed.recursive_scc(f).expect("f is recursive");
+        assert_eq!(scc, HashSet::from([f]));
+    }
+
+    #[test]
+    fn mutually_recursive_functions_accepted() {
+        // f calls g, g calls f: one two-member function SCC — permitted.
+        let f = MemberId(0);
+        let g = MemberId(1);
+        let prog = program(&["f", "g"], vec![function_calling(g), function_calling(f)]);
+        let analyzed = analyze(prog).expect("mutual function recursion is accepted");
+        let scc = analyzed.recursive_scc(f).expect("f is recursive");
+        assert_eq!(scc, HashSet::from([f, g]));
+        assert_eq!(analyzed.recursive_scc(g), Some(HashSet::from([f, g])));
+    }
+
+    #[test]
+    fn mutually_recursive_resources_rejected() {
+        // A cyclic SCC containing a non-function (here, resources) is still
+        // rejected — only function-only cycles are allowed.
+        let a = MemberId(0);
+        let b = MemberId(1);
+        let prog = program(
+            &["A", "B"],
+            vec![resource_requiring(Some(b)), resource_requiring(Some(a))],
+        );
+        assert!(matches!(
+            analyze(prog),
+            Err(AnalysisError::CircularDependency(_))
+        ));
     }
 
     #[test]

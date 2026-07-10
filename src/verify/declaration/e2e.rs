@@ -417,7 +417,7 @@ fn build_fn_certs_except(
             if let vmir::Declaration::Function(f) = decl {
                 let name = program.name(id).to_string();
                 if let Ok(Some(cert)) =
-                    verify_function(program, &name, f, &no_certs, &fn_certs, alloc)
+                    verify_function(program, &name, id, f, &no_certs, &fn_certs, None, alloc)
                 {
                     fn_certs.insert(id, cert);
                     progress = true;
@@ -537,7 +537,7 @@ fn build_all_certs(
                 vmir::Declaration::Function(f) if !fn_certs.contains_key(&id) => {
                     let name = program.name(id).to_string();
                     if let Ok(Some(cert)) =
-                        verify_function(program, &name, f, &certs, &fn_certs, alloc)
+                        verify_function(program, &name, id, f, &certs, &fn_certs, None, alloc)
                     {
                         fn_certs.insert(id, cert);
                         progress = true;
@@ -581,7 +581,7 @@ fn verify_named_function(program: &vmir::Program, name: &str) -> Result<(), Veri
     // Re-verify the target itself so a failing target returns its `Err` (the
     // fixpoint helper swallowed it).
     fn_certs.remove(&id);
-    verify_function(program, name, f, &certs, &fn_certs, &mut alloc).map(|_| ())
+    verify_function(program, name, id, f, &certs, &fn_certs, None, &mut alloc).map(|_| ())
 }
 
 #[test]
@@ -1885,18 +1885,20 @@ function inc(x: Int): Int
 }
 
 #[test]
-fn recursive_function_rejected_as_cycle() {
-    // A self-recursive function is a dependency self-loop → `analyze` rejects it.
+fn recursive_function_accepted_as_scc() {
+    // A self-recursive function is a self-looping singleton SCC → `analyze` now
+    // accepts it (limited-function encoding) rather than rejecting the cycle, and
+    // marks it recursive so its calls route through the limited twin.
     let input = r#"
 function loop(x: Int): Int { loop(x) }
 "#;
     let program = lower(input);
-    assert!(
-        matches!(
-            crate::vmir::analyze(program),
-            Err(crate::vmir::AnalysisError::CircularDependency(_))
-        ),
-        "self-recursive function should be a circular dependency"
+    let loop_id = program.id("loop").expect("loop function");
+    let analyzed = crate::vmir::analyze(program).expect("function recursion is accepted");
+    assert_eq!(
+        analyzed.recursive_scc(loop_id),
+        Some(std::collections::HashSet::from([loop_id])),
+        "self-recursive function should be its own recursive SCC"
     );
 }
 

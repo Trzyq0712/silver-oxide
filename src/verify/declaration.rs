@@ -1570,12 +1570,19 @@ pub(crate) fn verify_resource(
 /// (called at the top of this function's own `ctx` setup) has already installed
 /// their unfold rules — saturation (triggered via `prove_under_pc`) discharges
 /// the contract obligations lazily as needed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_function(
     program: &vmir::Program,
     function_name: &str,
+    self_id: MemberId,
     function: &Function,
     certs: &HashMap<MemberId, ResourceDefinition>,
     fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionDefinition>>,
+    // The members of `self_id`'s SCC iff it is a genuine recursion cycle (else
+    // `None`). In-SCC callees are retargeted to their limited twin in the recipe,
+    // and this function's own limited twin is recorded so its unfold rule frames
+    // `f(x) == f'(x)`.
+    recursive_scc: Option<&std::collections::HashSet<MemberId>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<Option<std::sync::Arc<FunctionDefinition>>, VerifyError> {
     let Some(body) = function.body.as_ref() else {
@@ -1616,11 +1623,16 @@ pub(crate) fn verify_function(
     // sites via `build_instance`), using the event log to reconstruct `Deref`
     // values as `unwrap(proj_i(snap))` terms.
     let events = ctx.heap_events.take().unwrap_or_default();
-    let (steps, res) = purify_function(&mut ctx, function, body, &state, &events)?;
+    let (steps, res) = purify_function(&mut ctx, function, body, &state, &events, recursive_scc)?;
+    // A recursive function records its limited twin so the unfold rule frames
+    // `f(x) == f'(x)`. Minted here (not in the recipe) so the id exists even if
+    // the body has no reachable recursive call under some path.
+    let limited = recursive_scc.map(|_| ctx.alloc.limited(self_id));
     Ok(Some(std::sync::Arc::new(FunctionDefinition {
         n_params: function.params.len(),
         steps,
         res,
+        limited,
     })))
 }
 
@@ -1637,6 +1649,10 @@ fn purify_function(
     body: &vmir::FunctionBody,
     state: &EvalState,
     events: &[HeapEvent],
+    // In-SCC callees (a recursion cycle's members) are lowered to their limited
+    // twin so a downstream unfold of this recipe halts after one level; `None`
+    // (non-recursive) keeps every callee as its full id.
+    recursive_scc: Option<&std::collections::HashSet<MemberId>>,
 ) -> Result<(Vec<crate::verify::rewrite::AxiomInst>, Val), VerifyError> {
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
 
@@ -1770,14 +1786,25 @@ fn purify_function(
                         AxiomPure::Ternary(tr(&map, c), tr(&map, t), tr(&map, e)),
                     ),
                     PureInst::RealCast(x) => emit(&mut steps, AxiomPure::RealCast(tr(&map, x))),
-                    PureInst::FunctionCall(fc) => emit(
-                        &mut steps,
-                        AxiomPure::App {
-                            func: crate::verify::func_registry::func_id_for_member(fc.function),
-                            type_args: fc.type_args.clone(),
-                            args: fc.args.iter().map(|a| tr(&map, a)).collect(),
-                        },
-                    ),
+                    PureInst::FunctionCall(fc) => {
+                        // A recursive call (callee in this function's SCC) targets
+                        // the limited twin `f'` — uninterpreted, so unfolding this
+                        // recipe at a call site stops after one level. Every other
+                        // callee keeps its full id and unfolds normally.
+                        let func = if recursive_scc.is_some_and(|s| s.contains(&fc.function)) {
+                            ctx.alloc.limited(fc.function)
+                        } else {
+                            crate::verify::func_registry::func_id_for_member(fc.function)
+                        };
+                        emit(
+                            &mut steps,
+                            AxiomPure::App {
+                                func,
+                                type_args: fc.type_args.clone(),
+                                args: fc.args.iter().map(|a| tr(&map, a)).collect(),
+                            },
+                        )
+                    }
                     PureInst::AdtCons {
                         adt,
                         type_args,

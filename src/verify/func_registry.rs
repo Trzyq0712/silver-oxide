@@ -43,6 +43,10 @@ pub struct FuncRegistry {
     cons: HashMap<(MemberId, usize), FuncId>,
     proj: HashMap<(MemberId, usize, usize), FuncId>,
     tag: HashMap<MemberId, FuncId>,
+    /// Limited-function twin id per recursive function (see
+    /// [`FuncRegistry::limited`]): an uninterpreted `f'` with no unfold rule,
+    /// used to break recursive unfolding.
+    limited: HashMap<MemberId, FuncId>,
     /// Display names for minted ids (which are outside the interner).
     names: HashMap<FuncId, String>,
     rules: Vec<Rule>,
@@ -123,6 +127,7 @@ impl FuncRegistry {
             cons: HashMap::new(),
             proj: HashMap::new(),
             tag: HashMap::new(),
+            limited: HashMap::new(),
             names,
             rules,
             shapes,
@@ -153,6 +158,7 @@ impl FuncRegistry {
             cons: HashMap::new(),
             proj: HashMap::new(),
             tag: HashMap::new(),
+            limited: HashMap::new(),
             names,
             rules,
             shapes: HashMap::new(),
@@ -185,6 +191,23 @@ impl FuncRegistry {
     pub fn tag(&mut self, adt: MemberId) -> FuncId {
         self.ensure(adt);
         self.tag[&adt]
+    }
+
+    /// The limited-function twin id `f'` of recursive function `func` (minting it
+    /// on first use). `f'` is **uninterpreted** — no unfold rule is ever
+    /// registered for it — so a recursive call routed through `f'` never unfolds
+    /// further, bounding saturation. A full `f`'s unfold rule additionally frames
+    /// `f(x) == f'(x)` so a materialized `f(x)` value flows to its twin. Distinct
+    /// `classes_by_op` bucket from `f`, and from every ADT concept id, since it is
+    /// minted from the same monotonic counter.
+    pub fn limited(&mut self, func: MemberId) -> FuncId {
+        if let Some(&id) = self.limited.get(&func) {
+            return id;
+        }
+        let name = self.label(func);
+        let id = self.mint(format!("{name}#limited"));
+        self.limited.insert(func, id);
+        id
     }
 
     // ---- Builtin `Option` resolution -------------------------------------
