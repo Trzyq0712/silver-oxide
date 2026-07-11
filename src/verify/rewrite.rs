@@ -11,7 +11,7 @@ use egg::{
 use crate::verify::analysis::ConstFold;
 use crate::verify::cert::FunctionDefinition;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
-use crate::vmir::{BinOp, Literal, TrigArg, Type, Val};
+use crate::vmir::{BinOp, Literal, Polarity, TrigArg, Type, Val};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 
@@ -487,12 +487,31 @@ pub(crate) fn build_instance(
     type_sigma: &[Type],
     changed: &mut Vec<Id>,
 ) -> Id {
+    let vals = build_instance_vals(egraph, insts, vals_seed, type_sigma, changed);
+    resolve_val(egraph, &vals, res)
+}
+
+/// Resolve a recipe-space `Val` against a built instance's temp slots.
+fn resolve_val(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
+    match v {
+        Val::Temp(n) => vals[*n],
+        Val::Literal(lit) => egraph.add(Symbolic::Lit(lit.clone())),
+    }
+}
+
+/// [`build_instance`], but returning the **full** temp-slot map (seed ++ one
+/// `Id` per step) so the caller can resolve several recipe values against one
+/// built instance (a function definition's `res` plus its exported facts).
+pub(crate) fn build_instance_vals(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    insts: &[AxiomInst],
+    vals_seed: &[Id],
+    type_sigma: &[Type],
+    changed: &mut Vec<Id>,
+) -> Vec<Id> {
     let mut vals: Vec<Id> = vals_seed.to_vec();
     fn get(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
-        match v {
-            Val::Temp(n) => vals[*n],
-            Val::Literal(lit) => egraph.add(Symbolic::Lit(lit.clone())),
-        }
+        resolve_val(egraph, vals, v)
     }
     let true_of =
         |egraph: &mut EGraph<Symbolic, ConstFold>| egraph.add(Symbolic::Lit(Literal::Bool(true)));
@@ -539,7 +558,7 @@ pub(crate) fn build_instance(
             }
         }
     }
-    get(egraph, &vals, res)
+    vals
 }
 
 struct AxiomApplier {
@@ -802,7 +821,43 @@ type CallKey = (Box<[Type]>, Vec<Id>);
 struct FunctionUnfoldApplier {
     func: FuncId,
     def: Arc<FunctionDefinition>,
+    /// `false`: the full rule (keyed on `f`) — definitional union, limited
+    /// framing, and every exported fact. `true`: the limited-post rule (keyed
+    /// on `f'`) — replays **only** post facts, no unions: unfolding a recursive
+    /// body yields `f'(smaller)`, and this is what delivers the postcondition
+    /// there (Silicon's `post` axiom triggering on the limited symbol).
+    limited_post: bool,
     memo: Mutex<HashSet<CallKey>>,
+}
+
+/// Replay a definition's exported facts against one built instance: for each
+/// fact, merge `guards ⟹ cond` (an `Ite` chain, innermost-first — the shape
+/// `VerifyContext::implication` builds) with `true`. Guarded, so a fact never
+/// fires outside its pre-token + path condition.
+fn replay_facts(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    def: &FunctionDefinition,
+    only_post: bool,
+    vals: &[Id],
+    changed: &mut Vec<Id>,
+) {
+    let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+    for fact in &def.facts {
+        if only_post && !fact.post {
+            continue;
+        }
+        let mut imp = resolve_val(egraph, vals, &fact.cond);
+        for (g, pol) in fact.guards.iter().rev() {
+            let g = resolve_val(egraph, vals, g);
+            imp = match pol {
+                Polarity::Positive => egraph.add(Symbolic::Ite([g, imp, true_])),
+                Polarity::Negative => egraph.add(Symbolic::Ite([g, true_, imp])),
+            };
+        }
+        if egraph.union(imp, true_) {
+            changed.push(egraph.find(imp));
+        }
+    }
 }
 
 impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
@@ -832,28 +887,33 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
         let mut changed = Vec::new();
         for (tys, args) in calls {
             debug_assert_eq!(args.len(), self.def.n_params, "function unfold arity");
-            let result = build_instance(
-                egraph,
-                &self.def.steps,
-                &self.def.res,
-                &args,
-                &tys,
-                &mut changed,
-            );
-            if egraph.union(eclass, result) {
-                changed.push(egraph.find(eclass));
-            }
-            // Recursive function: frame the full occurrence to its limited twin
-            // `f(args) == f'(args)`. `f'` has no unfold rule, so a limited call
-            // produced by unfolding `f`'s body never re-unfolds (bounding
-            // saturation); the frame lets a materialized `f(args)` value flow to
-            // any `f'(args)` a sibling unfold produced.
-            if let Some(lim) = self.def.limited {
-                let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.into()));
-                if egraph.union(eclass, twin) {
-                    changed.push(egraph.find(eclass));
+            let vals = build_instance_vals(egraph, &self.def.steps, &args, &tys, &mut changed);
+            // Definitional union `f(args) == body` — unconditional: the
+            // purified body is a total function of the args (Deref became
+            // `unwrap∘proj`, div is total in the e-graph), so the equation
+            // holds even at pre-violating args. Sound only while nothing else
+            // constrains `f` there — which Viper's ban on program functions in
+            // domain axioms guarantees. Absent for an abstract function.
+            if !self.limited_post {
+                if let Some(res) = &self.def.res {
+                    let result = resolve_val(egraph, &vals, res);
+                    if egraph.union(eclass, result) {
+                        changed.push(egraph.find(eclass));
+                    }
+                }
+                // Recursive function: frame the full occurrence to its limited twin
+                // `f(args) == f'(args)`. `f'` has no unfold rule, so a limited call
+                // produced by unfolding `f`'s body never re-unfolds (bounding
+                // saturation); the frame lets a materialized `f(args)` value flow to
+                // any `f'(args)` a sibling unfold produced.
+                if let Some(lim) = self.def.limited {
+                    let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.into()));
+                    if egraph.union(eclass, twin) {
+                        changed.push(egraph.find(eclass));
+                    }
                 }
             }
+            replay_facts(egraph, &self.def, self.limited_post, &vals, &mut changed);
         }
         changed
     }
@@ -871,9 +931,38 @@ pub(crate) fn function_rule(name: &str, func: FuncId, def: Arc<FunctionDefinitio
     let applier = FunctionUnfoldApplier {
         func,
         def,
+        limited_post: false,
         memo: Mutex::new(HashSet::new()),
     };
     Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule")
+}
+
+/// Mint a facts-only rule keyed on `func`: replays only the definition's post
+/// facts, no definitional union. Two users:
+/// - the limited-twin post rule of a recursive function ([`function_post_rule`]);
+/// - the spec-derived post rule installed for each SCC member **during** a
+///   recursive batch's own verification (Silicon's phase-1 `post` axiom is
+///   available while checking the body — that is what makes induction over a
+///   recursive call work).
+pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>) -> Rule {
+    let searcher = AxiomTriggerSearcher { func };
+    let applier = FunctionUnfoldApplier {
+        func,
+        def,
+        limited_post: true,
+        memo: Mutex::new(HashSet::new()),
+    };
+    Rewrite::new(format!("fn-post-{name}"), searcher, applier).expect("function post rule")
+}
+
+/// Mint the limited-twin post rule for a **recursive** function: keyed on
+/// `f'(args)` occurrences (which unfolding a recursive body produces), replays
+/// only the definition's post facts (no definitional union — that's the point
+/// of the limited symbol). Registered alongside [`function_rule`] when
+/// `def.limited` is set and a post fact exists.
+pub(crate) fn function_post_rule(name: &str, def: Arc<FunctionDefinition>) -> Rule {
+    let func = def.limited.expect("post rule requires a limited twin");
+    facts_rule(name, func, def)
 }
 
 #[cfg(test)]

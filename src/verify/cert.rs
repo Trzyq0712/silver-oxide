@@ -12,7 +12,7 @@ use crate::verify::analysis::ConstFold;
 use crate::verify::heap::LocationKind;
 use crate::verify::lang::Symbolic;
 use crate::verify::rewrite::AxiomInst;
-use crate::vmir::{Type, Val};
+use crate::vmir::{Polarity, Type, Val};
 /// A (non-recursive) function's verified body as a **pure term recipe** — the
 /// definition `f(params) == <steps>[res]`, add-only. Unlike a certificate this
 /// imports **no e-classes**: the function unfold rule rebuilds `steps` at each
@@ -24,13 +24,40 @@ use crate::vmir::{Type, Val};
 pub(crate) struct FunctionDefinition {
     pub(crate) n_params: usize,
     pub(crate) steps: Vec<AxiomInst>,
-    pub(crate) res: Val,
+    /// The body's result value — `None` for an **abstract** function, whose
+    /// synthesized definition carries only `facts` (its guarded post axiom)
+    /// and installs no definitional union.
+    pub(crate) res: Option<Val>,
     /// The function's limited-twin id `f'`, `Some` iff the function is
     /// (mutually) recursive. When set, its unfold rule additionally frames
     /// `f(x) == f'(x)` at every full occurrence, and the recipe's own in-SCC
     /// recursive calls already target `f'` (uninterpreted) so unfolding halts
     /// after one level. `None` for a non-recursive function (unchanged behavior).
     pub(crate) limited: Option<crate::verify::lang::FuncId>,
+    /// Guarded facts this function's verification established, replayed at
+    /// every occurrence of `f(args)` (Silicon's `bodyProp`/`post` axioms).
+    /// Derived from the body's `Assert` insts — each was *proven* under
+    /// `pre ∧ pc`, so replaying it guarded is unconditionally sound. Empty for
+    /// a heap-dependent function (its pre-token encoding is deferred).
+    pub(crate) facts: Vec<Fact>,
+}
+
+/// One exported fact of a [`FunctionDefinition`]: `guards ⟹ cond`, both over
+/// the definition's recipe-temp space. `guards` is outermost-first — the
+/// pre-token (the function's own `f#requires(params)` application) first, then
+/// the originating assert's path condition — and is folded innermost-first at
+/// replay, matching `VerifyContext::implication`.
+#[derive(Clone)]
+pub(crate) struct Fact {
+    pub(crate) guards: Vec<(Val, Polarity)>,
+    pub(crate) cond: Val,
+    /// The exit-post fact (`f#requires(params) ⟹ f#ensures(params, f(params))`,
+    /// with `f'` for a recursive function). Additionally replayed at
+    /// limited-twin occurrences (Silicon triggers `post` on `f'`), which is
+    /// what makes induction over a recursive call work; body-derived facts must
+    /// NOT be — replaying them on `f'` would re-mention `f'` at smaller args,
+    /// an unbounded matching loop.
+    pub(crate) post: bool,
 }
 
 /// One seed slot of a [`BodyRecipe`]: resolved at graft time to an actual arg or

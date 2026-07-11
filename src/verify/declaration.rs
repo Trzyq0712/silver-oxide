@@ -1279,6 +1279,16 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 func,
                 std::sync::Arc::clone(def),
             ));
+            // A recursive function's post fact also triggers on its limited
+            // twin `f'` — that is what delivers the postcondition at a
+            // recursive unroll (the twin has no unfold rule by design).
+            if def.limited.is_some() && def.facts.iter().any(|f| f.post) {
+                ctx.axiom_rules
+                    .push(crate::verify::rewrite::function_post_rule(
+                        &name,
+                        std::sync::Arc::clone(def),
+                    ));
+            }
         }
     }
     Ok(())
@@ -1586,14 +1596,34 @@ pub(crate) fn verify_function(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
 ) -> Result<Option<std::sync::Arc<FunctionDefinition>>, VerifyError> {
     let Some(body) = function.body.as_ref() else {
-        // Abstract/uninterpreted function: no body to verify, no certificate.
-        return Ok(None);
+        // Abstract/uninterpreted function: no body to verify. Its contract
+        // decls are verified as ordinary Functions (spec WF); synthesize the
+        // guarded post axiom from the contract links, if any.
+        return Ok(contract_post_definition(program, self_id, function));
     };
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
     ctx.heap_events = Some(Vec::new()); // record FromSnap/Unfold for purification
     assume_axioms(&mut ctx, program)?;
+    // Recursive batch: every SCC member's spec-derived post axiom is available
+    // while this body is checked (Silicon emits `post` in phase 1, before the
+    // phase-2 body check) — this is what lets the exit assert use a recursive
+    // call's postcondition (induction; termination is not checked, same as
+    // Silicon without `decreases`).
+    if let Some(scc) = recursive_scc {
+        for &m in scc {
+            let vmir::Declaration::Function(mf) = &program.decls[m] else {
+                continue;
+            };
+            if let Some(post) = contract_post_definition(program, m, mf) {
+                let name = ctx.member_name(m);
+                let func = crate::verify::func_registry::func_id_for_member(m);
+                ctx.axiom_rules
+                    .push(crate::verify::rewrite::facts_rule(&name, func, post));
+            }
+        }
+    }
     // Params seed the initial `Val::Temp(0..n_params)` slots (heap-free: no ctx heap).
     let params: Vec<egg::Id> = function
         .params
@@ -1623,7 +1653,15 @@ pub(crate) fn verify_function(
     // sites via `build_instance`), using the event log to reconstruct `Deref`
     // values as `unwrap(proj_i(snap))` terms.
     let events = ctx.heap_events.take().unwrap_or_default();
-    let (steps, res) = purify_function(&mut ctx, function, body, &state, &events, recursive_scc)?;
+    let (steps, res, facts) = purify_function(
+        &mut ctx,
+        self_id,
+        function,
+        body,
+        &state,
+        &events,
+        recursive_scc,
+    )?;
     // A recursive function records its limited twin so the unfold rule frames
     // `f(x) == f'(x)`. Minted here (not in the recipe) so the id exists even if
     // the body has no reachable recursive call under some path.
@@ -1634,9 +1672,96 @@ pub(crate) fn verify_function(
     Ok(Some(std::sync::Arc::new(FunctionDefinition {
         n_params: function.params.len(),
         steps,
-        res,
+        res: Some(res),
         limited,
+        facts,
     })))
+}
+
+/// Synthesize an **abstract** function's definition: no body, nothing to
+/// verify — just the guarded post axiom `f#requires(params) ⟹
+/// f#ensures(params, f(params))` built from the contract links. (Silicon's
+/// phase 1 emits `post`/`postProp` for abstract functions once the spec is
+/// well-defined; our contract decls get that WF check as ordinary `Function`
+/// verification, scheduled first by the link edges in `analyze`.) `None` when
+/// there is nothing to export: no ensures, a generic function, or a
+/// heap-dependent one (its opaque pre-token is deferred).
+fn contract_post_definition(
+    program: &vmir::Program,
+    self_id: MemberId,
+    function: &Function,
+) -> Option<std::sync::Arc<FunctionDefinition>> {
+    use crate::verify::cert::Fact;
+    use crate::verify::func_registry::func_id_for_member;
+    use crate::verify::rewrite::{AxiomInst, AxiomPure};
+
+    let en = function.ensures.as_ref()?;
+    if function.ty_params.count() != 0 {
+        return None;
+    }
+    if function
+        .requires
+        .as_ref()
+        .is_some_and(|rq| matches!(program.decls[rq.member], vmir::Declaration::Resource(_)))
+    {
+        return None;
+    }
+    let n_params = function.params.len();
+    let mut steps: Vec<AxiomInst> = Vec::new();
+    let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
+        let v = Val::Temp(n_params + steps.len());
+        steps.push(AxiomInst::Val(pure));
+        v
+    };
+    // Link args are over the params (`Temp(0..n_params)`) — identity in recipe
+    // space, so they can be used verbatim.
+    let mut guards = Vec::new();
+    if let Some(rq) = &function.requires {
+        let tok = emit(
+            &mut steps,
+            AxiomPure::App {
+                func: func_id_for_member(rq.member),
+                type_args: Vec::new(),
+                args: rq.args.clone(),
+            },
+        );
+        guards.push((tok, vmir::Polarity::Positive));
+    }
+    let self_app = emit(
+        &mut steps,
+        AxiomPure::App {
+            func: func_id_for_member(self_id),
+            type_args: Vec::new(),
+            args: (0..n_params).map(Val::Temp).collect(),
+        },
+    );
+    let args: Vec<Val> = en
+        .args
+        .iter()
+        .map(|a| match a {
+            vmir::ContractArg::Val(v) => v.clone(),
+            vmir::ContractArg::Result => self_app.clone(),
+        })
+        .collect();
+    let cond = emit(
+        &mut steps,
+        AxiomPure::App {
+            func: func_id_for_member(en.member),
+            type_args: Vec::new(),
+            args,
+        },
+    );
+    Some(std::sync::Arc::new(FunctionDefinition {
+        n_params,
+        steps,
+        res: None,
+        limited: None,
+        facts: vec![Fact {
+            guards,
+            cond,
+            post: true,
+        }],
+    }))
 }
 
 /// Turn a walked function body into a pure recipe `(steps, res)` in dense
@@ -1648,6 +1773,7 @@ pub(crate) fn verify_function(
 /// footprint slot by congruence.
 fn purify_function(
     ctx: &mut VerifyContext<'_>,
+    self_id: MemberId,
     function: &Function,
     body: &vmir::FunctionBody,
     state: &EvalState,
@@ -1656,7 +1782,15 @@ fn purify_function(
     // twin so a downstream unfold of this recipe halts after one level; `None`
     // (non-recursive) keeps every callee as its full id.
     recursive_scc: Option<&std::collections::HashSet<MemberId>>,
-) -> Result<(Vec<crate::verify::rewrite::AxiomInst>, Val), VerifyError> {
+) -> Result<
+    (
+        Vec<crate::verify::rewrite::AxiomInst>,
+        Val,
+        Vec<crate::verify::cert::Fact>,
+    ),
+    VerifyError,
+> {
+    use crate::verify::cert::Fact;
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
 
     let n_params = function.params.len();
@@ -1665,6 +1799,20 @@ fn purify_function(
     let mut map: Vec<Val> = (0..n_params).map(Val::Temp).collect();
     let mut at: HashMap<egg::Id, Val> = HashMap::new();
     let mut events = events.iter();
+    // ---- facts export (see `cert::Fact`): every body `Assert` was proven
+    // under `pre ∧ pc`, so it re-exports as a guarded fact at call sites.
+    // A heap-dependent function has no boolean pre-token to guard with yet —
+    // its export is deferred entirely.
+    let exportable = !function
+        .requires
+        .as_ref()
+        .is_some_and(|rq| matches!(ctx.decls[rq.member], vmir::Declaration::Resource(_)));
+    let mut facts: Vec<Fact> = Vec::new();
+    // Body `Val::Temp` index of each FunctionCall → callee, to spot the exit
+    // `assert f#ensures(..)` (which exports in `f'(params)` shape instead).
+    let mut callee_of: HashMap<usize, MemberId> = HashMap::new();
+    // The pre-token recipe step `f#requires(params)`, emitted on first use.
+    let mut pre_token: Option<Val> = None;
 
     // Emit a pure step, returning its dense recipe temp.
     let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
@@ -1790,6 +1938,7 @@ fn purify_function(
                     ),
                     PureInst::RealCast(x) => emit(&mut steps, AxiomPure::RealCast(tr(&map, x))),
                     PureInst::FunctionCall(fc) => {
+                        callee_of.insert(map.len(), fc.function);
                         // A recursive call (callee in this function's SCC) targets
                         // the limited twin `f'` — uninterpreted, so unfolding this
                         // recipe at a call site stops after one level. Every other
@@ -1913,16 +2062,93 @@ fn purify_function(
             InstKind::Heap(_) => {
                 unreachable!("function body may not contain inhale/exhale/combine/assign");
             }
-            // The entry `assume f#requires` (and any asserts) are dropped — that is
-            // what keeps the precondition out of the recipe (Finding B). They
-            // produce no body temp, so `map` stays aligned.
-            InstKind::Assume(_) | InstKind::Assert(_) => {}
+            // The entry `assume f#requires` is dropped — that is what keeps the
+            // precondition out of the recipe (Finding B). Produces no body
+            // temp, so `map` stays aligned.
+            InstKind::Assume(_) => {}
+            // An `Assert` was *proven* under `pre ∧ pc`, so it exports as a
+            // guarded fact (Silicon's `bodyProp`; the exit post assert is its
+            // `post` axiom) — replayed at every occurrence of this function.
+            InstKind::Assert(v) => {
+                if !exportable {
+                    continue;
+                }
+                let mut guards: Vec<(Val, Polarity)> = Vec::new();
+                if let Some(rq) = &function.requires {
+                    if pre_token.is_none() {
+                        let args: Vec<Val> = rq.args.iter().map(|a| tr(&map, a)).collect();
+                        pre_token = Some(emit(
+                            &mut steps,
+                            AxiomPure::App {
+                                func: crate::verify::func_registry::func_id_for_member(rq.member),
+                                type_args: Vec::new(),
+                                args,
+                            },
+                        ));
+                    }
+                    guards.push((pre_token.clone().unwrap(), Polarity::Positive));
+                }
+                for (val, pol) in &inst.pc.conds {
+                    guards.push((tr(&map, val), *pol));
+                }
+                let is_post = matches!(v, Val::Temp(n)
+                    if function.ensures.as_ref().is_some_and(|en| callee_of.get(n) == Some(&en.member)));
+                if is_post {
+                    // The post fact expresses the result as the (limited)
+                    // application itself — `ens(params, f'(params))` — not the
+                    // rebuilt body: at a recursive unroll's `f'(smaller)`
+                    // occurrence the fact must talk about that very node
+                    // (Silicon's `post` axiom `let r = f'(s,args) in …`).
+                    let self_fid = if recursive_scc.is_some() {
+                        let name = ctx.member_name(self_id);
+                        ctx.alloc.limited(self_id, &name)
+                    } else {
+                        crate::verify::func_registry::func_id_for_member(self_id)
+                    };
+                    let self_app = emit(
+                        &mut steps,
+                        AxiomPure::App {
+                            func: self_fid,
+                            type_args: Vec::new(),
+                            args: (0..n_params).map(Val::Temp).collect(),
+                        },
+                    );
+                    let en = function.ensures.as_ref().unwrap();
+                    let args: Vec<Val> = en
+                        .args
+                        .iter()
+                        .map(|a| match a {
+                            vmir::ContractArg::Val(v) => tr(&map, v),
+                            vmir::ContractArg::Result => self_app.clone(),
+                        })
+                        .collect();
+                    let cond = emit(
+                        &mut steps,
+                        AxiomPure::App {
+                            func: crate::verify::func_registry::func_id_for_member(en.member),
+                            type_args: Vec::new(),
+                            args,
+                        },
+                    );
+                    facts.push(Fact {
+                        guards,
+                        cond,
+                        post: true,
+                    });
+                } else {
+                    facts.push(Fact {
+                        guards,
+                        cond: tr(&map, v),
+                        post: false,
+                    });
+                }
+            }
             InstKind::Refute(_) => unreachable!("function body may not contain refute"),
         }
     }
 
     let res = tr(&map, &body.res);
-    Ok((steps, res))
+    Ok((steps, res, facts))
 }
 
 /// An expression tree over params and footprint slot values, the intermediate

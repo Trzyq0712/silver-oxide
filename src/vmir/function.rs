@@ -30,6 +30,34 @@ pub struct Function {
     /// contract function (`f#requires` / `f#ensures`) stores the lowered
     /// pre/postcondition here.
     pub body: Option<FunctionBody>,
+    /// Contract link: the precondition member applied to this function's
+    /// params. A boolean `Function` (`f#requires`) for a heap-free function, a
+    /// self-framed `Resource` for a heap-dependent one. Also set on the
+    /// generated `f#ensures` decl itself (over its leading params), so the
+    /// verifier knows which pre-token guards facts exported from its body.
+    pub requires: Option<ContractCall<Val>>,
+    /// Contract link: the postcondition member (`f#ensures`, a boolean
+    /// `Function`) applied to this function's params plus
+    /// [`ContractArg::Result`] (plus the trailing snapshot param when
+    /// heap-dependent). `Result` is only expressible here — a precondition
+    /// cannot mention the result.
+    pub ensures: Option<ContractCall<ContractArg>>,
+}
+
+/// An argument of a contract link: a value over the owning function's params,
+/// or — postcondition links only — the function's own result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContractArg {
+    Val(Val),
+    Result,
+}
+
+/// A contract link: `member` applied to explicit `args` (over the owning
+/// function's params; `A = ContractArg` additionally admits `Result`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContractCall<A> {
+    pub member: MemberId,
+    pub args: Vec<A>,
 }
 
 /// A pure function body: a stream of pure/heap instructions plus the result
@@ -124,6 +152,12 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
             self.with(params),
             self.with(ret)
         )?;
+        if let Some(rq) = &self.item.requires {
+            write!(f, "\n  requires {}", self.with(rq))?;
+        }
+        if let Some(en) = &self.item.ensures {
+            write!(f, "\n  ensures {}", self.with(en))?;
+        }
         // Heap-free: body heaps count from `h0`.
         match &self.item.body {
             None => Ok(()),
@@ -138,6 +172,28 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
                 write!(f, "}}")
             }
         }
+    }
+}
+
+impl Display for ContractArg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ContractArg::Val(v) => write!(f, "{v}"),
+            ContractArg::Result => write!(f, "result"),
+        }
+    }
+}
+
+impl<A: Display> Display for VmirDisplay<'_, &'_ ContractCall<A>> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.member(self.item.member))?;
+        for (i, a) in self.item.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{a}")?;
+        }
+        write!(f, ")")
     }
 }
 

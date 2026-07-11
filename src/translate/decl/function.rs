@@ -227,6 +227,8 @@ impl FunctionTranslator<'_, Metaed> {
                             params: params.clone().into(),
                             ret: vmir::Type::Bool,
                             body: Some(body),
+                            requires: None,
+                            ensures: None,
                         },
                     );
                 }
@@ -240,6 +242,13 @@ impl FunctionTranslator<'_, Metaed> {
             vmir::Type::Snap(req_id)
         });
         let param_vals: Vec<vmir::Val> = (0..n_params).map(vmir::Val::Temp).collect();
+        // Contract link over the leading params — set on the main decl AND on
+        // the `#ensures` decl itself (whose facts are proven under the entry
+        // pre assumption, so the verifier must guard them by this pre-token).
+        let requires_link = meta_requires.map(|m| vmir::ContractCall {
+            member: m,
+            args: param_vals.clone(),
+        });
 
         // #ensures: a boolean function `(params ++ result) -> Bool`, with the
         // snapshot appended for a heap-dependent function. `result` occupies
@@ -264,6 +273,16 @@ impl FunctionTranslator<'_, Metaed> {
                 });
                 val_base += 1;
             }
+            // WF context (heap-free): the postcondition's side conditions may
+            // rely on the precondition (`requires y != 0 ensures result == x/y`),
+            // so its body opens with `assume #requires(params)` — mirroring what
+            // the heap-dependent `FromSnap` entry assumes implicitly.
+            let wf_contract = (!heap_dep).then(|| pure_exp::FnContract {
+                requires: meta_requires,
+                ensures: None,
+                params: param_vals.clone(),
+                snap: None,
+            });
             let body = pure_exp::lower_function_body(
                 ctx,
                 &env,
@@ -271,7 +290,7 @@ impl FunctionTranslator<'_, Metaed> {
                 val_base,
                 vmir::HeapVal::Empty,
                 Some(result),
-                None,
+                wf_contract,
                 snap_entry,
                 &mut quants,
             )?;
@@ -284,6 +303,8 @@ impl FunctionTranslator<'_, Metaed> {
                     params: ens_params.into(),
                     ret: vmir::Type::Bool,
                     body: Some(body),
+                    requires: requires_link.clone(),
+                    ensures: None,
                 },
             );
         }
@@ -315,8 +336,11 @@ impl FunctionTranslator<'_, Metaed> {
             // Heap-dependent: the precondition is assumed by `FromSnap`, not
             // by a boolean entry stitch.
             requires: if heap_dep { None } else { meta_requires },
-            ensures: meta_ensures,
-            params: param_vals,
+            // The exit `assert #ensures(params, result)` — heap-free only for
+            // now (the heap-dependent exit check, taking the snapshot too, is
+            // deferred with the heap-dep facts export).
+            ensures: if heap_dep { None } else { meta_ensures },
+            params: param_vals.clone(),
             snap: contract_snap,
         };
         let body = match &f.body {
@@ -334,6 +358,20 @@ impl FunctionTranslator<'_, Metaed> {
             )?),
         };
         let name = definer.intern_name(&fname);
+        // The ensures link: `#ensures(params, result[, s])`. `Result` is the
+        // one place `ContractArg::Result` is expressible.
+        let ensures_link = meta_ensures.map(|m| {
+            let mut args: Vec<vmir::ContractArg> = param_vals
+                .iter()
+                .cloned()
+                .map(vmir::ContractArg::Val)
+                .collect();
+            args.push(vmir::ContractArg::Result);
+            if heap_dep {
+                args.push(vmir::ContractArg::Val(vmir::Val::Temp(n_params)));
+            }
+            vmir::ContractCall { member: m, args }
+        });
         definer.define_function(
             fn_slot,
             vmir::Function {
@@ -342,6 +380,8 @@ impl FunctionTranslator<'_, Metaed> {
                 params: fn_params.into(),
                 ret,
                 body,
+                requires: requires_link,
+                ensures: ensures_link,
             },
         );
         crate::translate::fill_quant_slots(definer, &fname, quant_slots, quants.finish());

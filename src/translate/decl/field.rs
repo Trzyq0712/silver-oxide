@@ -83,6 +83,8 @@ impl FieldTranslator<'_, Metaed> {
                 params: vec![vmir::Type::Ref].into(),
                 ret,
                 body: None,
+                requires: None,
+                ensures: None,
             },
         );
         Ok(())

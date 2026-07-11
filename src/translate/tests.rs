@@ -572,20 +572,42 @@ function get(x: Int): Int
         matches!(&body.insts[1].kind, vmir::InstKind::Assume(_)),
         "entry must assume the precondition"
     );
-    // No exit stitching: the body ends with its own (raw) result, no
-    // `get#ensures` call and no exit assert.
+    // Exit stitching: the body ends with a call to `get#ensures` followed by
+    // the exit assert (the definition-side postcondition check).
+    let n = body.insts.len();
     assert!(
-        !body
-            .insts
-            .iter()
-            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
-        "postconditions are disabled: no exit assert"
+        is_call(n - 2, ens_id),
+        "exit must call get#ensures(params, result)"
     );
     assert!(
-        !body.insts.iter().any(
-            |i| matches!(&i.kind, vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id)
-        ),
-        "postconditions are disabled: get#ensures is never called from the body"
+        matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)),
+        "exit must assert the postcondition"
+    );
+    // Contract links on the main decl: requires over the params, ensures over
+    // params ++ result.
+    let rq = get.requires.as_ref().expect("requires link");
+    assert_eq!(rq.member, req_id);
+    assert_eq!(rq.args, vec![vmir::Val::Temp(0)]);
+    let en = get.ensures.as_ref().expect("ensures link");
+    assert_eq!(en.member, ens_id);
+    assert_eq!(
+        en.args,
+        vec![
+            vmir::ContractArg::Val(vmir::Val::Temp(0)),
+            vmir::ContractArg::Result
+        ]
+    );
+    // The `#ensures` decl itself links back to `#requires` (its body's facts
+    // are proven under the entry pre assumption).
+    let vmir::Declaration::Function(ens) = &p.decls[ens_id] else {
+        unreachable!()
+    };
+    assert_eq!(ens.requires.as_ref().map(|r| r.member), Some(req_id));
+    assert!(
+        ens.body
+            .as_ref()
+            .is_some_and(|b| matches!(b.insts[1].kind, vmir::InstKind::Assume(_))),
+        "ensures body must open with `assume get#requires(params)` (post WD under pre)"
     );
 }
 
@@ -615,8 +637,8 @@ function inc(x: Int): Int
     let vmir::Declaration::Function(inc) = &p.decls[inc_id] else {
         panic!("inc must be a Function");
     };
-    // No precondition ⟹ no entry assume. Postconditions are disabled: no exit
-    // assert and no call to `inc#ensures` from the body at all.
+    // No precondition ⟹ no entry assume and no requires link. The exit still
+    // calls and asserts `inc#ensures(params, result)`.
     let body = inc.body.as_ref().expect("body");
     assert!(
         !body
@@ -625,19 +647,20 @@ function inc(x: Int): Int
             .any(|i| matches!(i.kind, vmir::InstKind::Assume(_))),
         "no requires ⟹ no entry assume"
     );
+    assert!(inc.requires.is_none(), "no requires ⟹ no requires link");
+    let n = body.insts.len();
     assert!(
-        !body
-            .insts
-            .iter()
-            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
-        "postconditions are disabled: no exit assert"
-    );
-    assert!(
-        !body.insts.iter().any(
-            |i| matches!(&i.kind, vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id)
+        matches!(
+            &body.insts[n - 2].kind,
+            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id
         ),
-        "postconditions are disabled: inc#ensures is never called from the body"
+        "exit must call inc#ensures(params, result)"
     );
+    assert!(
+        matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)),
+        "exit must assert the postcondition"
+    );
+    assert_eq!(inc.ensures.as_ref().map(|e| e.member), Some(ens_id));
 }
 
 #[test]

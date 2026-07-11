@@ -135,11 +135,12 @@ pub fn verify_with_stats(
                 match declaration::verify_function(
                     program, &name, id, f, &certs, &fn_certs, None, &mut alloc,
                 ) {
-                    // Abstract functions produce no certificate and no result row.
                     Ok(None) => None,
                     Ok(Some(cert)) => {
                         fn_certs.insert(id, cert);
-                        Some(Ok(()))
+                        // An abstract function's synthesized post axiom is not
+                        // a verification — no result row for it.
+                        f.body.is_some().then_some(Ok(()))
                     }
                     Err(e) => Some(Err(e)),
                 }

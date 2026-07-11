@@ -187,6 +187,16 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             if let Some(body) = &f.body {
                 inst_deps(&body.insts, out);
             }
+            // Contract links: an abstract function has no body insts, but its
+            // synthesized post axiom still needs the contract decls verified
+            // first. (For a concrete function these edges duplicate the body's
+            // call edges — harmless.)
+            if let Some(rq) = &f.requires {
+                out.push(rq.member);
+            }
+            if let Some(en) = &f.ensures {
+                out.push(en.member);
+            }
         }
         Declaration::Axiom(ax) => inst_deps(&ax.body.insts, out),
         Declaration::Quantifier(q) => {
@@ -270,6 +280,8 @@ mod tests {
                 insts: vec![inst],
                 res: Val::Temp(0),
             }),
+            requires: None,
+            ensures: None,
         })
     }
 

@@ -420,9 +420,9 @@ fn lower_func_app<Ext: PureExt>(
         let check = call_contract(sink, req_id, args.clone());
         sink.emit_assert(check);
     }
-    // Postconditions are not stitched at the use site (disabled for now — see
-    // `lower_function_body`'s matching entry-only stitching). `f#ensures` is
-    // still declared (`translate/decl/function.rs`) but never called here.
+    // No use-site `assume f#ensures(..)`: the postcondition is delivered by the
+    // verifier as a guarded rewrite keyed on `f` (the pre-token is the passed
+    // `assert f#requires(args)` above), so transitive call sites get it too.
     let ret = sink.emit_pure(
         ty,
         PureInst::FunctionCall(vmir::FunctionCall {
@@ -996,20 +996,23 @@ impl PureExt for typed::FuncEnsuresExt {
 }
 
 /// The contract functions to stitch around a function body: `assume
-/// requires(params)` at entry. `requires` is `None` when the function omits
-/// that clause; `params` are the function's parameter `Val`s
-/// (`Temp(0..n_params)`). For a heap-dependent function `requires` is `None`
-/// (the precondition is assumed implicitly by the entry `FromSnap`).
+/// requires(params)` at entry, `assert ensures(params, result)` at exit.
+/// `requires`/`ensures` are `None` when the function omits that clause; for a
+/// heap-dependent function `requires` is `None` (the precondition is assumed
+/// implicitly by the entry `FromSnap`) and `ensures` is `None` too (the
+/// snapshot-taking exit check is deferred). `params` are the function's
+/// parameter `Val`s (`Temp(0..n_params)`).
 ///
-/// `ensures`/`snap` are currently unread: postcondition stitching (both the
-/// exit `assert ensures(..)` here and the use-site `assume ensures(..)` in
-/// `lower_func_app`) is disabled for now, kept as a struct field rather than
-/// deleted so it's a small diff to re-enable.
+/// There is deliberately **no** use-site `assume ensures(..)`: postconditions
+/// are delivered by the verifier as guarded rewrites keyed on the function
+/// symbol (transitive call sites get them too) — see the facts replay in
+/// `verify::rewrite`.
 pub(crate) struct FnContract {
     pub requires: Option<vmir::MemberId>,
-    #[allow(dead_code)]
     pub ensures: Option<vmir::MemberId>,
     pub params: Vec<Val>,
+    /// The trailing snapshot param of a heap-dependent function — unread until
+    /// the heap-dependent exit check lands.
     #[allow(dead_code)]
     pub snap: Option<Val>,
 }
@@ -1092,10 +1095,21 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         sink.emit_assume(check);
     }
     let res = lower(b, env, &mut sink, hctx, exp)?;
-    // Postconditions are not stitched at the body's exit either (disabled for
-    // now — see `lower_func_app`'s matching use-site change). `f#ensures` is
-    // still declared and its own body still lowered separately; it's simply
-    // never asserted here.
+    // Exit: assert the postcondition — the definition-side check, and (via the
+    // verifier's facts export) the source of the post fact replayed at every
+    // occurrence of the function. Heap-free only: the caller passes
+    // `ensures: None` for a heap-dependent function (deferred).
+    if let Some(FnContract {
+        ensures: Some(ens),
+        params,
+        ..
+    }) = &contract
+    {
+        let mut args = params.clone();
+        args.push(res.clone());
+        let check = call_contract(&mut sink, *ens, args);
+        sink.emit_assert(check);
+    }
     quants.reap(&mut sink);
     Ok(vmir::FunctionBody {
         insts: sink.insts,

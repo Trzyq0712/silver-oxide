@@ -127,8 +127,7 @@ pub fn run_file_timed(
         vmir::analyze(vmir).map_err(|e| PipelineError::Analyze(e.to_string()))?
     );
 
-    let (results, member_times, stats) =
-        phase!("verify", verify::verify_with_stats(&analyzed));
+    let (results, member_times, stats) = phase!("verify", verify::verify_with_stats(&analyzed));
 
     timings.total = overall.elapsed();
     Ok((results, timings, member_times, stats))

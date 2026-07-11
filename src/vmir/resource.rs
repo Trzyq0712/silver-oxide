@@ -55,6 +55,8 @@ impl Resource {
             params: self.params.clone().into(),
             ret: Type::addr(group, Type::Snap(id), Bound::Unbounded),
             body: None,
+            requires: None,
+            ensures: None,
         }
     }
 

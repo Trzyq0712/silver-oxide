@@ -2685,11 +2685,9 @@ method m(x: Int) {
 
 #[test]
 fn function_ensures_forall_assumed_at_call_site() {
-    // KNOWN LIMITATION (postconditions disabled): `f` is abstract (no body),
-    // so `f#ensures(args, ret)` was previously the call site's only source of
-    // the quantified fact. Postcondition stitching is disabled for now (see
-    // `translate::pure_exp::lower_func_app`), so the call site no longer
-    // assumes it and the assert fails.
+    // `f` is abstract (no body): its postcondition arrives via the synthesized
+    // post axiom (`f#ensures(f())` — no requires, so unguarded), whose unfold
+    // exposes the quantified fact; the trigger `foo(9)` then instantiates it.
     let input = r#"
 domain D { function foo(i: Int): Bool }
 function f(): Int
@@ -2702,8 +2700,8 @@ method m() {
     let program = lower(input);
     let result = verify_named_method(&program, "m");
     assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "expected AssertionFailed (postconditions disabled), got {result:?}"
+        result.is_ok(),
+        "abstract function's post axiom should deliver the forall; got {result:?}"
     );
 }
 
@@ -2948,5 +2946,155 @@ function get(x: Ref): Int requires acc(x.f) { x.f }
     assert!(
         verify_named_function(&program, "get").is_ok(),
         "heap-dependent function should verify with the purified recipe"
+    );
+}
+
+// --- Function contracts as guarded rewrites (posts delivered transitively) ---
+
+#[test]
+fn abstract_function_post_available_at_call_site() {
+    // `foo` is abstract: nothing about it used to survive outside the
+    // (removed) immediate call-site assume. Its post now arrives via the
+    // synthesized guarded axiom `foo#requires(x) ⟹ foo#ensures(x, foo(x))`,
+    // whose guard the call-site `assert foo#requires(x)` establishes.
+    let input = r#"
+function foo(x: Int): Int
+    requires x != 0
+    ensures result == 10
+
+method m(x: Int)
+    requires x != 0
+{
+    assert foo(x) == 10
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        result.is_ok(),
+        "abstract post should deliver; got {result:?}"
+    );
+}
+
+#[test]
+fn function_post_propagates_transitively() {
+    // `m` never calls `mk`/`foo` directly — their applications only appear by
+    // unfolding `g`'s body. `mk`'s (abstract, unguarded) post gives
+    // `ok(mk(x))`; `foo`'s guarded post then fires (its defined pre-token
+    // `foo#requires(mk(x))` unfolds to `ok(mk(x))`), yielding
+    // `foo(mk(x)) == 10` and so `g(x) == 11`. Pure occurrence-keyed rewrites,
+    // no call-site stitching anywhere in `m`.
+    let input = r#"
+domain D { function ok(y: Int): Bool }
+
+function mk(x: Int): Int
+    ensures ok(result)
+
+function foo(y: Int): Int
+    requires ok(y)
+    ensures result == 10
+
+function g(x: Int): Int { foo(mk(x)) + 1 }
+
+method m(x: Int) {
+    assert g(x) == 11
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        result.is_ok(),
+        "posts should propagate to the transitive call site; got {result:?}"
+    );
+}
+
+#[test]
+fn postcondition_wd_under_precondition() {
+    // Post WD depends on pre truth: the divisor obligation inside
+    // `safediv#ensures`'s body is only provable under the entry
+    // `assume safediv#requires(x, y)` (mirroring the heap-dependent
+    // `FromSnap` entry).
+    let input = r#"
+function safediv(x: Int, y: Int): Int
+    requires y != 0
+    ensures result == x / y
+{ x / y }
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_function(&program, "safediv#ensures").is_ok(),
+        "post WD must hold under the assumed precondition"
+    );
+    assert!(
+        verify_named_function(&program, "safediv").is_ok(),
+        "body + exit post check must verify"
+    );
+}
+
+#[test]
+fn recursive_function_postcondition_by_induction() {
+    // Induction via the limited encoding: while checking `f`'s body, `f`'s own
+    // spec-derived post rule is installed (Silicon's phase-1 `post` axiom), so
+    // the recursive call's post (`f(next(x)) == 0`, guarded by
+    // `ok(next(x))` from the axiom) discharges the exit assert. At the outer
+    // call site the post rides the certificate's post fact.
+    let input = r#"
+domain D {
+    function ok(x: Int): Bool
+    function next(x: Int): Int
+    axiom { forall x: Int :: {next(x)} ok(next(x)) }
+}
+
+function f(x: Int): Int
+    requires ok(x)
+    ensures result == 0
+{ x == 0 ? 0 : f(next(x)) }
+
+method m(x: Int)
+    requires ok(x)
+{
+    assert f(x) == 0
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("recursive function SCC accepted");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn failed_function_exports_no_facts() {
+    // Success gating: `g` cannot prove `foo`'s precondition, so `g` itself
+    // fails — and none of its axioms (definition, facts) may install. `m`
+    // then knows nothing about `g` and fails too, instead of receiving facts
+    // proven from a refuted premise.
+    let input = r#"
+domain D { function ok(y: Int): Bool }
+
+function foo(y: Int): Int
+    requires ok(y)
+    ensures result == 10
+
+function g(x: Int): Int { foo(x) + 1 }
+
+method m(x: Int) {
+    assert g(x) == 11
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("acyclic");
+    let results = crate::verify::verify(&analyzed);
+    let get = |n: &str| {
+        results
+            .iter()
+            .find(|(name, _)| name == n)
+            .unwrap_or_else(|| panic!("no result for {n}"))
+    };
+    assert!(get("g").1.is_err(), "g cannot prove foo's precondition");
+    assert!(
+        get("m").1.is_err(),
+        "a failed g must not export its definition or facts to m"
     );
 }

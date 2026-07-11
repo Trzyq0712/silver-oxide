@@ -248,6 +248,8 @@ impl DomainTranslator<'_, Metaed> {
                     params: params.into(),
                     ret,
                     body: None,
+                    requires: None,
+                    ensures: None,
                 },
             );
         }
