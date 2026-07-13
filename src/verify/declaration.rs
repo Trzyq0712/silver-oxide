@@ -508,9 +508,33 @@ fn heap_subtract(
     ctx.egraph.union(existing.value, chunk2.value);
 
     let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
-    let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [remainder, zero]));
-    if ctx.prove_under_pc(eq, pc_lits) {
+    // Whether to drop the emptied chunk is a statement about the *heap*, so it has
+    // to hold at the heap's scope — **unconditionally**, not under this
+    // instruction's `pc`.
+    //
+    // The two differ because VMIR is linearized: the heap this subtract produces
+    // flows on into the sibling branch, where `pc` does not hold. A guarded consume
+    // (`h13 := <c> h12 - acc a (c ? 1/1 : 0/1)`, how the frontend lowers a move
+    // inside an `if`) has remainder `1/1 - (c ? 1/1 : 0/1)` — zero under `c`, but a
+    // full `1/1` under `!c`, where the permission was never given up. Proving
+    // `remainder == 0` under `pc = <c>` and dropping the chunk loses the permission
+    // for the `!c` path, which is what made the `else` arm of
+    // `fn rect_new(a, b) { if a.x <= b.x { Rect{a,b} } else { Rect{b,a} } }` unable
+    // to reclaim `a`.
+    //
+    // Const-fold, not `prove_under_pc`: this is heap hygiene, not an obligation, so
+    // it must stay O(1). Asking the prover instead makes every subtract fall
+    // through to the tier-3 clone and the tier-4 case split — the check is run once
+    // per chunk per consume, and it dominated everything (93s vs 4s). Keeping a
+    // chunk we merely *failed to prove* empty is always sound: the remainder term
+    // evaluates to 0 on-path and to the retained permission off-path, and a
+    // zero-permission chunk is inert (`perm > 0` gates every use). An ordinary
+    // unguarded consume still folds to `1/1 - 1/1 = 0` and drops, as before.
+    let empty = matches!(
+        ctx.egraph[remainder].data.known(),
+        Some(Literal::Real(r)) if *r == num::BigRational::from(num::BigInt::from(0))
+    );
+    if empty {
         out = out.without_chunk(kind, existing.addr);
     } else {
         out = out.with_chunk(kind, Chunk::new(existing.addr, remainder, existing.value));
