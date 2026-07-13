@@ -1614,7 +1614,13 @@ pub(crate) fn verify_function(
         // Abstract/uninterpreted function: no body to verify. Its contract
         // decls are verified as ordinary Functions (spec WF); synthesize the
         // guarded post axiom from the contract links, if any.
-        return Ok(contract_post_definition(alloc, program, self_id, function));
+        return Ok(contract_post_definition(
+            alloc,
+            program,
+            self_id,
+            function,
+            recursive_scc.is_some(),
+        ));
     };
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
@@ -1631,7 +1637,7 @@ pub(crate) fn verify_function(
             let vmir::Declaration::Function(mf) = &program.decls[m] else {
                 continue;
             };
-            if let Some(post) = contract_post_definition(ctx.alloc, program, m, mf) {
+            if let Some(post) = contract_post_definition(ctx.alloc, program, m, mf, false) {
                 let name = ctx.member_name(m);
                 let func = crate::verify::func_registry::func_id_for_member(m);
                 ctx.axiom_rules
@@ -1744,6 +1750,14 @@ fn contract_post_definition(
     program: &vmir::Program,
     self_id: MemberId,
     function: &Function,
+    // Set when this is the function's *own* definition and it sits in a
+    // recursion cycle: the fact then expresses the result as the limited twin
+    // `f'(params)` and the definition records `f'`, so the unfold rule frames
+    // `f(x) == f'(x)`. Without the frame an abstract SCC member would be
+    // unreachable from a sibling's recipe, which lowers it to `f'`. Cleared for
+    // the in-batch pre-seed (rules keyed on the full ids, no frames installed
+    // yet).
+    recursive: bool,
 ) -> Option<std::sync::Arc<FunctionDefinition>> {
     use crate::verify::cert::Fact;
     use crate::verify::func_registry::func_id_for_member;
@@ -1753,6 +1767,7 @@ fn contract_post_definition(
     if function.ty_params.count() != 0 {
         return None;
     }
+    let limited = recursive.then(|| alloc.limited(self_id, program.name(self_id)));
     let n_params = function.params.len();
     let mut steps: Vec<AxiomInst> = Vec::new();
     let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
@@ -1777,7 +1792,7 @@ fn contract_post_definition(
     let self_app = emit(
         &mut steps,
         AxiomPure::App {
-            func: func_id_for_member(self_id),
+            func: limited.unwrap_or_else(|| func_id_for_member(self_id)),
             type_args: Vec::new(),
             args: (0..n_params).map(Val::Temp).collect(),
         },
@@ -1802,7 +1817,7 @@ fn contract_post_definition(
         n_params,
         steps,
         res: None,
-        limited: None,
+        limited,
         facts: vec![Fact {
             guards,
             cond,

@@ -3308,3 +3308,122 @@ method m(y: Ref)
         assert!(r.is_ok(), "{name} should verify; got {r:?}");
     }
 }
+
+#[test]
+fn mutually_recursive_abstract_functions_deliver_each_others_posts() {
+    // `gen`/`con` are an abstract inverse pair, so the two sit in one recursion
+    // SCC — and an SCC member's calls are lowered to the limited twin `f'` in
+    // every sibling's recipe. An abstract member must therefore *also* carry a
+    // limited twin, so its unfold rule frames `f(x) == f'(x)`; without the frame
+    // `gen`'s post fact speaks about `con'(gen(x))` while the goal holds
+    // `con(gen(x))`, and the two never meet. (Prusti's `make_generic_*` /
+    // `make_concrete_*` pairs have exactly this shape.)
+    let input = r#"
+domain D {
+    function tag(x: Int): Int
+}
+
+function gen(x: Int): Int
+    ensures tag(result) == 7
+    ensures con(result) == x
+
+function con(y: Int): Int
+    ensures gen(result) == y
+
+method round_trip(a: Int, b: Int)
+{
+    assert tag(gen(a)) == 7
+    assert con(gen(a)) == a
+    assert gen(con(b)) == b
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("abstract function SCC accepted");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn adt_constructor_is_injective() {
+    // Two applications of the same constructor sharing an e-class must union
+    // their arguments pairwise. Here `f(p)`'s body and `g(p)`'s body both build a
+    // `Pair`, and `p` equates them — but the goal mentions no projection, so the
+    // component equality is reachable only through the injectivity rule
+    // (congruence runs forward only; `proj_rule` needs a `projᵢ` node to fire).
+    let input = r#"
+adt Pair {
+    mk(fst: Int, snd: Int)
+}
+
+function f(p: Pair): Pair
+    ensures result == mk(1, 2)
+
+function g(p: Pair): Pair
+    ensures result == mk(1, p.snd)
+
+method components(p: Pair)
+{
+    assume f(p) == g(p)
+    assert p.snd == 2
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn distinct_adt_constructors_are_disequal() {
+    // Constructor distinctness with no `tag` term anywhere: the `ConstFold`
+    // lattice reads the constructor identity straight off the operand's e-class,
+    // so `Nil() == Cons(..)` folds to `false`. In an SMT encoding this needs an
+    // O(variants) family of `tag` axioms plus a term to trigger them.
+    let input = r#"
+adt List {
+    Nil()
+    Cons(head: Int, tail: List)
+}
+
+method disequal(x: Int, l: List)
+{
+    assert (Nil() == Cons(x, l)) == false
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn merging_distinct_constructors_is_a_contradiction() {
+    // The dual: *assuming* two distinct constructors equal makes the e-class
+    // contradictory (`Data::Inconsistent`), which `prove_under_pc` reports at
+    // tier 0 — so anything is provable from it. This is the free-constructor
+    // property, and it is what makes the `assert false` below go through.
+    let input = r#"
+adt List {
+    Nil()
+    Cons(head: Int, tail: List)
+}
+
+method absurd(x: Int, l: List)
+{
+    assume Nil() == Cons(x, l)
+    assert false
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}

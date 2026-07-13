@@ -71,7 +71,7 @@ impl<'a> VerifyContext<'a> {
         alloc: &'a mut FuncRegistry,
     ) -> Self {
         Self {
-            egraph: egg::EGraph::default(),
+            egraph: egg::EGraph::new(ConstFold::new(alloc.ctor_table())),
             static_rules: rewrite::rules(),
             static_reduce: rewrite::reduce_rules(),
             axiom_rules: Vec::new(),
@@ -203,6 +203,7 @@ impl<'a> VerifyContext<'a> {
             .cloned()
             .collect();
         let egraph = std::mem::take(&mut self.egraph);
+        crate::verify::rewrite::new_memo_generation();
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         self.alloc.stats.saturations += 1;
         self.alloc.stats.record_run(&runner.iterations);
@@ -221,6 +222,7 @@ impl<'a> VerifyContext<'a> {
             .cloned()
             .collect();
         let egraph = std::mem::take(&mut self.egraph);
+        crate::verify::rewrite::new_memo_generation();
         let runner = egg::Runner::default().with_egraph(egraph).run(&rules);
         self.alloc.stats.reduces += 1;
         self.alloc.stats.record_run(&runner.iterations);
@@ -385,6 +387,7 @@ impl<'a> VerifyContext<'a> {
                 .chain(self.axiom_rules.iter())
                 .cloned()
                 .collect();
+            crate::verify::rewrite::new_memo_generation();
             let runner = egg::Runner::default().with_egraph(probe).run(&rules);
             self.alloc.stats.record_run(&runner.iterations);
             let probe = runner.egraph;

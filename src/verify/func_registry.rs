@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{FuncId, Symbolic};
-use crate::verify::rewrite::{proj_rule, tag_rule};
+use crate::verify::rewrite::{inj_rule, proj_rule, tag_rule};
 use crate::vmir::{Declaration, MemberId, Program, Type};
 
 type Rule = egg::Rewrite<Symbolic, ConstFold>;
@@ -63,6 +63,13 @@ pub struct FuncRegistry {
     /// synthetic variant — e.g. a snapshot's sole constructor). Drives minted-id
     /// names: `Adt::Ctor` when named, `Adt#i` when anonymous.
     variant_names: HashMap<MemberId, Vec<Option<String>>>,
+    /// Every minted constructor id, mapped to the ADT head it belongs to. Read by
+    /// the `ConstFold` analysis to decide constructor distinctness (two different
+    /// constructors of one head, at one instantiation, sharing an e-class ⇒ that
+    /// class is contradictory). It must be complete before any e-graph exists,
+    /// which is why [`FuncRegistry::new`] mints every head eagerly rather than on
+    /// first use.
+    ctor_head: HashMap<FuncId, MemberId>,
     /// Verifier cost metrics, accumulated across every unit of the run (the
     /// allocator is the per-run shared state threaded into each `VerifyContext`).
     pub(crate) stats: crate::verify::VerifyStats,
@@ -73,6 +80,8 @@ pub const BUILTIN_OPTION_SOME: FuncId = FuncId(usize::MAX - 1);
 pub const BUILTIN_OPTION_NONE: FuncId = FuncId(usize::MAX - 2);
 pub const BUILTIN_OPTION_VALUE: FuncId = FuncId(usize::MAX - 3);
 pub const BUILTIN_OPTION_TAG: FuncId = FuncId(usize::MAX - 4);
+/// Synthetic ADT head for the builtin `Option` (which has no `Adt` declaration).
+pub const BUILTIN_OPTION_HEAD: MemberId = MemberId(usize::MAX);
 
 impl FuncRegistry {
     /// Build an allocator for `program`: records the shape of every ADT head
@@ -120,12 +129,16 @@ impl FuncRegistry {
 
         let mut rules = Vec::new();
         rules.push(proj_rule(BUILTIN_OPTION_VALUE, BUILTIN_OPTION_SOME, 0));
+        rules.push(inj_rule(BUILTIN_OPTION_SOME));
         let mut option_tags = HashMap::new();
         option_tags.insert(BUILTIN_OPTION_SOME, 0);
         option_tags.insert(BUILTIN_OPTION_NONE, 1);
         rules.push(tag_rule(BUILTIN_OPTION_TAG, option_tags));
+        let mut ctor_head = HashMap::new();
+        ctor_head.insert(BUILTIN_OPTION_SOME, BUILTIN_OPTION_HEAD);
+        ctor_head.insert(BUILTIN_OPTION_NONE, BUILTIN_OPTION_HEAD);
 
-        FuncRegistry {
+        let mut registry = FuncRegistry {
             next: program.decls.len(),
             cons: HashMap::new(),
             proj: HashMap::new(),
@@ -137,8 +150,17 @@ impl FuncRegistry {
             shapes,
             head_names,
             variant_names,
+            ctor_head,
             stats: Default::default(),
+        };
+        // Mint every head up front. Lazily minting on first use would leave
+        // `ctor_head` incomplete for any `ConstFold` built before that use, and
+        // the analysis is handed an immutable snapshot of the table.
+        let heads: Vec<MemberId> = registry.shapes.keys().copied().collect();
+        for head in heads {
+            registry.ensure(head);
         }
+        registry
     }
 
     /// An empty allocator (no ADT heads). For tests / programs without ADTs.
@@ -152,10 +174,14 @@ impl FuncRegistry {
 
         let mut rules = Vec::new();
         rules.push(proj_rule(BUILTIN_OPTION_VALUE, BUILTIN_OPTION_SOME, 0));
+        rules.push(inj_rule(BUILTIN_OPTION_SOME));
         let mut option_tags = HashMap::new();
         option_tags.insert(BUILTIN_OPTION_SOME, 0);
         option_tags.insert(BUILTIN_OPTION_NONE, 1);
         rules.push(tag_rule(BUILTIN_OPTION_TAG, option_tags));
+        let mut ctor_head = HashMap::new();
+        ctor_head.insert(BUILTIN_OPTION_SOME, BUILTIN_OPTION_HEAD);
+        ctor_head.insert(BUILTIN_OPTION_NONE, BUILTIN_OPTION_HEAD);
 
         FuncRegistry {
             next: 0,
@@ -169,6 +195,7 @@ impl FuncRegistry {
             shapes: HashMap::new(),
             head_names: HashMap::new(),
             variant_names: HashMap::new(),
+            ctor_head,
             stats: Default::default(),
         }
     }
@@ -264,6 +291,12 @@ impl FuncRegistry {
     }
 
     /// The reduction rules minted so far, to inject into a context's runner.
+    /// An immutable snapshot of the constructor → ADT-head table, for the
+    /// `ConstFold` analysis. Complete: `new` mints every head eagerly.
+    pub fn ctor_table(&self) -> std::sync::Arc<HashMap<FuncId, MemberId>> {
+        std::sync::Arc::new(self.ctor_head.clone())
+    }
+
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }
@@ -300,7 +333,11 @@ impl FuncRegistry {
             };
             let cons_id = self.mint(cons_label.clone());
             self.cons.insert((adt, variant), cons_id);
+            self.ctor_head.insert(cons_id, adt);
             ctor_tags.insert(cons_id, variant);
+            if fields > 0 {
+                self.rules.push(inj_rule(cons_id));
+            }
             for field in 0..fields {
                 let proj_id = self.mint(format!("{cons_label}.{field}"));
                 self.proj.insert((adt, variant, field), proj_id);

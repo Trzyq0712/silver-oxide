@@ -19,6 +19,44 @@ fn var(name: &str) -> Var {
     name.parse().expect("valid pattern var")
 }
 
+/// The current memo generation — one per [`egg::Runner`] run.
+///
+/// An applier's memo ("already instantiated this call/σ") is a pure cost guard:
+/// re-instantiating is idempotent (adds hash-cons, unions no-op). But it is
+/// keyed on the e-class ids of *one* e-graph, and a `Rewrite`'s applier lives
+/// behind an `Arc` — cloning the rule list per run shares it. `prove_under_pc`'s
+/// tier 3 saturates a **clone** and throws the result away, so a memo carried
+/// across runs would record instantiations whose unions no longer exist,
+/// starving every later run of them (a completeness bug: goals that hold become
+/// unprovable, depending on what an earlier probe happened to touch). Bumping
+/// the generation before each run scopes the memo to that run.
+static MEMO_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Start a new memo generation. Call before every [`egg::Runner`] run.
+pub(crate) fn new_memo_generation() {
+    MEMO_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A run-scoped applier memo (see [`MEMO_GEN`]).
+struct Memo<K>(Mutex<(u64, HashSet<K>)>);
+
+impl<K: Eq + std::hash::Hash> Memo<K> {
+    fn new() -> Self {
+        Self(Mutex::new((u64::MAX, HashSet::new())))
+    }
+
+    /// `true` when `key` has not been seen *in the current generation*.
+    fn insert(&self, key: K) -> bool {
+        let generation = MEMO_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        let mut memo = self.0.lock().unwrap();
+        if memo.0 != generation {
+            memo.0 = generation;
+            memo.1.clear();
+        }
+        memo.1.insert(key)
+    }
+}
+
 /// The static structural rule set. Per-ADT cons/proj/tag reductions are minted
 /// by the registry (`verify::mono`) and appended by `VerifyContext::new`.
 pub fn rules() -> Vec<Rule> {
@@ -47,6 +85,26 @@ pub fn proj_rule(accessor: FuncId, ctor: FuncId, index: usize) -> Rule {
         ProjApplier { ctor, index },
     )
     .expect("valid proj rewrite")
+}
+
+/// Build the injectivity rule for one constructor: an e-class holding two
+/// applications of the same constructor unions their arguments pairwise
+/// (`C(a..) ≡ C(b..) ⟹ aᵢ ≡ bᵢ`). Sound because ADT constructors are free.
+///
+/// Congruence alone only runs *forward* (equal args ⟹ equal applications), and
+/// [`proj_rule`] recovers the backward direction only where a `projᵢ`
+/// application happens to exist in the graph. Two constructor terms can land in
+/// one class with no projection over them — e.g. a predicate snapshot function's
+/// body (`cons(snap(f0), snap(f1))`) meeting the value it was assigned
+/// (`cons(x, y)` from some other function's body) — and then the component
+/// equalities are only reachable through this rule.
+pub fn inj_rule(ctor: FuncId) -> Rule {
+    Rewrite::new(
+        format!("inj-{}", ctor.0),
+        AxiomTriggerSearcher { func: ctor },
+        InjApplier { ctor },
+    )
+    .expect("valid injectivity rewrite")
 }
 
 /// Build the discriminator reduction `tag_fn(ctor_C(..)) ⇒ index_C` for a single
@@ -332,6 +390,53 @@ impl Applier<Symbolic, ConstFold> for TagApplier {
 /// matching constructor `ctor`, union the `accessor(..)` e-class with that
 /// constructor's `index`-th value argument. (Type args are not children, so the
 /// value args start at 0.)
+/// Applier for [`inj_rule`]: unions the arguments of every pair of same-ctor
+/// applications sharing the matched e-class. Grouped by type args — two
+/// instantiations of a generic constructor are different operators, and only
+/// same-operator applications are congruent.
+struct InjApplier {
+    ctor: FuncId,
+}
+
+impl Applier<Symbolic, ConstFold> for InjApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        // One representative application per type instantiation; every later one
+        // is unioned against it argument-wise (transitivity covers the rest).
+        let mut reps: Vec<(Box<[Type]>, Box<[Id]>)> = Vec::new();
+        let mut pairs: Vec<(Id, Id)> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::FuncApp(f, tys, args) = node else {
+                continue;
+            };
+            if *f != self.ctor {
+                continue;
+            }
+            match reps.iter().find(|(t, _)| t == tys) {
+                Some((_, rep)) => pairs.extend(rep.iter().copied().zip(args.iter().copied())),
+                None => reps.push((tys.clone(), args.clone())),
+            }
+        }
+        let mut changed = Vec::new();
+        for (a, b) in pairs {
+            if egraph.union(a, b) {
+                changed.push(egraph.find(a));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
 struct ProjApplier {
     ctor: FuncId,
     index: usize,
@@ -563,7 +668,7 @@ pub(crate) fn build_instance_vals(
 
 struct AxiomApplier {
     axiom: PreparedAxiom,
-    memo: Mutex<HashSet<Vec<Type>>>,
+    memo: Memo<Vec<Type>>,
 }
 
 impl AxiomApplier {
@@ -619,8 +724,7 @@ impl Applier<Symbolic, ConstFold> for AxiomApplier {
             let Some(sigma): Option<Vec<Type>> = sigma.into_iter().collect() else {
                 continue;
             };
-            let mut memo = self.memo.lock().unwrap();
-            if memo.insert(sigma.clone()) {
+            if self.memo.insert(sigma.clone()) {
                 sigmas.push(sigma);
             }
         }
@@ -643,7 +747,7 @@ pub(crate) fn axiom_rule(name: &str, axiom: PreparedAxiom) -> Rule {
     };
     let applier = AxiomApplier {
         axiom,
-        memo: Mutex::new(HashSet::new()),
+        memo: Memo::new(),
     };
     Rewrite::new(format!("axiom-{name}"), searcher, applier).expect("axiom rule")
 }
@@ -684,7 +788,7 @@ pub(crate) struct PreparedQuantifier {
 /// instantiation is idempotent.
 struct QuantApplier {
     quant: PreparedQuantifier,
-    memo: Mutex<HashSet<Vec<Id>>>,
+    memo: Memo<Vec<Id>>,
 }
 
 impl Applier<Symbolic, ConstFold> for QuantApplier {
@@ -759,8 +863,7 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
                 // The capture tuple determines the instance, so the memo key
                 // needs no occurrence-class component (the memo is per
                 // quantifier already).
-                let mut memo = self.memo.lock().unwrap();
-                if memo.insert(vals.clone()) {
+                if self.memo.insert(vals.clone()) {
                     instances.push((*occ_id, vals));
                 }
             }
@@ -796,7 +899,7 @@ pub(crate) fn quantifier_rule(name: &str, quant: PreparedQuantifier) -> Rule {
     };
     let applier = QuantApplier {
         quant,
-        memo: Mutex::new(HashSet::new()),
+        memo: Memo::new(),
     };
     Rewrite::new(format!("quantifier-{name}"), searcher, applier).expect("quantifier rule")
 }
@@ -827,7 +930,7 @@ struct FunctionUnfoldApplier {
     /// body yields `f'(smaller)`, and this is what delivers the postcondition
     /// there (Silicon's `post` axiom triggering on the limited symbol).
     limited_post: bool,
-    memo: Mutex<HashSet<CallKey>>,
+    memo: Memo<CallKey>,
 }
 
 /// Replay a definition's exported facts against one built instance: for each
@@ -879,8 +982,7 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             }
             let args: Vec<Id> = args.iter().map(|&a| egraph.find(a)).collect();
             let key = (tys.clone(), args);
-            let mut memo = self.memo.lock().unwrap();
-            if memo.insert(key.clone()) {
+            if self.memo.insert(key.clone()) {
                 calls.push(key);
             }
         }
@@ -932,7 +1034,7 @@ pub(crate) fn function_rule(name: &str, func: FuncId, def: Arc<FunctionDefinitio
         func,
         def,
         limited_post: false,
-        memo: Mutex::new(HashSet::new()),
+        memo: Memo::new(),
     };
     Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule")
 }
@@ -950,7 +1052,7 @@ pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>)
         func,
         def,
         limited_post: true,
-        memo: Mutex::new(HashSet::new()),
+        memo: Memo::new(),
     };
     Rewrite::new(format!("fn-post-{name}"), searcher, applier).expect("function post rule")
 }

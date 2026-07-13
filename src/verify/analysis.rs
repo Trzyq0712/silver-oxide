@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use egg::{Analysis, DidMerge, EGraph, Id};
 use num::BigRational;
 
-use crate::verify::lang::Symbolic;
-use crate::vmir::{BinOp, Literal};
+use crate::verify::lang::{FuncId, Symbolic};
+use crate::vmir::{BinOp, Literal, MemberId, Type};
 
 /// Const-fold analysis data: a three-state lattice over an e-class's folded
 /// value. **Type-free**: only the literal is tracked (types are reconstructed
@@ -10,14 +13,27 @@ use crate::vmir::{BinOp, Literal};
 ///
 /// - `Unknown`: not (yet) a constant.
 /// - `Known(lit)`: folds to `lit`.
+/// - `Ctor(f, tys)`: the e-class holds an application of ADT constructor `f` at
+///   instantiation `tys`. This is what gives us **constructor distinctness**
+///   without the SMT tag encoding: an SMT solver cannot enumerate the terms of an
+///   equivalence class, so it must project class membership into a `tag(..)` term
+///   and pay O(variants) axioms plus a trigger to fire them. Here the closure is
+///   the data structure, so a variant clash is just a lattice conflict — no
+///   axioms, no `tag` term needed, and it is detected even when the program never
+///   mentions a discriminator.
 /// - `Inconsistent`: two **same-typed** literals of differing value were merged
-///   (e.g. `true == false`, `5 == 6`) — the e-class, and thus the whole
-///   verification unit, is contradictory. Merging literals of *different* types
-///   is instead a verifier panic (a genuine type error).
+///   (e.g. `true == false`, `5 == 6`), or two **different constructors of one ADT
+///   head at one instantiation** were merged (ADT constructors are free, so
+///   `Cons(..) == Nil` is a contradiction) — the e-class, and thus the whole
+///   verification unit, is contradictory. Merging across *different* types
+///   (literals of different types, or constructors of different heads /
+///   instantiations) is instead a verifier panic: a genuine type error, not a
+///   fact about the program.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Data {
     Unknown,
     Known(Literal),
+    Ctor(FuncId, Box<[Type]>),
     Inconsistent,
 }
 
@@ -47,27 +63,61 @@ fn same_type(a: &Literal, b: &Literal) -> bool {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct ConstFold;
+pub struct ConstFold {
+    /// Constructor id → the ADT head it belongs to (from
+    /// `FuncRegistry::ctor_table`). Any `FuncApp` whose id is absent is an
+    /// ordinary function, not a constructor. Empty by default (tests without
+    /// ADTs), which simply disables the distinctness lattice.
+    ctors: Arc<HashMap<FuncId, MemberId>>,
+}
+
+impl ConstFold {
+    pub fn new(ctors: Arc<HashMap<FuncId, MemberId>>) -> Self {
+        Self { ctors }
+    }
+
+    /// The ADT head of `f`, if `f` is a constructor.
+    fn head_of(&self, f: FuncId) -> Option<MemberId> {
+        self.ctors.get(&f).copied()
+    }
+}
 
 impl Analysis<Symbolic> for ConstFold {
     type Data = Data;
 
     fn make(egraph: &mut EGraph<Symbolic, Self>, enode: &Symbolic, _id: Id) -> Self::Data {
-        use Data::{Inconsistent, Known, Unknown};
+        use Data::{Ctor, Inconsistent, Known, Unknown};
         match enode {
             Symbolic::Lit(lit) => Known(lit.clone()),
+
+            Symbolic::FuncApp(f, tys, _) if egraph.analysis.head_of(*f).is_some() => {
+                Ctor(*f, tys.clone())
+            }
 
             Symbolic::Fresh(_) | Symbolic::FuncApp(..) => Unknown,
 
             Symbolic::RealCast(c) => match &egraph[*c].data {
                 Known(Literal::Int(n)) => Known(Literal::Real(BigRational::from(n.clone()))),
-                Known(_) => unreachable!("RealCast operand must be an integer literal"),
+                Known(_) | Ctor(..) => unreachable!("RealCast operand must be an integer literal"),
                 Inconsistent => Inconsistent,
                 Unknown => Unknown,
             },
 
             Symbolic::Binary(op, [l, r]) => match (&egraph[*l].data, &egraph[*r].data) {
                 (Inconsistent, _) | (_, Inconsistent) => Inconsistent,
+                // Disequality, the other half of what the SMT `tag` encoding buys:
+                // distinct constructors of one ADT are distinct values, so an `==`
+                // between them folds to `false` outright. No `tag` term and no
+                // `tag_bounds` axiom needed — the constructor identity is right
+                // there in the operand's e-class.
+                (Ctor(f, ftys), Ctor(g, gtys))
+                    if *op == BinOp::Eq
+                        && f != g
+                        && ftys == gtys
+                        && egraph.analysis.head_of(*f) == egraph.analysis.head_of(*g) =>
+                {
+                    Known(Literal::Bool(false))
+                }
                 (Known(lv), Known(rv)) => eval_binary(*op, lv, rv).map_or(Unknown, Known),
                 _ => Unknown,
             },
@@ -75,7 +125,7 @@ impl Analysis<Symbolic> for ConstFold {
             Symbolic::Ite([c, t, e]) => match &egraph[*c].data {
                 Known(Literal::Bool(true)) => egraph[*t].data.clone(),
                 Known(Literal::Bool(false)) => egraph[*e].data.clone(),
-                Known(_) => unreachable!("Condition of ITE must be a boolean literal"),
+                Known(_) | Ctor(..) => unreachable!("Condition of ITE must be a boolean literal"),
                 Inconsistent => Inconsistent,
                 Unknown => Unknown,
             },
@@ -83,7 +133,7 @@ impl Analysis<Symbolic> for ConstFold {
     }
 
     fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
-        use Data::{Inconsistent, Known, Unknown};
+        use Data::{Ctor, Inconsistent, Known, Unknown};
         match (&*a, &b) {
             (Inconsistent, Inconsistent) => DidMerge(false, false),
             (Inconsistent, _) => DidMerge(false, true),
@@ -91,6 +141,36 @@ impl Analysis<Symbolic> for ConstFold {
                 *a = Inconsistent;
                 DidMerge(true, false)
             }
+            (Ctor(f, ftys), Ctor(g, gtys)) => {
+                // Distinctness. Only comparable within one instantiation: the type
+                // args are part of the operator's identity (the polymorphic
+                // e-graph keeps `List[Int]::Nil` and `List[Bool]::Nil` apart by
+                // discriminant), so a clash across instantiations is a type error,
+                // not a contradiction.
+                let (fh, gh) = (self.head_of(*f), self.head_of(*g));
+                if fh != gh || ftys != gtys {
+                    panic!(
+                        "type error: merged constructors of different ADTs or \
+                         instantiations: {f:?}{ftys:?} vs {g:?}{gtys:?}"
+                    );
+                }
+                if f == g {
+                    DidMerge(false, false)
+                } else {
+                    // Distinct variants of one ADT, same instantiation: free
+                    // constructors are disjoint, so this class is contradictory.
+                    *a = Inconsistent;
+                    DidMerge(true, true)
+                }
+            }
+            (Ctor(..), Known(lit)) | (Known(lit), Ctor(..)) => {
+                panic!("type error: merged an ADT constructor with a literal: {lit:?}")
+            }
+            (Unknown, Ctor(..)) => {
+                *a = b;
+                DidMerge(true, false)
+            }
+            (Ctor(..), Unknown) => DidMerge(false, true),
             (Known(x), Known(y)) => {
                 if x == y {
                     DidMerge(false, false)
