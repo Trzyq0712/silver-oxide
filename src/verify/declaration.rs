@@ -1136,6 +1136,21 @@ fn eval_snap(
         });
     }
     let s = build_snapshot(ctx, *resource, members);
+
+    // The precondition held here — `walk_footprint` proved footprint
+    // sufficiency and the resource's bool. **Release the pre-token**: assume
+    // `R#pre(args, s)`, the uninterpreted stamp guarding every fact the callee
+    // exported (`pre_token`). Silicon does exactly this after consuming a
+    // function's precondition at a call site (`Evaluator.scala:652`). The token
+    // is never defined, so it can only ever become true here — which is what
+    // makes the guarded facts sound.
+    let name = program.name(*resource).to_string();
+    let tok = ctx.alloc.pre_token(*resource, &name);
+    let mut tok_args = args;
+    tok_args.push(s);
+    let tok = ctx.add_func_app_id(tok, Box::new([]), Type::Bool, tok_args.into());
+    ctx.assume_guarded(tok, pc_lits.iter().rev().copied());
+
     ctx.reduce();
     Ok(s)
 }
@@ -1599,7 +1614,7 @@ pub(crate) fn verify_function(
         // Abstract/uninterpreted function: no body to verify. Its contract
         // decls are verified as ordinary Functions (spec WF); synthesize the
         // guarded post axiom from the contract links, if any.
-        return Ok(contract_post_definition(program, self_id, function));
+        return Ok(contract_post_definition(alloc, program, self_id, function));
     };
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
@@ -1616,7 +1631,7 @@ pub(crate) fn verify_function(
             let vmir::Declaration::Function(mf) = &program.decls[m] else {
                 continue;
             };
-            if let Some(post) = contract_post_definition(program, m, mf) {
+            if let Some(post) = contract_post_definition(ctx.alloc, program, m, mf) {
                 let name = ctx.member_name(m);
                 let func = crate::verify::func_registry::func_id_for_member(m);
                 ctx.axiom_rules
@@ -1655,6 +1670,7 @@ pub(crate) fn verify_function(
     let events = ctx.heap_events.take().unwrap_or_default();
     let (steps, res, facts) = purify_function(
         &mut ctx,
+        program,
         self_id,
         function,
         body,
@@ -1678,15 +1694,53 @@ pub(crate) fn verify_function(
     })))
 }
 
+/// The **pre-token** guarding every fact a function's body exports: the
+/// application `(func, args)` that must hold for the facts to fire, over the
+/// function's own param space (`Val::Temp(0..n_params)` — so recipe space too,
+/// where the params are the identity).
+///
+/// The two function flavours supply it differently, but the guard *shape* is the
+/// same single boolean application either way:
+/// - **heap-free**: `f#requires(params)`, a **defined** boolean function. A call
+///   site's `Assert f#requires(args)` passing is what makes it true there.
+/// - **heap-dependent**: `R#pre(args, s)`, an **uninterpreted** token over the
+///   `#requires` Resource (see [`FuncRegistry::pre_token`]). The precondition is
+///   not definable from `(args, s)` — it also demands the footprint — so the
+///   token is stamped by [`eval_snap`] where the check passed.
+///
+/// `None` for a function without a precondition (its facts are unguarded).
+fn pre_token(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+    program: &vmir::Program,
+    function: &Function,
+) -> Option<(crate::verify::lang::FuncId, Vec<Val>)> {
+    match function.requires.as_ref()? {
+        vmir::Requires::Pure(rq) => Some((
+            crate::verify::func_registry::func_id_for_member(rq.member),
+            rq.args.clone(),
+        )),
+        vmir::Requires::Framed {
+            resource,
+            args,
+            snap,
+        } => {
+            let name = program.name(*resource).to_string();
+            let mut args = args.clone();
+            args.push(snap.clone());
+            Some((alloc.pre_token(*resource, &name), args))
+        }
+    }
+}
+
 /// Synthesize an **abstract** function's definition: no body, nothing to
-/// verify — just the guarded post axiom `f#requires(params) ⟹
-/// f#ensures(params, f(params))` built from the contract links. (Silicon's
-/// phase 1 emits `post`/`postProp` for abstract functions once the spec is
-/// well-defined; our contract decls get that WF check as ordinary `Function`
-/// verification, scheduled first by the link edges in `analyze`.) `None` when
-/// there is nothing to export: no ensures, a generic function, or a
-/// heap-dependent one (its opaque pre-token is deferred).
+/// verify — just the guarded post axiom `pre-token ⟹ f#ensures(params,
+/// f(params))` built from the contract links. (Silicon's phase 1 emits
+/// `post`/`postProp` for abstract functions once the spec is well-defined; our
+/// contract decls get that WF check as ordinary `Function` verification,
+/// scheduled first by the link edges in `analyze`.) `None` when there is nothing
+/// to export: no ensures, or a generic function.
 fn contract_post_definition(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
     program: &vmir::Program,
     self_id: MemberId,
     function: &Function,
@@ -1699,13 +1753,6 @@ fn contract_post_definition(
     if function.ty_params.count() != 0 {
         return None;
     }
-    if function
-        .requires
-        .as_ref()
-        .is_some_and(|rq| matches!(program.decls[rq.member], vmir::Declaration::Resource(_)))
-    {
-        return None;
-    }
     let n_params = function.params.len();
     let mut steps: Vec<AxiomInst> = Vec::new();
     let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
@@ -1716,13 +1763,13 @@ fn contract_post_definition(
     // Link args are over the params (`Temp(0..n_params)`) — identity in recipe
     // space, so they can be used verbatim.
     let mut guards = Vec::new();
-    if let Some(rq) = &function.requires {
+    if let Some((func, args)) = pre_token(alloc, program, function) {
         let tok = emit(
             &mut steps,
             AxiomPure::App {
-                func: func_id_for_member(rq.member),
+                func,
                 type_args: Vec::new(),
-                args: rq.args.clone(),
+                args,
             },
         );
         guards.push((tok, vmir::Polarity::Positive));
@@ -1771,8 +1818,10 @@ fn contract_post_definition(
 /// ordered `events` for the `FromSnap`/`Unfold` slot addresses. Reads the live
 /// `state.vals` (finalized after the walk) to resolve each `Deref`'s address to a
 /// footprint slot by congruence.
+#[allow(clippy::too_many_arguments)]
 fn purify_function(
     ctx: &mut VerifyContext<'_>,
+    program: &vmir::Program,
     self_id: MemberId,
     function: &Function,
     body: &vmir::FunctionBody,
@@ -1801,24 +1850,41 @@ fn purify_function(
     let mut events = events.iter();
     // ---- facts export (see `cert::Fact`): every body `Assert` was proven
     // under `pre ∧ pc`, so it re-exports as a guarded fact at call sites.
-    // A heap-dependent function has no boolean pre-token to guard with yet —
-    // its export is deferred entirely.
-    let exportable = !function
-        .requires
-        .as_ref()
-        .is_some_and(|rq| matches!(ctx.decls[rq.member], vmir::Declaration::Resource(_)));
     let mut facts: Vec<Fact> = Vec::new();
     // Body `Val::Temp` index of each FunctionCall → callee, to spot the exit
     // `assert f#ensures(..)` (which exports in `f'(params)` shape instead).
     let mut callee_of: HashMap<usize, MemberId> = HashMap::new();
-    // The pre-token recipe step `f#requires(params)`, emitted on first use.
-    let mut pre_token: Option<Val> = None;
+    // This function's pre-token (`f#requires(params)` when heap-free,
+    // `R#pre(params, s)` when heap-dependent — see `pre_token`), as a recipe
+    // step, emitted on first use.
+    let guard_app = pre_token(ctx.alloc, program, function);
+    let mut pre_guard: Option<Val> = None;
 
     // Emit a pure step, returning its dense recipe temp.
     let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
         let v = Val::Temp(n_params + steps.len());
         steps.push(AxiomInst::Val(pure));
         v
+    };
+    // This function's pre-token as a recipe step, emitted once on first use.
+    // Its args are over the params, which are the identity in recipe space, so
+    // they need no `tr`.
+    let guard = |steps: &mut Vec<AxiomInst>,
+                 app: &Option<(crate::verify::lang::FuncId, Vec<Val>)>,
+                 cache: &mut Option<Val>|
+     -> Option<Val> {
+        let (func, args) = app.as_ref()?;
+        if cache.is_none() {
+            *cache = Some(emit(
+                steps,
+                AxiomPure::App {
+                    func: *func,
+                    type_args: Vec::new(),
+                    args: args.clone(),
+                },
+            ));
+        }
+        cache.clone()
     };
     // Translate a body-space operand into recipe space.
     let tr = |map: &[Val], v: &Val| -> Val {
@@ -1893,7 +1959,7 @@ fn purify_function(
             // A nested heap-dependent call's `Snap`: the snapshot of the callee's
             // footprint, `cons(Some(v_i))` over the values read from the current
             // heap (a self-framed footprint is fully held, so each slot is Some).
-            InstKind::Pure(_, PureInst::Snap { .. }) => {
+            InstKind::Pure(_, PureInst::Snap { args, .. }) => {
                 let Some(HeapEvent::Snap { resource, values }) = events.next() else {
                     unreachable!("Snap inst without a logged Snap event");
                 };
@@ -1922,6 +1988,39 @@ fn purify_function(
                         args: members,
                     },
                 );
+                // The nested callee's precondition was *checked here*, by this
+                // `Snap`'s implicit exhale — but that check lives in the inst,
+                // not in an `Assert`, so deriving facts from asserts misses it.
+                // Export the callee's pre-token over the snapshot we just built,
+                // so a caller who rebuilds this recipe (and thereby materializes
+                // the nested `g(args, s)`) can discharge the guard on `g`'s own
+                // post fact without re-running the check. This is Silicon's
+                // `bodyPreconditionPropagationAxiom`
+                // (`FunctionData.scala:302`): `f%pre ⟹ pres of everything f calls`.
+                let name = program.name(*resource).to_string();
+                let tok = ctx.alloc.pre_token(*resource, &name);
+                let mut tok_args: Vec<Val> = args.iter().map(|a| tr(&map, a)).collect();
+                tok_args.push(s.clone());
+                let cond = emit(
+                    &mut steps,
+                    AxiomPure::App {
+                        func: tok,
+                        type_args: Vec::new(),
+                        args: tok_args,
+                    },
+                );
+                let mut guards: Vec<(Val, Polarity)> = Vec::new();
+                if let Some(g) = guard(&mut steps, &guard_app, &mut pre_guard) {
+                    guards.push((g, Polarity::Positive));
+                }
+                for (val, pol) in &inst.pc.conds {
+                    guards.push((tr(&map, val), *pol));
+                }
+                facts.push(Fact {
+                    guards,
+                    cond,
+                    post: false,
+                });
                 map.push(s);
             }
             InstKind::Pure(_, PureInst::Fresh) => {
@@ -2070,23 +2169,9 @@ fn purify_function(
             // guarded fact (Silicon's `bodyProp`; the exit post assert is its
             // `post` axiom) — replayed at every occurrence of this function.
             InstKind::Assert(v) => {
-                if !exportable {
-                    continue;
-                }
                 let mut guards: Vec<(Val, Polarity)> = Vec::new();
-                if let Some(rq) = &function.requires {
-                    if pre_token.is_none() {
-                        let args: Vec<Val> = rq.args.iter().map(|a| tr(&map, a)).collect();
-                        pre_token = Some(emit(
-                            &mut steps,
-                            AxiomPure::App {
-                                func: crate::verify::func_registry::func_id_for_member(rq.member),
-                                type_args: Vec::new(),
-                                args,
-                            },
-                        ));
-                    }
-                    guards.push((pre_token.clone().unwrap(), Polarity::Positive));
+                if let Some(g) = guard(&mut steps, &guard_app, &mut pre_guard) {
+                    guards.push((g, Polarity::Positive));
                 }
                 for (val, pol) in &inst.pc.conds {
                     guards.push((tr(&map, val), *pol));

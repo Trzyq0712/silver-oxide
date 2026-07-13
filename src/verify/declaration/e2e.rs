@@ -2033,13 +2033,11 @@ method m(y: Ref)
 
 #[test]
 fn heap_dep_heap_reading_ensures_consumed_at_call_site() {
-    // KNOWN LIMITATION (postconditions disabled): the postcondition itself
-    // reads the heap (`result == x.f`). With an abstract (bodyless) heap-dep
-    // function, `get#ensures` was previously the call site's *only* source of
-    // information about the result — but postcondition stitching (both the
-    // use-side assume and the body's own exit assert) is disabled for now
-    // (see `translate::pure_exp::lower_func_app`/`lower_function_body`), so
-    // the call site no longer learns `ret == y.f` and the assert fails.
+    // An **abstract** heap-dependent function: its heap-reading postcondition is
+    // the call site's only source of information about the result. Delivered by
+    // the synthesized post axiom (`contract_post_definition`), guarded by the
+    // pre-token `get#requires#pre(y, s)` — which the call site's `Snap` released
+    // when it proved the precondition. So the call site learns `a == y.f`.
     let input = r#"
 field f: Int
 
@@ -2056,10 +2054,7 @@ method m(y: Ref)
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "expected AssertionFailed (postconditions disabled), got {result:?}"
-    );
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
 
 // ---- Domain axioms ---------------------------------------------------------
@@ -3097,4 +3092,219 @@ method m(x: Int) {
         get("m").1.is_err(),
         "a failed g must not export its definition or facts to m"
     );
+}
+
+#[test]
+fn heap_dep_post_fires_only_where_the_precondition_bool_holds() {
+    // The pre-token stamps `get#requires`'s *whole* precondition — footprint and
+    // bool. `m` establishes `y.f > 0` before the call, so the `Snap` check
+    // passes, the token is released, and the guarded post (`result == x.f`)
+    // fires; `n` cannot show `y.f > 0`, so the call's own check fails and the
+    // token is never stamped for it.
+    let input = r#"
+field f: Int
+
+function get(x: Ref): Int
+    requires acc(x.f) && x.f > 0
+    ensures result == x.f
+
+method m(y: Ref)
+    requires acc(y.f) && y.f > 0
+{
+    var a: Int := get(y)
+    assert a == y.f
+}
+
+method n(y: Ref)
+    requires acc(y.f)
+{
+    var a: Int := get(y)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    let result = verify_named_method(&program, "n");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "the precondition's bool is unproven, so the call must fail: {result:?}"
+    );
+}
+
+#[test]
+fn heap_dep_post_propagates_through_a_transitive_call() {
+    // `outer`'s body calls the abstract heap-dep `inner`. At `m`'s call site the
+    // unfold rule rebuilds `outer`'s recipe, which materializes `inner(y, s')` —
+    // but nothing re-runs `inner`'s precondition check there. The `Snap` arm of
+    // `purify_function` exported `outer#pre ⟹ inner#pre(x, s')` for exactly this
+    // (Silicon's `bodyPreconditionPropagationAxiom`), so `inner`'s post fact
+    // fires on the materialized occurrence and `m` learns `outer(y) == y.f + 1`.
+    let input = r#"
+field f: Int
+
+function inner(x: Ref): Int
+    requires acc(x.f)
+    ensures result == x.f
+
+function outer(x: Ref): Int
+    requires acc(x.f)
+{ inner(x) + 1 }
+
+method m(y: Ref)
+    requires acc(y.f)
+{
+    assert outer(y) == y.f + 1
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("acyclic");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn heap_dep_exit_postcondition_check_bites() {
+    // The heap-dependent exit check (`assert bad#ensures(x, result, s)`) is now
+    // emitted, so a body that does not establish its own postcondition fails —
+    // and therefore exports no facts.
+    let input = r#"
+field f: Int
+
+function bad(x: Ref): Int
+    requires acc(x.f)
+    ensures result == x.f
+{ x.f + 1 }
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "bad");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed on the exit post check, got {result:?}"
+    );
+}
+
+#[test]
+fn heap_free_post_under_a_branch_hits_the_same_limitation() {
+    // The branch limitation is NOT heap-dep-specific — it is general to guarded
+    // fact replay. `f`'s precondition `x != 0` is provable only under `!e_c`, so
+    // the call-site assert commits `!e_c ⟹ (x != 0)` and nothing more; `f`'s post
+    // fact, guarded by that same formula, therefore does not fire unconditionally,
+    // and `ite(e_c, 10, f(x)) ≡ 10` needs a case split the e-graph won't do.
+    //
+    // Why heap-free usually escapes this and heap-dep never can: a heap-free
+    // guard is a **defined** formula (`f#requires(args)`), so it can be re-derived
+    // from scratch anywhere the e-graph can prove it — in the recursive test
+    // `recursive_function_postcondition_by_induction` the guard `ok(next(x))`
+    // follows from a domain axiom, hence holds unconditionally and the post fires
+    // unbranched. An **opaque** pre-token can never be re-derived: the pc-guarded
+    // release at the `Snap` is its only source, so a heap-dep call under a branch
+    // is *always* pc-bound. Same wall, hit every time instead of occasionally.
+    let input = r#"
+function f(x: Int): Int
+    requires x != 0
+    ensures result == 10
+
+function g(x: Int): Int
+    ensures result == 10
+{ x == 0 ? 10 : f(x) }
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "g");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "a post whose guard holds only under the branch is not reachable; got {result:?}"
+    );
+}
+
+#[test]
+fn heap_dep_post_under_a_branch_is_a_known_limitation() {
+    // KNOWN LIMITATION — a heap-dependent call whose `Snap` sits under a path
+    // condition cannot deliver its postcondition to a conclusion needed at a
+    // weaker pc. Nothing to do with recursion (see the branchless-recursive test
+    // below, which passes): `g` here is not recursive at all. It lowers to
+    //
+    //   e4  := <e2>  *[h0] f(e0)                  // the `x.f` arm
+    //   e5  := <!e2> snap[h0] peek#requires(e0)   // the `peek(x)` arm's snapshot
+    //   e6  := peek(e0, e5)
+    //   e7  := e2 ? e4 : e6
+    //   assert g#ensures(e0, e1, e7, e3)          // pc <> — must hold on BOTH branches
+    //
+    // Writing `V` for `unwrap(proj_0(e3))`: `e4 ≡ V` (a `Deref` carries no pc) and
+    // the goal unfolds to `ite(e2, V, e6) ≡ V`, so it needs `e6 ≡ V` — which is
+    // exactly `peek`'s postcondition. But that fact is guarded by `peek`'s
+    // pre-token, and `eval_snap` releases the token only under the `Snap`'s path
+    // condition `<!e2>`. Chaining `!e2 ⟹ token ⟹ (e6 == V)` into an unbranched
+    // goal needs a case split on `e2`, which the e-graph does not do. (Silicon
+    // does not meet this: it forks the path and proves the post once per branch.)
+    //
+    // The token is *opaque* by design — stamped where a `Snap`'s check passed,
+    // never defined — so no rewrite can make it true elsewhere. A heap-free guard
+    // is a defined formula and can be re-derived unconditionally when the caller's
+    // context allows (see `heap_free_post_under_a_branch_hits_the_same_limitation`
+    // for the case where it can't, and fails identically); an opaque token has no
+    // such escape, so heap-dep hits this wall on *every* branch. Two ways out, both
+    // deliberately deferred: bridge the token to the requires-Resource's bool
+    // (`R#bool(args, s) ⟹ R#pre(args, s)`, sound because the callee's proof
+    // assumes only that bool and is total in `(args, s)` — at the price of
+    // `perm(..)` in function preconditions, which purify already rejects), or
+    // teach the prove path to case-split a goal on its `ite` conditions (fixes
+    // both flavours at once).
+    //
+    // Practical bite: this is what keeps *branching* recursive heap-dep functions
+    // (the usual shape — a base case plus a recursive case) out of reach.
+    let input = r#"
+field f: Int
+
+function peek(x: Ref): Int
+    requires acc(x.f)
+    ensures result == x.f
+
+function g(x: Ref, b: Bool): Int
+    requires acc(x.f)
+    ensures result == x.f
+{ b ? x.f : peek(x) }
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "g");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "a heap-dep post under a branch is not yet reachable; got {result:?}"
+    );
+}
+
+#[test]
+fn branchless_recursive_heap_dep_function_verifies_by_induction() {
+    // Recursion over a snapshot works — it is the *branch*, not the recursion,
+    // that the pre-token cannot cross (see the limitation test above). With the
+    // recursive `Snap` at empty pc the token is released unconditionally, so the
+    // in-batch post rule (the induction hypothesis, keyed on the full id and
+    // installed while the body is checked) gives `rf(x, next(n), s') == x.f`,
+    // which discharges the exit assert. The call site in `m` then gets the post
+    // from the certificate's own post fact.
+    let input = r#"
+domain D {
+    function next(n: Int): Int
+}
+
+field f: Int
+
+function rf(x: Ref, n: Int): Int
+    requires acc(x.f)
+    ensures result == x.f
+{ rf(x, next(n)) }
+
+method m(y: Ref)
+    requires acc(y.f)
+{
+    assert rf(y, 3) == y.f
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("recursive function SCC accepted");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
 }

@@ -245,10 +245,23 @@ impl FunctionTranslator<'_, Metaed> {
         // Contract link over the leading params — set on the main decl AND on
         // the `#ensures` decl itself (whose facts are proven under the entry
         // pre assumption, so the verifier must guard them by this pre-token).
-        let requires_link = meta_requires.map(|m| vmir::ContractCall {
-            member: m,
-            args: param_vals.clone(),
-        });
+        // A heap-dependent link additionally names the decl's own snapshot
+        // param, which sits at a different index in the two decls (trailing on
+        // the main one, after `result` on `#ensures`).
+        let requires_link = |snap: Option<vmir::Val>| -> Option<vmir::Requires> {
+            let m = meta_requires?;
+            Some(match snap {
+                Some(snap) => vmir::Requires::Framed {
+                    resource: m,
+                    args: param_vals.clone(),
+                    snap,
+                },
+                None => vmir::Requires::Pure(vmir::ContractCall {
+                    member: m,
+                    args: param_vals.clone(),
+                }),
+            })
+        };
 
         // #ensures: a boolean function `(params ++ result) -> Bool`, with the
         // snapshot appended for a heap-dependent function. `result` occupies
@@ -261,16 +274,19 @@ impl FunctionTranslator<'_, Metaed> {
             let result = vmir::Val::Temp(n_params);
             let mut val_base = n_params + 1;
             let mut snap_entry = None;
+            let mut ens_snap = None;
             if let Some(snap_ty) = &snap_ty {
                 ens_params.push(snap_ty.clone());
                 let vmir::Type::Snap(req_id) = snap_ty else {
                     unreachable!()
                 };
+                let snap_val = vmir::Val::Temp(val_base);
                 snap_entry = Some(pure_exp::SnapEntry {
                     resource: *req_id,
                     args: param_vals.clone(),
-                    snap: vmir::Val::Temp(val_base),
+                    snap: snap_val.clone(),
                 });
+                ens_snap = Some(snap_val);
                 val_base += 1;
             }
             // WF context (heap-free): the postcondition's side conditions may
@@ -303,7 +319,7 @@ impl FunctionTranslator<'_, Metaed> {
                     params: ens_params.into(),
                     ret: vmir::Type::Bool,
                     body: Some(body),
-                    requires: requires_link.clone(),
+                    requires: requires_link(ens_snap),
                     ensures: None,
                 },
             );
@@ -336,12 +352,11 @@ impl FunctionTranslator<'_, Metaed> {
             // Heap-dependent: the precondition is assumed by `FromSnap`, not
             // by a boolean entry stitch.
             requires: if heap_dep { None } else { meta_requires },
-            // The exit `assert #ensures(params, result)` — heap-free only for
-            // now (the heap-dependent exit check, taking the snapshot too, is
-            // deferred with the heap-dep facts export).
-            ensures: if heap_dep { None } else { meta_ensures },
+            // The exit `assert #ensures(params, result[, s])` — the snapshot
+            // rides along for a heap-dependent function (`FnContract.snap`).
+            ensures: meta_ensures,
             params: param_vals.clone(),
-            snap: contract_snap,
+            snap: contract_snap.clone(),
         };
         let body = match &f.body {
             None => None,
@@ -380,7 +395,7 @@ impl FunctionTranslator<'_, Metaed> {
                 params: fn_params.into(),
                 ret,
                 body,
-                requires: requires_link,
+                requires: requires_link(contract_snap),
                 ensures: ensures_link,
             },
         );

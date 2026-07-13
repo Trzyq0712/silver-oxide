@@ -585,7 +585,9 @@ function get(x: Int): Int
     );
     // Contract links on the main decl: requires over the params, ensures over
     // params ++ result.
-    let rq = get.requires.as_ref().expect("requires link");
+    let Some(vmir::Requires::Pure(rq)) = get.requires.as_ref() else {
+        panic!("heap-free function links a boolean requires function");
+    };
     assert_eq!(rq.member, req_id);
     assert_eq!(rq.args, vec![vmir::Val::Temp(0)]);
     let en = get.ensures.as_ref().expect("ensures link");
@@ -602,7 +604,7 @@ function get(x: Int): Int
     let vmir::Declaration::Function(ens) = &p.decls[ens_id] else {
         unreachable!()
     };
-    assert_eq!(ens.requires.as_ref().map(|r| r.member), Some(req_id));
+    assert_eq!(ens.requires.as_ref().map(|r| r.member()), Some(req_id));
     assert!(
         ens.body
             .as_ref()
@@ -667,12 +669,11 @@ function inc(x: Int): Int
 fn heap_dependent_function_lowers_to_snapshot_passing() {
     // A function whose precondition grants permission (`acc`) is heap-dependent:
     // - `get#requires` is a self-framed Resource (footprint + bool);
-    // - `get` gains a trailing snapshot parameter `Snap(get#requires)` and its
-    //   body opens with `FromSnap` (no boolean entry assume); postcondition
-    //   stitching is disabled for now, so there's no exit assert;
-    // - `get#ensures` is still declared — a boolean Function over (params ++
-    //   [result, snap]) whose body also opens with `FromSnap` — just never
-    //   called from `get`'s own body.
+    // - `get` gains a trailing snapshot parameter `Snap(get#requires)`; its body
+    //   opens with `FromSnap` (no boolean entry assume — the resource bool is
+    //   assumed implicitly) and closes with `assert get#ensures(x, result, s)`;
+    // - `get#ensures` is a boolean Function over (params ++ [result, snap]) whose
+    //   body also opens with `FromSnap`, so it can read the precondition heap.
     let input = r#"
 field f: Int
 function get(x: Ref): Int
@@ -724,20 +725,23 @@ function get(x: Ref): Int
             .any(|i| matches!(i.kind, vmir::InstKind::Assume(_))),
         "heap-dep body has no boolean entry assume"
     );
-    // No exit stitching: no assert, and get#ensures is never called from the body.
+    // Exit: `assert get#ensures(params, result, s)` — the snapshot rides along,
+    // so the postcondition can read the precondition heap.
     let ens_id = p.id("get#ensures").expect("missing get#ensures");
+    let n = body.insts.len();
     assert!(
-        !body
-            .insts
-            .iter()
-            .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
-        "postconditions are disabled: no exit assert"
+        matches!(
+            &body.insts[n - 2].kind,
+            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
+                if fc.function == ens_id
+                    && fc.args.iter().cloned().collect::<Vec<_>>()
+                        == vec![vmir::Val::Temp(0), body.res.clone(), vmir::Val::Temp(1)]
+        ),
+        "exit must call get#ensures(params, result, snap)"
     );
     assert!(
-        !body.insts.iter().any(
-            |i| matches!(&i.kind, vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == ens_id)
-        ),
-        "postconditions are disabled: get#ensures is never called from the body"
+        matches!(&body.insts[n - 1].kind, vmir::InstKind::Assert(_)),
+        "exit must assert the postcondition"
     );
 
     // #ensures: boolean Function over (params ++ [result, snap]), body opens

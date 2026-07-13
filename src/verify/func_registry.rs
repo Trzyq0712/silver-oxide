@@ -47,6 +47,9 @@ pub struct FuncRegistry {
     /// [`FuncRegistry::limited`]): an uninterpreted `f'` with no unfold rule,
     /// used to break recursive unfolding.
     limited: HashMap<MemberId, FuncId>,
+    /// Precondition-token id per heap-dependent function's `#requires` Resource
+    /// (see [`FuncRegistry::pre_token`]).
+    pre_token: HashMap<MemberId, FuncId>,
     /// Display names for minted ids (which are outside the interner).
     names: HashMap<FuncId, String>,
     rules: Vec<Rule>,
@@ -128,6 +131,7 @@ impl FuncRegistry {
             proj: HashMap::new(),
             tag: HashMap::new(),
             limited: HashMap::new(),
+            pre_token: HashMap::new(),
             names,
             rules,
             shapes,
@@ -159,6 +163,7 @@ impl FuncRegistry {
             proj: HashMap::new(),
             tag: HashMap::new(),
             limited: HashMap::new(),
+            pre_token: HashMap::new(),
             names,
             rules,
             shapes: HashMap::new(),
@@ -208,6 +213,28 @@ impl FuncRegistry {
         }
         let id = self.mint(format!("{name}#lim"));
         self.limited.insert(func, id);
+        id
+    }
+
+    /// The **precondition token** of a heap-dependent function: an uninterpreted
+    /// boolean `R#pre(args ++ [s])` over its `#requires` Resource `R`'s params
+    /// and the snapshot (minted on first use, keyed on the resource — each
+    /// heap-dependent function has exactly one).
+    ///
+    /// Uninterpreted on purpose (Silicon's `f%precondition`): unlike a heap-free
+    /// function's `f#requires`, which is a *defined* boolean function and so can
+    /// guard exported facts by itself, "the precondition holds here" is not a
+    /// function of `(args, s)` — it also demands the footprint, which the
+    /// snapshot's values do not record. So the token is *stamped* where a
+    /// `Snap`'s implicit check passed (`declaration::eval_snap` assumes it) and
+    /// is what every fact exported from the function's body is guarded by. No
+    /// rule is ever registered for it.
+    pub fn pre_token(&mut self, resource: MemberId, name: &str) -> FuncId {
+        if let Some(&id) = self.pre_token.get(&resource) {
+            return id;
+        }
+        let id = self.mint(format!("{name}#pre"));
+        self.pre_token.insert(resource, id);
         id
     }
 

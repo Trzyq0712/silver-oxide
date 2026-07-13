@@ -1011,9 +1011,8 @@ pub(crate) struct FnContract {
     pub requires: Option<vmir::MemberId>,
     pub ensures: Option<vmir::MemberId>,
     pub params: Vec<Val>,
-    /// The trailing snapshot param of a heap-dependent function — unread until
-    /// the heap-dependent exit check lands.
-    #[allow(dead_code)]
+    /// The trailing snapshot param of a heap-dependent function, appended to the
+    /// exit `assert #ensures(params, result, s)`.
     pub snap: Option<Val>,
 }
 
@@ -1097,16 +1096,19 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     let res = lower(b, env, &mut sink, hctx, exp)?;
     // Exit: assert the postcondition — the definition-side check, and (via the
     // verifier's facts export) the source of the post fact replayed at every
-    // occurrence of the function. Heap-free only: the caller passes
-    // `ensures: None` for a heap-dependent function (deferred).
+    // occurrence of the function. A heap-dependent function's `#ensures` takes
+    // the snapshot too (`(params ++ [result, s])`), so it can read the
+    // precondition heap.
     if let Some(FnContract {
         ensures: Some(ens),
         params,
+        snap,
         ..
     }) = &contract
     {
         let mut args = params.clone();
         args.push(res.clone());
+        args.extend(snap.clone());
         let check = call_contract(&mut sink, *ens, args);
         sink.emit_assert(check);
     }

@@ -192,7 +192,7 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             // first. (For a concrete function these edges duplicate the body's
             // call edges — harmless.)
             if let Some(rq) = &f.requires {
-                out.push(rq.member);
+                out.push(rq.member());
             }
             if let Some(en) = &f.ensures {
                 out.push(en.member);

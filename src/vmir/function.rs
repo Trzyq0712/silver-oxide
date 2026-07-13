@@ -30,18 +30,54 @@ pub struct Function {
     /// contract function (`f#requires` / `f#ensures`) stores the lowered
     /// pre/postcondition here.
     pub body: Option<FunctionBody>,
-    /// Contract link: the precondition member applied to this function's
-    /// params. A boolean `Function` (`f#requires`) for a heap-free function, a
-    /// self-framed `Resource` for a heap-dependent one. Also set on the
-    /// generated `f#ensures` decl itself (over its leading params), so the
-    /// verifier knows which pre-token guards facts exported from its body.
-    pub requires: Option<ContractCall<Val>>,
+    /// Contract link: the precondition, applied to this function's params. Also
+    /// set on the generated `f#ensures` decl itself (over its leading params),
+    /// so the verifier knows which pre-token guards facts exported from its body.
+    pub requires: Option<Requires>,
     /// Contract link: the postcondition member (`f#ensures`, a boolean
     /// `Function`) applied to this function's params plus
     /// [`ContractArg::Result`] (plus the trailing snapshot param when
     /// heap-dependent). `Result` is only expressible here — a precondition
     /// cannot mention the result.
     pub ensures: Option<ContractCall<ContractArg>>,
+}
+
+/// A function's precondition link. The two variants are the two function
+/// flavours: a heap-free function's precondition is an ordinary boolean
+/// function, a heap-dependent one's is a self-framed resource whose snapshot the
+/// function takes as a parameter. Keeping them apart here means the invariant
+/// "heap-dependent ⟺ `#requires` is a `Resource` ⟺ there is a trailing
+/// `Type::Snap` param" holds by construction rather than by three conventions
+/// agreeing, and the verifier never has to probe the callee's declaration kind
+/// or hunt for the snapshot's param index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Requires {
+    /// Heap-free: a boolean `Function` (`f#requires`) applied to the params. It
+    /// is *defined* (it has a body), so it doubles as the pre-token guarding the
+    /// function's exported facts.
+    Pure(ContractCall<Val>),
+    /// Heap-dependent: a self-framed `Resource` (footprint + bool) applied to
+    /// `args`, plus `snap` — the trailing snapshot parameter that call sites
+    /// build with `PureInst::Snap` and the body opens with `HeapInst::FromSnap`.
+    /// There is no boolean requires-function, so the verifier guards this
+    /// function's facts with an uninterpreted pre-token over `args ++ [snap]`,
+    /// released where a `Snap`'s implicit precondition check passes.
+    Framed {
+        resource: MemberId,
+        args: Vec<Val>,
+        snap: Val,
+    },
+}
+
+impl Requires {
+    /// The precondition member — a boolean `Function` or a self-framed
+    /// `Resource` (used for dependency edges, where the flavour is irrelevant).
+    pub fn member(&self) -> MemberId {
+        match self {
+            Requires::Pure(c) => c.member,
+            Requires::Framed { resource, .. } => *resource,
+        }
+    }
 }
 
 /// An argument of a contract link: a value over the owning function's params,
@@ -180,6 +216,27 @@ impl Display for ContractArg {
         match self {
             ContractArg::Val(v) => write!(f, "{v}"),
             ContractArg::Result => write!(f, "result"),
+        }
+    }
+}
+
+impl Display for VmirDisplay<'_, &'_ Requires> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.item {
+            Requires::Pure(c) => write!(f, "{}", self.with(c)),
+            // The snapshot rides after the resource args, as it does in the
+            // pre-token the verifier builds from this link.
+            Requires::Framed {
+                resource,
+                args,
+                snap,
+            } => {
+                write!(f, "{}(", self.member(*resource))?;
+                for a in args {
+                    write!(f, "{a}, ")?;
+                }
+                write!(f, "{snap})")
+            }
         }
     }
 }

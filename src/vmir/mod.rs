@@ -19,7 +19,9 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
 pub use domain::{Axiom, Domain, QuantTrigger, Quantifier, TrigArg, TyParams};
-pub use function::{Args, ContractArg, ContractCall, Function, FunctionBody, FunctionCall, Params};
+pub use function::{
+    Args, ContractArg, ContractCall, Function, FunctionBody, FunctionCall, Params, Requires,
+};
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;
 pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
