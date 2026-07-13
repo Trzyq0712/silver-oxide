@@ -79,6 +79,8 @@ pub enum BinOp {
     Minus,
     Mult,
     Div,
+    /// Integer division (`\`) — `Int` operands only, unlike `Div`.
+    IntDiv,
     Mod,
 
     In,

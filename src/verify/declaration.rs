@@ -1211,12 +1211,11 @@ fn eval_from_snap(
 }
 
 /// Axiomatize the state: make every domain axiom's fact available to the unit
-/// about to be verified. A **ground** axiom (`ty_params == 0`) is evaluated
-/// into the e-graph and its boolean merged with `true` up front; a **generic**
-/// one becomes a lazy-instantiation rule (see `rewrite::axiom_rule`) chained
-/// into this context's saturations, firing on each ground application of its
-/// trigger. Axiom bodies are trusted — no obligations (div-by-zero, deref
-/// permission) are checked on them.
+/// about to be verified. An axiom body is evaluated into the e-graph and its
+/// boolean merged with `true` up front — domains are monomorphic, so there is no
+/// type-σ instantiation; quantification over *values* is a `forall` in the body,
+/// which becomes its own lazy-instantiation rule below. Axiom bodies are trusted
+/// — no obligations (div-by-zero, deref permission) are checked on them.
 ///
 /// Invariant: the eager ground-axiom evaluation below only ever sees **nullary**
 /// quantifier occurrences — axioms are closed and `let` is rejected in pure
@@ -1229,52 +1228,54 @@ fn eval_from_snap(
 fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
     for (id, decl) in program.decls.iter_enumerated() {
         // A pure `forall` becomes a value-σ lazy-instantiation rule, chained
-        // into every saturation (like generic axioms). Its body is never
-        // verified; instantiation adds a guarded clause per ground trigger.
+        // into every saturation. Its body is never verified; instantiation adds
+        // a guarded clause per ground trigger match.
         if let vmir::Declaration::Quantifier(q) = decl {
-            let prepared = prepare_quantifier(ctx.alloc, id, q)?;
             let name = ctx.interner.resolve(&q.name).to_string();
-            ctx.axiom_rules
-                .push(crate::verify::rewrite::quantifier_rule(&name, prepared));
+            // One rule per trigger group (alternatives), sharing one
+            // instantiation memo so two groups reaching the same σ build the
+            // instance once.
+            let memo = crate::verify::rewrite::quant_memo();
+            for (k, prepared) in prepare_quantifier(ctx.alloc, id, q)?
+                .into_iter()
+                .enumerate()
+            {
+                ctx.axiom_rules
+                    .push(crate::verify::rewrite::quantifier_rule(
+                        &format!("{name}#t{k}"),
+                        prepared,
+                        std::sync::Arc::clone(&memo),
+                    ));
+            }
             continue;
         }
         let vmir::Declaration::Axiom(ax) = decl else {
             continue;
         };
-        if ax.ty_params.count() == 0 {
-            let mut state = EvalState::new();
-            for inst in &ax.body.insts {
-                match &inst.kind {
-                    InstKind::Pure(ty, pi) => {
-                        let id = eval_pure_inst(ctx, &state, ty, pi);
-                        state.push_val(id, ty.clone());
-                    }
-                    InstKind::Assume(val) => {
-                        let id = state.get_val(ctx, val);
-                        let true_ = ctx.true_();
-                        ctx.egraph.union(id, true_);
-                        ctx.egraph.rebuild();
-                    }
-                    // An axiom body is never verified — a stray obligation
-                    // (there are none today: callees are precondition-free)
-                    // would be skipped, and heap insts cannot occur.
-                    InstKind::Assert(_) => {}
-                    _ => return Err(VerifyError::Unimplemented("non-pure inst in axiom body")),
+        let mut state = EvalState::new();
+        for inst in &ax.body.insts {
+            match &inst.kind {
+                InstKind::Pure(ty, pi) => {
+                    let id = eval_pure_inst(ctx, &state, ty, pi);
+                    state.push_val(id, ty.clone());
                 }
+                InstKind::Assume(val) => {
+                    let id = state.get_val(ctx, val);
+                    let true_ = ctx.true_();
+                    ctx.egraph.union(id, true_);
+                    ctx.egraph.rebuild();
+                }
+                // An axiom body is never verified — a stray obligation
+                // (there are none today: callees are precondition-free)
+                // would be skipped, and heap insts cannot occur.
+                InstKind::Assert(_) => {}
+                _ => return Err(VerifyError::Unimplemented("non-pure inst in axiom body")),
             }
-            let res = state.get_val(ctx, &ax.body.res);
-            let true_ = ctx.true_();
-            ctx.egraph.union(res, true_);
-            ctx.egraph.rebuild();
-        } else {
-            let prepared = prepare_axiom(ctx.alloc, ax)?;
-            let name = ax
-                .name
-                .map(|n| ctx.interner.resolve(&n).to_string())
-                .unwrap_or_else(|| "anon".to_string());
-            ctx.axiom_rules
-                .push(crate::verify::rewrite::axiom_rule(&name, prepared));
         }
+        let res = state.get_val(ctx, &ax.body.res);
+        let true_ = ctx.true_();
+        ctx.egraph.union(res, true_);
+        ctx.egraph.rebuild();
     }
     // One lazy unfold rule per already-verified function certificate: `analyze`
     // guarantees a function only ever calls functions verified earlier (it
@@ -1309,57 +1310,78 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
     Ok(())
 }
 
-/// Resolve a generic axiom's body into registry-level pure steps (every callee
-/// down to its verifier `FuncId`) plus its trigger, ready for the applier —
-/// which has no registry access at rule-application time.
-fn prepare_axiom(
-    alloc: &mut crate::verify::func_registry::FuncRegistry,
-    ax: &vmir::Axiom,
-) -> Result<crate::verify::rewrite::PreparedAxiom, VerifyError> {
-    use crate::verify::rewrite::PreparedAxiom;
-    let trigger = ax
-        .covering_trigger()
-        .ok_or(VerifyError::Unimplemented("generic axiom without trigger"))?;
-    let trigger_func = crate::verify::func_registry::func_id_for_member(trigger.function);
-    let trigger_type_args = trigger.type_args.clone();
-
-    let insts = prepare_body(alloc, &ax.body.insts)?;
-    Ok(PreparedAxiom {
-        n_params: ax.ty_params.count(),
-        trigger_func,
-        trigger_type_args,
-        insts,
-        res: ax.body.res.clone(),
-    })
-}
-
-/// Resolve a pure `forall` into a [`PreparedQuantifier`]: its body as
-/// registry-level pure steps, its boolean result, its occurrence id and
-/// capture-parameter arity, and its trigger (function + positional
-/// bound/capture map). Instantiation pairs each ground occurrence with the
-/// bound-variable σ read off ground applications of the trigger.
+/// Resolve a pure `forall` into one [`PreparedQuantifier`] **per trigger group**
+/// (the groups are alternatives — each gets its own instantiation rule): the
+/// body as registry-level pure steps, its boolean result, the occurrence id and
+/// capture arity, and the group's pattern terms with every head resolved to its
+/// verifier `FuncId`. Instantiation pairs each ground occurrence with the
+/// bound-variable σ read off a ground match of the group.
 fn prepare_quantifier(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     id: vmir::MemberId,
     q: &vmir::Quantifier,
-) -> Result<crate::verify::rewrite::PreparedQuantifier, VerifyError> {
+) -> Result<Vec<crate::verify::rewrite::PreparedQuantifier>, VerifyError> {
     use crate::verify::rewrite::PreparedQuantifier;
     let insts = prepare_body(alloc, &q.body.insts)?;
-    Ok(PreparedQuantifier {
-        quant_func: crate::verify::func_registry::func_id_for_member(id),
-        n_caps: q.params.len(),
-        n_bound: q.bound.len(),
-        trigger_func: crate::verify::func_registry::func_id_for_member(q.trigger.function),
-        trig_args: q.trigger.args.clone(),
-        insts,
-        res: q.body.res.clone(),
-    })
+    q.triggers
+        .iter()
+        .map(|group| {
+            let group = group
+                .terms
+                .iter()
+                .map(|t| prepare_trig_term(alloc, t))
+                .collect();
+            Ok(PreparedQuantifier {
+                quant_func: crate::verify::func_registry::func_id_for_member(id),
+                n_caps: q.params.len(),
+                n_bound: q.bound.len(),
+                group,
+                insts: insts.clone(),
+                res: q.body.res.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Resolve a trigger pattern term's heads to verifier `FuncId`s — the same
+/// mapping [`prepare_body`] applies to the corresponding `PureInst`, so a
+/// pattern matches exactly the nodes a body would build.
+fn prepare_trig_term(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+    term: &vmir::TrigTerm,
+) -> crate::verify::rewrite::PreparedTerm {
+    use crate::verify::rewrite::PreparedTerm;
+    match term {
+        vmir::TrigTerm::Bound(i) => PreparedTerm::Bound(*i),
+        vmir::TrigTerm::Capture(c) => PreparedTerm::Capture(*c),
+        vmir::TrigTerm::Lit(lit) => PreparedTerm::Lit(lit.clone()),
+        vmir::TrigTerm::App {
+            head,
+            type_args,
+            args,
+        } => {
+            let func = match head {
+                vmir::TrigHead::Func(id) => crate::verify::func_registry::func_id_for_member(*id),
+                vmir::TrigHead::AdtCons { adt, variant } => alloc.cons(*adt, *variant),
+                vmir::TrigHead::AdtProj {
+                    adt,
+                    variant,
+                    field,
+                } => alloc.proj(*adt, *variant, *field),
+                vmir::TrigHead::AdtTag { adt } => alloc.tag(*adt),
+            };
+            PreparedTerm::App {
+                func,
+                type_args: type_args.iter().cloned().collect(),
+                args: args.iter().map(|a| prepare_trig_term(alloc, a)).collect(),
+            }
+        }
+    }
 }
 
 /// Lower an axiom/quantifier body's inst stream into registry-resolved pure
 /// steps (every callee down to its verifier `FuncId`), ready for the applier —
-/// which has no registry access at rule-application time. Shared by
-/// [`prepare_axiom`] and [`prepare_quantifier`].
+/// which has no registry access at rule-application time.
 fn prepare_body(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     insts: &[vmir::Inst],
@@ -1764,9 +1786,6 @@ fn contract_post_definition(
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
 
     let en = function.ensures.as_ref()?;
-    if function.ty_params.count() != 0 {
-        return None;
-    }
     let limited = recursive.then(|| alloc.limited(self_id, program.name(self_id)));
     let n_params = function.params.len();
     let mut steps: Vec<AxiomInst> = Vec::new();

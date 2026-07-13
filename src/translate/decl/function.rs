@@ -223,7 +223,6 @@ impl FunctionTranslator<'_, Metaed> {
                         slot,
                         vmir::Function {
                             name,
-                            ty_params: 0.into(),
                             params: params.clone().into(),
                             ret: vmir::Type::Bool,
                             body: Some(body),
@@ -315,7 +314,6 @@ impl FunctionTranslator<'_, Metaed> {
                 slot,
                 vmir::Function {
                     name,
-                    ty_params: 0.into(),
                     params: ens_params.into(),
                     ret: vmir::Type::Bool,
                     body: Some(body),
@@ -391,7 +389,6 @@ impl FunctionTranslator<'_, Metaed> {
             fn_slot,
             vmir::Function {
                 name,
-                ty_params: 0.into(),
                 params: fn_params.into(),
                 ret,
                 body,

@@ -51,7 +51,6 @@ impl Resource {
     pub fn derive_location(&self, id: MemberId, group: lasso::Spur) -> Function {
         Function {
             name: self.name,
-            ty_params: 0.into(),
             params: self.params.clone().into(),
             ret: Type::addr(group, Type::Snap(id), Bound::Unbounded),
             body: None,
@@ -80,10 +79,7 @@ impl Resource {
             return None;
         }
         let Some(body) = &self.body else {
-            return Some(Snapshot::Abstract(Domain {
-                name: self.name,
-                ty_params: 0.into(),
-            }));
+            return Some(Snapshot::Abstract(Domain { name: self.name }));
         };
         let mut val_types: Vec<Type> = self.params.clone();
         let mut field_types = Vec::new();

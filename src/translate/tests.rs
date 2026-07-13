@@ -206,6 +206,66 @@ method m(x: Int, y: Int)
 }
 
 #[test]
+fn int_div_lowers_to_a_guarded_div() {
+    // `\` is Silver's integer division (`/` is permission division). It carries
+    // the same divisor≠0 obligation and collapses into the polymorphic VMIR
+    // `Div`, whose operands are `Int` here.
+    let input = r#"
+method m(x: Int, y: Int)
+    requires y != 0 ==> x \ y == x
+"#;
+    let p = run(input);
+
+    let req_id = p.id("m#requires").expect("missing m#requires");
+    let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
+        panic!("m#requires must be a Resource");
+    };
+    let body = req.body.as_ref().unwrap();
+
+    let div = body
+        .insts
+        .iter()
+        .find(|i| {
+            matches!(
+                &i.kind,
+                vmir::InstKind::Pure(
+                    vmir::Type::Int,
+                    vmir::PureInst::Binary(vmir::BinOp::Div, _, _)
+                )
+            )
+        })
+        .expect("requires body must contain an Int-typed Div");
+    assert!(
+        !div.pc.conds.is_empty(),
+        "the divisor≠0 obligation is discharged under the implication's guard"
+    );
+    assert!(
+        div.heap.is_some(),
+        "a Div is an obligation, so it checks in against the current heap"
+    );
+}
+
+#[test]
+fn int_div_on_perm_operands_is_a_type_error() {
+    // Unlike `/`, `\` is strictly Int × Int → Int, so it never reaches translation.
+    let input = r#"
+method m(x: Perm, y: Perm)
+    requires x \ y == x
+"#;
+    let mut program = viper_parser::vpr_program(input).expect("parse failed");
+    let mut ident_collector = IdentCollector::default();
+    program.walk_mut(&mut ident_collector);
+    let interner = ident_collector.finalize();
+    let mut globals_collector = GlobalsCollector::new(&interner);
+    program.walk(&mut globals_collector);
+    let globals = globals_collector.finalize().expect("globals error");
+    disambiguate(&mut program, &interner, &globals).expect("disambiguation failed");
+    inline_macros(&mut program, &interner).expect("macro inlining failed");
+    typecheck_program(&mut program, interner, &globals)
+        .expect_err("`\\` on Perm operands must be rejected");
+}
+
+#[test]
 fn if_else_arms_carry_complementary_path_conditions() {
     // Each arm's guarded instructions (the `assert`s) must run under the
     // branch condition: `<c>` in the then-arm, `<!c>` in the else-arm.
@@ -407,61 +467,26 @@ function len(l: List[Int]): Int
     );
 }
 
-/// A heapless obligation (`assert`, division) carries the current check-in heap
-/// on its `Inst`; `assume` (no verification) and a heap-embedding `Deref` do not.
 #[test]
-fn domain_fn_drops_unused_type_params() {
-    // A domain function is implicitly parameterized by the domain's type
-    // parameters, but a parameter it never mentions in its signature is
-    // irrelevant to the function's meaning and cannot be inferred at a call
-    // site. The desired lowering therefore drops the unused parameters: the
-    // translated `vmir::Function` keeps only the type parameters that actually
-    // occur in its params/ret, re-indexed `Generic(0..k)` in order of first
-    // appearance. A function using *none* of them lowers to `ty_params = 0`.
-    let input = r#"
+fn generic_domain_rejected() {
+    // Generics live on ADTs. A generic domain's axioms could only be
+    // instantiated off a *type* trigger, which Silver has no syntax to write —
+    // rather than infer one, translation refuses the domain.
+    let err = run_err(
+        r#"
 domain Box[T] {
-    function empty(): Int
     function wrap(x: T): T
 }
-"#;
-    let p = run(input);
-
-    let box_id = p.id("Box").expect("missing Box domain");
-    let vmir::Declaration::Domain(dom) = &p.decls[box_id] else {
-        panic!("Box must be a Domain");
-    };
-    // The domain itself still records all its declared type parameters.
-    assert_eq!(dom.ty_params, 1.into(), "Box declares one type parameter T");
-
-    // `empty(): Int` mentions no type parameter — it must lower to a
-    // monomorphic function (`ty_params = 0`), not carry the domain's unused T.
-    let empty_id = p.id("empty").expect("missing empty");
-    let vmir::Declaration::Function(empty) = &p.decls[empty_id] else {
-        panic!("empty must be a Function");
-    };
-    assert_eq!(
-        empty.ty_params,
-        0.into(),
-        "empty uses no type parameter, so its unused T must be dropped"
+"#,
     );
-    assert_eq!(empty.params, Vec::<vmir::Type>::new().into());
-    assert_eq!(empty.ret, vmir::Type::Int);
-
-    // `wrap(x: T): T` mentions T — it keeps exactly that one parameter,
-    // re-indexed to `Generic(0)`.
-    let wrap_id = p.id("wrap").expect("missing wrap");
-    let vmir::Declaration::Function(wrap) = &p.decls[wrap_id] else {
-        panic!("wrap must be a Function");
-    };
     assert_eq!(
-        wrap.ty_params,
-        1.into(),
-        "wrap uses its one type parameter T"
+        err,
+        TranslationError::GenericDomainUnsupported("Box".to_string())
     );
-    assert_eq!(wrap.params, vec![vmir::Type::Generic(0)].into());
-    assert_eq!(wrap.ret, vmir::Type::Generic(0));
 }
 
+/// A heapless obligation (`assert`, division) carries the current check-in heap
+/// on its `Inst`; `assume` (no verification) and a heap-embedding `Deref` do not.
 #[test]
 fn obligations_carry_check_in_heap() {
     use vmir::{BinOp, InstKind, PureInst};
@@ -951,7 +976,6 @@ domain D {
     let vmir::Declaration::Axiom(sz) = &p.decls[sz_id] else {
         panic!("sz must be a Axiom");
     };
-    assert_eq!(sz.ty_params, 0.into());
     let size_id = p.id("size").expect("missing size");
     assert!(
         sz.body.insts.iter().any(|i| matches!(
@@ -978,72 +1002,24 @@ domain D {
     );
 }
 
-#[test]
-fn generic_axiom_carries_type_params_and_trigger() {
-    let input = r#"
-domain List[T] {
-    function nil(): List[T]
-    function len(xs: List[T]): Int
-    axiom { len(nil()) == 0 }
-}
-"#;
-    let p = run(input);
-
-    let ax_id = p.id("List#axiom0").expect("missing axiom slot");
-    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
-        panic!("List#axiom0 must be a Axiom");
+/// The single trigger group of a quantifier that has exactly one.
+fn only_group(q: &vmir::Quantifier) -> &vmir::QuantTrigger {
+    let [group] = &q.triggers[..] else {
+        panic!("expected exactly one trigger group");
     };
-    assert_eq!(ax.ty_params, 1.into(), "axiom is generic over T");
-
-    // Both calls instantiate at the axiom's own `Generic(0)`.
-    let nil_id = p.id("nil").expect("missing nil");
-    let nil_call = ax
-        .body
-        .insts
-        .iter()
-        .find_map(|i| match &i.kind {
-            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == nil_id => {
-                Some(fc)
-            }
-            _ => None,
-        })
-        .expect("axiom body must call nil()");
-    assert_eq!(
-        nil_call.type_args,
-        vec![vmir::Type::Generic(0)],
-        "nil's instantiation is the axiom's type parameter"
-    );
-
-    // Display smoke: generic binder + result line render.
-    let s = format!("{p}");
-    assert!(s.contains("axiom"), "rendered:\n{s}");
+    group
 }
 
-#[test]
-fn generic_axiom_without_trigger_rejected() {
-    // `mk[T]` covers T, but... use a genuinely uncoverable shape: the axiom
-    // only mentions T through a function whose type args don't cover it is
-    // impossible via calls alone, so use a domain function of arity 0 type
-    // args: here `tag() == 7` never mentions T at all — that axiom is simply
-    // monomorphic (fine). A missing trigger needs T used but never covered by
-    // one call's type args — impossible for a single-param domain via node
-    // types, so this asserts the monomorphic case stays accepted.
-    let input = r#"
-domain D[T] {
-    function tag(): Int
-    axiom { tag() == 7 }
-}
-"#;
-    let p = run(input);
-    let ax_id = p.id("D#axiom0").expect("missing axiom slot");
-    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
-        panic!("D#axiom0 must be a Axiom");
+/// The single term of a trigger group that has exactly one, as an application:
+/// `(head, args)`.
+fn only_app(group: &vmir::QuantTrigger) -> (&vmir::TrigHead, &[vmir::TrigTerm]) {
+    let [term] = &group.terms[..] else {
+        panic!("expected exactly one trigger term");
     };
-    assert_eq!(
-        ax.ty_params,
-        0.into(),
-        "axiom not mentioning T is monomorphic"
-    );
+    let vmir::TrigTerm::App { head, args, .. } = term else {
+        panic!("expected an application trigger term");
+    };
+    (head, args)
 }
 
 #[test]
@@ -1064,12 +1040,9 @@ domain D {
     assert_eq!(q.bound.len(), 1, "one binder");
     assert!(q.params.is_empty(), "top-level forall captures nothing");
     let foo_id = p.id("foo").expect("missing foo");
-    assert_eq!(q.trigger.function, foo_id, "trigger is foo");
-    assert_eq!(
-        &*q.trigger.args,
-        &[vmir::TrigArg::Bound(0)],
-        "arg 0 binds bound var 0"
-    );
+    let (head, args) = only_app(only_group(q));
+    assert_eq!(*head, vmir::TrigHead::Func(foo_id), "trigger is foo");
+    assert_eq!(args, &[vmir::TrigTerm::Bound(0)], "arg 0 binds bound var 0");
 
     // The axiom body references the occurrence via a nullary call to `q_id`.
     let ax_id = p.id("basic").expect("missing axiom basic");
@@ -1109,10 +1082,11 @@ method m(x: Int) {
     assert_eq!(q.params.len(), 1, "captures the method param x");
     assert_eq!(q.bound.len(), 1, "one binder");
     let g_id = p.id("g").expect("missing g");
-    assert_eq!(q.trigger.function, g_id);
+    let (head, args) = only_app(only_group(q));
+    assert_eq!(*head, vmir::TrigHead::Func(g_id));
     assert_eq!(
-        &*q.trigger.args,
-        &[vmir::TrigArg::Capture(0), vmir::TrigArg::Bound(0)],
+        args,
+        &[vmir::TrigTerm::Capture(0), vmir::TrigTerm::Bound(0)],
         "trigger is g(capture x, bound i)"
     );
 
@@ -1132,30 +1106,113 @@ method m(x: Int) {
 }
 
 #[test]
-fn forall_missing_trigger_rejected() {
-    let err = run_err(
-        r#"
+fn nested_trigger_lowers_to_nested_app() {
+    // A trigger may be an arbitrarily nested application: `{f(g(i))}` binds the
+    // binder at depth 1.
+    let input = r#"
 domain D {
-    function foo(i: Int): Bool
-    axiom bad { forall i: Int :: foo(i) }
+    function g(i: Int): Int
+    function f(i: Int): Bool
+    axiom nested { forall i: Int :: {f(g(i))} f(g(i)) }
 }
-"#,
+"#;
+    let p = run(input);
+    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("nested#quant0").unwrap()] else {
+        panic!("nested#quant0 must be a Quantifier");
+    };
+    let f_id = p.id("f").expect("missing f");
+    let g_id = p.id("g").expect("missing g");
+    let (head, args) = only_app(only_group(q));
+    assert_eq!(*head, vmir::TrigHead::Func(f_id));
+    assert_eq!(
+        args,
+        &[vmir::TrigTerm::App {
+            head: vmir::TrigHead::Func(g_id),
+            type_args: Vec::new(),
+            args: Box::new([vmir::TrigTerm::Bound(0)]),
+        }],
+        "trigger is f(g(i)) — the binder sits under the nested call"
     );
-    assert_eq!(err, TranslationError::TriggerNotCovering);
 }
 
 #[test]
-fn forall_non_covering_trigger_rejected() {
-    // Trigger `foo(0)` — argument is not a bound variable.
-    let err = run_err(
-        r#"
+fn multi_term_trigger_group_keeps_both_terms() {
+    // `{f(i), g(i)}` is one group with two terms — a conjunctive multi-pattern.
+    let input = r#"
 domain D {
-    function foo(i: Int): Bool
-    axiom bad { forall i: Int :: {foo(0)} foo(i) }
+    function f(i: Int): Bool
+    function g(i: Int): Bool
+    axiom both { forall i: Int :: {f(i), g(i)} f(i) == g(i) }
 }
-"#,
+"#;
+    let p = run(input);
+    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("both#quant0").unwrap()] else {
+        panic!("both#quant0 must be a Quantifier");
+    };
+    let group = only_group(q);
+    assert_eq!(group.terms.len(), 2, "one group, two terms");
+    let heads: Vec<_> = group
+        .terms
+        .iter()
+        .map(|t| match t {
+            vmir::TrigTerm::App { head, .. } => head.clone(),
+            _ => panic!("terms must be applications"),
+        })
+        .collect();
+    assert_eq!(
+        heads,
+        vec![
+            vmir::TrigHead::Func(p.id("f").unwrap()),
+            vmir::TrigHead::Func(p.id("g").unwrap()),
+        ]
     );
-    assert_eq!(err, TranslationError::TriggerNotCovering);
+}
+
+#[test]
+fn alternative_trigger_groups_all_kept() {
+    // `{f(i)}{g(i)}` are alternatives: both groups reach VMIR (the verifier mints
+    // one instantiation rule per group), none is silently dropped.
+    let input = r#"
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int): Bool
+    axiom alt { forall i: Int :: {f(i)}{g(i)} f(i) == g(i) }
+}
+"#;
+    let p = run(input);
+    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("alt#quant0").unwrap()] else {
+        panic!("alt#quant0 must be a Quantifier");
+    };
+    assert_eq!(q.triggers.len(), 2, "two alternative groups");
+    for (group, name) in q.triggers.iter().zip(["f", "g"]) {
+        let (head, args) = only_app(group);
+        assert_eq!(*head, vmir::TrigHead::Func(p.id(name).unwrap()));
+        assert_eq!(args, &[vmir::TrigTerm::Bound(0)]);
+    }
+}
+
+#[test]
+fn trigger_literal_argument_lowers_to_lit() {
+    // A literal is a legal trigger argument, as long as the group still covers
+    // every binder.
+    let input = r#"
+domain D {
+    function f(i: Int, j: Int): Bool
+    axiom lit { forall i: Int :: {f(i, 0)} f(i, 0) }
+}
+"#;
+    let p = run(input);
+    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("lit#quant0").unwrap()] else {
+        panic!("lit#quant0 must be a Quantifier");
+    };
+    let (_, args) = only_app(only_group(q));
+    assert_eq!(
+        args,
+        &[
+            vmir::TrigTerm::Bound(0),
+            vmir::TrigTerm::Lit(vmir::Literal::Int(0.into())),
+        ]
+    );
 }
 
 #[test]
@@ -1183,8 +1240,8 @@ domain D {
     assert!(outer.params.is_empty(), "outer captures nothing");
     assert_eq!(outer.bound.len(), 1);
     assert_eq!(
-        &*outer.trigger.args,
-        &[vmir::TrigArg::Bound(0), vmir::TrigArg::Bound(0)]
+        only_app(only_group(outer)).1,
+        &[vmir::TrigTerm::Bound(0), vmir::TrigTerm::Bound(0)]
     );
     // The outer body calls the inner occurrence with the outer binder
     // (`Temp(0)`) as its capture argument.
@@ -1202,8 +1259,8 @@ domain D {
     assert_eq!(&*inner.params, &[vmir::Type::Int], "inner captures i");
     assert_eq!(inner.bound.len(), 1);
     assert_eq!(
-        &*inner.trigger.args,
-        &[vmir::TrigArg::Capture(0), vmir::TrigArg::Bound(0)]
+        only_app(only_group(inner)).1,
+        &[vmir::TrigTerm::Capture(0), vmir::TrigTerm::Bound(0)]
     );
 
     // The axiom body still references the outer occurrence via a nullary call.
@@ -1256,40 +1313,11 @@ domain D {
     };
     // #quant0 = outer (trigger g, no captures), #quant1 = inner (trigger g,
     // one capture), #quant2 = sibling (trigger h).
-    assert_eq!(quant("ord#quant0").trigger.function, g_id);
+    let head = |name: &str| only_app(only_group(quant(name))).0.clone();
+    assert_eq!(head("ord#quant0"), vmir::TrigHead::Func(g_id));
     assert!(quant("ord#quant0").params.is_empty());
-    assert_eq!(quant("ord#quant1").trigger.function, g_id);
+    assert_eq!(head("ord#quant1"), vmir::TrigHead::Func(g_id));
     assert_eq!(quant("ord#quant1").params.len(), 1);
-    assert_eq!(quant("ord#quant2").trigger.function, h_id);
+    assert_eq!(head("ord#quant2"), vmir::TrigHead::Func(h_id));
     assert!(quant("ord#quant2").params.is_empty());
-}
-
-#[test]
-fn nested_forall_uncovered_inner_trigger_rejected() {
-    // The inner trigger `g(i, i)` mentions only the captured `i` — the inner
-    // binder `j` is never covered.
-    let err = run_err(
-        r#"
-domain D {
-    function g(i: Int, j: Int): Bool
-    axiom bad { forall i: Int :: {g(i, i)} (forall j: Int :: {g(i, i)} g(i, j)) }
-}
-"#,
-    );
-    assert_eq!(err, TranslationError::TriggerNotCovering);
-}
-
-#[test]
-fn generic_forall_rejected() {
-    // A `forall` inside a generic axiom (D[T] makes the axiom generic via mk).
-    let err = run_err(
-        r#"
-domain D[T] {
-    function mk(): D[T]
-    function p(x: D[T]): Bool
-    axiom bad { p(mk()) ? (forall i: Int :: {p(mk())} p(mk())) : true }
-}
-"#,
-    );
-    assert_eq!(err, TranslationError::GenericForallUnsupported);
 }

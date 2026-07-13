@@ -385,6 +385,7 @@ walk_enum!(
     Minus,
     Mult,
     Div,
+    IntDiv,
     Mod,
     Union,
     SetMinus,

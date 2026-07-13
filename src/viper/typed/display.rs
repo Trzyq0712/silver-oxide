@@ -605,6 +605,7 @@ impl<'a> Display for Show<'a, &'a BinOp> {
             BinOp::Minus => "-",
             BinOp::Mult => "*",
             BinOp::Div => "/",
+            BinOp::IntDiv => "\\",
             BinOp::Mod => "%",
             BinOp::In => "in",
             BinOp::Union => "union",

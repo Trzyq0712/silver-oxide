@@ -1,7 +1,39 @@
+use crate::vmir::Type;
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{Type, domain::TyParams};
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
+
+/// The type-parameter arity of a generic declaration. ADTs are the only generic
+/// declarations: domains, functions, methods and resources are monomorphic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TyParams(usize);
+
+impl From<usize> for TyParams {
+    fn from(n: usize) -> Self {
+        Self(n)
+    }
+}
+
+impl TyParams {
+    /// The type-parameter arity.
+    pub fn count(&self) -> usize {
+        self.0
+    }
+}
+
+impl Display for TyParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // A declaration's generic parameters are positional (`Generic(n)` → `?n`),
+        // so the binder only states the **arity** (`<2>`); the params are referred
+        // to as `?0`, `?1`, … Angle brackets match type-argument instantiation
+        // (`[..]` is reserved for heaps / addr groups). Nothing is printed for a
+        // non-generic declaration.
+        if self.0 == 0 {
+            return Ok(());
+        }
+        write!(f, "<{}>", self.0)
+    }
+}
 
 /// An algebraic data type: a list of variants (constructors), variant index =
 /// discriminator tag. Purely semantic — no synthetic `@tag` / accessor member

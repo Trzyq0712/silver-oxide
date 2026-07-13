@@ -4,17 +4,10 @@ use std::fmt;
 pub enum TranslationError {
     Unsupported(&'static str),
     UnknownIdent(String),
-    /// A generic axiom has no single function application whose type arguments
-    /// cover all of the axiom's type parameters — the verifier would have no
-    /// trigger from which to read a ground instantiation.
-    AxiomGenericsNotInferable(String),
-    /// A `forall` with no trigger group that is a single function application
-    /// whose arguments are each a bound variable or a captured enclosing
-    /// variable, with the bound positions covering all binders.
-    TriggerNotCovering,
-    /// A `forall` inside a generic axiom — not supported (no type-σ + value-σ
-    /// mix).
-    GenericForallUnsupported,
+    /// A `domain` declaring type parameters. Generics live on ADTs only: a
+    /// generic domain would need a *type* trigger to instantiate its axioms, and
+    /// Silver has no syntax to write one.
+    GenericDomainUnsupported(String),
 }
 
 impl fmt::Display for TranslationError {
@@ -22,17 +15,10 @@ impl fmt::Display for TranslationError {
         match self {
             TranslationError::Unsupported(what) => write!(f, "unsupported: {what}"),
             TranslationError::UnknownIdent(name) => write!(f, "unknown identifier: {name}"),
-            TranslationError::AxiomGenericsNotInferable(name) => write!(
+            TranslationError::GenericDomainUnsupported(name) => write!(
                 f,
-                "axiom `{name}`: no function application instantiates all of the axiom's type parameters"
+                "domain `{name}` declares type parameters: generic domains are not supported, declare an `adt` instead"
             ),
-            TranslationError::TriggerNotCovering => write!(
-                f,
-                "`forall` trigger must be a single application of bound or captured variables, with the bound ones covering all binders"
-            ),
-            TranslationError::GenericForallUnsupported => {
-                write!(f, "`forall` inside a generic axiom is not supported")
-            }
         }
     }
 }

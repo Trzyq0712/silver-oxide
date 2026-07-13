@@ -40,17 +40,6 @@ pub(crate) struct MethodContracts {
     pub heap_dep: bool,
 }
 
-/// A generic function's declared signature — the data needed to recover a call
-/// site's type-argument instantiation. `ty_params` is the ordered list of
-/// type-parameter names; `params`/`ret` are the declared types (possibly
-/// mentioning those names as `Type::Generic`).
-#[derive(Clone)]
-pub(crate) struct GenericSig {
-    pub ty_params: Vec<Spur>,
-    pub params: Vec<typed::Type>,
-    pub ret: typed::Type,
-}
-
 /// Read-only mid-translation state, owned and progressively folded by the
 /// coordinator. Every body-lowering helper takes `&TranslationContext` — none
 /// of them touch `Builder`'s write side (`decls`/`vmir_interner`/`decl_names`)
@@ -65,19 +54,11 @@ pub(crate) struct TranslationContext<'a> {
     pub contracts: HashMap<Spur, MethodContracts>,
     /// ADT constructor/destructor metadata.
     pub adt: AdtInfo,
-    /// A generic function's `Spur` to its declared generic signature.
-    pub fn_generic_sigs: HashMap<Spur, GenericSig>,
     /// Location **group** tags (`Type::Addr.group`) — field/predicate names.
     /// A clone of `Builder`'s `groups` interner, taken once `declare`
     /// finishes (fields/predicates are the only ones that register groups,
     /// all during `declare`; nothing registers one afterwards).
     pub(crate) groups: Rodeo<Spur>,
-    /// Type parameters of the **generic body currently being lowered** (a
-    /// domain axiom's used generics), so `lower_type`/`call_type_args` map a
-    /// `typed::Type::Generic` to its positional `vmir::Type::Generic(i)`.
-    /// Scoped by `DomainTranslator::define` (set per axiom, cleared after);
-    /// empty everywhere else — method/function/resource bodies are monomorphic.
-    pub(crate) decl_generics: Vec<Spur>,
 }
 
 impl<'a> TranslationContext<'a> {
@@ -88,44 +69,8 @@ impl<'a> TranslationContext<'a> {
             field_types: HashMap::new(),
             contracts: HashMap::new(),
             adt: AdtInfo::default(),
-            fn_generic_sigs: HashMap::new(),
             groups: Rodeo::new(),
-            decl_generics: Vec::new(),
         }
-    }
-
-    /// A call's full type-argument instantiation, in the callee's own
-    /// type-parameter order, recovered by matching the callee's declared
-    /// generic signature against the concrete argument and result types. Empty
-    /// for a monomorphic callee (no registered generic signature). This is the
-    /// inference the backend would otherwise have to redo: doing it once here
-    /// lets the verifier read the instantiation verbatim.
-    pub(crate) fn call_type_args(
-        &self,
-        name: Spur,
-        arg_tys: &[&typed::Type],
-        ret_ty: &typed::Type,
-    ) -> Vec<vmir::Type> {
-        let Some(sig) = self.fn_generic_sigs.get(&name) else {
-            return Vec::new();
-        };
-        let mut subst: HashMap<Spur, typed::Type> = HashMap::new();
-        for (decl, actual) in sig.params.iter().zip(arg_tys) {
-            super::match_generic(decl, actual, &mut subst);
-        }
-        super::match_generic(&sig.ret, ret_ty, &mut subst);
-        // Every type parameter is guaranteed to occur in the params/ret (a
-        // parameter used only in the body is not a real type parameter), so the
-        // match populates all of them.
-        sig.ty_params
-            .iter()
-            .map(|n| {
-                let t = subst
-                    .get(n)
-                    .expect("type parameter must occur in params/ret");
-                self.lower_type(t)
-            })
-            .collect()
     }
 
     /// The `#requires` contract resource of method `m`, if it has one.
@@ -138,13 +83,13 @@ impl<'a> TranslationContext<'a> {
         self.contracts.get(&m).and_then(|c| c.ensures)
     }
 
-    /// Lower a type against the current body's type parameters
-    /// (`decl_generics` — empty outside generic bodies, i.e. everywhere but a
-    /// domain axiom). For ADT-declaration field types (which may mention type
-    /// parameters) call the free [`super::lower_type`] with the owning ADT's
-    /// parameter list instead.
+    /// Lower a type in a monomorphic context — every body VMIR lowers is one
+    /// (domains are monomorphic, methods/functions/resources are too). For
+    /// ADT-declaration field types (which may mention the ADT's type parameters)
+    /// call the free [`super::lower_type`] with the owning ADT's parameter list
+    /// instead.
     pub(crate) fn lower_type(&self, ty: &typed::Type) -> vmir::Type {
-        super::lower_type(&self.name_map, &self.decl_generics, ty)
+        super::lower_type(&self.name_map, &[], ty)
     }
 
     /// The interned group tag for a field/predicate name (registered in the

@@ -4,10 +4,13 @@ use std::fmt::{self, Display, Formatter};
 
 use lasso::Spur;
 
+/// A domain — a monomorphic namespace of uninterpreted functions. Generics live
+/// on ADTs: a domain declaring type parameters is rejected at translation
+/// (`GenericDomainUnsupported`), since instantiating its axioms would need a
+/// *type* trigger, which Silver has no syntax to write.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Domain {
     pub name: Spur,
-    pub ty_params: TyParams,
 }
 
 /// A ground (quantifier-free) axiom: a closed boolean fact the verifier
@@ -17,14 +20,12 @@ pub struct Domain {
 /// stitched from a callee's `#ensures`; no params, so `Val::Temp` counts from
 /// 0) whose `res` is the axiom's boolean — merged with `true` before
 /// verification. Axiom bodies are **never verified**: no well-definedness
-/// obligations (div-by-zero etc.) are checked on them. A generic axiom
-/// (`ty_params > 0`) holds for every ground instantiation of its type
-/// parameters ("forall over types"); the verifier instantiates it lazily,
-/// triggered by ground applications of the functions it mentions.
+/// obligations (div-by-zero etc.) are checked on them. Quantification over
+/// *values* is a `forall` in the body (a [`Quantifier`] occurrence); there is no
+/// quantification over types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Axiom {
     pub name: Option<Spur>,
-    pub ty_params: TyParams,
     pub body: FunctionBody,
 }
 
@@ -40,8 +41,8 @@ pub struct Axiom {
 /// followed by the bound variables (`Temp(n_caps..n_caps + bound.len())`); the
 /// body's own temps count from there. Like an axiom, a quantifier body is
 /// **never verified**; it only contributes a lazy-instantiation rule.
-/// Instantiation of a ground occurrence `Q(c..)` at a ground trigger
-/// application `f(t..)` adds the guarded clause `Ite(Q(c..), res[c,σ], true)`.
+/// Instantiation of a ground occurrence `Q(c..)` at a ground match of one
+/// trigger group adds the guarded clause `Ite(Q(c..), res[c,σ], true)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Quantifier {
     pub name: Spur,
@@ -50,90 +51,63 @@ pub struct Quantifier {
     /// The binder types; they occupy `Val::Temp(params.len()..)` after the
     /// captures.
     pub bound: Box<[crate::vmir::Type]>,
-    pub trigger: QuantTrigger,
+    /// The trigger groups, in source order — **alternatives**: a match of *any*
+    /// one of them instantiates the quantifier. Never empty and never inferred:
+    /// a `forall` without a usable trigger is a type error.
+    pub triggers: Box<[QuantTrigger]>,
     pub body: FunctionBody,
 }
 
-/// A quantifier's trigger: one function application whose arguments are each a
-/// bound variable or a captured param, with the bound positions jointly
-/// covering all binders (repeats allowed). At a ground occurrence `Q(c..)` and
-/// a ground application `f(t0, t1, ..)`: an `args[k] = Bound(i)` position
-/// determines σ(i) = tk, an `args[k] = Capture(j)` position requires tk = cj.
+/// One trigger group — a conjunctive multi-pattern (`{f(x), g(x)}`): the
+/// quantifier instantiates at a σ only when **every** term matches. Each term's
+/// root is an application ([`TrigTerm::App`]), and the group's `Bound` positions
+/// jointly cover all binders (typecheck-enforced; repeats allowed).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuantTrigger {
-    pub function: crate::vmir::MemberId,
-    pub args: Box<[TrigArg]>,
+    pub terms: Box<[TrigTerm]>,
 }
 
-/// One argument position of a quantifier's trigger application: either a bound
-/// variable (defines σ at that binder) or a capture param (must equal the
-/// occurrence's capture argument).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TrigArg {
+/// A trigger pattern term. Matching it against a ground e-class, at a ground
+/// occurrence `Q(c..)`: a `Bound(i)` position determines σ(i) = the matched
+/// class, a `Capture(j)` position requires that class to equal `cj`, a `Lit`
+/// requires the literal, and an `App` requires an application of that head whose
+/// arguments recursively match — so a trigger may nest arbitrarily
+/// (`{f(g(x), c)}`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TrigTerm {
     Bound(usize),
     Capture(usize),
+    Lit(crate::vmir::Literal),
+    App {
+        head: TrigHead,
+        type_args: Vec<crate::vmir::Type>,
+        args: Box<[TrigTerm]>,
+    },
 }
 
+/// The head of a trigger application — the same heads a body's `PureInst` can
+/// produce, so a trigger matches exactly what the program can build.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TyParams(usize);
-
-impl From<usize> for TyParams {
-    fn from(n: usize) -> Self {
-        Self(n)
-    }
-}
-
-impl TyParams {
-    /// The type-parameter arity.
-    pub fn count(&self) -> usize {
-        self.0
-    }
-}
-
-impl Axiom {
-    /// The axiom's **trigger**: the first `FunctionCall` in the body whose
-    /// `type_args` mention all of the axiom's type parameters. A ground
-    /// instantiation of that one application determines the instantiation of
-    /// the whole (closed) axiom — the verifier reads σ off matched
-    /// applications of it. `None` when the axiom is generic but no single call
-    /// covers every parameter (rejected at translation); for a monomorphic
-    /// axiom the first call (if any) trivially covers zero parameters.
-    pub fn covering_trigger(&self) -> Option<&crate::vmir::FunctionCall> {
-        let n = self.ty_params.count();
-        self.body.insts.iter().find_map(|inst| {
-            let crate::vmir::InstKind::Pure(_, crate::vmir::PureInst::FunctionCall(call)) =
-                &inst.kind
-            else {
-                return None;
-            };
-            let mut seen = std::collections::HashSet::new();
-            for ty in &call.type_args {
-                ty.collect_generics(&mut seen);
-            }
-            (0..n).all(|i| seen.contains(&i)).then_some(call)
-        })
-    }
-}
-
-impl Display for TyParams {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // A declaration's generic parameters are positional (`Generic(n)` → `?n`),
-        // so the binder only states the **arity** (`<2>`); the params are referred
-        // to as `?0`, `?1`, … Angle brackets match type-argument instantiation
-        // (`[..]` is reserved for heaps / addr groups). Nothing is printed for a
-        // non-generic declaration.
-        if self.0 == 0 {
-            return Ok(());
-        }
-        write!(f, "<{}>", self.0)
-    }
+pub enum TrigHead {
+    Func(crate::vmir::MemberId),
+    AdtCons {
+        adt: crate::vmir::MemberId,
+        variant: usize,
+    },
+    AdtProj {
+        adt: crate::vmir::MemberId,
+        variant: usize,
+        field: usize,
+    },
+    AdtTag {
+        adt: crate::vmir::MemberId,
+    },
 }
 
 impl<'a> Display for VmirDisplay<'a, &'a Domain> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = self.interner.resolve(&self.item.name);
-        let ty_params = &self.item.ty_params;
-        writeln!(f, "domain {name}{ty_params}")
+        writeln!(f, "domain {name}")
     }
 }
 
@@ -143,7 +117,6 @@ impl<'a> Display for VmirDisplay<'a, &'a Axiom> {
         if let Some(n) = &self.item.name {
             write!(f, " {}", self.interner.resolve(n))?;
         }
-        write!(f, "{}", self.item.ty_params)?;
         writeln!(f, " {{")?;
         write!(
             f,
@@ -155,10 +128,59 @@ impl<'a> Display for VmirDisplay<'a, &'a Axiom> {
     }
 }
 
+/// A trigger term, rendered against the enclosing quantifier's capture arity
+/// (`n_caps`): a capture prints as `e{c}`, a binder as `e{n_caps + i}` — the same
+/// variable syntax the body uses.
+impl<'a> Display for VmirDisplay<'a, (usize, &'a TrigTerm)> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let (n_caps, term) = self.item;
+        match term {
+            TrigTerm::Bound(i) => write!(f, "e{}", n_caps + i),
+            TrigTerm::Capture(c) => write!(f, "e{c}"),
+            TrigTerm::Lit(lit) => write!(f, "{lit}"),
+            TrigTerm::App {
+                head,
+                type_args,
+                args,
+            } => {
+                match head {
+                    TrigHead::Func(id) => write!(f, "{}", self.member(*id))?,
+                    TrigHead::AdtCons { adt, variant } => {
+                        write!(f, "{}", self.adt_variant(*adt, *variant))?
+                    }
+                    TrigHead::AdtProj {
+                        adt,
+                        variant,
+                        field,
+                    } => write!(f, "{}.{field}", self.adt_variant(*adt, *variant))?,
+                    TrigHead::AdtTag { adt } => write!(f, "{}@tag", self.member(*adt))?,
+                }
+                if !type_args.is_empty() {
+                    write!(f, "<")?;
+                    for (i, t) in type_args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", self.with(t))?;
+                    }
+                    write!(f, ">")?;
+                }
+                write!(f, "(")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", self.with((n_caps, a)))?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
 impl<'a> Display for VmirDisplay<'a, &'a Quantifier> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = self.interner.resolve(&self.item.name);
-        let trigger_fn = self.member(self.item.trigger.function);
         let n_caps = self.item.params.len();
         // The occurrence is a callable boolean; the parens carry the capture
         // params. Captures occupy `Val::Temp(0..n_caps)` (`e0..`), binders
@@ -178,17 +200,19 @@ impl<'a> Display for VmirDisplay<'a, &'a Quantifier> {
             }
             write!(f, "e{}: {}", n_caps + k, self.with(ty))?;
         }
-        write!(f, " :: {{{}(", trigger_fn)?;
-        for (k, a) in self.item.trigger.args.iter().enumerate() {
-            if k > 0 {
-                write!(f, ", ")?;
+        // Trigger groups, alternatives side by side: `{f(e1), g(e1)}{h(e1)}`.
+        write!(f, " :: ")?;
+        for group in self.item.triggers.iter() {
+            write!(f, "{{")?;
+            for (k, term) in group.terms.iter().enumerate() {
+                if k > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", self.with((n_caps, term)))?;
             }
-            match a {
-                crate::vmir::TrigArg::Bound(i) => write!(f, "e{}", n_caps + i)?,
-                crate::vmir::TrigArg::Capture(c) => write!(f, "e{c}")?,
-            }
+            write!(f, "}}")?;
         }
-        writeln!(f, ")}} {{")?;
+        writeln!(f, " {{")?;
         // The body's own temps (and the display counter) start after the
         // captures and binders.
         write!(

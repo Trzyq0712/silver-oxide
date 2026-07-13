@@ -196,6 +196,7 @@ peg::parser! {
             --
             x:(@) (_ "*" _) y:@ { ExpKind::BinOp(BinOp::Mult, Exp::unknown(x), Exp::unknown(y)) }
             x:(@) (_ "/" _) y:@ { ExpKind::BinOp(BinOp::Div, Exp::unknown(x), Exp::unknown(y)) }
+            x:(@) (_ "\\" _) y:@ { ExpKind::BinOp(BinOp::IntDiv, Exp::unknown(x), Exp::unknown(y)) }
             x:(@) (_ "%" _) y:@ { ExpKind::BinOp(BinOp::Mod, Exp::unknown(x), Exp::unknown(y)) }
             "-" _ x:@ { ExpKind::UnOp(UnOp::Neg, Exp::unknown(x)) }
             "!" _ x:@ { ExpKind::UnOp(UnOp::Not, Exp::unknown(x)) }

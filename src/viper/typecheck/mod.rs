@@ -817,7 +817,8 @@ impl<'a, 'g> ConstraintCtx<'a, 'g> {
                     .impose(rk.concretizes_explicit(ViperTcType::Numeric))?;
                 self.tc.impose(key.is_sym_meet_of(lk, rk))?;
             }
-            SBinOp::Mod => {
+            // `\` is integer division: strictly `Int`, unlike `/` below.
+            SBinOp::Mod | SBinOp::IntDiv => {
                 self.tc.impose(lk.concretizes_explicit(ViperTcType::Int))?;
                 self.tc.impose(rk.concretizes_explicit(ViperTcType::Int))?;
                 self.tc.impose(key.concretizes_explicit(ViperTcType::Int))?;
@@ -1205,6 +1206,11 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_body = self.lower_pure::<typed::AxiomExt>(body)?;
+                // Triggers are validated for `forall` only — `build_forall`
+                // rejects `exists` outright, and that is the error worth showing.
+                if matches!(kind, viper::QuantifierKind::Forall) {
+                    check_triggers(&bound, &lowered_triggers, self.env.interner)?;
+                }
                 Ext::build_forall(*kind, bound, lowered_triggers, lowered_body)
             }
 
@@ -1415,6 +1421,7 @@ fn lower_bin_op(op: &viper::BinOp) -> BinOp {
         S::Minus => BinOp::Minus,
         S::Mult => BinOp::Mult,
         S::Div => BinOp::Div,
+        S::IntDiv => BinOp::IntDiv,
         S::Mod => BinOp::Mod,
         other => panic!("unsupported binary operator: {other:?}"),
     }
@@ -1888,6 +1895,86 @@ fn typecheck_method(
     }))
 }
 
+/// Validate a `forall`'s triggers. Triggers are **never inferred**: a quantifier
+/// with no trigger group is rejected, and so is a group we could not match on.
+/// Every group must be usable (none is silently dropped) — the verifier mints one
+/// instantiation rule per group, so all of them reach VMIR.
+///
+/// A group is a conjunctive multi-pattern; each of its terms must be an
+/// *application* (function, domain function, ADT constructor / destructor /
+/// discriminator) whose subterms are variables, literals or nested applications —
+/// interpreted operators cannot be e-matched. The group must mention every bound
+/// variable (at any depth), or a match would leave a binder uninstantiated.
+fn check_triggers(
+    bound: &[TypedIdent],
+    triggers: &[Vec<TypedPureExp<typed::AxiomExt>>],
+    interner: &Interner,
+) -> Result<(), TypeError> {
+    if triggers.is_empty() || triggers.iter().any(|g| g.is_empty()) {
+        return Err(TypeError::MissingTrigger);
+    }
+    for group in triggers {
+        let mut covered: HashSet<Spur> = HashSet::new();
+        for term in group {
+            if !is_trigger_application(term) {
+                return Err(TypeError::TriggerNotAnApplication);
+            }
+            check_trigger_subterms(term, &mut covered)?;
+        }
+        if let Some(bv) = bound.iter().find(|bv| !covered.contains(&bv.name.0)) {
+            return Err(TypeError::TriggerNotCovering(
+                interner.resolve(&bv.name.0).to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a trigger term's root is an application — the only shape a trigger
+/// can match on.
+fn is_trigger_application(term: &TypedPureExp<typed::AxiomExt>) -> bool {
+    use PureExpKind as P;
+    matches!(
+        term.exp.as_ref(),
+        P::DomainFunctionCall(_)
+            | P::AdtConstructor(_)
+            | P::AdtDestructor(..)
+            | P::AdtDiscriminator(..)
+            | P::Ext(typed::AxiomExt::FunctionCall(_))
+    )
+}
+
+/// Walk a trigger term, rejecting any subterm that is not a variable, a literal
+/// or an application, and recording every variable it mentions in `seen` (the
+/// bound ones among these are what the group covers).
+fn check_trigger_subterms(
+    term: &TypedPureExp<typed::AxiomExt>,
+    seen: &mut HashSet<Spur>,
+) -> Result<(), TypeError> {
+    use PureExpKind as P;
+    match term.exp.as_ref() {
+        P::Ident(id) => {
+            seen.insert(id.0);
+            Ok(())
+        }
+        P::Const(_) => Ok(()),
+        P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => check_trigger_subterms(e, seen),
+        P::DomainFunctionCall(call)
+        | P::AdtConstructor(call)
+        | P::Ext(typed::AxiomExt::FunctionCall(call)) => {
+            for a in &call.args {
+                check_trigger_subterms(a, seen)?;
+            }
+            Ok(())
+        }
+        P::Unary(..)
+        | P::Binary(..)
+        | P::Ternary { .. }
+        | P::LetIn { .. }
+        | P::Ext(typed::AxiomExt::Forall(_)) => Err(TypeError::TriggerBadSubterm),
+    }
+}
+
 /// Reject calls to Silver functions with a precondition anywhere in an axiom —
 /// Viper's one restriction on normal functions in axioms (a precondition-free
 /// function is also heap-free, so no snapshot argument is needed downstream).
@@ -2193,11 +2280,94 @@ domain D { axiom a { null.f == 0 } }
 
     #[test]
     fn axiom_forall_typechecks() {
-        // A pure `forall` is now a first-class term in an axiom (trigger
-        // validity is checked later, at translation).
         let result = run_pipeline(
             r#"
-domain D { axiom q { forall x: Int :: {x == x} x == x } }
+domain D { function f(i: Int): Bool  axiom q { forall x: Int :: {f(x)} f(x) } }
+"#,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn forall_without_trigger_rejected() {
+        // Triggers are never inferred.
+        let result = run_pipeline(
+            r#"
+domain D { function f(i: Int): Bool  axiom q { forall x: Int :: f(x) } }
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::MissingTrigger))),
+            "expected MissingTrigger, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_must_be_an_application() {
+        let result = run_pipeline(
+            r#"
+domain D { function f(i: Int): Bool  axiom q { forall x: Int :: {x == x} f(x) } }
+"#,
+        );
+        assert!(
+            result.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::TriggerNotAnApplication))),
+            "expected TriggerNotAnApplication, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_with_arithmetic_subterm_rejected() {
+        // Interpreted operators cannot be e-matched, at any depth.
+        let result = run_pipeline(
+            r#"
+domain D { function f(i: Int): Bool  axiom q { forall x: Int :: {f(x + 1)} f(x) } }
+"#,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|es| es.iter().any(|e| matches!(e, TypeError::TriggerBadSubterm))),
+            "expected TriggerBadSubterm, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn trigger_not_covering_all_binders_rejected() {
+        // `f(x)` leaves `y` uninstantiated — and every group must cover, so an
+        // alternative group that does cover is no excuse.
+        let result = run_pipeline(
+            r#"
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int, j: Int): Bool
+    axiom q { forall x: Int, y: Int :: {g(x, y)}{f(x)} g(x, y) }
+}
+"#,
+        );
+        assert!(
+            result.as_ref().is_err_and(|es| es
+                .iter()
+                .any(|e| matches!(e, TypeError::TriggerNotCovering(v) if v == "y"))),
+            "expected TriggerNotCovering(y), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn nested_and_multi_term_triggers_typecheck() {
+        let result = run_pipeline(
+            r#"
+domain D {
+    function h(i: Int): Int
+    function f(i: Int): Bool
+    function g(i: Int): Bool
+    axiom nested { forall x: Int :: {f(h(x))} f(h(x)) }
+    axiom both { forall x: Int :: {f(x), g(x)} f(x) == g(x) }
+    axiom alt { forall x: Int :: {f(x)}{g(x)} f(x) == g(x) }
+}
 "#,
         );
         assert!(result.is_ok(), "expected Ok, got: {result:?}");

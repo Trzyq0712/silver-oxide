@@ -93,7 +93,7 @@ impl BodyRecipe {
         changed: &mut Vec<Id>,
     ) -> Id {
         let seed: Vec<Id> = self.seed_refs.iter().map(resolve).collect();
-        crate::verify::rewrite::build_instance(egraph, &self.steps, &self.res, &seed, &[], changed)
+        crate::verify::rewrite::build_instance(egraph, &self.steps, &self.res, &seed, changed)
     }
 }
 

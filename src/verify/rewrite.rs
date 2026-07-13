@@ -11,7 +11,7 @@ use egg::{
 use crate::verify::analysis::ConstFold;
 use crate::verify::cert::FunctionDefinition;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
-use crate::vmir::{BinOp, Literal, Polarity, TrigArg, Type, Val};
+use crate::vmir::{BinOp, Literal, Polarity, Type, Val};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 
@@ -38,7 +38,7 @@ pub(crate) fn new_memo_generation() {
 }
 
 /// A run-scoped applier memo (see [`MEMO_GEN`]).
-struct Memo<K>(Mutex<(u64, HashSet<K>)>);
+pub(crate) struct Memo<K>(Mutex<(u64, HashSet<K>)>);
 
 impl<K: Eq + std::hash::Hash> Memo<K> {
     fn new() -> Self {
@@ -475,12 +475,12 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
     }
 }
 
-// ---- Generic domain axioms ("forall over types") --------------------------
+// ---- Prepared pure bodies (axioms, quantifiers, function definitions) ------
 
-/// A pure step of a prepared axiom body. Mirrors the `PureInst` subset legal in
-/// an axiom, with every callee resolved to its verifier `FuncId` up front (the
-/// applier has no registry access) and types still mentioning the axiom's
-/// `Generic(i)` parameters — substituted per instantiation.
+/// A pure step of a prepared body. Mirrors the `PureInst` subset legal in an
+/// axiom, with every callee resolved to its verifier `FuncId` up front (the
+/// applier has no registry access) and its type arguments ground (only ADTs are
+/// generic, and their instantiations are fixed at translation).
 #[derive(Clone)]
 pub(crate) enum AxiomPure {
     Binary(BinOp, Val, Val),
@@ -499,21 +499,6 @@ pub(crate) enum AxiomPure {
 pub(crate) enum AxiomInst {
     Val(AxiomPure),
     Assume(Val),
-}
-
-/// A generic domain axiom prepared for lazy instantiation: the body as
-/// registry-resolved pure steps, its boolean result, and the **trigger** — the
-/// one function application whose `type_args` cover all `n_params` type
-/// parameters, so a ground application of it determines σ for the whole
-/// (closed) axiom.
-pub(crate) struct PreparedAxiom {
-    pub n_params: usize,
-    pub trigger_func: FuncId,
-    /// The trigger's declared (generic) `type_args` — the pattern matched
-    /// against a ground application's payload to extract σ.
-    pub trigger_type_args: Vec<Type>,
-    pub insts: Vec<AxiomInst>,
-    pub res: Val,
 }
 
 /// Searcher: any e-class containing an application of the trigger function
@@ -571,28 +556,22 @@ impl Searcher<Symbolic, ConstFold> for AxiomTriggerSearcher {
     }
 }
 
-/// Applier: for each ground application of the trigger in the matched e-class,
-/// extract σ from its type payload, instantiate the whole axiom body at σ, and
-/// merge its boolean with `true`. Memoized per σ (instantiation is idempotent —
-/// re-adding hash-conses and re-unioning no-ops — so the memo is purely a
-/// saturation-cost guard). Axiom bodies are never verified: no obligations.
-/// Add a prepared body (of an axiom or a quantifier) to the e-graph, seeding
-/// the value slots with `vals_seed` (the bound-variable σ for a quantifier;
-/// empty for a closed axiom) and substituting `type_sigma` into every type
-/// argument (the type-parameter σ for a generic axiom; empty for a quantifier).
-/// Runs the body's `Assume`s (merging each with `true`) and returns the changed
-/// e-classes together with the body's `res` e-class id. The caller decides how
-/// to discharge `res` (an axiom merges it with `true`; a quantifier guards it; a
-/// function unfold unions it with the call e-class).
+/// Add a prepared body (of an axiom, a quantifier, or a function definition) to
+/// the e-graph, seeding the value slots with `vals_seed` (the captures ++
+/// bound-variable σ for a quantifier, the arguments for a function definition;
+/// empty for a closed axiom). Runs the body's `Assume`s (merging each with
+/// `true`) and returns the changed e-classes together with the body's `res`
+/// e-class id. The caller decides how to discharge `res` (an axiom merges it
+/// with `true`; a quantifier guards it; a function unfold unions it with the
+/// call e-class).
 pub(crate) fn build_instance(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     res: &Val,
     vals_seed: &[Id],
-    type_sigma: &[Type],
     changed: &mut Vec<Id>,
 ) -> Id {
-    let vals = build_instance_vals(egraph, insts, vals_seed, type_sigma, changed);
+    let vals = build_instance_vals(egraph, insts, vals_seed, changed);
     resolve_val(egraph, &vals, res)
 }
 
@@ -611,7 +590,6 @@ pub(crate) fn build_instance_vals(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     vals_seed: &[Id],
-    type_sigma: &[Type],
     changed: &mut Vec<Id>,
 ) -> Vec<Id> {
     let mut vals: Vec<Id> = vals_seed.to_vec();
@@ -644,10 +622,7 @@ pub(crate) fn build_instance_vals(
                         type_args,
                         args,
                     } => {
-                        let tys: Box<[Type]> = type_args
-                            .iter()
-                            .map(|t| t.subst_generics(type_sigma))
-                            .collect();
+                        let tys: Box<[Type]> = type_args.iter().cloned().collect();
                         let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
                         egraph.add(Symbolic::FuncApp(*func, tys, args))
                     }
@@ -666,129 +641,169 @@ pub(crate) fn build_instance_vals(
     vals
 }
 
-struct AxiomApplier {
-    axiom: PreparedAxiom,
-    memo: Memo<Vec<Type>>,
-}
-
-impl AxiomApplier {
-    /// Add the axiom body instantiated at `sigma` and merge `res` with `true`.
-    /// Returns the e-classes changed by the unions.
-    fn instantiate(&self, egraph: &mut EGraph<Symbolic, ConstFold>, sigma: &[Type]) -> Vec<Id> {
-        let mut changed = Vec::new();
-        let res = build_instance(
-            egraph,
-            &self.axiom.insts,
-            &self.axiom.res,
-            &[],
-            sigma,
-            &mut changed,
-        );
-        let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-        if egraph.union(res, true_) {
-            changed.push(egraph.find(res));
-        }
-        changed
-    }
-}
-
-impl Applier<Symbolic, ConstFold> for AxiomApplier {
-    fn apply_one(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        _subst: &Subst,
-        _searcher_ast: Option<&PatternAst<Symbolic>>,
-        _rule_name: Symbol,
-    ) -> Vec<Id> {
-        // Extract every distinct ground σ this e-class's trigger applications
-        // determine. Collected first: `instantiate` needs `&mut egraph`.
-        let mut sigmas: Vec<Vec<Type>> = Vec::new();
-        for node in &egraph[eclass].nodes {
-            let Symbolic::FuncApp(f, tys, _) = node else {
-                continue;
-            };
-            if *f != self.axiom.trigger_func || tys.len() != self.axiom.trigger_type_args.len() {
-                continue;
-            }
-            let mut sigma: Vec<Option<Type>> = vec![None; self.axiom.n_params];
-            let matched = self
-                .axiom
-                .trigger_type_args
-                .iter()
-                .zip(tys.iter())
-                .all(|(pat, ground)| pat.match_generics(ground, &mut sigma));
-            if !matched {
-                continue;
-            }
-            let Some(sigma): Option<Vec<Type>> = sigma.into_iter().collect() else {
-                continue;
-            };
-            if self.memo.insert(sigma.clone()) {
-                sigmas.push(sigma);
-            }
-        }
-        let mut changed = Vec::new();
-        for sigma in sigmas {
-            changed.extend(self.instantiate(egraph, &sigma));
-        }
-        changed
-    }
-
-    fn vars(&self) -> Vec<Var> {
-        vec![]
-    }
-}
-
-/// Mint the lazy-instantiation rule for one prepared generic axiom.
-pub(crate) fn axiom_rule(name: &str, axiom: PreparedAxiom) -> Rule {
-    let searcher = AxiomTriggerSearcher {
-        func: axiom.trigger_func,
-    };
-    let applier = AxiomApplier {
-        axiom,
-        memo: Memo::new(),
-    };
-    Rewrite::new(format!("axiom-{name}"), searcher, applier).expect("axiom rule")
-}
-
 // ---- Pure `forall` quantifiers (value-σ triggered) -------------------------
 
-/// A pure `forall` prepared for lazy instantiation: its opaque occurrence
-/// function (`quant_func`), the capture and bound-variable arities, the trigger
-/// function whose ground applications drive instantiation, the positional
-/// trigger-argument map (`trig_args[k]` = the bound variable that trigger
-/// argument `k` binds, or the capture param it must equal), and the body
+/// One trigger pattern term, with every head resolved to its verifier `FuncId`
+/// (the applier has no registry access). The `vmir::TrigTerm` grammar, flattened
+/// to what the e-graph speaks: an `App` matches a `FuncApp` node with the same
+/// function, type payload and arity, whose argument e-classes match `args`
+/// recursively.
+#[derive(Clone)]
+pub(crate) enum PreparedTerm {
+    Bound(usize),
+    Capture(usize),
+    Lit(Literal),
+    App {
+        func: FuncId,
+        type_args: Box<[Type]>,
+        args: Vec<PreparedTerm>,
+    },
+}
+
+impl PreparedTerm {
+    /// The function a term is rooted at — the searcher's anchor. Only an `App`
+    /// can be a top-level trigger term (typecheck-enforced).
+    fn root_func(&self) -> Option<FuncId> {
+        match self {
+            PreparedTerm::App { func, .. } => Some(*func),
+            _ => None,
+        }
+    }
+}
+
+/// A pure `forall` prepared for lazy instantiation, **one trigger group** per
+/// prepared quantifier (a `forall` with several alternative groups mints one rule
+/// per group). Carries its opaque occurrence function (`quant_func`), the capture
+/// and bound-variable arities, the group's pattern terms, and the body
 /// (registry-resolved pure steps + boolean `res`, with temps `0..n_caps` the
-/// captures and `n_caps..n_caps+n_bound` the binders). Unlike a generic axiom,
-/// σ is over *values* (e-class ids read off the trigger's arguments), not
-/// types.
+/// captures and `n_caps..n_caps+n_bound` the binders). σ is over *values*
+/// (e-class ids read off the matched trigger applications).
 pub(crate) struct PreparedQuantifier {
     pub quant_func: FuncId,
     pub n_caps: usize,
     pub n_bound: usize,
-    pub trigger_func: FuncId,
-    pub trig_args: Box<[TrigArg]>,
+    /// The group's terms — a conjunctive multi-pattern: an instance needs *all*
+    /// of them matched, under one σ.
+    pub group: Vec<PreparedTerm>,
     pub insts: Vec<AxiomInst>,
     pub res: Val,
 }
 
-/// Applier: pair every ground occurrence `Q(c..)` in the e-graph with every
-/// ground application of the trigger in the matched e-class whose capture
-/// positions match the occurrence's capture args; read the bound-variable σ off
-/// the binder positions, instantiate the body at `caps ++ σ`, and add the
-/// **guarded** clause `Ite(Q(c..), res[c,σ], true) == true`. The instance is
-/// released only once that ground occurrence merges `true` (existing
-/// `ite(true, t, e) = t` rule), so instantiation is sound regardless of the
-/// quantifier's truth. Occurrences are never created here — a top-level
-/// (nullary) occurrence is added by the eager ground-axiom evaluation, a nested
-/// one by an outer instance's `build_instance`; an unmaterialized quantifier is
-/// correctly never instantiated (its guard could never fire). Memoized per
-/// `caps ++ σ` (canonicalized at insert) — a saturation-cost guard, since
-/// instantiation is idempotent.
+/// A partial bound-variable substitution, one slot per binder.
+type Sigma = Vec<Option<Id>>;
+
+/// Match `term` against e-class `class` under the occurrence's capture args,
+/// extending `sigma`. Returns every consistent extension (an e-class may hold
+/// several nodes matching the pattern's head, each binding σ differently), or an
+/// empty vector when the term cannot match.
+fn match_term(
+    egraph: &EGraph<Symbolic, ConstFold>,
+    term: &PreparedTerm,
+    class: Id,
+    caps: &[Id],
+    sigma: &Sigma,
+) -> Vec<Sigma> {
+    let class = egraph.find(class);
+    match term {
+        PreparedTerm::Bound(i) => match sigma[*i] {
+            // A repeated binder must land on the same e-class.
+            Some(prev) if egraph.find(prev) != class => vec![],
+            Some(_) => vec![sigma.clone()],
+            None => {
+                let mut next = sigma.clone();
+                next[*i] = Some(class);
+                vec![next]
+            }
+        },
+        PreparedTerm::Capture(c) => {
+            if egraph.find(caps[*c]) == class {
+                vec![sigma.clone()]
+            } else {
+                vec![]
+            }
+        }
+        PreparedTerm::Lit(lit) => {
+            if egraph[class]
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Symbolic::Lit(l) if l == lit))
+            {
+                vec![sigma.clone()]
+            } else {
+                vec![]
+            }
+        }
+        PreparedTerm::App {
+            func,
+            type_args,
+            args,
+        } => {
+            let mut out = Vec::new();
+            for node in &egraph[class].nodes {
+                let Symbolic::FuncApp(f, tys, children) = node else {
+                    continue;
+                };
+                if f != func || tys != type_args || children.len() != args.len() {
+                    continue;
+                }
+                // Thread σ left to right across the arguments, branching on every
+                // consistent way each of them matches.
+                let mut partials = vec![sigma.clone()];
+                for (arg, &child) in args.iter().zip(children.iter()) {
+                    partials = partials
+                        .iter()
+                        .flat_map(|s| match_term(egraph, arg, child, caps, s))
+                        .collect();
+                    if partials.is_empty() {
+                        break;
+                    }
+                }
+                out.extend(partials);
+            }
+            out
+        }
+    }
+}
+
+/// Every σ that matches `term` somewhere in the e-graph, extending `sigma` — used
+/// for the non-anchor terms of a multi-term group, which the searcher's matched
+/// e-class says nothing about. Scans the classes holding an application of the
+/// term's root function.
+fn match_term_anywhere(
+    egraph: &EGraph<Symbolic, ConstFold>,
+    term: &PreparedTerm,
+    caps: &[Id],
+    sigma: &Sigma,
+) -> Vec<Sigma> {
+    let Some(root) = term.root_func() else {
+        return vec![];
+    };
+    let Some(classes) = egraph.classes_for_op(&Discriminant::FuncApp(root)) else {
+        return vec![];
+    };
+    classes
+        .flat_map(|class| match_term(egraph, term, class, caps, sigma))
+        .collect()
+}
+
+/// Applier: pair every ground occurrence `Q(c..)` in the e-graph with every way
+/// this group's terms match under one σ — the first (anchor) term against the
+/// searcher's e-class, the rest anywhere in the e-graph, so a multi-term group
+/// `{f(x), g(x)}` only fires when *both* applications are present. Instantiate
+/// the body at `caps ++ σ` and add the **guarded** clause
+/// `Ite(Q(c..), res[c,σ], true) == true`. The instance is released only once that
+/// ground occurrence merges `true` (existing `ite(true, t, e) = t` rule), so
+/// instantiation is sound regardless of the quantifier's truth. Occurrences are
+/// never created here — a top-level (nullary) occurrence is added by the eager
+/// ground-axiom evaluation, a nested one by an outer instance's `build_instance`;
+/// an unmaterialized quantifier is correctly never instantiated (its guard could
+/// never fire). Memoized per `caps ++ σ` (canonicalized at insert) — a
+/// saturation-cost guard, since instantiation is idempotent. The memo is **shared
+/// across a `forall`'s alternative groups**: two groups reaching the same σ build
+/// the instance once.
 struct QuantApplier {
     quant: PreparedQuantifier,
-    memo: Memo<Vec<Id>>,
+    memo: Arc<Memo<Vec<Id>>>,
 }
 
 impl Applier<Symbolic, ConstFold> for QuantApplier {
@@ -818,42 +833,28 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
                 }
             }
         }
-        // Pair each trigger application in the matched e-class with each
-        // occurrence. Collected first: `build_instance` needs `&mut egraph`.
+        let (anchor, rest) = self
+            .quant
+            .group
+            .split_first()
+            .expect("a trigger group is never empty");
+        // Collect the instances first: `build_instance` needs `&mut egraph`.
         let mut instances: Vec<(Id, Vec<Id>)> = Vec::new();
-        for node in &egraph[eclass].nodes {
-            let Symbolic::FuncApp(f, _, args) = node else {
-                continue;
-            };
-            if *f != self.quant.trigger_func || args.len() != self.quant.trig_args.len() {
-                continue;
+        for (occ_id, caps) in &occurrences {
+            let empty: Sigma = vec![None; self.quant.n_bound];
+            let mut sigmas = match_term(egraph, anchor, eclass, caps, &empty);
+            for term in rest {
+                sigmas = sigmas
+                    .iter()
+                    .flat_map(|s| match_term_anywhere(egraph, term, caps, s))
+                    .collect();
+                if sigmas.is_empty() {
+                    break;
+                }
             }
-            for (occ_id, caps) in &occurrences {
-                // Positional match: a `Bound(i)` argument defines σ(i) (a
-                // repeated binder must land on the same e-class); a
-                // `Capture(c)` argument must equal the occurrence's capture.
-                let mut sigma: Vec<Option<Id>> = vec![None; self.quant.n_bound];
-                let mut ok = true;
-                for (k, &arg) in args.iter().enumerate() {
-                    match self.quant.trig_args[k] {
-                        TrigArg::Bound(i) => match &mut sigma[i] {
-                            Some(prev) if egraph.find(*prev) != egraph.find(arg) => {
-                                ok = false;
-                                break;
-                            }
-                            slot => *slot = Some(egraph.find(arg)),
-                        },
-                        TrigArg::Capture(c) => {
-                            if egraph.find(caps[c]) != egraph.find(arg) {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if !ok {
-                    continue;
-                }
+            for sigma in sigmas {
+                // A group covers every binder (typecheck-enforced), so a
+                // complete match leaves no slot open.
                 let Some(sigma): Option<Vec<Id>> = sigma.into_iter().collect() else {
                     continue;
                 };
@@ -875,7 +876,6 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
                 &self.quant.insts,
                 &self.quant.res,
                 &vals,
-                &[],
                 &mut changed,
             );
             let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
@@ -892,16 +892,27 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
     }
 }
 
-/// Mint the lazy-instantiation rule for one prepared pure `forall`.
-pub(crate) fn quantifier_rule(name: &str, quant: PreparedQuantifier) -> Rule {
+/// Mint the lazy-instantiation rule for one trigger group of a pure `forall`.
+/// The rule searches on the group's **anchor** — its first term's root function —
+/// and the applier matches the whole group from there. `memo` is shared by the
+/// rules of one `forall`'s alternative groups.
+pub(crate) fn quantifier_rule(
+    name: &str,
+    quant: PreparedQuantifier,
+    memo: Arc<Memo<Vec<Id>>>,
+) -> Rule {
     let searcher = AxiomTriggerSearcher {
-        func: quant.trigger_func,
+        func: quant.group[0]
+            .root_func()
+            .expect("a trigger term is an application"),
     };
-    let applier = QuantApplier {
-        quant,
-        memo: Memo::new(),
-    };
+    let applier = QuantApplier { quant, memo };
     Rewrite::new(format!("quantifier-{name}"), searcher, applier).expect("quantifier rule")
+}
+
+/// A fresh instantiation memo, shared across one `forall`'s trigger-group rules.
+pub(crate) fn quant_memo() -> Arc<Memo<Vec<Id>>> {
+    Arc::new(Memo::new())
 }
 
 // ---- Function-call unfolding (lazy, rewrite-rule triggered) ---------------
@@ -989,7 +1000,7 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
         let mut changed = Vec::new();
         for (tys, args) in calls {
             debug_assert_eq!(args.len(), self.def.n_params, "function unfold arity");
-            let vals = build_instance_vals(egraph, &self.def.steps, &args, &tys, &mut changed);
+            let vals = build_instance_vals(egraph, &self.def.steps, &args, &mut changed);
             // Definitional union `f(args) == body` — unconditional: the
             // purified body is a total function of the args (Deref became
             // `unwrap∘proj`, div is total in the e-graph), so the equation

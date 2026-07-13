@@ -34,6 +34,19 @@ pub enum TypeError {
     UnboundTypeParam(String),
     /// An `exists` quantifier (only pure `forall` is supported so far).
     ExistsUnsupported,
+    /// A `forall` with no trigger group (or an empty one). Triggers are never
+    /// inferred — every quantifier must state how it is instantiated.
+    MissingTrigger,
+    /// A trigger term whose root is not an application (a function, domain
+    /// function, ADT constructor/destructor/discriminator call).
+    TriggerNotAnApplication,
+    /// A subterm of a trigger that is neither a variable, a literal, nor a
+    /// nested application — interpreted operators (`+`, `!`, `?:`, `let`) and
+    /// nested quantifiers cannot be matched on.
+    TriggerBadSubterm,
+    /// A trigger group that does not mention every bound variable: matching it
+    /// would leave a binder uninstantiated. Names the missing variable.
+    TriggerNotCovering(String),
     /// A field dereference in a domain axiom.
     FieldAccessInAxiom,
     /// An `unfolding` expression in a domain axiom.
@@ -106,6 +119,22 @@ impl std::fmt::Display for TypeError {
             TypeError::ExistsUnsupported => {
                 write!(f, "`exists` quantifiers are not supported yet")
             }
+            TypeError::MissingTrigger => write!(
+                f,
+                "`forall` needs an explicit trigger — triggers are never inferred, write `{{ f(x) }}`"
+            ),
+            TypeError::TriggerNotAnApplication => write!(
+                f,
+                "a trigger term must be a function, domain-function or ADT application"
+            ),
+            TypeError::TriggerBadSubterm => write!(
+                f,
+                "a trigger may only contain variables, literals and nested applications"
+            ),
+            TypeError::TriggerNotCovering(name) => write!(
+                f,
+                "trigger does not mention bound variable `{name}`; every trigger group must cover all binders"
+            ),
             TypeError::FieldAccessInAxiom => {
                 write!(f, "field access not allowed in a domain axiom")
             }

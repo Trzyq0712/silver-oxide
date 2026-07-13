@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{Inst, MemberId, TyParams, Type, Val};
+use crate::vmir::{Inst, MemberId, Type, Val};
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
 
@@ -18,10 +18,6 @@ use std::fmt::{self, Display, Formatter};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Function {
     pub name: Spur,
-    /// Type-parameter arity — a function is generic only in the type-params used
-    /// in its declaration (params/ret). `0` for a non-generic function; a lifted
-    /// domain function carries its owning domain's arity.
-    pub ty_params: TyParams,
     pub params: Params,
     pub ret: Type,
     /// The function's definition, when it has a body. `None` ⟹ abstract /
@@ -179,12 +175,9 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
         let name = self.interner.resolve(&self.item.name);
         let params = &self.item.params;
         let ret = &self.item.ret;
-        // `ty_params` renders the generic arity (`<1>`), or nothing when
-        // non-generic.
         write!(
             f,
-            "function {name}{}{} -> {}",
-            self.item.ty_params,
+            "function {name}{} -> {}",
             self.with(params),
             self.with(ret)
         )?;

@@ -152,6 +152,9 @@ pub enum BinOp {
     Minus,
     Mult,
     Div,
+    /// Integer division (`\`). Silver reserves `/` for permission division, so
+    /// `Int` division has its own token.
+    IntDiv,
     Mod,
     Union,
     SetMinus,

@@ -122,14 +122,11 @@ pub(crate) fn lower<Ext: PureExt>(
             })?;
             Ok(sink.emit_pure(ty, PureInst::Ternary(c, t, e)))
         }
-        // A domain function call (pure, heap-free). Lowered as a polymorphic VMIR
-        // function application (one `FuncId` for the function — no monomorphic
-        // copy). `type_args` is the **full** instantiation in the function's own
-        // type-parameter order, recovered from the concrete arg/result types, so
-        // the verifier reads it verbatim (no reconstruction).
+        // A domain function call (pure, heap-free). Domains are monomorphic, so
+        // the application carries no type arguments — only ADT constructors and
+        // projections do.
         P::DomainFunctionCall(call) => {
-            let arg_tys: Vec<&typed::Type> = call.args.iter().map(|a| &a.ty).collect();
-            let type_args = b.call_type_args(call.name.0, &arg_tys, &exp.ty);
+            let type_args = Vec::new();
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(lower(b, env, sink, hctx, a)?);
@@ -319,7 +316,9 @@ fn lower_binary<Ext: PureExt>(
         B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),
         B::Mult => sink.emit_pure(ty, PureInst::Binary(V::Mult, lv, rv)),
         // The divisor≠0 obligation is checked in the current value heap.
-        B::Div => sink.with_heap(hctx.value, |sink| {
+        // `IntDiv` (`\`) collapses into the same VMIR `Div`: the op is already
+        // polymorphic, and `\`'s operands are `Int` by type checking.
+        B::Div | B::IntDiv => sink.with_heap(hctx.value, |sink| {
             sink.emit_pure_guarded(ty, PureInst::Binary(V::Div, lv, rv))
         }),
         B::Mod => sink.with_heap(hctx.value, |sink| {
@@ -628,11 +627,6 @@ fn lower_forall(
     sink: &mut Sink,
     q: &typed::Forall,
 ) -> Result<Val, TranslationError> {
-    // v2 still excludes `forall` inside a generic axiom (no type-σ + value-σ
-    // mix).
-    if !b.decl_generics.is_empty() {
-        return Err(TranslationError::GenericForallUnsupported);
-    }
     let quant_id = sink
         .quant_ids
         .pop_front()
@@ -646,20 +640,19 @@ fn lower_forall(
         bound.push(b.lower_type(&bv.ty));
     }
 
-    // Select the trigger group before capture discovery: its arguments lead the
-    // capture order, so trigger captures get the smallest indices.
-    let trig_call = select_trigger(&q.triggers, &binder_idx, env, n)?;
-
-    // Capture discovery: the free identifiers of the chosen trigger's arguments
-    // and the body, in first-appearance order. A doubly-nested `forall`'s
-    // captures of *this* level's variables surface here too (they are free in
-    // this body), so every level captures exactly what its subtree needs.
+    // Capture discovery: the free identifiers of the trigger terms and the body,
+    // in first-appearance order — triggers first, so their captures get the
+    // smallest indices. A doubly-nested `forall`'s captures of *this* level's
+    // variables surface here too (they are free in this body), so every level
+    // captures exactly what its subtree needs.
     let mut captures: Vec<(Spur, vmir::Type)> = Vec::new();
     let mut cap_idx: HashMap<Spur, usize> = HashMap::new();
     {
         let mut scope: Vec<Spur> = binder_idx.keys().copied().collect();
-        for a in &trig_call.args {
-            collect_captures(b, a, &mut scope, &mut captures, &mut cap_idx);
+        for group in &q.triggers {
+            for term in group {
+                collect_captures(b, term, &mut scope, &mut captures, &mut cap_idx);
+            }
         }
         collect_captures(b, &q.body, &mut scope, &mut captures, &mut cap_idx);
     }
@@ -675,28 +668,19 @@ fn lower_forall(
         occ_args.push(v.clone());
     }
 
-    let function = *b.name_map.get(&trig_call.name.0).ok_or_else(|| {
-        TranslationError::UnknownIdent(b.interner.resolve(&trig_call.name.0).to_string())
-    })?;
-    let trig_args: Vec<vmir::TrigArg> = trig_call
-        .args
-        .iter()
-        .map(|a| {
-            let typed::PureExpKind::Ident(id) = a.exp.as_ref() else {
-                unreachable!("select_trigger admits only identifier arguments");
-            };
-            match binder_idx.get(&id.0) {
-                Some(&i) => vmir::TrigArg::Bound(i),
-                // Scanned first above, so every non-binder trigger arg is a
-                // capture with an assigned index.
-                None => vmir::TrigArg::Capture(cap_idx[&id.0]),
-            }
-        })
-        .collect();
-    let trigger = vmir::QuantTrigger {
-        function,
-        args: trig_args.into(),
-    };
+    // Trigger groups: alternatives, each a conjunctive multi-pattern. Typecheck
+    // has already established every group's shape (application-rooted terms over
+    // variables/literals/nested applications) and that it covers all binders.
+    let mut triggers = Vec::with_capacity(q.triggers.len());
+    for group in &q.triggers {
+        let terms = group
+            .iter()
+            .map(|t| lower_trig_term(b, t, &binder_idx, &cap_idx))
+            .collect::<Result<Vec<_>, _>>()?;
+        triggers.push(vmir::QuantTrigger {
+            terms: terms.into(),
+        });
+    }
 
     // The quantifier body's environment: captures then binders.
     let mut inner_env: HashMap<Spur, Val> = HashMap::new();
@@ -732,7 +716,7 @@ fn lower_forall(
             name: Default::default(),
             params: captures.into_iter().map(|(_, ty)| ty).collect(),
             bound: bound.into(),
-            trigger,
+            triggers: triggers.into(),
             body,
         },
     ));
@@ -811,49 +795,90 @@ fn collect_captures(
     }
 }
 
-/// Select a `forall`'s trigger group: some group must be exactly one function
-/// application (domain function or Silver function) whose arguments are each an
-/// identifier of a bound variable or of an enclosing-environment value (a
-/// capture), with the bound positions jointly covering all `n` binders (a
-/// repeated binder is allowed as long as coverage holds). Returns the chosen
-/// call; the caller assigns capture indices after capture discovery.
-fn select_trigger<'t>(
-    triggers: &'t [Vec<typed::TypedPureExp<typed::AxiomExt>>],
+/// Lower one trigger term into its VMIR pattern tree. A variable resolves to the
+/// binder it names (`Bound`) or to its capture slot (`Capture` — every free
+/// variable of a trigger was assigned one during capture discovery); a literal to
+/// `Lit`; anything else is an application, lowered to the same head the body's
+/// `PureInst` would produce, with its arguments lowered recursively (a trigger
+/// may nest arbitrarily). Shapes outside this grammar were rejected at typecheck
+/// (`check_triggers`).
+fn lower_trig_term(
+    b: &TranslationContext<'_>,
+    term: &typed::TypedPureExp<typed::AxiomExt>,
     binder_idx: &HashMap<Spur, usize>,
-    env: &HashMap<Spur, Val>,
-    n: usize,
-) -> Result<&'t typed::Call<typed::AxiomExt>, TranslationError> {
+    cap_idx: &HashMap<Spur, usize>,
+) -> Result<vmir::TrigTerm, TranslationError> {
     use typed::PureExpKind as P;
-    for group in triggers {
-        let [term] = &group[..] else {
-            continue;
-        };
-        let call: &typed::Call<typed::AxiomExt> = match term.exp.as_ref() {
-            P::DomainFunctionCall(c) => c,
-            P::Ext(typed::AxiomExt::FunctionCall(c)) => c,
-            _ => continue,
-        };
-        let mut covered = vec![false; n];
-        let mut ok = true;
-        for a in &call.args {
-            let P::Ident(id) = a.exp.as_ref() else {
-                ok = false;
-                break;
-            };
-            match binder_idx.get(&id.0) {
-                Some(&idx) => covered[idx] = true,
-                None if env.contains_key(&id.0) => {}
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
+    let lower_args = |args: &[typed::TypedPureExp<typed::AxiomExt>]| {
+        args.iter()
+            .map(|a| lower_trig_term(b, a, binder_idx, cap_idx))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    match term.exp.as_ref() {
+        P::Ident(id) => Ok(match binder_idx.get(&id.0) {
+            Some(&i) => vmir::TrigTerm::Bound(i),
+            None => vmir::TrigTerm::Capture(cap_idx[&id.0]),
+        }),
+        P::Const(lit) => Ok(vmir::TrigTerm::Lit(lower_literal(lit)?)),
+        P::DomainFunctionCall(call) | P::Ext(typed::AxiomExt::FunctionCall(call)) => {
+            let function = *b.name_map.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
+            Ok(vmir::TrigTerm::App {
+                head: vmir::TrigHead::Func(function),
+                type_args: Vec::new(),
+                args: lower_args(&call.args)?.into(),
+            })
         }
-        if ok && covered.iter().all(|&c| c) {
-            return Ok(call);
+        P::AdtConstructor(call) => {
+            let &(adt_spur, variant) = b.adt.ctor_tag.get(&call.name.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
+            })?;
+            Ok(vmir::TrigTerm::App {
+                head: vmir::TrigHead::AdtCons {
+                    adt: b.name_map[&adt_spur],
+                    variant,
+                },
+                type_args: adt_type_args(b, &term.ty),
+                args: lower_args(&call.args)?.into(),
+            })
+        }
+        P::AdtDestructor(base, field) => {
+            let &(adt, variant, field) = b.adt.dtor_sem.get(&field.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&field.0).to_string())
+            })?;
+            Ok(vmir::TrigTerm::App {
+                head: vmir::TrigHead::AdtProj {
+                    adt,
+                    variant,
+                    field,
+                },
+                type_args: adt_type_args(b, &base.ty),
+                args: Box::new([lower_trig_term(b, base, binder_idx, cap_idx)?]),
+            })
+        }
+        // `{ e.isCons }` triggers on the tag application the discriminator reads
+        // (the `== tag` comparison around it is not a matchable shape).
+        P::AdtDiscriminator(base, variant) => {
+            let &(adt_spur, _) = b.adt.ctor_tag.get(&variant.0).ok_or_else(|| {
+                TranslationError::UnknownIdent(b.interner.resolve(&variant.0).to_string())
+            })?;
+            Ok(vmir::TrigTerm::App {
+                head: vmir::TrigHead::AdtTag {
+                    adt: b.name_map[&adt_spur],
+                },
+                type_args: adt_type_args(b, &base.ty),
+                args: Box::new([lower_trig_term(b, base, binder_idx, cap_idx)?]),
+            })
+        }
+        P::Unary(..)
+        | P::Binary(..)
+        | P::Ternary { .. }
+        | P::LetIn { .. }
+        | P::Ext(typed::AxiomExt::Forall(_)) => {
+            unreachable!("typecheck rejects non-matchable trigger subterms")
         }
     }
-    Err(TranslationError::TriggerNotCovering)
 }
 
 impl PureExt for typed::MethodEnsuresExt {

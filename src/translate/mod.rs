@@ -46,7 +46,7 @@ pub use errors::TranslationError;
 pub(crate) use builder::{
     Builder, DeclSlot, Declarator, Definer, QuantScope, alloc_quant_slots, fill_quant_slots,
 };
-pub(crate) use context::{GenericSig, MethodContracts, TranslationContext};
+pub(crate) use context::{MethodContracts, TranslationContext};
 
 /// Build a `vmir::Program` from a typed `typed::Program`.
 pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<TranslationError>> {
@@ -149,7 +149,7 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
     Ok(builder.finalize())
 }
 
-pub(crate) use types::{lower_type, match_generic};
+pub(crate) use types::lower_type;
 
 #[cfg(test)]
 mod tests;

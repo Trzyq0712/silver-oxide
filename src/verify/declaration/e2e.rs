@@ -2117,47 +2117,6 @@ method client() {
 }
 
 #[test]
-fn generic_axiom_instantiates_at_use_site() {
-    // The axiom is generic over T; `client` grounds it at `Int` through the
-    // annotated local. The lazy rule fires on the `nil[Int]()` application,
-    // instantiates `len(nil()) == 0` at Int, and congruence closes the goal.
-    let input = r#"
-domain List[T] {
-    function nil(): List[T]
-    function len(xs: List[T]): Int
-    axiom { len(nil()) == 0 }
-}
-method client() {
-    var l: List[Int] := nil()
-    assert len(l) == 0
-}
-"#;
-    let program = lower(input);
-    let result = verify_named_method(&program, "client");
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-#[test]
-fn generic_axiom_two_instantiations_in_one_unit() {
-    let input = r#"
-domain List[T] {
-    function nil(): List[T]
-    function len(xs: List[T]): Int
-    axiom { len(nil()) == 0 }
-}
-method client() {
-    var l: List[Int] := nil()
-    var m: List[Bool] := nil()
-    assert len(l) == 0
-    assert len(m) == 0
-}
-"#;
-    let program = lower(input);
-    let result = verify_named_method(&program, "client");
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-#[test]
 fn axiom_body_is_never_verified() {
     // The axiom divides by zero; axioms are trusted (no well-definedness
     // obligations), so an unrelated method still verifies.
@@ -2193,36 +2152,6 @@ function probe(): Int
     let program = lower(input);
     let result = verify_named_function(&program, "probe");
     assert!(result.is_ok(), "expected Ok, got {result:?}");
-}
-
-#[test]
-fn generic_axiom_monomorphic_conjunct_not_yet_split() {
-    // KNOWN DIVERGENCE (documented, fix deferred): the axiom is generic over T
-    // (via `mk`), so the whole body — including the monomorphic conjunct
-    // `tag() == 7` — sits behind the `mk[T]` trigger, and `client` never
-    // applies `mk`. Silicon happens to pass this variant only because
-    // `ground()` defaults `tag()`'s unconstrained T to Ref at the call site,
-    // minting a D[Ref] occurrence that instantiates the axiom (and fails the
-    // variant with `tag` declared outside the domain). Planned fix: split
-    // top-level `&&` conjuncts into separate axioms (sound — types are
-    // non-empty, so ∀T distributes over ∧), making this conjunct ground.
-    let input = r#"
-domain D[T] {
-    function mk(): D[T]
-    function tag(): Int
-    axiom { mk() == mk() && tag() == 7 }
-}
-method client() {
-    assert tag() == 7
-}
-"#;
-    let program = lower(input);
-    let result = verify_named_method(&program, "client");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "documents the current divergence; if this starts passing, conjunct \
-         splitting (or equivalent) landed — update this test to assert Ok"
-    );
 }
 
 // ---- Pure `forall` quantifiers (v1: domain axioms, no Tier-4) --------------
@@ -3426,4 +3355,174 @@ method absurd(x: Int, l: List)
     for (name, r) in &results {
         assert!(r.is_ok(), "{name} should verify; got {r:?}");
     }
+}
+
+// ---- Trigger shapes: nesting, multi-term groups, alternatives --------------
+
+#[test]
+fn nested_trigger_instantiates_on_the_nested_application() {
+    // The trigger is `f(g(i))`: the binder sits under a nested call, so σ(i) is
+    // read off the *inner* application's argument. Matching `f(g(7))` in the goal
+    // gives σ = {i ↦ 7}.
+    let input = r#"
+domain D {
+    function g(i: Int): Int
+    function f(i: Int): Bool
+    axiom nested { forall i: Int :: {f(g(i))} f(g(i)) }
+}
+method m() {
+    assert f(g(7))
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn nested_trigger_does_not_fire_on_the_outer_head_alone() {
+    // `f(3)` is an application of the trigger's *root* function, but its argument
+    // is not a `g` application — the nested pattern does not match, so nothing is
+    // instantiated and the goal stands unproven.
+    let input = r#"
+domain D {
+    function g(i: Int): Int
+    function f(i: Int): Bool
+    axiom nested { forall i: Int :: {f(g(i))} f(g(i)) }
+}
+method m() {
+    assert f(3)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed, got {result:?}"
+    );
+}
+
+#[test]
+fn multi_term_trigger_needs_every_term_present() {
+    // Group `{p(i), q(i)}` is conjunctive: `p(7)` alone must not instantiate the
+    // quantifier, so the goal `p(7) ==> q(7)`'s body stays unproven.
+    let input = r#"
+domain D {
+    function p(i: Int): Bool
+    function q(i: Int): Bool
+    function r(i: Int): Bool
+    axiom both { forall i: Int :: {p(i), q(i)} r(i) }
+}
+method m() {
+    assert p(7) == p(7) && r(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "only `p(7)` is present, so the group must not fire; got {result:?}"
+    );
+}
+
+#[test]
+fn multi_term_trigger_fires_when_all_terms_present() {
+    // Same quantifier, now with both `p(7)` and `q(7)` in the e-graph: the group
+    // matches at σ = {i ↦ 7} and releases `r(7)`.
+    let input = r#"
+domain D {
+    function p(i: Int): Bool
+    function q(i: Int): Bool
+    function r(i: Int): Bool
+    axiom both { forall i: Int :: {p(i), q(i)} r(i) }
+}
+method m() {
+    assume p(7)
+    assume q(7)
+    assert r(7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn alternative_trigger_groups_each_fire() {
+    // `{p(i)}{q(i)}` are alternatives — either application alone instantiates the
+    // quantifier. Each method exercises one group.
+    let input = r#"
+domain D {
+    function p(i: Int): Bool
+    function q(i: Int): Bool
+    function r(i: Int): Bool
+    axiom alt { forall i: Int :: {p(i)}{q(i)} r(i) }
+}
+method via_p() {
+    assume p(7)
+    assert r(7)
+}
+method via_q() {
+    assume q(8)
+    assert r(8)
+}
+"#;
+    let program = lower(input);
+    for m in ["via_p", "via_q"] {
+        let result = verify_named_method(&program, m);
+        assert!(result.is_ok(), "{m}: expected Ok, got {result:?}");
+    }
+}
+
+#[test]
+fn literal_trigger_argument_matches_only_that_literal() {
+    // The trigger `f(i, 0)` pins its second argument: `f(7, 0)` instantiates the
+    // quantifier, `f(7, 1)` does not.
+    let input = r#"
+domain D {
+    function f(i: Int, j: Int): Bool
+    function r(i: Int): Bool
+    axiom lit { forall i: Int :: {f(i, 0)} r(i) }
+}
+method hit() {
+    assume f(7, 0)
+    assert r(7)
+}
+method miss() {
+    assume f(7, 1)
+    assert r(7)
+}
+"#;
+    let program = lower(input);
+    let hit = verify_named_method(&program, "hit");
+    assert!(hit.is_ok(), "expected Ok, got {hit:?}");
+    let miss = verify_named_method(&program, "miss");
+    assert!(
+        matches!(miss, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "`f(7, 1)` must not match the literal trigger; got {miss:?}"
+    );
+}
+
+#[test]
+fn adt_constructor_trigger_matches_a_construction() {
+    // A trigger may be headed by an ADT constructor: `{Cons(x, l)}` fires wherever
+    // a `Cons` application exists.
+    let input = r#"
+adt List {
+    Nil()
+    Cons(head: Int, tail: List)
+}
+domain D {
+    function ok(l: List): Bool
+}
+domain A {
+    axiom cons_ok { forall x: Int, l: List :: {Cons(x, l)} ok(Cons(x, l)) }
+}
+method m(l: List) {
+    assert ok(Cons(3, l))
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
 }

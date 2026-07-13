@@ -1,0 +1,35 @@
+// Trigger shapes: an arbitrarily nested application, a conjunctive multi-term
+// group, and alternative groups. Triggers are always written out — never
+// inferred.
+
+domain L {
+    function tail(l: L): L
+    function len(l: L): Int
+    function sorted(l: L): Bool
+    function bounded(l: L): Bool
+
+    // Nested trigger: the binder sits under `tail`, so the axiom instantiates at
+    // every `len(tail(l))` in the program.
+    axiom tail_shorter { forall l: L :: {len(tail(l))} len(tail(l)) < len(l) }
+
+    // Multi-term group: fires only where both applications are present.
+    axiom sorted_bounded { forall l: L :: {sorted(l), bounded(l)} sorted(l) ==> bounded(l) }
+
+    // Alternatives: either application instantiates the axiom.
+    axiom len_nonneg { forall l: L :: {len(l)}{tail(l)} len(l) >= 0 }
+}
+
+method nested(l: L) {
+    assert len(tail(l)) < len(l)
+}
+
+method multi_term(l: L) {
+    assume sorted(l)
+    assume bounded(l) == bounded(l)
+    assert bounded(l)
+}
+
+method alternatives(l: L) {
+    assume tail(l) == tail(l)
+    assert len(l) >= 0
+}

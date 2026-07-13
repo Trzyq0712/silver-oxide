@@ -201,10 +201,28 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
         Declaration::Axiom(ax) => inst_deps(&ax.body.insts, out),
         Declaration::Quantifier(q) => {
             inst_deps(&q.body.insts, out);
-            out.push(q.trigger.function);
+            for group in q.triggers.iter() {
+                for term in group.terms.iter() {
+                    trig_term_deps(term, out);
+                }
+            }
         }
         // Leaf declarations: nothing to depend on.
         Declaration::Domain(_) | Declaration::Adt(_) => {}
+    }
+}
+
+/// The members a trigger pattern mentions: the function at each application head
+/// it matches on (an ADT head is not a declaration the verifier schedules — its
+/// ids are minted on demand).
+fn trig_term_deps(term: &crate::vmir::TrigTerm, out: &mut Vec<MemberId>) {
+    if let crate::vmir::TrigTerm::App { head, args, .. } = term {
+        if let crate::vmir::TrigHead::Func(id) = head {
+            out.push(*id);
+        }
+        for a in args.iter() {
+            trig_term_deps(a, out);
+        }
     }
 }
 
@@ -273,7 +291,6 @@ mod tests {
         };
         Declaration::Function(Function {
             name: lasso::Spur::try_from_usize(0).unwrap(),
-            ty_params: 0.into(),
             params: vec![].into(),
             ret: Type::Int,
             body: Some(FunctionBody {

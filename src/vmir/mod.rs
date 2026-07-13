@@ -16,9 +16,10 @@ pub use ty::Type;
 pub use heap::{Assign, HeapInst, HeapVal, Sign};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
+pub use adt::TyParams;
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
-pub use domain::{Axiom, Domain, QuantTrigger, Quantifier, TrigArg, TyParams};
+pub use domain::{Axiom, Domain, QuantTrigger, Quantifier, TrigHead, TrigTerm};
 pub use function::{
     Args, ContractArg, ContractCall, Function, FunctionBody, FunctionCall, Params, Requires,
 };
