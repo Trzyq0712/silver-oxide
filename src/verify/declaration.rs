@@ -909,8 +909,29 @@ fn walk_footprint(
                 SeedRef::SlotValue(j) => values[*j],
             }
         };
+        // Heap framing is a *syntactic* e-class match (`heap_subtract`,
+        // `ValueSource::ReadHeap`), so a slot address has to be in normal form
+        // before we look it up. A slot address that reaches through a snapshot —
+        // `Pt(f(r, cons(Some(unwrap(proj_0(s))))))`, the shape a Rust `&mut`
+        // reparented under `old(..)` produces — is only e-class-equal to the held
+        // chunk's address once the `proj∘cons` / `unwrap∘Some` reductions have
+        // fired.
+        //
+        // Reduce only when the rebuild actually introduced something to reduce.
+        // The recipe is add-only, so if `build` added no e-node then every term it
+        // named was already present — and therefore already normalized by the
+        // reduce that first introduced it. Guarding on the node count keeps repeat
+        // call sites (the common case: one resource, many uses) free; reducing
+        // unconditionally per slot re-runs the ADT rule set over the whole e-graph
+        // every time and costs ~3.5x end to end.
+        let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
         let bperm = slot.perm.build(&mut ctx.egraph, resolve, &mut changed);
+        if ctx.egraph.total_number_of_nodes() != before {
+            ctx.reduce();
+        }
+        let addr = ctx.egraph.find(addr);
+        let bperm = ctx.egraph.find(bperm);
         let elem = slot.elem.clone();
         let value = match &source {
             // Values are read from the *original* heap (aliased slots agree).

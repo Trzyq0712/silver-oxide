@@ -1,6 +1,6 @@
 saturations=0
-reduces=1
-sat_iterations=2
+reduces=3
+sat_iterations=4
 egraph_nodes_peak=17
 egraph_classes_peak=14
 rule_applications=1
