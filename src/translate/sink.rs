@@ -3,11 +3,9 @@
 //! uniform; how the resulting stream is interpreted is the caller's concern
 //! (resource delta+bool, method effects, function result).
 
-use std::collections::VecDeque;
-
 use crate::vmir::{
-    self, BinOp, HeapInst, HeapVal, Inst, InstKind, MemberId, PathConds, Polarity, PureInst,
-    Quantifier, ResourceCall, Sign, Type, Val, none,
+    self, BinOp, HeapInst, HeapVal, Inst, InstKind, PathConds, Polarity, PureInst, ResourceCall,
+    Sign, Type, Val, none,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -41,15 +39,6 @@ pub(crate) struct Sink {
     /// onto a heapless obligation's `Inst` by the emitters. `None` outside any
     /// heap-bearing region (e.g. before the first heap is threaded).
     pub heap: Option<HeapVal>,
-    /// Pre-allocated occurrence ids for the `forall`s in this lowering region,
-    /// in encounter (preorder) order. Each `forall` pops the next id to emit its
-    /// occurrence call; a quantifier body's inner sink inherits the remaining
-    /// queue, so nested `forall`s consume the same flat preorder allocation.
-    /// Empty in every Sink outside an axiom (or quantifier-body) lowering.
-    pub quant_ids: VecDeque<MemberId>,
-    /// Quantifier declarations built while lowering this region's `forall`s,
-    /// paired with their occurrence id, for the caller to fill their slots.
-    pub quant_out: Vec<(MemberId, Quantifier)>,
 }
 
 impl Sink {
@@ -61,8 +50,6 @@ impl Sink {
             heap_count: heap_base,
             pc: Vec::new(),
             heap: None,
-            quant_ids: VecDeque::new(),
-            quant_out: Vec::new(),
         }
     }
 

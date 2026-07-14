@@ -94,7 +94,10 @@ impl Analysis<Symbolic> for ConstFold {
                 Ctor(*f, tys.clone())
             }
 
-            Symbolic::Fresh(_) | Symbolic::FuncApp(..) => Unknown,
+            // A quantifier is opaque to constant folding: its truth is decided by
+            // the instantiation rule (guarded merges with `true`), never by its
+            // payload or its capture children.
+            Symbolic::Fresh(_) | Symbolic::FuncApp(..) | Symbolic::Forall(..) => Unknown,
 
             Symbolic::RealCast(c) => match &egraph[*c].data {
                 Known(Literal::Int(n)) => Known(Literal::Real(BigRational::from(n.clone()))),

@@ -34,6 +34,12 @@ pub(crate) struct HeapCtx<'a> {
     /// postcondition (`FuncEnsuresExt::Result`); `None` everywhere else. Held by
     /// reference so `HeapCtx` stays `Copy` (`Val` is not `Copy`).
     pub result: Option<&'a Val>,
+    /// Set while lowering a `forall` body. There is no heap in there (`value` and
+    /// `perm` are the inert `Empty`) and there cannot be one: the body is compiled
+    /// into a recipe the verifier rebuilds inside a rewrite rule, which can
+    /// neither read the symbolic heap nor discharge an obligation. It gates the
+    /// one construct that would need both — a heap-dependent call's `Snap`.
+    pub in_quantifier: bool,
 }
 
 impl<'a> HeapCtx<'a> {
@@ -44,6 +50,7 @@ impl<'a> HeapCtx<'a> {
             perm: heap,
             old: Some(old),
             result: None,
+            in_quantifier: false,
         }
     }
 }
@@ -405,6 +412,14 @@ fn lower_func_app<Ext: PureExt>(
         // Narrow the current value heap to the callee's precondition snapshot.
         // `Snap` implicitly asserts the precondition under the running pc.
         let req_id = requires.expect("heap-dep implies a requires");
+        // A quantifier body has no heap to narrow, and could not have one (see
+        // `HeapCtx::in_quantifier`). A binder-dependent footprint would need
+        // quantified permissions besides.
+        if hctx.in_quantifier {
+            return Err(TranslationError::HeapDepFunctionInQuantifier(
+                b.interner.resolve(&call.name.0).to_string(),
+            ));
+        }
         let s = sink.emit_pure_guarded(
             vmir::Type::Snap(req_id),
             PureInst::Snap {
@@ -481,69 +496,6 @@ pub(crate) trait PureExt: Sized + Clone + std::fmt::Debug {
         ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError>;
-
-    /// The number of `forall` occurrence slots this extension node consumes,
-    /// **including** `forall`s nested inside another's body (see
-    /// [`count_foralls`]).
-    fn count_foralls_ext(ext: &Self) -> usize;
-}
-
-/// The number of `forall`s in a pure expression, **including** those nested
-/// inside another `forall`'s body. Each contributes one occurrence slot; the
-/// preorder here matches the order lowering consumes ids (a `forall`'s own id
-/// precedes its body's). Triggers are not descended — they are validated, never
-/// lowered, so they consume no ids.
-pub(crate) fn count_foralls<Ext: PureExt>(exp: &typed::TypedPureExp<Ext>) -> usize {
-    use typed::PureExpKind as P;
-    match exp.exp.as_ref() {
-        P::Ident(_) | P::Const(_) => 0,
-        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => count_foralls(e),
-        P::Binary(_, l, r) => count_foralls(l) + count_foralls(r),
-        P::Ternary { if_, then, else_ } => {
-            count_foralls(if_) + count_foralls(then) + count_foralls(else_)
-        }
-        P::LetIn { value, exp, .. } => count_foralls(value) + count_foralls(exp),
-        P::DomainFunctionCall(call) | P::AdtConstructor(call) => count_foralls_call(call),
-        P::Ext(ext) => Ext::count_foralls_ext(ext),
-    }
-}
-
-pub(crate) fn count_foralls_call<Ext: PureExt>(call: &typed::Call<Ext>) -> usize {
-    call.args.iter().map(count_foralls).sum()
-}
-
-fn count_foralls_heap_node<Ext: PureExt>(node: &typed::HeapNode<Ext>) -> usize {
-    match node {
-        typed::HeapNode::Field(e, _) => count_foralls(e),
-        typed::HeapNode::FunctionCall(call) => count_foralls_call(call),
-        typed::HeapNode::Unfolding(pwp, e) => count_foralls_pred_with_perm(pwp) + count_foralls(e),
-    }
-}
-
-pub(crate) fn count_foralls_pred_with_perm<Ext: PureExt>(
-    pwp: &typed::PredicateWithPerm<Ext>,
-) -> usize {
-    count_foralls_call(&pwp.pred_call) + count_foralls(&pwp.perm)
-}
-
-fn count_foralls_resource<Ext: PureExt>(res: &typed::ResourceExp<Ext>) -> usize {
-    match res.0.as_ref() {
-        typed::ResourceExpKind::Field(e, _) => count_foralls(e),
-        typed::ResourceExpKind::PredicateCall(call) => count_foralls_call(call),
-    }
-}
-
-pub(crate) fn count_foralls_spatial<Ext: PureExt>(s: &typed::SpatialExp<Ext>) -> usize {
-    use typed::SpatialExpKind as SK;
-    match s.0.as_ref() {
-        SK::Implies(c, body) => count_foralls(c) + count_foralls_spatial(body),
-        SK::Conj(l, r) => count_foralls_spatial(l) + count_foralls_spatial(r),
-        SK::Ternary { if_, then, else_ } => {
-            count_foralls(if_) + count_foralls_spatial(then) + count_foralls_spatial(else_)
-        }
-        SK::Acc(res, perm) => count_foralls_resource(res) + count_foralls(perm),
-        SK::Pure(e) => count_foralls(e),
-    }
 }
 
 impl PureExt for ! {
@@ -555,10 +507,6 @@ impl PureExt for ! {
         _ty: vmir::Type,
         ext: &Self,
     ) -> Result<Val, TranslationError> {
-        match *ext {}
-    }
-
-    fn count_foralls_ext(ext: &Self) -> usize {
         match *ext {}
     }
 }
@@ -575,13 +523,6 @@ impl PureExt for typed::HeapExt {
         match ext {
             typed::HeapExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
             typed::HeapExt::Forall(q) => lower_forall(b, env, sink, q),
-        }
-    }
-
-    fn count_foralls_ext(ext: &Self) -> usize {
-        match ext {
-            typed::HeapExt::Heap(node) => count_foralls_heap_node(node),
-            typed::HeapExt::Forall(q) => 1 + count_foralls(&q.body),
         }
     }
 }
@@ -604,34 +545,21 @@ impl PureExt for typed::AxiomExt {
             typed::AxiomExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
-
-    fn count_foralls_ext(ext: &Self) -> usize {
-        match ext {
-            typed::AxiomExt::FunctionCall(call) => count_foralls_call(call),
-            typed::AxiomExt::Forall(q) => 1 + count_foralls(&q.body),
-        }
-    }
 }
 
-/// Lower a pure `forall` into its opaque boolean occurrence call (arguments =
-/// the captured enclosing values), defining the [`vmir::Quantifier`] (params +
-/// body + trigger) into `sink.quant_out` for the caller to slot. The occurrence
-/// id is the next pre-allocated one in `sink.quant_ids`. The body is lowered in
-/// an inner sink with the captures as `Val::Temp(0..n_caps)` and the bound
-/// variables as `Temp(n_caps..n_caps + n)`; the inner sink inherits the
-/// occurrence-id queue, so nested `forall`s consume ids in flat preorder and
-/// their built quantifiers bubble up through `quant_out`.
+/// Lower a pure `forall` into an inline [`PureInst::Forall`] step of the
+/// enclosing stream: a boolean value whose captures are the enclosing values its
+/// body and triggers reference. The body is lowered in an inner sink with the
+/// captures as `Val::Temp(0..n_caps)` and the bound variables as
+/// `Temp(n_caps..n_caps + n)`, so a nested `forall` is simply a `PureInst::Forall`
+/// of *that* stream, capturing this level's binders — no id budget, no
+/// declaration lifting.
 fn lower_forall(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     q: &typed::Forall,
 ) -> Result<Val, TranslationError> {
-    let quant_id = sink
-        .quant_ids
-        .pop_front()
-        .expect("forall occurrence under-allocated");
-
     let n = q.bound.len();
     let mut bound = Vec::with_capacity(n);
     let mut binder_idx: HashMap<Spur, usize> = HashMap::new();
@@ -658,14 +586,13 @@ fn lower_forall(
     }
     let n_caps = captures.len();
 
-    // The occurrence call's arguments: each capture resolved in the enclosing
-    // environment.
-    let mut occ_args = Vec::with_capacity(n_caps);
+    // The capture arguments: each capture resolved in the enclosing environment.
+    let mut cap_args = Vec::with_capacity(n_caps);
     for (name, _) in &captures {
         let v = env
             .get(name)
             .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(name).to_string()))?;
-        occ_args.push(v.clone());
+        cap_args.push(v.clone());
     }
 
     // Trigger groups: alternatives, each a conjunctive multi-pattern. Typecheck
@@ -692,43 +619,30 @@ fn lower_forall(
     }
 
     // Lower the body in an inner sink whose params (captures ++ binders) occupy
-    // `Val::Temp(0..n_caps + n)`. The occurrence-id queue is threaded through
-    // so nested `forall`s pop from the same flat preorder queue.
+    // `Val::Temp(0..n_caps + n)`.
     let mut inner = Sink::new(n_caps + n, 0);
-    inner.quant_ids = std::mem::take(&mut sink.quant_ids);
     let hctx = HeapCtx {
         value: HeapVal::Empty,
         perm: HeapVal::Empty,
         old: None,
         result: None,
+        in_quantifier: true,
     };
-    let res = lower(b, &inner_env, &mut inner, hctx, &q.body);
-    sink.quant_ids = std::mem::take(&mut inner.quant_ids);
-    sink.quant_out.append(&mut inner.quant_out);
+    let res = lower(b, &inner_env, &mut inner, hctx, &q.body)?;
     let body = vmir::FunctionBody {
         insts: inner.insts,
-        res: res?,
+        res,
     };
 
-    sink.quant_out.push((
-        quant_id,
-        vmir::Quantifier {
-            name: Default::default(),
-            params: captures.into_iter().map(|(_, ty)| ty).collect(),
+    Ok(sink.emit_pure(
+        vmir::Type::Bool,
+        PureInst::Forall(Box::new(vmir::Forall {
+            captures: cap_args,
+            cap_types: captures.into_iter().map(|(_, ty)| ty).collect(),
             bound: bound.into(),
             triggers: triggers.into(),
             body,
-        },
-    ));
-
-    // Emit the opaque boolean occurrence call carrying the captured values.
-    Ok(sink.emit_pure(
-        vmir::Type::Bool,
-        PureInst::FunctionCall(vmir::FunctionCall {
-            function: quant_id,
-            type_args: Vec::new(),
-            args: occ_args.into(),
-        }),
+        })),
     ))
 }
 
@@ -919,14 +833,6 @@ impl PureExt for typed::MethodEnsuresExt {
             typed::MethodEnsuresExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
-
-    fn count_foralls_ext(ext: &Self) -> usize {
-        match ext {
-            typed::MethodEnsuresExt::Heap(node) => count_foralls_heap_node(node),
-            typed::MethodEnsuresExt::Old(e) => count_foralls(e),
-            typed::MethodEnsuresExt::Forall(q) => 1 + count_foralls(&q.body),
-        }
-    }
 }
 
 impl PureExt for typed::MethodBodyExt {
@@ -975,15 +881,6 @@ impl PureExt for typed::MethodBodyExt {
             typed::MethodBodyExt::Forall(q) => lower_forall(b, env, sink, q),
         }
     }
-
-    fn count_foralls_ext(ext: &Self) -> usize {
-        match ext {
-            typed::MethodBodyExt::Heap(node) => count_foralls_heap_node(node),
-            typed::MethodBodyExt::Old(_, e) => count_foralls(e),
-            typed::MethodBodyExt::Perm(res) => count_foralls_resource(res),
-            typed::MethodBodyExt::Forall(q) => 1 + count_foralls(&q.body),
-        }
-    }
 }
 
 impl PureExt for typed::FuncEnsuresExt {
@@ -1007,15 +904,6 @@ impl PureExt for typed::FuncEnsuresExt {
             // context.
             typed::FuncEnsuresExt::Old(inner) => lower(b, env, sink, hctx, inner),
             typed::FuncEnsuresExt::Forall(q) => lower_forall(b, env, sink, q),
-        }
-    }
-
-    fn count_foralls_ext(ext: &Self) -> usize {
-        match ext {
-            typed::FuncEnsuresExt::Heap(node) => count_foralls_heap_node(node),
-            typed::FuncEnsuresExt::Result => 0,
-            typed::FuncEnsuresExt::Old(e) => count_foralls(e),
-            typed::FuncEnsuresExt::Forall(q) => 1 + count_foralls(&q.body),
         }
     }
 }
@@ -1083,10 +971,8 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     result: Option<Val>,
     contract: Option<FnContract>,
     snap_entry: Option<SnapEntry>,
-    quants: &mut crate::translate::QuantScope,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
-    quants.seed(&mut sink);
     // A heap-dependent body reads the heap reconstructed from its snapshot
     // parameter; a heap-free body reads the inert `heap` (`Empty`).
     let heap = match snap_entry {
@@ -1106,6 +992,7 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         perm: heap,
         old: None,
         result: result.as_ref(),
+        in_quantifier: false,
     };
     // Entry: assume the precondition. (Heap-dependent bodies skip this — the
     // `FromSnap` above assumes the requires resource's bool implicitly.)
@@ -1137,43 +1024,30 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         let check = call_contract(&mut sink, *ens, args);
         sink.emit_assert(check);
     }
-    quants.reap(&mut sink);
     Ok(vmir::FunctionBody {
         insts: sink.insts,
         res,
     })
 }
 
-/// Lower a domain-axiom body (heap-free, no contract), seeding the sink with the
-/// pre-allocated occurrence ids for **all** the axiom's `forall`s (nested
-/// included, flat preorder). Returns the lowered body plus every
-/// [`vmir::Quantifier`] built for those `forall`s, paired with its occurrence
-/// id, for the caller to slot. A body with no `forall`s passes an empty
-/// `quant_ids` and yields no quantifiers.
+/// Lower a domain-axiom body (heap-free, no contract). Any `forall` it contains
+/// is an inline [`PureInst::Forall`] step of the returned stream.
 pub(crate) fn lower_axiom_body(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     exp: &typed::TypedPureExp<typed::AxiomExt>,
-    quant_ids: std::collections::VecDeque<vmir::MemberId>,
-) -> Result<(vmir::FunctionBody, Vec<(vmir::MemberId, vmir::Quantifier)>), TranslationError> {
+) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(0, 0);
-    sink.quant_ids = quant_ids;
     let hctx = HeapCtx {
         value: HeapVal::Empty,
         perm: HeapVal::Empty,
         old: None,
         result: None,
+        in_quantifier: false,
     };
     let res = lower(b, env, &mut sink, hctx, exp)?;
-    debug_assert!(
-        sink.quant_ids.is_empty(),
-        "axiom body lowered fewer `forall`s than were pre-allocated"
-    );
-    Ok((
-        vmir::FunctionBody {
-            insts: sink.insts,
-            res,
-        },
-        sink.quant_out,
-    ))
+    Ok(vmir::FunctionBody {
+        insts: sink.insts,
+        res,
+    })
 }

@@ -29,11 +29,6 @@ pub(crate) struct DomainTranslator<'a, P = Declared> {
     /// is registered under the generated name `{domain}#axiom{i}` (`#` marks a
     /// generated member); axioms are not callable, so no `name_map` entry.
     axiom_slots: Vec<DeclSlot<vmir::Axiom>>,
-    /// One inner `Vec` per axiom (parallel to `src.axioms`), holding the
-    /// pre-allocated occurrence slots for that axiom's top-level `forall`s, in
-    /// preorder. Each is registered as `{axiom}#quant{j}`; not callable, so no
-    /// `name_map` entry — the occurrence call carries the `MemberId` directly.
-    quant_slots: Vec<Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>>,
     _p: PhantomData<P>,
 }
 
@@ -60,7 +55,6 @@ impl<'a> DomainTranslator<'a, Declared> {
         }
 
         let mut axiom_slots = Vec::with_capacity(d.axioms.len());
-        let mut quant_slots = Vec::with_capacity(d.axioms.len());
         for (i, ax) in d.axioms.iter().enumerate() {
             let ax_name = match &ax.name {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
@@ -68,12 +62,6 @@ impl<'a> DomainTranslator<'a, Declared> {
             };
             let (_, aslot) = decl.alloc_slot::<vmir::Axiom>(&ax_name);
             axiom_slots.push(aslot);
-            // Pre-allocate one occurrence slot per `forall` (nested included),
-            // in the preorder the body lowering will encounter them.
-            let n_foralls = pure_exp::count_foralls(&ax.exp);
-            quant_slots.push(crate::translate::alloc_quant_slots(
-                decl, &ax_name, n_foralls,
-            ));
         }
 
         DomainTranslator {
@@ -82,7 +70,6 @@ impl<'a> DomainTranslator<'a, Declared> {
             slot,
             fn_slots,
             axiom_slots,
-            quant_slots,
             _p: PhantomData,
         }
     }
@@ -95,7 +82,6 @@ impl<'a> DomainTranslator<'a, Declared> {
             slot: self.slot,
             fn_slots: self.fn_slots,
             axiom_slots: self.axiom_slots,
-            quant_slots: self.quant_slots,
             _p: PhantomData,
         }
     }
@@ -138,20 +124,8 @@ impl DomainTranslator<'_, Metaed> {
         // `Empty` heap is never read. Axiom bodies are never verified, only
         // assumed.
         let env = HashMap::new();
-        for (i, ((ax, aslot), qslots)) in self
-            .src
-            .axioms
-            .iter()
-            .zip(self.axiom_slots)
-            .zip(self.quant_slots)
-            .enumerate()
-        {
-            // Seed the occurrence ids for this axiom's `forall`s (preorder), so
-            // each lowers to its nullary occurrence call and yields a built
-            // quantifier back in `quant_built`.
-            let quant_ids: std::collections::VecDeque<vmir::MemberId> =
-                qslots.iter().map(|(id, _)| *id).collect();
-            let (body, quant_built) = pure_exp::lower_axiom_body(ctx, &env, &ax.exp, quant_ids)?;
+        for (i, (ax, aslot)) in self.src.axioms.iter().zip(self.axiom_slots).enumerate() {
+            let body = pure_exp::lower_axiom_body(ctx, &env, &ax.exp)?;
             // The axiom's carried name matches its slot registration: the
             // Silver name when given, the generated `{domain}#axiom{i}` slot
             // name otherwise.
@@ -159,7 +133,6 @@ impl DomainTranslator<'_, Metaed> {
                 Some(n) => ctx.interner.resolve(&n.0).to_string(),
                 None => format!("{name_str}#axiom{i}"),
             };
-            crate::translate::fill_quant_slots(definer, &ax_name, qslots, quant_built);
             let name = definer.intern_name(&ax_name);
             definer.define_axiom(
                 aslot,

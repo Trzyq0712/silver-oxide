@@ -70,6 +70,12 @@ pub struct FuncRegistry {
     /// which is why [`FuncRegistry::new`] mints every head eagerly rather than on
     /// first use.
     ctor_head: HashMap<FuncId, MemberId>,
+    /// Every `forall` in the program, compiled once (see
+    /// [`crate::verify::quant`]). Built here — the registry already walks the
+    /// whole program and owns the `FuncId` minting a recipe's steps and triggers
+    /// need — and frozen afterwards, so the single instantiation rule can hold a
+    /// plain `Arc` snapshot.
+    quant_table: std::sync::Arc<crate::verify::quant::RecipeTable>,
     /// Verifier cost metrics, accumulated across every unit of the run (the
     /// allocator is the per-run shared state threaded into each `VerifyContext`).
     pub(crate) stats: crate::verify::VerifyStats,
@@ -151,6 +157,7 @@ impl FuncRegistry {
             head_names,
             variant_names,
             ctor_head,
+            quant_table: Default::default(),
             stats: Default::default(),
         };
         // Mint every head up front. Lazily minting on first use would leave
@@ -160,7 +167,19 @@ impl FuncRegistry {
         for head in heads {
             registry.ensure(head);
         }
+        // Compile every `forall` (needs the heads above, since a body or trigger
+        // may mention an ADT op). A quantifier body is pure and heap-free by
+        // construction — typecheck rejects heap/old/perm inside one, and translate
+        // rejects a heap-dependent call — so compiling it cannot fail.
+        registry.quant_table = crate::verify::quant::build_recipe_table(&mut registry, program)
+            .expect("a quantifier body is pure by construction");
         registry
+    }
+
+    /// The program's compiled `forall`s. Cheap to clone (`Arc`); frozen once
+    /// [`FuncRegistry::new`] returns.
+    pub(crate) fn quant_table(&self) -> &std::sync::Arc<crate::verify::quant::RecipeTable> {
+        &self.quant_table
     }
 
     /// An empty allocator (no ADT heads). For tests / programs without ADTs.
@@ -192,6 +211,7 @@ impl FuncRegistry {
             pre_token: HashMap::new(),
             names,
             rules,
+            quant_table: Default::default(),
             shapes: HashMap::new(),
             head_names: HashMap::new(),
             variant_names: HashMap::new(),

@@ -45,6 +45,8 @@ pub(crate) fn infer_type(
             Symbolic::Ite([_, then, _]) => {
                 infer_type(egraph, fresh_types, func_ret_types, *then, memo)
             }
+            // A quantifier is a proposition.
+            Symbolic::Forall(..) => Some(Type::Bool),
         };
         if t.is_some() {
             result = t;

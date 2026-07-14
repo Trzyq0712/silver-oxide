@@ -2448,6 +2448,174 @@ method client(x: Int) {
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
 
+/// Translate `input`, expecting it to be *rejected* by translation.
+fn lower_err(input: &str) -> Vec<crate::translate::TranslationError> {
+    let mut program = viper_parser::vpr_program(input).expect("parse");
+    let mut ic = IdentCollector::default();
+    program.walk_mut(&mut ic);
+    let interner = ic.finalize();
+    let mut gc = GlobalsCollector::new(&interner);
+    program.walk(&mut gc);
+    let globals = gc.finalize().expect("globals");
+    disambiguate(&mut program, &interner, &globals).expect("disambiguation");
+    inline_macros(&mut program, &interner).expect("macros");
+    let typed = typecheck_program(&mut program, interner, &globals).expect("typecheck");
+    translate::translate(&typed).expect_err("expected translation to reject this program")
+}
+
+#[test]
+fn forall_body_division_guarded_by_the_binder_is_well_defined() {
+    // WD of a quantifier body, checked once at the point it is stated, against
+    // *fresh* binders in a scratch clone of the live graph. The body's own guard
+    // travels with it (short-circuit lowering emits the path condition), so the
+    // division is discharged under `<i != 0>`.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method m() {
+    inhale forall i: Int :: {foo(i)} i != 0 ==> foo(10 / i)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn forall_body_unguarded_division_is_not_well_defined() {
+    // The same body without the guard: for an arbitrary binding the divisor may be
+    // zero, so the quantifier is ill-defined and the unit is rejected. (Under the
+    // old encoding quantifier bodies were trusted — this obligation did not exist.)
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method m() {
+    inhale forall i: Int :: {foo(i)} foo(10 / i)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::SideCondition(_))),
+        "expected a division side condition, got {result:?}"
+    );
+}
+
+#[test]
+fn forall_body_callee_precondition_must_hold_for_every_binding() {
+    // The other half of WD: a call inside the body stitches `assert f#requires(..)`,
+    // which must hold for an arbitrary binding. The binder guard establishes it.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+function pos(i: Int): Bool
+    requires i > 0
+{ true }
+
+method ok() {
+    inhale forall i: Int :: {foo(i)} i > 0 ==> pos(i)
+}
+"#;
+    let program = lower(input);
+    assert!(verify_named_method(&program, "ok").is_ok());
+}
+
+#[test]
+fn forall_body_unguarded_callee_precondition_fails() {
+    // Without the guard the callee's precondition is unprovable for a fresh binder.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+function pos(i: Int): Bool
+    requires i > 0
+{ true }
+
+method bad() {
+    inhale forall i: Int :: {foo(i)} pos(i)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "bad");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (callee precondition), got {result:?}"
+    );
+}
+
+#[test]
+fn nested_forall_body_wd_is_checked_under_the_outer_binder() {
+    // A nested quantifier is WD-checked recursively, with its encloser's binders
+    // already fresh: dividing by the *outer* binder is ill-defined unless the outer
+    // body guards it.
+    let input = r#"
+domain D {
+    function f(i: Int): Bool
+    function g(i: Int, j: Int): Bool
+}
+method m() {
+    inhale forall i: Int :: {f(i)} (forall j: Int :: {g(i, j)} g(i, 10 / i))
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::SideCondition(_))),
+        "expected a division side condition from the inner body, got {result:?}"
+    );
+}
+
+#[test]
+fn forall_in_a_function_body_instantiates_at_a_call_site() {
+    // A quantifier inside a *function* body reaches a caller through the function's
+    // certificate: the purified recipe carries a `Forall` step, so unfolding `q(3)`
+    // at the call site rebuilds the quantifier e-node with the caller's argument as
+    // its capture — and the single generic rule instantiates it in that unit, mid-run.
+    //
+    // This was impossible while quantifiers were rewrite rules: a rule cannot be
+    // injected into a running egg `Runner`, so a certificate-grafted quantifier
+    // never fired.
+    let input = r#"
+domain D { function g(a: Int, i: Int): Bool }
+
+function q(x: Int): Bool
+{ forall i: Int :: {g(x, i)} g(x, i) }
+
+method m() {
+    inhale q(3)
+    assert g(3, 7)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn heap_dependent_call_in_a_forall_body_is_rejected() {
+    // A quantifier body must stay pure and heap-free: its compiled recipe is
+    // rebuilt inside a rewrite rule, which can neither read the symbolic heap nor
+    // discharge the `Snap`'s implicit precondition check. (A binder-dependent
+    // footprint would need quantified permissions, which are unsupported.)
+    let input = r#"
+field f: Int
+domain D { function t(i: Int): Bool }
+
+function get(x: Ref): Int
+    requires acc(x.f)
+{ x.f }
+
+method m(y: Ref)
+    requires acc(y.f)
+{
+    inhale forall i: Int :: {t(i)} get(y) == get(y)
+}
+"#;
+    let errs = lower_err(input);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            crate::translate::TranslationError::HeapDepFunctionInQuantifier(_)
+        )),
+        "expected HeapDepFunctionInQuantifier, got {errs:?}"
+    );
+}
+
 #[test]
 fn method_assert_forall_fails_gracefully() {
     // Proving a `forall` goal is out of scope: the occurrence never merges
@@ -2521,11 +2689,13 @@ method client() {
 }
 
 #[test]
-fn method_ensures_forall_not_provable_from_requires_twin() {
-    // KNOWN LIMITATION: the same syntactic `forall` in requires and ensures
-    // lowers to two distinct Quantifier decls; the exit exhale must prove the
-    // *ensures* occurrence, which nothing merges `true`. Proving foralls is
-    // out of scope — this documents the graceful failure.
+fn method_ensures_forall_discharged_by_an_identical_requires() {
+    // A `forall` is an e-node whose identity is its compiled body + captures, so
+    // the same syntactic quantifier in `requires` and `ensures` hash-conses to ONE
+    // e-class: assuming it at entry discharges the exit exhale. (Under the old
+    // twin-declaration encoding these were two unrelated occurrence functions and
+    // this could not be proven.) Proving a forall *outright* is still out of
+    // scope — see `method_assert_forall_fails_gracefully`.
     let input = r#"
 domain D { function foo(i: Int): Bool }
 method m()
@@ -2536,10 +2706,7 @@ method m()
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "expected AssertionFailed (proving foralls unsupported), got {result:?}"
-    );
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
 
 #[test]
@@ -2581,11 +2748,11 @@ function f(x: Int): Bool
 }
 
 #[test]
-fn function_requires_forall_call_site_unprovable() {
-    // KNOWN LIMITATION (twin decls): the caller's inhaled `forall` and the
-    // callee's `#requires` occurrence are distinct Quantifier decls, so the
-    // call-site `assert f#requires(args)` cannot be discharged. Graceful
-    // failure, same as any forall-proving goal.
+fn function_requires_forall_discharged_from_an_identical_inhale() {
+    // The caller's inhaled `forall` and the callee's `#requires` quantifier are
+    // the same e-node (same body, same capture `x`), so the call-site
+    // `assert f#requires(x)` discharges. This is the twin-decl limitation
+    // dissolving: quantifier identity is now structural, not per-declaration.
     let input = r#"
 domain D { function g(a: Int, i: Int): Bool }
 function f(x: Int): Bool
@@ -2601,10 +2768,7 @@ method m(x: Int) {
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "expected AssertionFailed (twin-decl limitation), got {result:?}"
-    );
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
 
 #[test]

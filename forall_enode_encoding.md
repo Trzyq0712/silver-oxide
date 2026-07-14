@@ -1,8 +1,32 @@
 # Foralls as e-nodes: encoding quantifiers directly in the e-graph
 
-Status: design sketch, not implemented. Supersedes-in-spirit the per-quantifier
-rule minting in `rewrite.rs` (`PreparedQuantifier` / `quantifier_rule`) if
-adopted.
+Status: **IMPLEMENTED** (2026-07-14). The per-quantifier rule minting
+(`PreparedQuantifier` / `quantifier_rule`) and the `Declaration::Quantifier`
+lifting are gone. What landed, and where it deviates from this sketch:
+
+- `forall` is an **inline** `PureInst::Forall(Box<vmir::Forall>)` (captures +
+  binders + triggers + body), not a lifted declaration. Nesting is a
+  `PureInst::Forall` inside the encloser's body — the `QuantScope` counted-queue
+  slot machinery is deleted outright.
+- E-node: `Symbolic::Forall(RecipeId, Box<[Id]>)`. **No `type_args` payload** —
+  generic domains were killed since this was written (generics = ADTs only), so a
+  recipe's steps carry their own ground types.
+- Recipe table (`verify/quant.rs`) lives in `FuncRegistry` (which already walks
+  the program and mints the ids a recipe needs) and is built in
+  `FuncRegistry::new`, frozen thereafter. Identity excludes triggers; trigger sets
+  union on dedup, exactly as argued below.
+- One rule, `rewrite::forall_rule` (`ForallSearcher` + `ForallApplier`), replacing
+  N per-quantifier rules. The `BackoffScheduler` worry is moot: `saturate()` uses
+  `SimpleScheduler`.
+- WD: implemented as the clone-the-graph scratch check, in **verified units only**
+  (`walk_body`); axiom bodies stay trusted, as they were.
+- **Heap-dependent calls in a quantifier body are rejected** at translation
+  (`TranslationError::HeapDepFunctionInQuantifier`) — the encounter-time snapshot
+  capture described below is *not* implemented; the rejection is the seam it will
+  land at.
+- Free win beyond the sketch: identical quantifiers hash-cons to one e-class, so
+  the **twin-decl problem dissolved** — `ensures forall ..` now discharges against
+  an identical `requires forall ..` (two e2e tests flipped to `Ok`).
 
 ## Idea
 

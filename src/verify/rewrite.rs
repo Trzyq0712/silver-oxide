@@ -10,7 +10,8 @@ use egg::{
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::cert::FunctionDefinition;
-use crate::verify::lang::{Discriminant, FuncId, Symbolic};
+use crate::verify::lang::{Discriminant, FuncId, RecipeId, Symbolic};
+use crate::verify::quant::RecipeTable;
 use crate::vmir::{BinOp, Literal, Polarity, Type, Val};
 
 type Rule = Rewrite<Symbolic, ConstFold>;
@@ -481,7 +482,7 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
 /// axiom, with every callee resolved to its verifier `FuncId` up front (the
 /// applier has no registry access) and its type arguments ground (only ADTs are
 /// generic, and their instantiations are fixed at translation).
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum AxiomPure {
     Binary(BinOp, Val, Val),
     Ternary(Val, Val, Val),
@@ -493,12 +494,18 @@ pub(crate) enum AxiomPure {
     },
 }
 
-/// One instruction of a prepared axiom body: a value-producing pure step, or an
-/// assumption (stitched from a callee's `#ensures`) merged with `true`.
-#[derive(Clone)]
+/// One instruction of a prepared body: a value-producing pure step, an
+/// assumption (stitched from a callee's `#ensures`) merged with `true`, or a
+/// nested `forall` — materialized as a [`Symbolic::Forall`] node whose capture
+/// children are resolved through the *enclosing* instance's temps. That last arm
+/// is all closure-converted nesting needs: an outer instantiation builds the
+/// inner quantifier with the outer σ baked into its children, and the generic
+/// rule picks the new node up on the next iteration.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum AxiomInst {
     Val(AxiomPure),
     Assume(Val),
+    Forall { recipe: RecipeId, caps: Vec<Val> },
 }
 
 /// Searcher: any e-class containing an application of the trigger function
@@ -636,6 +643,11 @@ pub(crate) fn build_instance_vals(
                     changed.push(egraph.find(id));
                 }
             }
+            AxiomInst::Forall { recipe, caps } => {
+                let caps: Box<[Id]> = caps.iter().map(|v| get(egraph, &vals, v)).collect();
+                let id = egraph.add(Symbolic::Forall(*recipe, caps));
+                vals.push(id);
+            }
         }
     }
     vals
@@ -648,7 +660,7 @@ pub(crate) fn build_instance_vals(
 /// to what the e-graph speaks: an `App` matches a `FuncApp` node with the same
 /// function, type payload and arity, whose argument e-classes match `args`
 /// recursively.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PreparedTerm {
     Bound(usize),
     Capture(usize),
@@ -671,28 +683,10 @@ impl PreparedTerm {
     }
 }
 
-/// A pure `forall` prepared for lazy instantiation, **one trigger group** per
-/// prepared quantifier (a `forall` with several alternative groups mints one rule
-/// per group). Carries its opaque occurrence function (`quant_func`), the capture
-/// and bound-variable arities, the group's pattern terms, and the body
-/// (registry-resolved pure steps + boolean `res`, with temps `0..n_caps` the
-/// captures and `n_caps..n_caps+n_bound` the binders). σ is over *values*
-/// (e-class ids read off the matched trigger applications).
-pub(crate) struct PreparedQuantifier {
-    pub quant_func: FuncId,
-    pub n_caps: usize,
-    pub n_bound: usize,
-    /// The group's terms — a conjunctive multi-pattern: an instance needs *all*
-    /// of them matched, under one σ.
-    pub group: Vec<PreparedTerm>,
-    pub insts: Vec<AxiomInst>,
-    pub res: Val,
-}
-
 /// A partial bound-variable substitution, one slot per binder.
 type Sigma = Vec<Option<Id>>;
 
-/// Match `term` against e-class `class` under the occurrence's capture args,
+/// Match `term` against e-class `class` under the forall node's capture children,
 /// extending `sigma`. Returns every consistent extension (an e-class may hold
 /// several nodes matching the pattern's head, each binding σ differently), or an
 /// empty vector when the term cannot match.
@@ -765,10 +759,8 @@ fn match_term(
     }
 }
 
-/// Every σ that matches `term` somewhere in the e-graph, extending `sigma` — used
-/// for the non-anchor terms of a multi-term group, which the searcher's matched
-/// e-class says nothing about. Scans the classes holding an application of the
-/// term's root function.
+/// Every σ that matches `term` somewhere in the e-graph, extending `sigma`. Scans
+/// the classes holding an application of the term's root function.
 fn match_term_anywhere(
     egraph: &EGraph<Symbolic, ConstFold>,
     term: &PreparedTerm,
@@ -786,27 +778,82 @@ fn match_term_anywhere(
         .collect()
 }
 
-/// Applier: pair every ground occurrence `Q(c..)` in the e-graph with every way
-/// this group's terms match under one σ — the first (anchor) term against the
-/// searcher's e-class, the rest anywhere in the e-graph, so a multi-term group
-/// `{f(x), g(x)}` only fires when *both* applications are present. Instantiate
-/// the body at `caps ++ σ` and add the **guarded** clause
-/// `Ite(Q(c..), res[c,σ], true) == true`. The instance is released only once that
-/// ground occurrence merges `true` (existing `ite(true, t, e) = t` rule), so
-/// instantiation is sound regardless of the quantifier's truth. Occurrences are
-/// never created here — a top-level (nullary) occurrence is added by the eager
-/// ground-axiom evaluation, a nested one by an outer instance's `build_instance`;
-/// an unmaterialized quantifier is correctly never instantiated (its guard could
-/// never fire). Memoized per `caps ++ σ` (canonicalized at insert) — a
-/// saturation-cost guard, since instantiation is idempotent. The memo is **shared
-/// across a `forall`'s alternative groups**: two groups reaching the same σ build
-/// the instance once.
-struct QuantApplier {
-    quant: PreparedQuantifier,
-    memo: Arc<Memo<Vec<Id>>>,
+/// Searcher for the **single** quantifier-instantiation rule: every e-class
+/// holding a `Forall` node, found through `classes_for_op` (one bucket per
+/// recipe — indexed, no whole-graph scan). Quantifiers are *data*, not rules, so
+/// a `forall` materialized mid-run by an outer instantiation or a certificate
+/// graft is picked up on the very next iteration — the thing per-quantifier
+/// rules structurally cannot do (egg forbids rule injection mid-`Runner`).
+struct ForallSearcher {
+    table: Arc<RecipeTable>,
 }
 
-impl Applier<Symbolic, ConstFold> for QuantApplier {
+impl Searcher<Symbolic, ConstFold> for ForallSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let mut ms = Vec::new();
+        let mut limit = limit;
+        for rid in self.table.ids() {
+            let Some(classes) = egraph.classes_for_op(&Discriminant::Forall(rid)) else {
+                continue;
+            };
+            for eclass in classes {
+                if limit == 0 {
+                    return ms;
+                }
+                limit -= 1;
+                ms.push(SearchMatches {
+                    eclass,
+                    // One empty subst: the applier reads the node itself (recipe
+                    // + captures), which an egg `Subst` cannot carry.
+                    substs: vec![Subst::default()],
+                    ast: None,
+                });
+            }
+        }
+        ms
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        egraph[eclass]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::Forall(..)))
+            .then(|| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Applier: for the matched forall e-class, take each `Forall(recipe, caps)` node
+/// in it and pair it with every σ under which one of its recipe's trigger groups
+/// matches the graph. Instantiate the body at `caps ++ σ` and add the **guarded**
+/// clause `Ite(forall, res[caps, σ], true) == true`: the instance is released only
+/// once that forall e-class merges `true` (existing `ite-true` rule), so
+/// instantiating is sound regardless of the quantifier's truth.
+///
+/// Memoized per `(recipe, caps ++ σ)` (canonicalized at insert) — a saturation-cost
+/// guard only, since instances are idempotent.
+struct ForallApplier {
+    table: Arc<RecipeTable>,
+    memo: Arc<Memo<(RecipeId, Vec<Id>)>>,
+}
+
+impl Applier<Symbolic, ConstFold> for ForallApplier {
     fn apply_one(
         &self,
         egraph: &mut EGraph<Symbolic, ConstFold>,
@@ -815,71 +862,59 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
         _searcher_ast: Option<&PatternAst<Symbolic>>,
         _rule_name: Symbol,
     ) -> Vec<Id> {
-        // Enumerate the ground occurrences of this quantifier currently in the
-        // e-graph. Distinct capture tuples in one e-class are distinct
-        // occurrences (each yields its own instance); the guard condition is
-        // the occurrence's e-class either way.
-        let mut occurrences: Vec<(Id, Box<[Id]>)> = Vec::new();
-        if let Some(classes) = egraph.classes_for_op(&Discriminant::FuncApp(self.quant.quant_func))
-        {
-            for occ_class in classes {
-                for node in &egraph[occ_class].nodes {
-                    let Symbolic::FuncApp(f, _, caps) = node else {
+        // Distinct capture tuples in one e-class are distinct quantifiers (each
+        // yields its own instances); the guard is this e-class either way.
+        let quants: Vec<(RecipeId, Box<[Id]>)> = egraph[eclass]
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Symbolic::Forall(rid, caps) => Some((*rid, caps.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Collect the instances first: `build_instance` needs `&mut egraph`.
+        let mut instances: Vec<(RecipeId, Vec<Id>)> = Vec::new();
+        for (rid, caps) in &quants {
+            let recipe = self.table.get(*rid);
+            let caps: Vec<Id> = caps.iter().map(|&c| egraph.find(c)).collect();
+            for group in &recipe.groups {
+                let Some((anchor, rest)) = group.split_first() else {
+                    continue;
+                };
+                let empty: Sigma = vec![None; recipe.n_bound];
+                let mut sigmas = match_term_anywhere(egraph, anchor, &caps, &empty);
+                for term in rest {
+                    sigmas = sigmas
+                        .iter()
+                        .flat_map(|s| match_term_anywhere(egraph, term, &caps, s))
+                        .collect();
+                    if sigmas.is_empty() {
+                        break;
+                    }
+                }
+                for sigma in sigmas {
+                    // A group covers every binder (typecheck-enforced), so a
+                    // complete match leaves no slot open.
+                    let Some(sigma): Option<Vec<Id>> = sigma.into_iter().collect() else {
                         continue;
                     };
-                    if *f == self.quant.quant_func && caps.len() == self.quant.n_caps {
-                        occurrences.push((occ_class, caps.clone()));
+                    // The seed is the body's leading temps: captures then binders.
+                    let mut vals = caps.clone();
+                    vals.extend(sigma);
+                    if self.memo.insert((*rid, vals.clone())) {
+                        instances.push((*rid, vals));
                     }
                 }
             }
         }
-        let (anchor, rest) = self
-            .quant
-            .group
-            .split_first()
-            .expect("a trigger group is never empty");
-        // Collect the instances first: `build_instance` needs `&mut egraph`.
-        let mut instances: Vec<(Id, Vec<Id>)> = Vec::new();
-        for (occ_id, caps) in &occurrences {
-            let empty: Sigma = vec![None; self.quant.n_bound];
-            let mut sigmas = match_term(egraph, anchor, eclass, caps, &empty);
-            for term in rest {
-                sigmas = sigmas
-                    .iter()
-                    .flat_map(|s| match_term_anywhere(egraph, term, caps, s))
-                    .collect();
-                if sigmas.is_empty() {
-                    break;
-                }
-            }
-            for sigma in sigmas {
-                // A group covers every binder (typecheck-enforced), so a
-                // complete match leaves no slot open.
-                let Some(sigma): Option<Vec<Id>> = sigma.into_iter().collect() else {
-                    continue;
-                };
-                // The seed is the body's leading temps: captures then binders.
-                let mut vals: Vec<Id> = caps.iter().map(|&c| egraph.find(c)).collect();
-                vals.extend(sigma);
-                // The capture tuple determines the instance, so the memo key
-                // needs no occurrence-class component (the memo is per
-                // quantifier already).
-                if self.memo.insert(vals.clone()) {
-                    instances.push((*occ_id, vals));
-                }
-            }
-        }
+
         let mut changed = Vec::new();
-        for (occ_id, vals) in instances {
-            let res = build_instance(
-                egraph,
-                &self.quant.insts,
-                &self.quant.res,
-                &vals,
-                &mut changed,
-            );
+        for (rid, vals) in instances {
+            let recipe = self.table.get(rid);
+            let res = build_instance(egraph, &recipe.insts, &recipe.res, &vals, &mut changed);
             let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-            let guard = egraph.add(Symbolic::Ite([occ_id, res, true_]));
+            let guard = egraph.add(Symbolic::Ite([eclass, res, true_]));
             if egraph.union(guard, true_) {
                 changed.push(egraph.find(guard));
             }
@@ -892,27 +927,18 @@ impl Applier<Symbolic, ConstFold> for QuantApplier {
     }
 }
 
-/// Mint the lazy-instantiation rule for one trigger group of a pure `forall`.
-/// The rule searches on the group's **anchor** — its first term's root function —
-/// and the applier matches the whole group from there. `memo` is shared by the
-/// rules of one `forall`'s alternative groups.
-pub(crate) fn quantifier_rule(
-    name: &str,
-    quant: PreparedQuantifier,
-    memo: Arc<Memo<Vec<Id>>>,
-) -> Rule {
-    let searcher = AxiomTriggerSearcher {
-        func: quant.group[0]
-            .root_func()
-            .expect("a trigger term is an application"),
+/// The one rule that instantiates **every** `forall` in the program. Quantifiers
+/// are e-nodes, so this replaces the old per-quantifier, per-trigger-group rule
+/// minting entirely.
+pub(crate) fn forall_rule(table: Arc<RecipeTable>) -> Rule {
+    let searcher = ForallSearcher {
+        table: Arc::clone(&table),
     };
-    let applier = QuantApplier { quant, memo };
-    Rewrite::new(format!("quantifier-{name}"), searcher, applier).expect("quantifier rule")
-}
-
-/// A fresh instantiation memo, shared across one `forall`'s trigger-group rules.
-pub(crate) fn quant_memo() -> Arc<Memo<Vec<Id>>> {
-    Arc::new(Memo::new())
+    let applier = ForallApplier {
+        table,
+        memo: Arc::new(Memo::new()),
+    };
+    Rewrite::new("forall-instantiate", searcher, applier).expect("forall rule")
 }
 
 // ---- Function-call unfolding (lazy, rewrite-rule triggered) ---------------

@@ -99,6 +99,10 @@ pub enum PureInst {
         type_args: Vec<crate::vmir::Type>,
         base: Val,
     },
+    /// An inline, nestable pure `forall` (see [`Forall`](crate::vmir::Forall)).
+    /// Produces the quantified `Bool`; its captures are values of *this* temp
+    /// space, its body a self-contained stream in its own.
+    Forall(Box<crate::vmir::Forall>),
 }
 
 // ======================
@@ -192,6 +196,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
             PureInst::AdtTag { adt, base, .. } => {
                 write!(f, "{}@tag({base})", self.member(*adt))
             }
+            PureInst::Forall(q) => write!(f, "{}", self.with(&**q)),
         }
     }
 }

@@ -31,9 +31,6 @@ pub(crate) struct FunctionTranslator<'a, P = Declared> {
     /// self-framed `Resource` (not a boolean function), and call sites pass its
     /// snapshot as an extra argument.
     heap_dep: bool,
-    /// One pre-allocated occurrence slot per `forall` in the contracts and
-    /// body, registered `{function}#quant{j}` (see `alloc_quant_slots`).
-    quant_slots: Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>,
     _p: PhantomData<P>,
 }
 
@@ -84,16 +81,6 @@ impl<'a> FunctionTranslator<'a, Declared> {
             },
         );
 
-        // One occurrence slot per `forall`, in define's lowering order:
-        // requires, ensures, body.
-        let n_foralls = f
-            .requires
-            .as_ref()
-            .map_or(0, pure_exp::count_foralls_spatial)
-            + f.ensures.as_ref().map_or(0, pure_exp::count_foralls)
-            + f.body.as_ref().map_or(0, pure_exp::count_foralls);
-        let quant_slots = crate::translate::alloc_quant_slots(d, &name, n_foralls);
-
         FunctionTranslator {
             src: f,
             silver_name: f.name.0,
@@ -103,7 +90,6 @@ impl<'a> FunctionTranslator<'a, Declared> {
             requires,
             ensures,
             heap_dep,
-            quant_slots,
             _p: PhantomData,
         }
     }
@@ -120,7 +106,6 @@ impl<'a> FunctionTranslator<'a, Declared> {
             requires: self.requires,
             ensures: self.ensures,
             heap_dep: self.heap_dep,
-            quant_slots: self.quant_slots,
             _p: PhantomData,
         }
     }
@@ -167,13 +152,8 @@ impl FunctionTranslator<'_, Metaed> {
             requires: meta_requires,
             ensures: meta_ensures,
             heap_dep,
-            quant_slots,
             _p,
         } = self;
-
-        // One flat occurrence-id budget across requires, ensures, and body —
-        // consumed in that (counting) order.
-        let mut quants = crate::translate::QuantScope::new(&quant_slots);
 
         let fname = ctx.interner.resolve(&silver_name).to_string();
         let n_params = f.params.len();
@@ -199,7 +179,6 @@ impl FunctionTranslator<'_, Metaed> {
                         n_params,
                         vmir::HeapVal::Empty,
                         0,
-                        &mut quants,
                     )?;
                     definer.define_resource(
                         slot,
@@ -212,13 +191,7 @@ impl FunctionTranslator<'_, Metaed> {
                     );
                 }
                 RequiresSlot::HeapFree(slot) => {
-                    let body = spatial::lower_pure_precond_body(
-                        ctx,
-                        &env,
-                        requires,
-                        n_params,
-                        &mut quants,
-                    )?;
+                    let body = spatial::lower_pure_precond_body(ctx, &env, requires, n_params)?;
                     definer.define_function(
                         slot,
                         vmir::Function {
@@ -307,7 +280,6 @@ impl FunctionTranslator<'_, Metaed> {
                 Some(result),
                 wf_contract,
                 snap_entry,
-                &mut quants,
             )?;
             let name = definer.intern_name(&format!("{fname}#ensures"));
             definer.define_function(
@@ -367,7 +339,6 @@ impl FunctionTranslator<'_, Metaed> {
                 None,
                 Some(contract),
                 snap_entry,
-                &mut quants,
             )?),
         };
         let name = definer.intern_name(&fname);
@@ -396,7 +367,6 @@ impl FunctionTranslator<'_, Metaed> {
                 ensures: ensures_link,
             },
         );
-        crate::translate::fill_quant_slots(definer, &fname, quant_slots, quants.finish());
         Ok(())
     }
 }

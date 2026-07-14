@@ -192,6 +192,18 @@ fn eval_pure_inst(
                 args.into(),
             )
         }
+        // A `forall` is a single e-node: the compiled body (its `RecipeId`, interned
+        // program-wide) as payload, the captured terms as children. Nothing is
+        // instantiated here — the one generic rule (`rewrite::forall_rule`) does that
+        // at the next saturation, guarded on this node merging `true`.
+        PureInst::Forall(q) => {
+            let table = std::sync::Arc::clone(ctx.alloc.quant_table());
+            let recipe = table
+                .id_of(q)
+                .expect("every syntactic forall is interned by FuncRegistry::new");
+            let caps: Box<[egg::Id]> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
+            ctx.add(Symbolic::Forall(recipe, caps))
+        }
         // `Snap` needs the program + certificates; every inst walker intercepts
         // it and dispatches to `eval_snap` before reaching this function.
         PureInst::Snap { .. } => {
@@ -1271,29 +1283,17 @@ fn eval_from_snap(
 /// method statements and contracts capture enclosing params/locals; those
 /// bodies are evaluated per unit, never eagerly here).
 fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
-    for (id, decl) in program.decls.iter_enumerated() {
-        // A pure `forall` becomes a value-σ lazy-instantiation rule, chained
-        // into every saturation. Its body is never verified; instantiation adds
-        // a guarded clause per ground trigger match.
-        if let vmir::Declaration::Quantifier(q) = decl {
-            let name = ctx.interner.resolve(&q.name).to_string();
-            // One rule per trigger group (alternatives), sharing one
-            // instantiation memo so two groups reaching the same σ build the
-            // instance once.
-            let memo = crate::verify::rewrite::quant_memo();
-            for (k, prepared) in prepare_quantifier(ctx.alloc, id, q)?
-                .into_iter()
-                .enumerate()
-            {
-                ctx.axiom_rules
-                    .push(crate::verify::rewrite::quantifier_rule(
-                        &format!("{name}#t{k}"),
-                        prepared,
-                        std::sync::Arc::clone(&memo),
-                    ));
-            }
-            continue;
-        }
+    // One rule instantiates every `forall` in the program: quantifiers are
+    // e-nodes (data), not rules, so one generic rule suffices — and a `forall`
+    // materialized *during* saturation (by an outer instantiation, or by a
+    // certificate graft) is picked up on the next iteration, which per-quantifier
+    // rules structurally could not do (egg forbids mid-run rule injection).
+    if !ctx.alloc.quant_table().is_empty() {
+        let table = std::sync::Arc::clone(ctx.alloc.quant_table());
+        ctx.axiom_rules
+            .push(crate::verify::rewrite::forall_rule(table));
+    }
+    for decl in program.decls.iter() {
         let vmir::Declaration::Axiom(ax) = decl else {
             continue;
         };
@@ -1355,43 +1355,10 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
     Ok(())
 }
 
-/// Resolve a pure `forall` into one [`PreparedQuantifier`] **per trigger group**
-/// (the groups are alternatives — each gets its own instantiation rule): the
-/// body as registry-level pure steps, its boolean result, the occurrence id and
-/// capture arity, and the group's pattern terms with every head resolved to its
-/// verifier `FuncId`. Instantiation pairs each ground occurrence with the
-/// bound-variable σ read off a ground match of the group.
-fn prepare_quantifier(
-    alloc: &mut crate::verify::func_registry::FuncRegistry,
-    id: vmir::MemberId,
-    q: &vmir::Quantifier,
-) -> Result<Vec<crate::verify::rewrite::PreparedQuantifier>, VerifyError> {
-    use crate::verify::rewrite::PreparedQuantifier;
-    let insts = prepare_body(alloc, &q.body.insts)?;
-    q.triggers
-        .iter()
-        .map(|group| {
-            let group = group
-                .terms
-                .iter()
-                .map(|t| prepare_trig_term(alloc, t))
-                .collect();
-            Ok(PreparedQuantifier {
-                quant_func: crate::verify::func_registry::func_id_for_member(id),
-                n_caps: q.params.len(),
-                n_bound: q.bound.len(),
-                group,
-                insts: insts.clone(),
-                res: q.body.res.clone(),
-            })
-        })
-        .collect()
-}
-
 /// Resolve a trigger pattern term's heads to verifier `FuncId`s — the same
 /// mapping [`prepare_body`] applies to the corresponding `PureInst`, so a
 /// pattern matches exactly the nodes a body would build.
-fn prepare_trig_term(
+pub(crate) fn prepare_trig_term(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     term: &vmir::TrigTerm,
 ) -> crate::verify::rewrite::PreparedTerm {
@@ -1427,13 +1394,23 @@ fn prepare_trig_term(
 /// Lower an axiom/quantifier body's inst stream into registry-resolved pure
 /// steps (every callee down to its verifier `FuncId`), ready for the applier —
 /// which has no registry access at rule-application time.
-fn prepare_body(
+pub(crate) fn prepare_body(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
+    quants: &crate::verify::quant::RecipeTable,
     insts: &[vmir::Inst],
 ) -> Result<Vec<crate::verify::rewrite::AxiomInst>, VerifyError> {
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
     let mut out = Vec::with_capacity(insts.len());
     for inst in insts {
+        // A nested `forall` is a step like any other: it materializes the inner
+        // e-node with the enclosing instance's values as capture children.
+        if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
+            out.push(AxiomInst::Forall {
+                recipe: quants.id_of(q)?,
+                caps: q.captures.clone(),
+            });
+            continue;
+        }
         let prepared = match &inst.kind {
             InstKind::Pure(_, pi) => AxiomInst::Val(match pi {
                 PureInst::Binary(op, l, r) => AxiomPure::Binary(*op, l.clone(), r.clone()),
@@ -1477,7 +1454,8 @@ fn prepare_body(
                 PureInst::Fresh
                 | PureInst::Deref(..)
                 | PureInst::Perm(..)
-                | PureInst::Snap { .. } => {
+                | PureInst::Snap { .. }
+                | PureInst::Forall(_) => {
                     return Err(VerifyError::Unimplemented("impure inst in axiom body"));
                 }
             }),
@@ -1489,6 +1467,106 @@ fn prepare_body(
         out.push(prepared);
     }
     Ok(out)
+}
+
+/// Check the well-definedness of a `forall` **at the point it is encountered**,
+/// in a throwaway clone of the live e-graph.
+///
+/// Cloning (rather than seeding a blank graph) makes every ambient fact — the
+/// host's path condition, the assumed axioms, grafted certificates — available
+/// for free, with no seeding policy and no pollution of the real graph: whatever
+/// the binders' fresh values touch dies with the scratch graph.
+///
+/// The binders become fresh values and the captures keep their real e-classes, so
+/// the body's side conditions are discharged *for an arbitrary binding*. Those
+/// conditions are exactly a pure expression's: `Div`/`Mod` divisors, and the
+/// `assert f#requires(..)` stitched at a call to a contract-bearing function.
+/// Body-local path conditions come along (short-circuit lowering emits them), so
+/// a guard proves its own consequent's WD: `forall x :: {f(x)} x != 0 ==> f(10 / x)`
+/// discharges the division under `<x != 0>`.
+///
+/// A nested `forall` is checked recursively here — with its encloser's binders
+/// already fresh — so no WD obligation ever survives into a recipe. That is what
+/// keeps instantiation (which runs inside a rewrite rule, where nothing can be
+/// proven) obligation-free.
+fn check_forall_wd(
+    ctx: &mut VerifyContext<'_>,
+    q: &vmir::Forall,
+    caps: &[egg::Id],
+    host_pc: &[(egg::Id, Polarity)],
+) -> Result<(), VerifyError> {
+    // Keep the live graph aside; `ctx.egraph` is the scratch for the duration.
+    let live = ctx.egraph.clone();
+    let result = check_forall_wd_in_scratch(ctx, q, caps, host_pc);
+    ctx.egraph = live;
+    result
+}
+
+fn check_forall_wd_in_scratch(
+    ctx: &mut VerifyContext<'_>,
+    q: &vmir::Forall,
+    caps: &[egg::Id],
+    host_pc: &[(egg::Id, Polarity)],
+) -> Result<(), VerifyError> {
+    let mut state = EvalState::new();
+    for (id, ty) in caps.iter().zip(q.cap_types.iter()) {
+        state.push_val(*id, ty.clone());
+    }
+    for ty in q.bound.iter() {
+        let fresh = ctx.fresh_symbolic_value(ty.clone());
+        state.push_val(fresh, ty.clone());
+    }
+
+    for inst in &q.body.insts {
+        // The body's own guards sit *under* the host's: a side condition must hold
+        // wherever the quantifier is stated, and wherever the body reaches it.
+        let mut pc_lits = host_pc.to_vec();
+        pc_lits.extend(collect_pc_lits(ctx, &state, &inst.pc));
+
+        for (goal, err) in inst_obligations(ctx, &state, &inst.kind) {
+            if !ctx.prove_under_pc(goal, &pc_lits) {
+                return Err(err);
+            }
+        }
+        match &inst.kind {
+            // A nested quantifier: check it under this level's fresh binders, then
+            // build its node like any other step.
+            InstKind::Pure(ty, pi @ PureInst::Forall(inner)) => {
+                let inner_caps: Vec<egg::Id> = inner
+                    .captures
+                    .iter()
+                    .map(|v| state.get_val(ctx, v))
+                    .collect();
+                check_forall_wd(ctx, inner, &inner_caps, &pc_lits)?;
+                let id = eval_pure_inst(ctx, &state, ty, pi);
+                state.push_val(id, ty.clone());
+            }
+            InstKind::Pure(ty, pi) => {
+                let id = eval_pure_inst(ctx, &state, ty, pi);
+                state.push_val(id, ty.clone());
+            }
+            // A callee's postcondition, stitched at the call: assume it under the
+            // guards it was emitted with.
+            InstKind::Assume(val) => {
+                let id = state.get_val(ctx, val);
+                ctx.assume_guarded(id, pc_lits.iter().rev().copied());
+            }
+            // A callee's precondition, stitched at the call site: the other half of
+            // a quantifier body's well-definedness, and the reason a WD check needs
+            // the *ambient* facts (the guard establishing it may be the body's own
+            // implication, or a fact the host already knows).
+            InstKind::Assert(val) => {
+                let id = state.get_val(ctx, val);
+                if !ctx.prove_under_pc(id, &pc_lits) {
+                    return Err(VerifyError::AssertionFailed);
+                }
+            }
+            InstKind::Refute(_) | InstKind::Heap(_) => {
+                return Err(VerifyError::Unimplemented("impure inst in a forall body"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Per-instruction evaluator: the shared signature of [`eval_method_inst`] and
@@ -1544,6 +1622,17 @@ fn walk_body(
         for (goal, err) in inst_obligations(ctx, state, &inst.kind) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
                 return Err(err.with_inst(inst_text.clone()));
+            }
+        }
+        // A quantifier's own side conditions, discharged once per syntactic
+        // occurrence against fresh binders in a scratch clone (see
+        // [`check_forall_wd`]). It happens here, not in the evaluator, because it
+        // needs the path condition — and here it cannot be forgotten by one of the
+        // three drivers. Axiom bodies never reach this walk: they stay trusted.
+        if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
+            let caps: Vec<egg::Id> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
+            if let Err(err) = check_forall_wd(ctx, q, &caps, &pc_lits) {
+                return Err(err.with_inst(inst_text));
             }
         }
         if let Err(err) = eval(ctx, program, state, inst, certs) {
@@ -2105,6 +2194,18 @@ fn purify_function(
             InstKind::Pure(_, PureInst::Fresh) => {
                 unreachable!("function body may not contain Fresh (method-only)");
             }
+            // A `forall` in the body purifies to a `Forall` step: replayed at each
+            // call site, it rebuilds the quantifier e-node with the caller's
+            // arguments as capture children. This is how a quantifier reaches a
+            // caller through a certificate — impossible while quantifiers were
+            // rules rather than data.
+            InstKind::Pure(_, PureInst::Forall(q)) => {
+                let recipe = ctx.alloc.quant_table().id_of(q)?;
+                let caps = q.captures.iter().map(|v| tr(&map, v)).collect();
+                let v = Val::Temp(n_params + steps.len());
+                steps.push(AxiomInst::Forall { recipe, caps });
+                map.push(v);
+            }
             InstKind::Pure(_, pi) => {
                 let v = match pi {
                     PureInst::Binary(op, l, r) => {
@@ -2187,7 +2288,8 @@ fn purify_function(
                     PureInst::Fresh
                     | PureInst::Deref(..)
                     | PureInst::Perm(..)
-                    | PureInst::Snap { .. } => unreachable!("handled above"),
+                    | PureInst::Snap { .. }
+                    | PureInst::Forall(_) => unreachable!("handled above"),
                 };
                 map.push(v);
             }
@@ -2329,6 +2431,10 @@ enum RTree {
     Ternary(Box<RTree>, Box<RTree>, Box<RTree>),
     RealCast(Box<RTree>),
     App(crate::verify::lang::FuncId, Vec<Type>, Vec<RTree>),
+    /// A `forall` in a resource body (e.g. a predicate body's quantified
+    /// conjunct): the recipe plus one subtree per capture. Rebuilt at each graft
+    /// site like any other step.
+    Forall(crate::verify::lang::RecipeId, Vec<RTree>),
 }
 
 /// Flatten an [`RTree`] into a [`BodyRecipe`]: collect the distinct seed leaves
@@ -2368,7 +2474,9 @@ fn flatten(tree: &RTree) -> BodyRecipe {
                 collect(e, seeds);
             }
             RTree::RealCast(x) => collect(x, seeds),
-            RTree::App(_, _, args) => args.iter().for_each(|a| collect(a, seeds)),
+            RTree::App(_, _, args) | RTree::Forall(_, args) => {
+                args.iter().for_each(|a| collect(a, seeds))
+            }
             RTree::Param(_) | RTree::SlotValue(_) | RTree::Lit(_) => {}
         }
     }
@@ -2390,16 +2498,16 @@ fn flatten(tree: &RTree) -> BodyRecipe {
     // Pass 2: emit steps, temps numbered after the seed.
     let base = seed_refs.len();
     let mut steps: Vec<AxiomInst> = Vec::new();
-    let mut emit = |steps: &mut Vec<AxiomInst>, p: AxiomPure| -> Val {
+    let mut emit = |steps: &mut Vec<AxiomInst>, p: AxiomInst| -> Val {
         let v = Val::Temp(base + steps.len());
-        steps.push(AxiomInst::Val(p));
+        steps.push(p);
         v
     };
     fn go(
         tree: &RTree,
         steps: &mut Vec<AxiomInst>,
         seed_temp: &impl Fn(&SeedRef) -> Val,
-        emit: &mut impl FnMut(&mut Vec<AxiomInst>, AxiomPure) -> Val,
+        emit: &mut impl FnMut(&mut Vec<AxiomInst>, AxiomInst) -> Val,
     ) -> Val {
         match tree {
             RTree::Param(i) => seed_temp(&SeedRef::Param(*i)),
@@ -2408,27 +2516,37 @@ fn flatten(tree: &RTree) -> BodyRecipe {
             RTree::Binary(op, l, r) => {
                 let l = go(l, steps, seed_temp, emit);
                 let r = go(r, steps, seed_temp, emit);
-                emit(steps, AxiomPure::Binary(*op, l, r))
+                emit(steps, AxiomInst::Val(AxiomPure::Binary(*op, l, r)))
             }
             RTree::Ternary(c, t, e) => {
                 let c = go(c, steps, seed_temp, emit);
                 let t = go(t, steps, seed_temp, emit);
                 let e = go(e, steps, seed_temp, emit);
-                emit(steps, AxiomPure::Ternary(c, t, e))
+                emit(steps, AxiomInst::Val(AxiomPure::Ternary(c, t, e)))
             }
             RTree::RealCast(x) => {
                 let x = go(x, steps, seed_temp, emit);
-                emit(steps, AxiomPure::RealCast(x))
+                emit(steps, AxiomInst::Val(AxiomPure::RealCast(x)))
+            }
+            RTree::Forall(recipe, caps) => {
+                let caps = caps.iter().map(|c| go(c, steps, seed_temp, emit)).collect();
+                emit(
+                    steps,
+                    AxiomInst::Forall {
+                        recipe: *recipe,
+                        caps,
+                    },
+                )
             }
             RTree::App(func, tys, args) => {
                 let args = args.iter().map(|a| go(a, steps, seed_temp, emit)).collect();
                 emit(
                     steps,
-                    AxiomPure::App {
+                    AxiomInst::Val(AxiomPure::App {
                         func: *func,
                         type_args: tys.clone(),
                         args,
-                    },
+                    }),
                 )
             }
         }
@@ -2461,6 +2579,15 @@ fn rtree_pure(ctx: &mut VerifyContext<'_>, map: &[RTree], pi: &PureInst) -> RTre
             crate::verify::func_registry::func_id_for_member(fc.function),
             fc.type_args.clone(),
             fc.args.iter().map(&tr).collect(),
+        ),
+        // A quantified conjunct of a predicate body. Its captures are body values,
+        // so they purify like any other argument; the recipe itself is ground.
+        PureInst::Forall(q) => RTree::Forall(
+            ctx.alloc
+                .quant_table()
+                .id_of(q)
+                .expect("every syntactic forall is interned by FuncRegistry::new"),
+            q.captures.iter().map(&tr).collect(),
         ),
         PureInst::AdtCons {
             adt,
@@ -2514,6 +2641,9 @@ impl RTree {
                 tys.clone(),
                 args.iter().map(|a| a.clone_tree()).collect(),
             ),
+            RTree::Forall(r, caps) => {
+                RTree::Forall(*r, caps.iter().map(|c| c.clone_tree()).collect())
+            }
         }
     }
 

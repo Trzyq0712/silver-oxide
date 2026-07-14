@@ -13,6 +13,15 @@ use crate::vmir::Type;
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FuncId(pub usize);
 
+/// A compiled quantifier body, interned in the program-level
+/// [`RecipeTable`](crate::verify::quant::RecipeTable). It is the *payload* of a
+/// [`Symbolic::Forall`] node — the quantifier's "code", with the capture
+/// children as its environment.
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, derive_more::From, derive_more::Into,
+)]
+pub struct RecipeId(pub usize);
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
     Fresh(u32),
@@ -35,6 +44,21 @@ pub enum Symbolic {
     /// sort or sentinel id. (No rewrite rule matches an address `FuncId`.)
     FuncApp(FuncId, Box<[Type]>, Box<[Id]>),
     RealCast(Id),
+    /// A pure `forall`: the compiled body (`RecipeId`, interned program-wide) as
+    /// payload, the **captured** outer terms as children. The node *is* the
+    /// occurrence — no opaque occurrence function, no capture arity to track: a
+    /// capture is child `c`, canonicalized by congruence and deduped by hashcons
+    /// (so two alpha-equivalent `forall`s with the same captures are one
+    /// e-class).
+    ///
+    /// The trigger is deliberately **not** part of the identity: it is
+    /// operational (when to instantiate), not propositional (what the quantifier
+    /// means). Trigger sets are unioned on the recipe entry instead, so two
+    /// foralls that denote the same proposition share an e-class and one being
+    /// assumed `true` releases the other's instances. Instantiation adds the
+    /// guarded clause `Ite(forall, body[caps, σ], true) == true` — the instance
+    /// is only released once this node merges `true`.
+    Forall(RecipeId, Box<[Id]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,6 +74,9 @@ pub enum Discriminant {
     /// the full-enode `Eq`/`Hash` in the congruence memo (see [`Symbolic::FuncApp`]).
     FuncApp(FuncId),
     RealCast,
+    /// The recipe alone: one `classes_by_op` bucket per quantifier body, which is
+    /// exactly the index the single instantiation rule scans.
+    Forall(RecipeId),
 }
 
 impl Language for Symbolic {
@@ -65,6 +92,7 @@ impl Language for Symbolic {
             S::Ite(_) => D::Ite,
             S::FuncApp(id, _, _) => D::FuncApp(*id),
             S::RealCast(_) => D::RealCast,
+            S::Forall(r, _) => D::Forall(*r),
         }
     }
 
@@ -82,6 +110,7 @@ impl Language for Symbolic {
             (FuncApp(id1, _, args1), FuncApp(id2, _, args2)) => {
                 id1 == id2 && args1.len() == args2.len()
             }
+            (Forall(r1, caps1), Forall(r2, caps2)) => r1 == r2 && caps1.len() == caps2.len(),
             _ => false,
         }
     }
@@ -95,6 +124,8 @@ impl Language for Symbolic {
             RealCast(id) => std::slice::from_ref(id),
             // Type args are in the payload, not children — only value args.
             FuncApp(_, _, ids) => ids,
+            // The recipe is payload; the captures are the children.
+            Forall(_, caps) => caps,
         }
     }
 
@@ -106,6 +137,7 @@ impl Language for Symbolic {
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_mut(id),
             FuncApp(_, _, ids) => ids,
+            Forall(_, caps) => caps,
         }
     }
 }
@@ -133,6 +165,7 @@ impl Display for Symbolic {
                     write!(f, "fn{}<{}>", id.0, args.join(", "))
                 }
             }
+            Symbolic::Forall(r, _) => write!(f, "forall#{}", r.0),
         }
     }
 }

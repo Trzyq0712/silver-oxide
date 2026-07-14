@@ -1002,8 +1002,8 @@ domain D {
     );
 }
 
-/// The single trigger group of a quantifier that has exactly one.
-fn only_group(q: &vmir::Quantifier) -> &vmir::QuantTrigger {
+/// The single trigger group of a `forall` that has exactly one.
+fn only_group(q: &vmir::Forall) -> &vmir::QuantTrigger {
     let [group] = &q.triggers[..] else {
         panic!("expected exactly one trigger group");
     };
@@ -1022,10 +1022,34 @@ fn only_app(group: &vmir::QuantTrigger) -> (&vmir::TrigHead, &[vmir::TrigTerm]) 
     (head, args)
 }
 
+/// The `forall`s of an instruction stream, in order — inline `PureInst::Forall`
+/// steps. A `forall` is a value, not a declaration: nesting lives in the body.
+fn foralls(insts: &[vmir::Inst]) -> Vec<&vmir::Forall> {
+    insts
+        .iter()
+        .filter_map(|i| match &i.kind {
+            vmir::InstKind::Pure(_, vmir::PureInst::Forall(q)) => Some(&**q),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The sole `forall` of the named axiom's body.
+fn axiom_forall<'a>(p: &'a vmir::Program, name: &str) -> &'a vmir::Forall {
+    let id = p.id(name).unwrap_or_else(|| panic!("missing axiom {name}"));
+    let vmir::Declaration::Axiom(ax) = &p.decls[id] else {
+        panic!("{name} must be an Axiom");
+    };
+    let [q] = foralls(&ax.body.insts)[..] else {
+        panic!("expected exactly one top-level forall in {name}");
+    };
+    q
+}
+
 #[test]
-fn forall_axiom_lowers_to_quantifier() {
-    // A `forall` axiom lowers to a `Declaration::Quantifier` (occurrence body +
-    // trigger) plus a ground axiom whose body is the nullary occurrence call.
+fn forall_axiom_lowers_to_inline_forall() {
+    // A `forall` axiom lowers to an inline `PureInst::Forall` step of the axiom's
+    // own body — no lifted declaration, no occurrence call.
     let input = r#"
 domain D {
     function foo(i: Int): Bool
@@ -1033,41 +1057,39 @@ domain D {
 }
 "#;
     let p = run(input);
-    let q_id = p.id("basic#quant0").expect("missing quantifier slot");
-    let vmir::Declaration::Quantifier(q) = &p.decls[q_id] else {
-        panic!("basic#quant0 must be a Quantifier");
-    };
+    assert!(
+        p.id("basic#quant0").is_none(),
+        "a forall is no longer a declaration"
+    );
+    let q = axiom_forall(&p, "basic");
     assert_eq!(q.bound.len(), 1, "one binder");
-    assert!(q.params.is_empty(), "top-level forall captures nothing");
+    assert!(q.captures.is_empty(), "top-level forall captures nothing");
     let foo_id = p.id("foo").expect("missing foo");
     let (head, args) = only_app(only_group(q));
     assert_eq!(*head, vmir::TrigHead::Func(foo_id), "trigger is foo");
     assert_eq!(args, &[vmir::TrigTerm::Bound(0)], "arg 0 binds bound var 0");
 
-    // The axiom body references the occurrence via a nullary call to `q_id`.
+    // The axiom's result is the forall's own value.
     let ax_id = p.id("basic").expect("missing axiom basic");
     let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
-        panic!("basic must be a Axiom");
+        panic!("basic must be an Axiom");
     };
-    assert!(
-        ax.body.insts.iter().any(|i| matches!(
-            &i.kind,
-            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-                if fc.function == q_id && fc.args.iter().next().is_none()
-        )),
-        "axiom body must call the nullary occurrence"
+    assert_eq!(
+        ax.body.res,
+        vmir::Val::Temp(ax.body.insts.len() - 1),
+        "the axiom's boolean is the forall step"
     );
 
-    // Display path must not panic and should name the quantifier.
+    // Display path must not panic and should render the quantifier inline.
     let s = format!("{p}");
-    assert!(s.contains("quantifier basic#quant0"), "rendered:\n{s}");
+    assert!(s.contains("forall("), "rendered:\n{s}");
 }
 
 #[test]
-fn forall_in_method_inhale_lowers_to_quantifier() {
-    // A `forall` in a method-body `inhale` lowers to a `{method}#quant{j}`
-    // declaration; the free method param becomes a capture, passed as the
-    // occurrence call's argument in the method body.
+fn forall_in_method_inhale_lowers_to_inline_forall() {
+    // A `forall` in a method-body `inhale` is an inline step of the method's
+    // stream; the free method param becomes a capture, carried as a value of the
+    // enclosing temp space.
     let input = r#"
 domain D { function g(a: Int, i: Int): Bool }
 method m(x: Int) {
@@ -1075,11 +1097,15 @@ method m(x: Int) {
 }
 "#;
     let p = run(input);
-    let q_id = p.id("m#quant0").expect("missing quantifier slot");
-    let vmir::Declaration::Quantifier(q) = &p.decls[q_id] else {
-        panic!("m#quant0 must be a Quantifier");
+    let m_id = p.id("m").expect("missing method m");
+    let vmir::Declaration::Method(m) = &p.decls[m_id] else {
+        panic!("m must be a Method");
     };
-    assert_eq!(q.params.len(), 1, "captures the method param x");
+    let [q] = foralls(&m.insts)[..] else {
+        panic!("expected one forall in the method body");
+    };
+    assert_eq!(q.captures.len(), 1, "captures the method param x");
+    assert_eq!(&*q.cap_types, &[vmir::Type::Int]);
     assert_eq!(q.bound.len(), 1, "one binder");
     let g_id = p.id("g").expect("missing g");
     let (head, args) = only_app(only_group(q));
@@ -1088,20 +1114,6 @@ method m(x: Int) {
         args,
         &[vmir::TrigTerm::Capture(0), vmir::TrigTerm::Bound(0)],
         "trigger is g(capture x, bound i)"
-    );
-
-    // The method body calls the occurrence with one argument (the captured x).
-    let m_id = p.id("m").expect("missing method m");
-    let vmir::Declaration::Method(m) = &p.decls[m_id] else {
-        panic!("m must be a Method");
-    };
-    assert!(
-        m.insts.iter().any(|i| matches!(
-            &i.kind,
-            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-                if fc.function == q_id && fc.args.iter().count() == 1
-        )),
-        "method body must call the occurrence with the captured value"
     );
 }
 
@@ -1117,9 +1129,7 @@ domain D {
 }
 "#;
     let p = run(input);
-    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("nested#quant0").unwrap()] else {
-        panic!("nested#quant0 must be a Quantifier");
-    };
+    let q = axiom_forall(&p, "nested");
     let f_id = p.id("f").expect("missing f");
     let g_id = p.id("g").expect("missing g");
     let (head, args) = only_app(only_group(q));
@@ -1146,10 +1156,7 @@ domain D {
 }
 "#;
     let p = run(input);
-    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("both#quant0").unwrap()] else {
-        panic!("both#quant0 must be a Quantifier");
-    };
-    let group = only_group(q);
+    let group = only_group(axiom_forall(&p, "both"));
     assert_eq!(group.terms.len(), 2, "one group, two terms");
     let heads: Vec<_> = group
         .terms
@@ -1170,8 +1177,8 @@ domain D {
 
 #[test]
 fn alternative_trigger_groups_all_kept() {
-    // `{f(i)}{g(i)}` are alternatives: both groups reach VMIR (the verifier mints
-    // one instantiation rule per group), none is silently dropped.
+    // `{f(i)}{g(i)}` are alternatives: both groups reach VMIR (the verifier tries
+    // each), none is silently dropped.
     let input = r#"
 domain D {
     function f(i: Int): Bool
@@ -1180,9 +1187,7 @@ domain D {
 }
 "#;
     let p = run(input);
-    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("alt#quant0").unwrap()] else {
-        panic!("alt#quant0 must be a Quantifier");
-    };
+    let q = axiom_forall(&p, "alt");
     assert_eq!(q.triggers.len(), 2, "two alternative groups");
     for (group, name) in q.triggers.iter().zip(["f", "g"]) {
         let (head, args) = only_app(group);
@@ -1202,10 +1207,7 @@ domain D {
 }
 "#;
     let p = run(input);
-    let vmir::Declaration::Quantifier(q) = &p.decls[p.id("lit#quant0").unwrap()] else {
-        panic!("lit#quant0 must be a Quantifier");
-    };
-    let (_, args) = only_app(only_group(q));
+    let (_, args) = only_app(only_group(axiom_forall(&p, "lit")));
     assert_eq!(
         args,
         &[
@@ -1216,10 +1218,9 @@ domain D {
 }
 
 #[test]
-fn nested_forall_lowers() {
-    // An inner `forall` captures the outer binder: it lowers to a second
-    // quantifier with one capture param, whose occurrence call inside the outer
-    // body passes the outer binder.
+fn nested_forall_lowers_inside_its_encloser() {
+    // An inner `forall` is a step of the outer's *body*, capturing the outer
+    // binder — closure conversion, no lifting, no id budget.
     let input = r#"
 domain D {
     function g(i: Int, j: Int): Bool
@@ -1227,70 +1228,39 @@ domain D {
 }
 "#;
     let p = run(input);
-    let outer_id = p.id("nest#quant0").expect("missing outer quantifier");
-    let inner_id = p.id("nest#quant1").expect("missing inner quantifier");
-    let vmir::Declaration::Quantifier(outer) = &p.decls[outer_id] else {
-        panic!("nest#quant0 must be a Quantifier");
-    };
-    let vmir::Declaration::Quantifier(inner) = &p.decls[inner_id] else {
-        panic!("nest#quant1 must be a Quantifier");
-    };
+    let outer = axiom_forall(&p, "nest");
 
     // Outer: no captures, one binder, trigger g(i, i).
-    assert!(outer.params.is_empty(), "outer captures nothing");
+    assert!(outer.captures.is_empty(), "outer captures nothing");
     assert_eq!(outer.bound.len(), 1);
     assert_eq!(
         only_app(only_group(outer)).1,
         &[vmir::TrigTerm::Bound(0), vmir::TrigTerm::Bound(0)]
     );
-    // The outer body calls the inner occurrence with the outer binder
-    // (`Temp(0)`) as its capture argument.
-    assert!(
-        outer.body.insts.iter().any(|i| matches!(
-            &i.kind,
-            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-                if fc.function == inner_id && fc.args.iter().eq(&[vmir::Val::Temp(0)])
-        )),
-        "outer body must call the inner occurrence with the outer binder"
-    );
 
-    // Inner: one capture (i: Int), one binder (j), mixed trigger g(i, j) =
-    // [Capture(0), Bound(0)].
-    assert_eq!(&*inner.params, &[vmir::Type::Int], "inner captures i");
+    // The inner forall lives in the outer's body, capturing the outer binder —
+    // which, with no outer captures, is the outer body's `Temp(0)`.
+    let [inner] = foralls(&outer.body.insts)[..] else {
+        panic!("expected the inner forall inside the outer body");
+    };
+    assert_eq!(&inner.captures[..], &[vmir::Val::Temp(0)], "captures i");
+    assert_eq!(&*inner.cap_types, &[vmir::Type::Int]);
     assert_eq!(inner.bound.len(), 1);
     assert_eq!(
         only_app(only_group(inner)).1,
         &[vmir::TrigTerm::Capture(0), vmir::TrigTerm::Bound(0)]
     );
 
-    // The axiom body still references the outer occurrence via a nullary call.
-    let ax_id = p.id("nest").expect("missing axiom nest");
-    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
-        panic!("nest must be a Axiom");
-    };
-    assert!(
-        ax.body.insts.iter().any(|i| matches!(
-            &i.kind,
-            vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc))
-                if fc.function == outer_id && fc.args.iter().next().is_none()
-        )),
-        "axiom body must call the nullary outer occurrence"
-    );
-
-    // Display path must not panic and should render the capture param.
+    // Display path must not panic and should render the nested block.
     let s = format!("{p}");
-    assert!(
-        s.contains("quantifier nest#quant1(e0: Int)"),
-        "rendered:\n{s}"
-    );
+    assert!(s.contains("forall(e0: Int := e0)"), "rendered:\n{s}");
 }
 
 #[test]
-fn nested_forall_slot_order() {
-    // Flat preorder ids across nesting: a nested `forall` takes the slot after
-    // its encloser; a later sibling top-level `forall` takes the next one. The
-    // id-keyed slot fill must pair each declaration correctly even though the
-    // inner quantifier finishes building before the outer.
+fn sibling_and_nested_foralls_keep_their_scopes() {
+    // Two top-level `forall`s in one axiom, the first with a nested inner one:
+    // each is a step of the stream that hosts it — the outer two in the axiom
+    // body, the inner one inside its encloser.
     let input = r#"
 domain D {
     function g(i: Int, j: Int): Bool
@@ -1304,20 +1274,26 @@ domain D {
     let p = run(input);
     let g_id = p.id("g").expect("missing g");
     let h_id = p.id("h").expect("missing h");
-    let quant = |name: &str| {
-        let id = p.id(name).unwrap_or_else(|| panic!("missing {name}"));
-        match &p.decls[id] {
-            vmir::Declaration::Quantifier(q) => q,
-            _ => panic!("{name} must be a Quantifier"),
-        }
+    let ax_id = p.id("ord").expect("missing axiom ord");
+    let vmir::Declaration::Axiom(ax) = &p.decls[ax_id] else {
+        panic!("ord must be an Axiom");
     };
-    // #quant0 = outer (trigger g, no captures), #quant1 = inner (trigger g,
-    // one capture), #quant2 = sibling (trigger h).
-    let head = |name: &str| only_app(only_group(quant(name))).0.clone();
-    assert_eq!(head("ord#quant0"), vmir::TrigHead::Func(g_id));
-    assert!(quant("ord#quant0").params.is_empty());
-    assert_eq!(head("ord#quant1"), vmir::TrigHead::Func(g_id));
-    assert_eq!(quant("ord#quant1").params.len(), 1);
-    assert_eq!(head("ord#quant2"), vmir::TrigHead::Func(h_id));
-    assert!(quant("ord#quant2").params.is_empty());
+    let top = foralls(&ax.body.insts);
+    let [first, second] = top[..] else {
+        panic!("expected two top-level foralls");
+    };
+    assert_eq!(*only_app(only_group(first)).0, vmir::TrigHead::Func(g_id));
+    assert!(first.captures.is_empty());
+    assert_eq!(*only_app(only_group(second)).0, vmir::TrigHead::Func(h_id));
+    assert!(second.captures.is_empty());
+
+    let [inner] = foralls(&first.body.insts)[..] else {
+        panic!("expected one nested forall in the first");
+    };
+    assert_eq!(*only_app(only_group(inner)).0, vmir::TrigHead::Func(g_id));
+    assert_eq!(inner.captures.len(), 1, "captures the outer binder");
+    assert!(
+        foralls(&second.body.insts).is_empty(),
+        "the sibling has no nested forall"
+    );
 }

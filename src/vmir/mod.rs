@@ -6,6 +6,7 @@ mod heap;
 mod inst;
 mod method;
 mod pure;
+mod quant;
 mod resource;
 mod ty;
 
@@ -19,12 +20,13 @@ pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 pub use adt::TyParams;
 pub use adt::{Adt, AdtVariant};
 pub use analyze::{AnalysisError, AnalyzedProgram, DepGraph, analyze};
-pub use domain::{Axiom, Domain, QuantTrigger, Quantifier, TrigHead, TrigTerm};
+pub use domain::{Axiom, Domain};
 pub use function::{
     Args, ContractArg, ContractCall, Function, FunctionBody, FunctionCall, Params, Requires,
 };
 pub use inst::{Inst, InstKind, PathConds, Polarity};
 pub use method::Method;
+pub use quant::{Forall, QuantTrigger, TrigHead, TrigTerm};
 pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
 pub use ty::Bound;
 
@@ -69,7 +71,6 @@ impl Program {
 pub enum Declaration {
     Domain(Domain),
     Axiom(Axiom),
-    Quantifier(Quantifier),
     Function(Function),
     Method(Method),
     Resource(Resource),
@@ -81,7 +82,6 @@ impl Declaration {
         match self {
             Self::Domain(d) => d.name,
             Self::Axiom(a) => a.name.unwrap_or_default(),
-            Self::Quantifier(q) => q.name,
             Self::Function(f) => f.name,
             Self::Method(m) => m.name,
             Self::Resource(r) => r.name,

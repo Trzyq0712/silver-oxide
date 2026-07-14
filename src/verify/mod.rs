@@ -8,6 +8,7 @@ mod error;
 mod func_registry;
 mod heap;
 pub mod lang;
+mod quant;
 mod rewrite;
 mod stats;
 mod types;

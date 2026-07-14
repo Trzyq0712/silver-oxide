@@ -199,14 +199,6 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             }
         }
         Declaration::Axiom(ax) => inst_deps(&ax.body.insts, out),
-        Declaration::Quantifier(q) => {
-            inst_deps(&q.body.insts, out);
-            for group in q.triggers.iter() {
-                for term in group.terms.iter() {
-                    trig_term_deps(term, out);
-                }
-            }
-        }
         // Leaf declarations: nothing to depend on.
         Declaration::Domain(_) | Declaration::Adt(_) => {}
     }
@@ -251,6 +243,17 @@ fn inst_deps(insts: &[Inst], out: &mut Vec<MemberId>) {
             // (footprint layout), so the resource must be verified first.
             InstKind::Pure(_, PureInst::Snap { resource, .. })
             | InstKind::Heap(HeapInst::FromSnap { resource, .. }) => out.push(*resource),
+            // An inline `forall` depends on whatever its body calls and its
+            // triggers match on — the body is an ordinary inst stream one scope
+            // down, so recurse (nested `forall`s included).
+            InstKind::Pure(_, PureInst::Forall(q)) => {
+                inst_deps(&q.body.insts, out);
+                for group in q.triggers.iter() {
+                    for term in group.terms.iter() {
+                        trig_term_deps(term, out);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -347,7 +350,6 @@ mod tests {
                     Declaration::Adt(a) => a.name = n,
                     Declaration::Domain(do_) => do_.name = n,
                     Declaration::Axiom(a) => a.name = Some(n),
-                    Declaration::Quantifier(q) => q.name = n,
                 }
             }
         }

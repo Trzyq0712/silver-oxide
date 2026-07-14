@@ -36,10 +36,6 @@ pub(crate) struct MethodTranslator<'a, P = Declared> {
     body_slot: Option<DeclSlot<vmir::Method>>,
     /// `#requires` resource id (the pre-state a two-state `#ensures` reads).
     requires: Option<vmir::MemberId>,
-    /// One pre-allocated occurrence slot per `forall` in the body's statements
-    /// (nested included), registered `{method}#quant{j}` — same scheme as an
-    /// axiom's `{axiom}#quant{j}`.
-    quant_slots: Vec<(vmir::MemberId, DeclSlot<vmir::Quantifier>)>,
     _p: PhantomData<P>,
 }
 
@@ -69,20 +65,6 @@ impl<'a> MethodTranslator<'a, Declared> {
         } else {
             None
         };
-        // Pre-allocate one occurrence slot per `forall` in the contracts and
-        // body (nested included), in the order define lowers them: requires,
-        // ensures, body statements. Each block is lowered exactly once (CFG
-        // topo walk), so a static source count is exact; the id-keyed slot
-        // fill makes the walk order irrelevant.
-        let n_foralls = m
-            .requires
-            .as_ref()
-            .map_or(0, pure_exp::count_foralls_spatial)
-            + m.ensures
-                .as_ref()
-                .map_or(0, pure_exp::count_foralls_spatial)
-            + m.body.as_ref().map_or(0, |b| count_foralls_stmts(&b.0));
-        let quant_slots = crate::translate::alloc_quant_slots(d, &name, n_foralls);
         ctx.contracts.insert(
             m.name.0,
             MethodContracts {
@@ -98,7 +80,6 @@ impl<'a> MethodTranslator<'a, Declared> {
             ensures_slot,
             body_slot,
             requires,
-            quant_slots,
             _p: PhantomData,
         }
     }
@@ -113,7 +94,6 @@ impl<'a> MethodTranslator<'a, Declared> {
             ensures_slot: self.ensures_slot,
             body_slot: self.body_slot,
             requires: self.requires,
-            quant_slots: self.quant_slots,
             _p: PhantomData,
         }
     }
@@ -132,13 +112,8 @@ impl MethodTranslator<'_, Metaed> {
             ensures_slot,
             body_slot,
             requires: meta_requires,
-            quant_slots,
             _p,
         } = self;
-
-        // One flat occurrence-id budget across requires, ensures, and body —
-        // consumed in that (counting) order.
-        let mut quants = crate::translate::QuantScope::new(&quant_slots);
 
         // #requires: a self-framed Resource.
         if let Some(requires) = &m.requires {
@@ -156,7 +131,6 @@ impl MethodTranslator<'_, Metaed> {
                 params.len(),
                 vmir::HeapVal::Empty,
                 0,
-                &mut quants,
             )?;
             let name =
                 definer.intern_name(&format!("{}#requires", ctx.interner.resolve(&silver_name)));
@@ -216,7 +190,6 @@ impl MethodTranslator<'_, Metaed> {
                 params.len(),
                 vmir::HeapVal::Empty,
                 snap_entry,
-                &mut quants,
             )?;
             let name =
                 definer.intern_name(&format!("{}#ensures", ctx.interner.resolve(&silver_name)));
@@ -235,16 +208,9 @@ impl MethodTranslator<'_, Metaed> {
         if let Some(slot) = body_slot {
             let body = m.body.as_ref().expect("slot implies a body");
             let name = definer.intern_name(ctx.interner.resolve(&silver_name));
-            let method = lower_method(ctx, m, name, body, &mut quants)?;
+            let method = lower_method(ctx, m, name, body)?;
             definer.define_method(slot, method);
         }
-
-        crate::translate::fill_quant_slots(
-            definer,
-            ctx.interner.resolve(&silver_name),
-            quant_slots,
-            quants.finish(),
-        );
 
         Ok(())
     }
@@ -255,7 +221,6 @@ pub(crate) fn lower_method(
     m: &typed::Method,
     name: Spur,
     body: &typed::StmtBlock,
-    quants: &mut crate::translate::QuantScope,
 ) -> Result<vmir::Method, TranslationError> {
     // Control flow is linearized through the basic-block CFG: blocks are walked
     // in topological order, each lowered under its reaching path condition, with
@@ -267,10 +232,6 @@ pub(crate) fn lower_method(
     })?;
 
     let mut sink = Sink::new(0, 0);
-    // Occurrence ids for the body's `forall`s (see `count_foralls_stmts`);
-    // each `lower_forall` pops the next and pushes its built quantifier onto
-    // `sink.quant_out`.
-    quants.seed(&mut sink);
 
     // Initial environment: fresh values for params and rets. The method has no
     // signature on the VMIR side — params/rets are just initial Fresh insts.
@@ -445,53 +406,10 @@ pub(crate) fn lower_method(
         exit_env.insert(bid, env);
     }
 
-    quants.reap(&mut sink);
     Ok(vmir::Method {
         name,
         insts: sink.insts,
     })
-}
-
-/// The number of `forall`s in the statements (nested included), one occurrence
-/// slot each — the statement-level analogue of [`pure_exp::count_foralls`].
-/// Each block is lowered exactly once by the CFG walk, so this static count
-/// matches lowering's consumption exactly.
-fn count_foralls_stmts(stmts: &[typed::Statement]) -> usize {
-    use pure_exp::{count_foralls, count_foralls_pred_with_perm, count_foralls_spatial};
-    use typed::Statement as S;
-    fn count_rhs(rhs: &typed::AssignRhs) -> usize {
-        match rhs {
-            typed::AssignRhs::Exp(e) => pure_exp::count_foralls(e),
-            typed::AssignRhs::MethodCall(call) => pure_exp::count_foralls_call(call),
-            typed::AssignRhs::New(_) => 0,
-        }
-    }
-    stmts
-        .iter()
-        .map(|s| match s {
-            S::Var(_, rhs) => rhs.as_ref().map_or(0, count_rhs),
-            S::Assign(lhss, rhs) => {
-                lhss.iter()
-                    .map(|l| match l {
-                        typed::AssignLhs::Field(e, _) => count_foralls(e),
-                        typed::AssignLhs::Var(_) => 0,
-                    })
-                    .sum::<usize>()
-                    + count_rhs(rhs)
-            }
-            S::If(c, then, els) => {
-                count_foralls(c)
-                    + count_foralls_stmts(&then.0)
-                    + els.as_ref().map_or(0, |b| count_foralls_stmts(&b.0))
-            }
-            S::Block(inner) => count_foralls_stmts(&inner.0),
-            S::Fold(pwp) | S::Unfold(pwp) => count_foralls_pred_with_perm(pwp),
-            S::Assume(e) | S::Assert(e) | S::Refute(e) | S::Inhale(e) | S::Exhale(e) => {
-                count_foralls_spatial(e)
-            }
-            S::Label(_) | S::Goto(_) => 0,
-        })
-        .sum()
 }
 
 /// Collect the VMIR type of every method-scoped `var` declaration (plus the
