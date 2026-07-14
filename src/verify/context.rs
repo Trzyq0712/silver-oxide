@@ -523,6 +523,12 @@ impl<'a> VerifyContext<'a> {
         roots: &[egg::Id],
     ) -> bool {
         self.alloc.stats.prove_tier4 += 1;
+        // Diagnostic kill switch: run with SILVER_OXIDE_NO_TIER4=1 to measure
+        // which members/goals depend on the case split (everything else in the
+        // prove path is unaffected).
+        if std::env::var_os("SILVER_OXIDE_NO_TIER4").is_some() {
+            return false;
+        }
         let mut budget = SPLIT_BUDGET;
         for depth in 1..=SPLIT_DEPTH {
             if self.split_tree(probe, goal, roots, depth, &mut budget) {
