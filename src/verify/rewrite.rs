@@ -532,6 +532,26 @@ impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
         if known_bool(egraph, eclass) != Some(false) {
             return vec![];
         }
+        // Symmetry for *disproven* equalities: land the mirrored node in the
+        // same class, so a goal built in the other argument order (Prusti's
+        // `requires 0 != value(arg2)` vs the div obligation's `Eq(b, 0)`) sees
+        // the known boolean. Proven equalities need no mirror — `eq-true-union`
+        // merges the args and congruence collapses both orders.
+        let mirrors: Vec<[Id; 2]> = egraph[eclass]
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Symbolic::Binary(BinOp::Eq, [l, r]) if l != r => Some([*r, *l]),
+                _ => None,
+            })
+            .collect();
+        let mut mirror_changed = Vec::new();
+        for [r, l] in mirrors {
+            let mirrored = egraph.add(Symbolic::Binary(BinOp::Eq, [r, l]));
+            if egraph.union(eclass, mirrored) {
+                mirror_changed.push(egraph.find(eclass));
+            }
+        }
         // Collect first: node inspection needs `&egraph`.
         // Each derivation: pin `cond` to `cond_val`, and disprove the other
         // arm's comparison `other == z`.
@@ -575,7 +595,7 @@ impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
                 }
             }
         }
-        let mut changed = Vec::new();
+        let mut changed = mirror_changed;
         for d in derivs {
             let lit = egraph.add(Symbolic::Lit(Literal::Bool(d.cond_val)));
             if egraph.union(d.cond, lit) {

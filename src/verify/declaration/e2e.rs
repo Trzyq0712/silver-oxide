@@ -3692,6 +3692,22 @@ method m(l: List) {
 }
 
 #[test]
+fn disequality_holds_in_both_argument_orders() {
+    // Prusti writes div preconditions constant-first (`requires 0 != value(b)`)
+    // while the div obligation builds `Eq(b, 0)`. `Binary(Eq, ..)` is not
+    // commutative as an e-node; the disproven-eq mirror in the `eq-ite` applier
+    // lands the flipped node in the same (false) class.
+    let input = r#"
+function d_flip(a: Int, b: Int): Int
+    requires 0 != b
+{ a \ b }
+"#;
+    let program = lower(input);
+    let result = verify_named_function(&program, "d_flip");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
 fn enum_exhaustiveness_two_variants_via_boxed_discriminator() {
     // Prusti's enum-match exhaustiveness shape: an opaque discriminator value
     // (`box(0)`/`box(1)` — *not* e-graph literals) selected by an `ite` over
