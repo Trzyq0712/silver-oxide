@@ -62,18 +62,6 @@ impl<'g> LocalEnv<'g> {
         Ok(())
     }
 
-    fn add_label(&mut self, name: Spur) -> Result<(), TypeError> {
-        let s = self.interner.resolve(&name).to_string();
-        if self.locals.contains_key(&name) {
-            return Err(TypeError::ShadowedName(s));
-        }
-        if self.labels.contains(&name) {
-            return Err(TypeError::ShadowedName(s));
-        }
-        self.labels.insert(name);
-        Ok(())
-    }
-
     /// Typecheck a pure expression and lower it to `typed`.
     /// `result_ty` enables the `result` keyword (function postconditions); pass `None`
     /// for methods, predicates, and function bodies.

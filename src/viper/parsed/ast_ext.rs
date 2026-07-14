@@ -163,23 +163,9 @@ impl Field {
     }
 }
 
-impl<T> Block<T> {
-    pub(super) fn map<U>(self, f: impl FnOnce(T) -> U) -> Block<U> {
-        Block(f(self.0))
-    }
-}
-
 impl ExpKind {
     pub fn is_true(&self) -> bool {
         matches!(self, ExpKind::Const(ConstKind::Bool(true)))
-    }
-
-    fn conjoin(acc: Option<Exp>, new: Exp) -> Option<Exp> {
-        Some(match acc {
-            None => new,
-            Some(t) if t.kind.is_true() => new,
-            Some(other) => Exp::impure(ExpKind::BinOp(BinOp::And, other, new)),
-        })
     }
 }
 

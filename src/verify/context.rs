@@ -22,10 +22,11 @@ pub(crate) struct VerifyContext<'a> {
     /// Terminating structural reductions, run after heap-producing ops to
     /// normalize (collapse snapshot towers) without a full saturation.
     static_reduce: Vec<egg::Rewrite<Symbolic, ConstFold>>,
-    /// Per-unit lazy-instantiation rules for **generic** domain axioms (one per
-    /// axiom, minted by `assume_axioms`; ground axioms are pre-added instead),
-    /// pure `forall`s (one per quantifier), and verified function bodies (one
-    /// per already-certified `fn_certs` entry — see `rewrite::function_rule`).
+    /// Per-unit lazy rules, minted by `assume_axioms`: the single quantifier
+    /// instantiation rule (`rewrite::forall_rule` — quantifiers are e-nodes;
+    /// ground axioms are pre-added to the graph instead) and one unfold rule
+    /// per verified function body (one per `fn_certs` entry — see
+    /// `rewrite::function_rule`).
     /// Chained into full saturation (incl. the tier-3 probe) but not `reduce`.
     pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     /// Monotonic source of fresh-value ids (`Symbolic::Fresh(n)`). A plain counter
