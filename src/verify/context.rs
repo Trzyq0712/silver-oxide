@@ -610,10 +610,12 @@ impl<'a> VerifyContext<'a> {
 const SPLIT_DEPTH: usize = 3;
 
 /// Cap on probe saturations per tier-4 goal: an unprovable goal stops costing
-/// time instead of exploring the full case tree. Sized so a depth-1 sweep over
-/// a typical cone (a dozen candidates, two probes each) always completes and
-/// deeper trees get a meaningful but bounded allowance.
-const SPLIT_BUDGET: usize = 192;
+/// time instead of exploring the full case tree. Sized empirically: the widest
+/// provable goal in the Prusti benchmark (`m_rect_normalize`'s mid-body
+/// exhale, a depth-2 tree over a ~20-condition cone) needs ~350 probes;
+/// raising further buys nothing (the one remaining failure is
+/// budget-insensitive up to 2048) and each failing goal burns the full cap.
+const SPLIT_BUDGET: usize = 384;
 
 /// The `ite` conditions worth splitting on: those in the **cone** of `roots`
 /// (the goal and the path-condition literals) whose truth value is undecided
