@@ -351,18 +351,19 @@ fn distributive_ite_rules() -> Vec<Rule> {
             EqBucketSearcher,
             EqIteDistributeApplier {
                 memo: Memo::new(),
-                push_memo: Memo::new(),
+                contra_memo: Memo::new(),
             },
         )
         .expect("eq-ite rule"),
-        // LT rules. The left form is load-bearing: CFG linearization encodes a
-        // conditional inhale/exhale as a *scaled permission* `c ? p : 0`, so the
-        // permission ≥ 0 obligation of such an instruction is a `<` applied to
-        // an `ite`. Pushing the `<` inward lets `ConstFold` decide each branch,
-        // after which `ite-same` collapses the result. Terminating: strictly
-        // reduces the `ite` nesting above the `<`.
-        rw!("lt-ite-l"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
-        rw!("lt-ite-r"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
+        // LT distribution. Load-bearing: CFG linearization encodes a
+        // conditional inhale/exhale as a *scaled permission* `c ? p : 0`, so
+        // the permission ≥ 0 obligation of such an instruction is a `<`
+        // applied to an `ite` tower. The fused rule pushes the `<` all the way
+        // to the tower's leaves in ONE application (each leaf comparison
+        // const-folds, then `ite-reduce` collapses the rebuilt tower), instead
+        // of one level per saturation iteration.
+        Rewrite::new("lt-ite", LtBucketSearcher, LtIteDistributeApplier { memo: Memo::new() })
+            .expect("lt-ite rule"),
         // // MULT rules
         // rw!("mult-ite-l"; "(* (ite ?c ?x ?y) ?z)" => "(ite ?c (* ?x ?z) (* ?y ?z))"),
         // rw!("mult-ite-r"; "(* ?z (ite ?c ?x ?y))" => "(ite ?c (* ?z ?x) (* ?z ?y))"),
@@ -499,6 +500,172 @@ impl Searcher<Symbolic, ConstFold> for EqBucketSearcher {
     }
 }
 
+/// Searcher for the fused `<`-over-ite distribution: every e-class holding an
+/// `Lt` node, via the `classes_by_op` bucket.
+struct LtBucketSearcher;
+
+impl Searcher<Symbolic, ConstFold> for LtBucketSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let Some(classes) = egraph.classes_for_op(&Discriminant::Binary(BinOp::Lt)) else {
+            return vec![];
+        };
+        classes
+            .take(limit)
+            .map(|eclass| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+            .collect()
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        egraph[eclass]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::Binary(BinOp::Lt, _)))
+            .then(|| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// The plan of one full `<`-over-ite descent: mirrors the ite tower under a
+/// comparison operand, with the comparison applied at every leaf. `Leaf` holds
+/// the operand's e-class; the caller builds `lt(leaf, z)` (or `lt(z, leaf)`)
+/// there.
+enum LtPlan {
+    Leaf(Id),
+    Ite(Id, Box<LtPlan>, Box<LtPlan>),
+}
+
+impl LtPlan {
+    /// Descend the ite tower rooted at `class` (read-only). `seen` guards
+    /// against e-class cycles; `depth` bounds pathological towers. A class
+    /// with no ite node is a leaf.
+    fn descend(
+        egraph: &EGraph<Symbolic, ConstFold>,
+        class: Id,
+        seen: &mut Vec<Id>,
+        depth: usize,
+    ) -> LtPlan {
+        let class = egraph.find(class);
+        if depth == 0 || seen.contains(&class) {
+            return LtPlan::Leaf(class);
+        }
+        seen.push(class);
+        let plan = match egraph[class]
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                Symbolic::Ite([c, t, e]) => Some((*c, *t, *e)),
+                _ => None,
+            }) {
+            Some((c, t, e)) => LtPlan::Ite(
+                egraph.find(c),
+                Box::new(Self::descend(egraph, t, seen, depth - 1)),
+                Box::new(Self::descend(egraph, e, seen, depth - 1)),
+            ),
+            None => LtPlan::Leaf(class),
+        };
+        seen.pop();
+        plan
+    }
+
+    fn is_leaf(&self) -> bool {
+        matches!(self, LtPlan::Leaf(_))
+    }
+
+    /// Build the mirrored tower, applying `lt` at each leaf. `ite_on_left`
+    /// selects which side of the `<` the tower operand sits on.
+    fn build(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        z: Id,
+        ite_on_left: bool,
+    ) -> Id {
+        match self {
+            LtPlan::Leaf(leaf) => {
+                let args = if ite_on_left { [*leaf, z] } else { [z, *leaf] };
+                egraph.add(Symbolic::Binary(BinOp::Lt, args))
+            }
+            LtPlan::Ite(c, t, e) => {
+                let t = t.build(egraph, z, ite_on_left);
+                let e = e.build(egraph, z, ite_on_left);
+                egraph.add(Symbolic::Ite([*c, t, e]))
+            }
+        }
+    }
+}
+
+/// Applier for the fused `lt-ite`: for each `Lt` node whose operand class
+/// holds an ite tower, rebuild the whole tower once with the comparison at
+/// the leaves and union it with the `Lt` class. One application replaces a
+/// per-level rewrite cascade (one saturation iteration per tower level).
+struct LtIteDistributeApplier {
+    /// One descent per canonical (tower root, other operand, side).
+    memo: Memo<(Id, Id, bool)>,
+}
+
+/// Tower descent bound: deeper towers keep their tail as an opaque leaf (the
+/// next application, memo-keyed on the new class, picks it up if it matters).
+const LT_DESCEND_DEPTH: usize = 24;
+
+impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        let mut plans: Vec<(LtPlan, Id, bool)> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::Binary(BinOp::Lt, [l, r]) = node else {
+                continue;
+            };
+            for (tower, z, ite_on_left) in [(*l, *r, true), (*r, *l, false)] {
+                let (tower, z) = (egraph.find(tower), egraph.find(z));
+                if !self.memo.insert((tower, z, ite_on_left)) {
+                    continue;
+                }
+                let plan = LtPlan::descend(egraph, tower, &mut Vec::new(), LT_DESCEND_DEPTH);
+                if !plan.is_leaf() {
+                    plans.push((plan, z, ite_on_left));
+                }
+            }
+        }
+        let mut changed = Vec::new();
+        for (plan, z, ite_on_left) in plans {
+            let distributed = plan.build(egraph, z, ite_on_left);
+            if egraph.union(eclass, distributed) {
+                changed.push(egraph.find(eclass));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
 /// Applier for `eq-ite`: unit propagation through an `ite` operand of a
 /// **disproven** equality. From `(ite c x y) == z` proven `false` (an assumed
 /// `d != tag`) with one arm already equal to `z`:
@@ -521,9 +688,9 @@ struct EqIteDistributeApplier {
     /// Cost guard: one derivation per canonical `[c, x, y, z]` quadruple
     /// (re-deriving is idempotent — the unions no-op).
     memo: Memo<[Id; 4]>,
-    /// Cost guard for the unary push-down (see `apply_one`), keyed by the
-    /// function and the canonical ite triple it was pushed through.
-    push_memo: Memo<(FuncId, [Id; 3])>,
+    /// Cost guard for the contrapositive-congruence derivation, keyed by the
+    /// function and the canonical argument pair it disproved.
+    contra_memo: Memo<(FuncId, [Id; 2])>,
 }
 
 impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
@@ -567,90 +734,95 @@ impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
         // onto the axiom instances (`value(cons(1)) ≡ 1`), which is what lets
         // the unit propagation below pin the condition. Demand-driven (only
         // under a disproven equality), so no guard-tower blowup.
-        let mut pushes: Vec<(Id, FuncId, Box<[Type]>, [Id; 3])> = Vec::new();
+        // Contrapositive congruence: congruence says `a ≡ b ⟹ f(a) ≡ f(b)`,
+        // so from a *disproven* `f(a) == f(b)` (with `f` unary — the single
+        // argument is the only thing that can differ) conclude `a == b` is
+        // false. This is what connects an unboxed comparison to its boxed
+        // source: `value(v) != 0` with the axiom instance `value(cons(0)) ≡ 0`
+        // in `0`'s class disproves `v == cons(0)`, which (a) feeds the ite
+        // unit propagation below when `v` is an ite of constructions, and
+        // (b) collapses a predicate-body disjunction tower
+        // `ite(v == cons(0), true, rest) ≡ true` down to its live arm via
+        // `ite-reduce`. Demand-driven: only pairs of same-function unary
+        // applications straddling an already-disproven equality.
+        let mut contras: Vec<[Id; 2]> = Vec::new();
         for node in &egraph[eclass].nodes {
             let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
                 continue;
             };
-            for side in [egraph.find(*l), egraph.find(*r)] {
-                for app in &egraph[side].nodes {
-                    let Symbolic::FuncApp(f, tys, args) = app else {
+            let (l, r) = (egraph.find(*l), egraph.find(*r));
+            for lapp in &egraph[l].nodes {
+                let Symbolic::FuncApp(lf, ltys, largs) = lapp else {
+                    continue;
+                };
+                let [a] = largs.as_ref() else { continue };
+                for rapp in &egraph[r].nodes {
+                    let Symbolic::FuncApp(rf, rtys, rargs) = rapp else {
                         continue;
                     };
-                    let [w] = args.as_ref() else { continue };
-                    for inner in &egraph[*w].nodes {
-                        let Symbolic::Ite([c, a, b]) = inner else {
-                            continue;
-                        };
-                        let key = [egraph.find(*c), egraph.find(*a), egraph.find(*b)];
-                        if self.push_memo.insert((*f, key)) {
-                            pushes.push((side, *f, tys.clone(), key));
-                        }
+                    let [b] = rargs.as_ref() else { continue };
+                    if lf != rf || ltys != rtys {
+                        continue;
+                    }
+                    let (a, b) = (egraph.find(*a), egraph.find(*b));
+                    if a != b && self.contra_memo.insert((*lf, [a, b])) {
+                        contras.push([a, b]);
                     }
                 }
             }
         }
-        for (side, f, tys, [c, a, b]) in pushes {
-            let fa = egraph.add(Symbolic::FuncApp(f, tys.clone(), Box::new([a])));
-            let fb = egraph.add(Symbolic::FuncApp(f, tys, Box::new([b])));
-            let ite = egraph.add(Symbolic::Ite([c, fa, fb]));
-            if egraph.union(side, ite) {
-                mirror_changed.push(egraph.find(side));
+        for [a, b] in contras {
+            let eq = egraph.add(Symbolic::Binary(BinOp::Eq, [a, b]));
+            let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+            if egraph.union(eq, false_) {
+                mirror_changed.push(egraph.find(eq));
             }
         }
-        // Collect first: node inspection needs `&egraph`.
+        // Unit propagation, driven **to the bottom of the tower in one
+        // application**: disproving one arm's comparison exposes the next
+        // tower level, so process a worklist of disproven `(operand, z)`
+        // pairs instead of waiting one saturation iteration per level.
         // Each derivation: pin `cond` to `cond_val`, and disprove the other
         // arm's comparison `other == z`.
-        struct Deriv {
-            cond: Id,
-            cond_val: bool,
-            other: Id,
-            z: Id,
-        }
-        let mut derivs: Vec<Deriv> = Vec::new();
+        let mut work: Vec<(Id, Id)> = Vec::new();
         for node in &egraph[eclass].nodes {
             let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
                 continue;
             };
-            for (ite_side, z) in [(*l, *r), (*r, *l)] {
-                let z = egraph.find(z);
-                for inner in &egraph[ite_side].nodes {
-                    let Symbolic::Ite([c, x, y]) = inner else {
-                        continue;
-                    };
-                    let (c, x, y) = (egraph.find(*c), egraph.find(*x), egraph.find(*y));
-                    if (x != z && y != z) || !self.memo.insert([c, x, y, z]) {
-                        continue;
-                    }
-                    if x == z {
-                        derivs.push(Deriv {
-                            cond: c,
-                            cond_val: false,
-                            other: y,
-                            z,
-                        });
-                    }
-                    if y == z {
-                        derivs.push(Deriv {
-                            cond: c,
-                            cond_val: true,
-                            other: x,
-                            z,
-                        });
-                    }
-                }
-            }
+            work.push((egraph.find(*l), egraph.find(*r)));
+            work.push((egraph.find(*r), egraph.find(*l)));
         }
         let mut changed = mirror_changed;
-        for d in derivs {
-            let lit = egraph.add(Symbolic::Lit(Literal::Bool(d.cond_val)));
-            if egraph.union(d.cond, lit) {
-                changed.push(egraph.find(d.cond));
+        while let Some((ite_side, z)) = work.pop() {
+            // Collect this level's derivations (node inspection needs `&egraph`).
+            let mut derivs: Vec<(Id, bool, Id)> = Vec::new();
+            for inner in &egraph[ite_side].nodes {
+                let Symbolic::Ite([c, x, y]) = inner else {
+                    continue;
+                };
+                let (c, x, y) = (egraph.find(*c), egraph.find(*x), egraph.find(*y));
+                if (x != z && y != z) || !self.memo.insert([c, x, y, z]) {
+                    continue;
+                }
+                if x == z {
+                    derivs.push((c, false, y));
+                }
+                if y == z {
+                    derivs.push((c, true, x));
+                }
             }
-            let other_eq = egraph.add(Symbolic::Binary(BinOp::Eq, [d.other, d.z]));
-            let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
-            if egraph.union(other_eq, false_) {
-                changed.push(egraph.find(other_eq));
+            for (cond, cond_val, other) in derivs {
+                let lit = egraph.add(Symbolic::Lit(Literal::Bool(cond_val)));
+                if egraph.union(cond, lit) {
+                    changed.push(egraph.find(cond));
+                }
+                let other_eq = egraph.add(Symbolic::Binary(BinOp::Eq, [other, z]));
+                let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+                if egraph.union(other_eq, false_) {
+                    changed.push(egraph.find(other_eq));
+                }
+                // The freshly disproven comparison is the next tower level.
+                work.push((egraph.find(other), egraph.find(z)));
             }
         }
         changed
