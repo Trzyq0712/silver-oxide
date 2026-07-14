@@ -45,6 +45,8 @@ pub struct VerifyStats {
     pub prove_tier3: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
+    /// Per-rule search/apply wall clock (excluded from `Eq` / the snapshot).
+    pub rule_timing: RuleTimingTrend,
 }
 
 /// `Timing` wrapper whose `PartialEq`/`Eq` ignore the floats, so `VerifyStats`
@@ -58,6 +60,33 @@ impl PartialEq for TimingTrend {
     }
 }
 impl Eq for TimingTrend {}
+
+/// Wall-clock seconds one rule spent in its searcher/applier over the whole
+/// run. Non-deterministic — a trend, never gated.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleTime {
+    pub search: f64,
+    pub apply: f64,
+}
+
+/// Per-rule timing map wrapper, `Eq`-transparent like [`TimingTrend`] so the
+/// gated snapshot stays purely deterministic. `Debug` is a count summary — the
+/// full map is rendered by `verify --breakdown`.
+#[derive(Clone, Default)]
+pub struct RuleTimingTrend(pub BTreeMap<String, RuleTime>);
+
+impl std::fmt::Debug for RuleTimingTrend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RuleTimingTrend({} rules)", self.0.len())
+    }
+}
+
+impl PartialEq for RuleTimingTrend {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for RuleTimingTrend {}
 
 impl VerifyStats {
     /// A stable, human-readable rendering of the **deterministic** fields only

@@ -222,7 +222,9 @@ impl FuncRegistry {
 
     /// Consume the allocator, returning the accumulated verifier cost metrics.
     pub(crate) fn into_stats(self) -> crate::verify::VerifyStats {
-        self.stats
+        let mut stats = self.stats;
+        stats.rule_timing.0 = crate::verify::rewrite::take_rule_timing();
+        stats
     }
 
     /// Constructor id for variant `variant` of `adt` (minting the concept on first

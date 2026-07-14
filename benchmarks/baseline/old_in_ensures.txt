@@ -7,6 +7,6 @@ rule_applications=5
 prove_calls=9
 prove_tier3=0
 rule.eq-refl=1
-rule.ite-true=2
+rule.ite-reduce=2
 rule.proj-18446744073709551612=1
 rule.proj-6=1

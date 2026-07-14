@@ -39,6 +39,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for (name, dur) in &rows {
                     eprintln!("  {name:<24} {dur:>10.3?}");
                 }
+                let mut rules: Vec<_> = stats.rule_timing.0.iter().collect();
+                rules.sort_by(|a, b| (b.1.search + b.1.apply).total_cmp(&(a.1.search + a.1.apply)));
+                eprintln!("[RULE-TIMING] (search+apply, slowest first)");
+                for (name, t) in rules.iter().take(20) {
+                    eprintln!(
+                        "  {name:<40} search {:>8.1}ms  apply {:>8.1}ms",
+                        t.search * 1e3,
+                        t.apply * 1e3
+                    );
+                }
             }
             eprintln!("[STATS] {stats:?}");
         }

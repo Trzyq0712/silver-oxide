@@ -193,23 +193,32 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Run rewrite saturation over the e-graph in place. The rule set is the
-    /// static rules plus the ADT reductions minted so far by the allocator.
+    /// static rules plus the ADT reductions minted so far by the allocator
+    /// plus the per-unit axiom/function rules.
     pub(crate) fn saturate(&mut self) {
         let egraph = std::mem::take(&mut self.egraph);
         crate::verify::rewrite::new_memo_generation();
-        let rules = self
-            .static_rules
-            .iter()
-            .chain(self.alloc.rules())
-            .chain(self.axiom_rules.iter());
-        let runner = egg::Runner::default()
-            .with_scheduler(egg::SimpleScheduler)
-            .with_egraph(egraph)
-            .run(rules);
-        let iterations = runner.iterations;
-        self.egraph = runner.egraph;
+        self.egraph = self.saturate_flat(egraph);
         self.alloc.stats.saturations += 1;
+    }
+
+    /// One full-rule-set run, shared by [`Self::saturate`] and
+    /// [`Self::run_probe`]. The instantiation memo generation is the caller's
+    /// to set.
+    fn saturate_flat(
+        &mut self,
+        egraph: egg::EGraph<Symbolic, ConstFold>,
+    ) -> egg::EGraph<Symbolic, ConstFold> {
+        let (egraph, iterations) = run_rules(
+            egraph,
+            self.static_rules
+                .iter()
+                .chain(self.alloc.rules())
+                .chain(self.axiom_rules.iter()),
+            None,
+        );
         self.alloc.stats.record_run(&iterations);
+        egraph
     }
 
     /// Run only the terminating structural reductions in place. Used after
@@ -219,13 +228,12 @@ impl<'a> VerifyContext<'a> {
     pub(crate) fn reduce(&mut self) {
         let egraph = std::mem::take(&mut self.egraph);
         crate::verify::rewrite::new_memo_generation();
-        let rules = self.static_reduce.iter().chain(self.alloc.rules());
-        let runner = egg::Runner::default()
-            .with_scheduler(egg::SimpleScheduler)
-            .with_egraph(egraph)
-            .run(rules);
-        let iterations = runner.iterations;
-        self.egraph = runner.egraph;
+        let (egraph, iterations) = run_rules(
+            egraph,
+            self.static_reduce.iter().chain(self.alloc.rules()),
+            None,
+        );
+        self.egraph = egraph;
         self.alloc.stats.reduces += 1;
         self.alloc.stats.record_run(&iterations);
     }
@@ -399,17 +407,23 @@ impl<'a> VerifyContext<'a> {
         probe: egg::EGraph<Symbolic, ConstFold>,
     ) -> egg::EGraph<Symbolic, ConstFold> {
         crate::verify::rewrite::new_memo_generation();
-        let rules = self
-            .static_rules
-            .iter()
-            .chain(self.alloc.rules())
-            .chain(self.axiom_rules.iter());
-        let runner = egg::Runner::default()
-            .with_scheduler(egg::SimpleScheduler)
-            .with_egraph(probe)
-            .run(rules);
-        let iterations = runner.iterations;
-        self.alloc.stats.record_run(&iterations);
-        runner.egraph
+        self.saturate_flat(probe)
     }
+}
+
+/// One egg run over `rules`. Returns the graph and the iteration log — the
+/// caller records the log into the stats once the rule borrow is released.
+fn run_rules<'r>(
+    egraph: egg::EGraph<Symbolic, ConstFold>,
+    rules: impl IntoIterator<Item = &'r egg::Rewrite<Symbolic, ConstFold>>,
+    iter_limit: Option<usize>,
+) -> (egg::EGraph<Symbolic, ConstFold>, Vec<egg::Iteration<()>>) {
+    let mut runner = egg::Runner::default()
+        .with_scheduler(egg::SimpleScheduler)
+        .with_egraph(egraph);
+    if let Some(limit) = iter_limit {
+        runner = runner.with_iter_limit(limit);
+    }
+    let runner = runner.run(rules);
+    (runner.egraph, runner.iterations)
 }

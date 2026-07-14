@@ -58,10 +58,130 @@ impl<K: Eq + std::hash::Hash> Memo<K> {
     }
 }
 
+// ---- Per-rule timing --------------------------------------------------------
+
+thread_local! {
+    /// Per-rule search/apply wall clock, accumulated by [`timed`] wrappers and
+    /// drained into `VerifyStats` at the end of a run. Thread-local so parallel
+    /// tests don't bleed into each other; one verification runs on one thread.
+    /// Keyed by the interned rule `Symbol` (Copy) — stringified only at drain.
+    static RULE_TIMING: std::cell::RefCell<HashMap<Symbol, RuleTime>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+use crate::verify::stats::RuleTime;
+
+/// Drain the accumulated per-rule timing (resets the sink).
+pub(crate) fn take_rule_timing() -> std::collections::BTreeMap<String, RuleTime> {
+    RULE_TIMING.with(|t| {
+        std::mem::take(&mut *t.borrow_mut())
+            .into_iter()
+            .map(|(name, time)| (name.as_str().to_string(), time))
+            .collect()
+    })
+}
+
+fn note_time(name: Symbol, search: f64, apply: f64) {
+    RULE_TIMING.with(|t| {
+        let mut map = t.borrow_mut();
+        let entry = map.entry(name).or_default();
+        entry.search += search;
+        entry.apply += apply;
+    });
+}
+
+/// Wrap a rule so its searcher/applier report wall-clock time into the
+/// thread-local sink. Pure observation — search results and applications are
+/// delegated unchanged.
+fn timed(rw: Rule) -> Rule {
+    let name = rw.name;
+    Rewrite::new(
+        name,
+        TimedSearcher {
+            name,
+            inner: rw.searcher,
+        },
+        TimedApplier {
+            name,
+            inner: rw.applier,
+        },
+    )
+    .expect("wrapping preserves var bindings")
+}
+
+struct TimedSearcher {
+    name: Symbol,
+    inner: Arc<dyn Searcher<Symbolic, ConstFold> + Send + Sync>,
+}
+
+impl Searcher<Symbolic, ConstFold> for TimedSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let start = std::time::Instant::now();
+        let out = self.inner.search_with_limit(egraph, limit);
+        note_time(self.name, start.elapsed().as_secs_f64(), 0.0);
+        out
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        let start = std::time::Instant::now();
+        let out = self.inner.search_eclass_with_limit(egraph, eclass, limit);
+        note_time(self.name, start.elapsed().as_secs_f64(), 0.0);
+        out
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        self.inner.vars()
+    }
+}
+
+struct TimedApplier {
+    name: Symbol,
+    inner: Arc<dyn Applier<Symbolic, ConstFold> + Send + Sync>,
+}
+
+impl Applier<Symbolic, ConstFold> for TimedApplier {
+    fn apply_matches(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        matches: &[SearchMatches<Symbolic>],
+        rule_name: Symbol,
+    ) -> Vec<Id> {
+        let start = std::time::Instant::now();
+        let out = self.inner.apply_matches(egraph, matches, rule_name);
+        note_time(self.name, 0.0, start.elapsed().as_secs_f64());
+        out
+    }
+
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        subst: &Subst,
+        searcher_ast: Option<&PatternAst<Symbolic>>,
+        rule_name: Symbol,
+    ) -> Vec<Id> {
+        self.inner
+            .apply_one(egraph, eclass, subst, searcher_ast, rule_name)
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        self.inner.vars()
+    }
+}
+
 /// The static structural rule set. Per-ADT cons/proj/tag reductions are minted
 /// by the registry (`verify::mono`) and appended by `VerifyContext::new`.
 pub fn rules() -> Vec<Rule> {
-    static_rules()
+    static_rules().into_iter().map(timed).collect()
 }
 
 /// The terminating structural reductions used to **normalize** the e-graph after
@@ -72,7 +192,7 @@ pub fn rules() -> Vec<Rule> {
 /// appended by `VerifyContext::new`. Kept separate from [`rules`] so that future
 /// *non-terminating* rules are run only during full saturation, never here.
 pub fn reduce_rules() -> Vec<Rule> {
-    terminating_ite_rules()
+    terminating_ite_rules().into_iter().map(timed).collect()
 }
 
 /// Build the projection reduction `accessor(ctor(a0..an)) ⇒ a_index` for a
@@ -80,12 +200,14 @@ pub fn reduce_rules() -> Vec<Rule> {
 /// verifier register reductions for member ids minted after `VerifyContext`
 /// construction (monomorphic Option instances).
 pub fn proj_rule(accessor: FuncId, ctor: FuncId, index: usize) -> Rule {
-    Rewrite::new(
-        format!("proj-{}", accessor.0),
-        UnaryAppSearcher { func: accessor },
-        ProjApplier { ctor, index },
+    timed(
+        Rewrite::new(
+            format!("proj-{}", accessor.0),
+            UnaryAppSearcher { func: accessor },
+            ProjApplier { ctor, index },
+        )
+        .expect("valid proj rewrite"),
     )
-    .expect("valid proj rewrite")
 }
 
 /// Build the injectivity rule for one constructor: an e-class holding two
@@ -100,23 +222,27 @@ pub fn proj_rule(accessor: FuncId, ctor: FuncId, index: usize) -> Rule {
 /// (`cons(x, y)` from some other function's body) — and then the component
 /// equalities are only reachable through this rule.
 pub fn inj_rule(ctor: FuncId) -> Rule {
-    Rewrite::new(
-        format!("inj-{}", ctor.0),
-        AxiomTriggerSearcher { func: ctor },
-        InjApplier { ctor },
+    timed(
+        Rewrite::new(
+            format!("inj-{}", ctor.0),
+            AxiomTriggerSearcher { func: ctor },
+            InjApplier { ctor },
+        )
+        .expect("valid injectivity rewrite"),
     )
-    .expect("valid injectivity rewrite")
 }
 
 /// Build the discriminator reduction `tag_fn(ctor_C(..)) ⇒ index_C` for a single
 /// (possibly synthesised) tag function. Companion to [`proj_rule`].
 pub fn tag_rule(tag_fn: FuncId, ctor_tags: HashMap<FuncId, usize>) -> Rule {
-    Rewrite::new(
-        format!("tag-{}", tag_fn.0),
-        UnaryAppSearcher { func: tag_fn },
-        TagApplier { ctor_tags },
+    timed(
+        Rewrite::new(
+            format!("tag-{}", tag_fn.0),
+            UnaryAppSearcher { func: tag_fn },
+            TagApplier { ctor_tags },
+        )
+        .expect("valid tag rewrite"),
     )
-    .expect("valid tag rewrite")
 }
 
 /// The static (ADT-independent) rule set run during saturation.
@@ -141,22 +267,9 @@ fn static_rules() -> Vec<Rule> {
         rw!("eq-true-union"; "(== ?a ?b)" => {
             UnionEqArgs { a: var("?a"), b: var("?b") }
         }),
-        // (a && b) proven true  =>  a and b are each true.
-        // `a && b` is `a ? b : false`; when that e-class is `true`, both
-        // conjuncts hold (e.g. `assume a && b` lets `assert a` / `assert b`).
-        rw!("and-true-decompose"; "(ite ?a ?b false)" => {
-            AndTrueDecompose { a: var("?a"), b: var("?b") }
-        }),
-        // (a || b) proven false  =>  a and b are each false.
-        // `a || b` is `a ? true : b`; when that e-class is `false`, both
-        // disjuncts are false (e.g. `assume !(a || b)` lets `assert !a` / `assert !b`).
-        rw!("or-false-decompose"; "(ite ?a true ?b)" => {
-            OrFalseDecompose { a: var("?a"), b: var("?b") }
-        }),
-        // (!x) proven true  =>  x is false.
-        rw!("not-true-decompose"; "(ite ?x false true)" => {
-            NotTrueDecompose { x: var("?x") }
-        }),
+        // The boolean decompositions (and-true, or-false, not-true) live in the
+        // fused `ite-reduce` pass — they are `Ite`-bucket shapes conditioned on
+        // the class's proven boolean, exactly what its applier already inspects.
     ]);
     rules.extend(distributive_ite_rules());
     rules
@@ -199,33 +312,212 @@ fn distributive_ite_rules() -> Vec<Rule> {
 /// conditional inhale carries its guard in the permission, not the path
 /// condition), the saturation-only `lt-ite` rule distributes the comparison
 /// instead.
+/// The terminating `ite` simplifications, fused into **one** rule that scans
+/// the `Ite` op bucket once per iteration and node-checks every shape. The
+/// twelve equivalent `rw!` patterns cost ~70% of all search time on real
+/// programs: `implication()` encodes every guard as an `Ite` tower, so the
+/// bucket holds thousands of classes, and the nested two-level patterns
+/// (`ite-collapse-*`, `ite-nested-*`) pay a backtracking cross-product over it
+/// per pattern per iteration. The fused pass is linear in the bucket (plus the
+/// nodes of the two branch classes for the nested shapes) and union-only.
+///
+/// Shapes (c ⋄ t ⋄ e over one node, plus one nested level):
+/// - `ite(true, x, y) ⇒ x`, `ite(false, x, y) ⇒ y` (via `ConstFold` on `c`)
+/// - `ite(c, x, x) ⇒ x`
+/// - `ite(c, true, false) ⇒ c`
+/// - `ite(c, c, false) ⇒ c`, `ite(c, true, c) ⇒ c`
+/// - `ite(c, c, true) ⇒ true`, `ite(c, false, c) ⇒ false`
+/// - `ite(c, ite(c, x, y), x) ⇒ x`, `ite(c, x, ite(c, y, x)) ⇒ x`
+/// - `ite(c, ite(c, x, y), y) ⇒ ite(c, x, y)`, `ite(c, x, ite(c, x, y)) ⇒ ite(c, x, y)`
 fn terminating_ite_rules() -> Vec<Rule> {
-    vec![
-        // ite(true, x, y) => x
-        rw!("ite-true";  "(ite true ?x ?y)"  => "?x"),
-        // ite(false, x, y) => y
-        rw!("ite-false"; "(ite false ?x ?y)" => "?y"),
-        // c ? x : x  =>  x
-        rw!("ite-same"; "(ite ?c ?x ?x)" => "?x"),
-        // b && true  == b || false  == c ? true : false => c
-        rw!("ite-ident"; "(ite ?c true false)" => "?c"),
-        // b && b  ==  c ? c : false => c
-        rw!("and-self";  "(ite ?c ?c false)" => "?c"),
-        // b || b  ==  c ? true : c => c
-        rw!("or-self";   "(ite ?c true ?c)" => "?c"),
-        // c ? c : true  =>  true   (If c is true, it's true. If c is false, it's true)
-        rw!("ite-c-true"; "(ite ?c ?c true)" => "true"),
-        // c ? false : c =>  false  (If c is true, it's false. If c is false, it's false)
-        rw!("ite-false-c"; "(ite ?c false ?c)" => "false"),
-        // c ? (c ? x : y) : x  =>  x
-        rw!("ite-nested-x-t"; "(ite ?c (ite ?c ?x ?y) ?x)" => "?x"),
-        // c ? x : (c ? y : x)  =>  x
-        rw!("ite-nested-x-f"; "(ite ?c ?x (ite ?c ?y ?x))" => "?x"),
-        // c ? (c ? x : y) : y  =>  c ? x : y  (Merges outer root directly to inner node)
-        rw!("ite-collapse-t"; "(ite ?c (ite ?c ?x ?y) ?y)" => "(ite ?c ?x ?y)"),
-        // c ? x : (c ? x : y)  =>  c ? x : y  (Merges outer root directly to inner node)
-        rw!("ite-collapse-f"; "(ite ?c ?x (ite ?c ?x ?y))" => "(ite ?c ?x ?y)"),
-    ]
+    vec![Rewrite::new("ite-reduce", IteBucketSearcher, IteReduceApplier).expect("ite rule")]
+}
+
+/// Searcher for the fused ite rule: every e-class holding an `Ite` node, via
+/// the `classes_by_op` bucket (no whole-graph scan). One empty subst per class;
+/// the applier re-reads the nodes.
+struct IteBucketSearcher;
+
+impl Searcher<Symbolic, ConstFold> for IteBucketSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let Some(classes) = egraph.classes_for_op(&Discriminant::Ite) else {
+            return vec![];
+        };
+        classes
+            .take(limit)
+            .map(|eclass| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+            .collect()
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        egraph[eclass]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::Ite(..)))
+            .then(|| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// The known boolean of a class, per `ConstFold`. Subsumes matching a literal
+/// node (the analysis is seeded by literals), so this fires at least wherever
+/// the old `true`/`false` patterns did.
+fn known_bool(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Option<bool> {
+    match egraph[class].data.known() {
+        Some(Literal::Bool(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+struct IteReduceApplier;
+
+impl Applier<Symbolic, ConstFold> for IteReduceApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        // Collect the unions first: node inspection needs `&egraph`.
+        enum Target {
+            Class(Id),
+            True,
+            False,
+        }
+        let mut unions: Vec<(Id, Target)> = Vec::new();
+        let self_lit = known_bool(egraph, eclass);
+        for node in &egraph[eclass].nodes {
+            let Symbolic::Ite([c, t, e]) = node else {
+                continue;
+            };
+            let (c, t, e) = (egraph.find(*c), egraph.find(*t), egraph.find(*e));
+            let (t_lit, e_lit) = (known_bool(egraph, t), known_bool(egraph, e));
+            // Decompositions: the *class's* proven boolean constrains the parts.
+            match self_lit {
+                // (a && b) proven true => a, b each true.  a && b is a ? b : false.
+                Some(true) if e_lit == Some(false) => {
+                    unions.push((c, Target::True));
+                    unions.push((t, Target::True));
+                }
+                // (!x) proven true => x false.  !x is x ? false : true.
+                Some(true) if t_lit == Some(false) && e_lit == Some(true) => {
+                    unions.push((c, Target::False));
+                }
+                // (a || b) proven false => a, b each false.  a || b is a ? true : b.
+                Some(false) if t_lit == Some(true) => {
+                    unions.push((c, Target::False));
+                    unions.push((e, Target::False));
+                }
+                _ => {}
+            }
+            match known_bool(egraph, c) {
+                // ite(true, x, y) => x
+                Some(true) => unions.push((eclass, Target::Class(t))),
+                // ite(false, x, y) => y
+                Some(false) => unions.push((eclass, Target::Class(e))),
+                None => {}
+            }
+            // c ? x : x => x
+            if t == e {
+                unions.push((eclass, Target::Class(t)));
+            }
+            // c ? true : false => c
+            if t_lit == Some(true) && e_lit == Some(false) {
+                unions.push((eclass, Target::Class(c)));
+            }
+            // c ? c : false => c  (b && b)
+            if t == c && e_lit == Some(false) {
+                unions.push((eclass, Target::Class(c)));
+            }
+            // c ? true : c => c  (b || b)
+            if t_lit == Some(true) && e == c {
+                unions.push((eclass, Target::Class(c)));
+            }
+            // c ? c : true => true
+            if t == c && e_lit == Some(true) {
+                unions.push((eclass, Target::True));
+            }
+            // c ? false : c => false
+            if t_lit == Some(false) && e == c {
+                unions.push((eclass, Target::False));
+            }
+            // Nested same-condition ite in the true branch:
+            //   c ? (c ? x : y) : e
+            for inner in &egraph[t].nodes {
+                let Symbolic::Ite([c2, x, y]) = inner else {
+                    continue;
+                };
+                if egraph.find(*c2) != c {
+                    continue;
+                }
+                // c ? (c ? x : y) : x => x
+                if egraph.find(*x) == e {
+                    unions.push((eclass, Target::Class(e)));
+                }
+                // c ? (c ? x : y) : y => c ? x : y
+                if egraph.find(*y) == e {
+                    unions.push((eclass, Target::Class(t)));
+                }
+            }
+            // Nested same-condition ite in the false branch:
+            //   c ? t : (c ? x : y)
+            for inner in &egraph[e].nodes {
+                let Symbolic::Ite([c2, x, y]) = inner else {
+                    continue;
+                };
+                if egraph.find(*c2) != c {
+                    continue;
+                }
+                // c ? x : (c ? y : x) => x
+                if egraph.find(*y) == t {
+                    unions.push((eclass, Target::Class(t)));
+                }
+                // c ? x : (c ? x : y) => c ? x : y
+                if egraph.find(*x) == t {
+                    unions.push((eclass, Target::Class(e)));
+                }
+            }
+        }
+
+        let mut changed = Vec::new();
+        for (source, target) in unions {
+            let target = match target {
+                Target::Class(id) => id,
+                Target::True => egraph.add(Symbolic::Lit(Literal::Bool(true))),
+                Target::False => egraph.add(Symbolic::Lit(Literal::Bool(false))),
+            };
+            if egraph.union(source, target) {
+                changed.push(egraph.find(source));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
 }
 
 /// Applier for `eq-true-union`: when a matched `Eq` e-class is proven `true`,
@@ -262,110 +554,6 @@ impl Applier<Symbolic, ConstFold> for UnionEqArgs {
 
     fn vars(&self) -> Vec<Var> {
         vec![self.a, self.b]
-    }
-}
-
-/// Applier for `and-true-decompose`: when a matched `a ? b : false` (i.e.
-/// `a && b`) e-class is proven `true`, both conjuncts must be true, so union
-/// each with the `true` literal. Sound and size-bounded (one shared literal).
-struct AndTrueDecompose {
-    a: Var,
-    b: Var,
-}
-
-impl Applier<Symbolic, ConstFold> for AndTrueDecompose {
-    fn apply_one(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        subst: &Subst,
-        _searcher_ast: Option<&PatternAst<Symbolic>>,
-        _rule_name: Symbol,
-    ) -> Vec<Id> {
-        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(true))) {
-            return vec![];
-        }
-        let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-        let mut changed = Vec::new();
-        for v in [self.a, self.b] {
-            let id = subst[v];
-            if egraph.union(id, true_) {
-                changed.push(egraph.find(id));
-            }
-        }
-        changed
-    }
-
-    fn vars(&self) -> Vec<Var> {
-        vec![self.a, self.b]
-    }
-}
-
-/// Applier for `or-false-decompose`: when a matched `a ? true : b` (i.e.
-/// `a || b`) e-class is proven `false`, both disjuncts must be false, so union
-/// each with the `false` literal. Sound and size-bounded.
-struct OrFalseDecompose {
-    a: Var,
-    b: Var,
-}
-
-impl Applier<Symbolic, ConstFold> for OrFalseDecompose {
-    fn apply_one(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        subst: &Subst,
-        _searcher_ast: Option<&PatternAst<Symbolic>>,
-        _rule_name: Symbol,
-    ) -> Vec<Id> {
-        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(false))) {
-            return vec![];
-        }
-        let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
-        let mut changed = Vec::new();
-        for v in [self.a, self.b] {
-            let id = subst[v];
-            if egraph.union(id, false_) {
-                changed.push(egraph.find(id));
-            }
-        }
-        changed
-    }
-
-    fn vars(&self) -> Vec<Var> {
-        vec![self.a, self.b]
-    }
-}
-
-/// Applier for `not-true-decompose`: when a matched `x ? false : true` (i.e.
-/// `!x`) e-class is proven `true`, `x` must be false, so union it with the `false` literal.
-struct NotTrueDecompose {
-    x: Var,
-}
-
-impl Applier<Symbolic, ConstFold> for NotTrueDecompose {
-    fn apply_one(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        subst: &Subst,
-        _searcher_ast: Option<&PatternAst<Symbolic>>,
-        _rule_name: Symbol,
-    ) -> Vec<Id> {
-        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(true))) {
-            return vec![];
-        }
-        let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
-        let id = subst[self.x];
-        if egraph.union(id, false_) {
-            vec![egraph.find(id)]
-        } else {
-            vec![]
-        }
-    }
-
-    fn vars(&self) -> Vec<Var> {
-        vec![self.x]
     }
 }
 
@@ -1036,7 +1224,7 @@ pub(crate) fn forall_rule(table: Arc<RecipeTable>) -> Rule {
         table,
         memo: Arc::new(Memo::new()),
     };
-    Rewrite::new("forall-instantiate", searcher, applier).expect("forall rule")
+    timed(Rewrite::new("forall-instantiate", searcher, applier).expect("forall rule"))
 }
 
 // ---- Function-call unfolding (lazy, rewrite-rule triggered) ---------------
@@ -1171,7 +1359,7 @@ pub(crate) fn function_rule(name: &str, func: FuncId, def: Arc<FunctionDefinitio
         limited_post: false,
         memo: Memo::new(),
     };
-    Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule")
+    timed(Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule"))
 }
 
 /// Mint a facts-only rule keyed on `func`: replays only the definition's post
@@ -1189,7 +1377,7 @@ pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>)
         limited_post: true,
         memo: Memo::new(),
     };
-    Rewrite::new(format!("fn-post-{name}"), searcher, applier).expect("function post rule")
+    timed(Rewrite::new(format!("fn-post-{name}"), searcher, applier).expect("function post rule"))
 }
 
 /// Mint the limited-twin post rule for a **recursive** function: keyed on

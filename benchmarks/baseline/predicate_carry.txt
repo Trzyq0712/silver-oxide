@@ -6,4 +6,4 @@ egraph_classes_peak=28
 rule_applications=7
 prove_calls=23
 prove_tier3=0
-rule.ite-true=7
+rule.ite-reduce=7
