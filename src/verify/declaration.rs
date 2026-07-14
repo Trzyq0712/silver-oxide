@@ -109,13 +109,16 @@ fn display_heaps(state: &EvalState, kind: &InstKind, heaps_before: usize) -> Vec
             HeapInst::Combine { base, .. }
             | HeapInst::Inhale { base, .. }
             | HeapInst::Exhale { base, .. },
-        ) => vec![
-            (base.to_string(), get_heap(state, base)),
-            (
-                format!("h{heaps_before}"),
-                state.heaps[heaps_before].clone(),
-            ),
-        ],
+        ) => {
+            let mut res = vec![(base.to_string(), get_heap(state, base))];
+            if heaps_before < state.heaps.len() {
+                res.push((
+                    format!("h{heaps_before}"),
+                    state.heaps[heaps_before].clone(),
+                ));
+            }
+            res
+        }
         _ => state
             .heaps
             .last()
@@ -1621,6 +1624,8 @@ fn walk_body(
         let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
         for (goal, err) in inst_obligations(ctx, state, &inst.kind) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
+                let heaps = display_heaps(state, &inst.kind, heaps_before);
+                snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), Some(goal));
                 return Err(err.with_inst(inst_text.clone()));
             }
         }
@@ -1632,10 +1637,14 @@ fn walk_body(
         if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
             let caps: Vec<egg::Id> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
             if let Err(err) = check_forall_wd(ctx, q, &caps, &pc_lits) {
+                let heaps = display_heaps(state, &inst.kind, heaps_before);
+                snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
                 return Err(err.with_inst(inst_text));
             }
         }
         if let Err(err) = eval(ctx, program, state, inst, certs) {
+            let heaps = display_heaps(state, &inst.kind, heaps_before);
+            snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
             return Err(err.with_inst(inst_text));
         }
         let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);

@@ -36,12 +36,8 @@ pub(crate) struct Snapshotter {
 
 impl Snapshotter {
     pub(crate) fn from_env(method_name: &str) -> Self {
-        let dir = std::env::var_os("SILVER_OXIDE_VIZ").map(|base| {
-            let dir = if base.is_empty() {
-                PathBuf::from("log")
-            } else {
-                PathBuf::from(base)
-            };
+        let dir = crate::util::log_dir().map(|base| {
+            let dir = PathBuf::from(base);
             // Best-effort: a failed create just means later writes no-op-fail.
             let _ = std::fs::create_dir_all(&dir);
             dir

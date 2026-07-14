@@ -132,15 +132,16 @@ fn build_dep_graph(program: &Program) -> DepGraph {
     graph
 }
 
-/// Env-gated (`VIPER_DOT`) dump of the dependency graph to
-/// `log_dir()/callgraph.dot` for debugging. Node labels are member names;
+/// Env-gated (`SILVER_OXIDE_VIZ`) dump of the dependency graph to
+/// `<dir>/callgraph.dot` for debugging. Node labels are member names;
 /// edges are unlabeled.
 fn dump_callgraph(graph: &DepGraph, program: &Program) {
     use petgraph::dot::{Config, Dot};
 
-    if std::env::var("VIPER_DOT").is_err() {
-        return;
-    }
+    let dir = match crate::util::log_dir() {
+        Some(d) => d,
+        None => return,
+    };
     let edge_attr = |_, _| String::new();
     let node_attr = |_, (id, _): (MemberId, &MemberId)| format!("label = \"{}\"", program.name(id));
     let dot = Dot::with_attr_getters(
@@ -149,7 +150,6 @@ fn dump_callgraph(graph: &DepGraph, program: &Program) {
         &edge_attr,
         &node_attr,
     );
-    let dir = crate::util::log_dir();
     let path = format!("{dir}/callgraph.dot");
     if let Err(e) =
         std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, format!("{dot:?}")))
