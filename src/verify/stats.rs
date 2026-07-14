@@ -48,6 +48,10 @@ pub struct VerifyStats {
     /// clone+saturate path (the clearest deterioration signal).
     pub prove_calls: u64,
     pub prove_tier3: u64,
+    /// Goals that escalated to the tier-4 case split, and how many were proven
+    /// by it.
+    pub prove_tier4: u64,
+    pub prove_splits: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
     /// Per-rule search/apply wall clock (excluded from `Eq` / the snapshot).

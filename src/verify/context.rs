@@ -426,14 +426,22 @@ impl<'a> VerifyContext<'a> {
         // Tier 3 shortcut: if every PC literal already carries its required
         // polarity in the just-saturated live graph, assuming the PC adds
         // nothing — the probe would re-saturate an identical graph and reach
-        // the tier-2 verdict again. Fail without paying the clone.
+        // the tier-2 verdict again. Skip straight to the tier-4 case split
+        // (an empty-pc goal — a method's exit exhale after a CFG join — is
+        // exactly the shape that needs one).
         if pc_lits.iter().all(|(id, pol)| {
             matches!(
                 self.egraph[*id].data.known(),
                 Some(Literal::Bool(b)) if *b == matches!(pol, Polarity::Positive)
             )
         }) {
-            return false;
+            let probe = self.egraph.clone();
+            let proven = self.split_prove(&probe, goal, &[goal]);
+            if proven {
+                self.union(imp, true_);
+                self.egraph.rebuild();
+            }
+            return proven;
         }
 
         // Tier 3: clone, assume the path condition, saturate the clone, check.
@@ -461,7 +469,15 @@ impl<'a> VerifyContext<'a> {
             true
         } else {
             let probe = self.run_probe(probe);
-            probe.find(goal) == probe.find(true_p)
+            if probe.find(goal) == probe.find(true_p) {
+                true
+            } else {
+                // Tier 4: prove by case analysis on an ite condition.
+                let roots: Vec<egg::Id> = std::iter::once(goal)
+                    .chain(pc_lits.iter().map(|(id, _)| *id))
+                    .collect();
+                self.split_prove(&probe, goal, &roots)
+            }
         };
 
         // Persist the result so future identical obligations hit tier 1.
@@ -470,6 +486,96 @@ impl<'a> VerifyContext<'a> {
             self.egraph.rebuild();
         }
         proven
+    }
+
+    /// Whether a saturated probe discharges `goal`: either the goal is merged
+    /// with `true`, or the probe's assumptions are contradictory so the goal
+    /// holds vacuously (this is what closes an unreachable case's branch).
+    fn probe_holds(probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
+        if probe.classes().any(|c| c.data.is_inconsistent()) {
+            return true;
+        }
+        let Some(true_p) = probe.lookup(Symbolic::Lit(Literal::Bool(true))) else {
+            return false;
+        };
+        probe.find(goal) == probe.find(true_p)
+    }
+
+    /// Tier 4 — **case split**. The e-graph cannot reason by cases: an `ite`
+    /// whose condition is an unconstrained boolean stays opaque, so a fact that
+    /// holds in *both* branches is never concluded. That is exactly what a CFG
+    /// join leaves behind — the held permission is a sum of branch-scaled
+    /// `ite(flag, p, 0)` terms, and the exit exhale needs it under a disjunction
+    /// of the flags. Pick an undecided `ite` condition from the cone of the goal
+    /// and the path condition, and prove the goal twice — assuming it, and
+    /// assuming its negation. If both branches close, the goal holds.
+    ///
+    /// Searched by **iterative deepening**: every candidate is tried at depth 1
+    /// before any pair at depth 2, so a goal needing one split (the common
+    /// case) costs at most `2·|candidates|` probe saturations, and a
+    /// mis-ordered candidate costs one level, not a subtree. `SPLIT_BUDGET`
+    /// caps total probe saturations per goal so an unprovable goal degrades
+    /// gracefully.
+    fn split_prove(
+        &mut self,
+        probe: &egg::EGraph<Symbolic, ConstFold>,
+        goal: egg::Id,
+        roots: &[egg::Id],
+    ) -> bool {
+        self.alloc.stats.prove_tier4 += 1;
+        let mut budget = SPLIT_BUDGET;
+        for depth in 1..=SPLIT_DEPTH {
+            if self.split_tree(probe, goal, roots, depth, &mut budget) {
+                self.alloc.stats.prove_splits += 1;
+                return true;
+            }
+            if budget == 0 {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Prove `goal` by a case tree of at most `depth` nested splits: a branch
+    /// that does not close outright recurses (both arms must close).
+    fn split_tree(
+        &mut self,
+        probe: &egg::EGraph<Symbolic, ConstFold>,
+        goal: egg::Id,
+        roots: &[egg::Id],
+        depth: usize,
+        budget: &mut usize,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        for cond in split_candidates(probe, roots) {
+            if *budget < 2 {
+                return false;
+            }
+            let mut all_closed = true;
+            for want_true in [true, false] {
+                if *budget == 0 {
+                    return false;
+                }
+                *budget -= 1;
+                let mut branch = probe.clone();
+                let lit = branch.add(Symbolic::Lit(Literal::Bool(want_true)));
+                branch.union(cond, lit);
+                branch.rebuild();
+                let branch = self.run_probe(branch);
+                if !Self::probe_holds(&branch, goal)
+                    && !self.split_tree(&branch, goal, roots, depth - 1, budget)
+                {
+                    all_closed = false;
+                    break;
+                }
+            }
+            if all_closed {
+                return true;
+            }
+        }
+        false
     }
 
     /// Saturate a detached probe e-graph with the full rule set, inside a
@@ -496,6 +602,52 @@ impl<'a> VerifyContext<'a> {
         self.clean = clean;
         out
     }
+}
+
+/// How many nested `ite` conditions tier 4 may split on. A CFG join of an
+/// n-way branch needs up to n-1 nested splits (one per excluded arm); 3 covers
+/// the 4-variant enums in the Prusti output.
+const SPLIT_DEPTH: usize = 3;
+
+/// Cap on probe saturations per tier-4 goal: an unprovable goal stops costing
+/// time instead of exploring the full case tree. Sized so a depth-1 sweep over
+/// a typical cone (a dozen candidates, two probes each) always completes and
+/// deeper trees get a meaningful but bounded allowance.
+const SPLIT_BUDGET: usize = 192;
+
+/// The `ite` conditions worth splitting on: those in the **cone** of `roots`
+/// (the goal and the path-condition literals) whose truth value is undecided
+/// (a `ConstFold`-known condition would make one branch vacuous). The cone,
+/// not the whole e-graph: a saturated probe holds hundreds of `ite`s with no
+/// bearing on the goal, and trying each is what makes naive splitting
+/// exponential. Breadth-first from the roots, so the conditions structurally
+/// nearest the goal — the ones that actually gate it — are tried first; no
+/// further ranking.
+fn split_candidates(probe: &egg::EGraph<Symbolic, ConstFold>, roots: &[egg::Id]) -> Vec<egg::Id> {
+    use egg::Language as _;
+    let mut visited: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut queue: std::collections::VecDeque<egg::Id> =
+        roots.iter().map(|id| probe.find(*id)).collect();
+
+    while let Some(id) = queue.pop_front() {
+        if !visited.insert(id) {
+            continue;
+        }
+        for node in &probe[id].nodes {
+            if let Symbolic::Ite([c, _, _]) = node {
+                let c = probe.find(*c);
+                if probe[c].data.known().is_none() && seen.insert(c) {
+                    out.push(c);
+                }
+            }
+            for child in node.children() {
+                queue.push_back(probe.find(*child));
+            }
+        }
+    }
+    out
 }
 
 /// One egg run over `rules`. Returns the graph and the iteration log — the

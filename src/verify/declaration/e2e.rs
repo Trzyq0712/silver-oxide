@@ -2258,12 +2258,11 @@ method m() {
 }
 
 #[test]
-fn quantifier_guarded_implication_not_yet() {
-    // KNOWN LIMITATION (no Tier-4): proving `b() ==> foo(7)` needs a
-    // goal-directed case-split on `b()` to collapse the guard `Ite(b(), Q,
-    // true)` and then `Ite(Q, foo(7), true)`. Without Tier-4 neither guard
-    // collapses (nothing concrete), so this fails. Flip to `is_ok` when Tier-4
-    // lands.
+fn quantifier_guarded_implication_by_case_split() {
+    // Proving `b() ==> foo(7)` needs a goal-directed case split on `b()` to
+    // collapse the guard `Ite(b(), Q, true)` and then `Ite(Q, foo(7), true)`.
+    // Neither guard collapses on its own (nothing concrete to fold); tier 4
+    // splits on `b()` and closes both arms.
     let input = r#"
 domain D {
     function foo(i: Int): Bool
@@ -2276,11 +2275,7 @@ method m() {
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "documents the no-Tier-4 limitation; if this starts passing, \
-         goal-directed ITE case-splitting landed — flip to assert Ok"
-    );
+    assert!(result.is_ok(), "expected Ok via tier-4, got {result:?}");
 }
 
 #[test]
@@ -3279,21 +3274,14 @@ function bad(x: Ref): Int
 }
 
 #[test]
-fn heap_free_post_under_a_branch_hits_the_same_limitation() {
-    // The branch limitation is NOT heap-dep-specific — it is general to guarded
-    // fact replay. `f`'s precondition `x != 0` is provable only under `!e_c`, so
-    // the call-site assert commits `!e_c ⟹ (x != 0)` and nothing more; `f`'s post
-    // fact, guarded by that same formula, therefore does not fire unconditionally,
-    // and `ite(e_c, 10, f(x)) ≡ 10` needs a case split the e-graph won't do.
-    //
-    // Why heap-free usually escapes this and heap-dep never can: a heap-free
-    // guard is a **defined** formula (`f#requires(args)`), so it can be re-derived
-    // from scratch anywhere the e-graph can prove it — in the recursive test
-    // `recursive_function_postcondition_by_induction` the guard `ok(next(x))`
-    // follows from a domain axiom, hence holds unconditionally and the post fires
-    // unbranched. An **opaque** pre-token can never be re-derived: the pc-guarded
-    // release at the `Snap` is its only source, so a heap-dep call under a branch
-    // is *always* pc-bound. Same wall, hit every time instead of occasionally.
+fn heap_free_post_under_a_branch_via_case_split() {
+    // Guarded fact replay does not cross a branch on its own: `f`'s
+    // precondition `x != 0` is provable only under `!e_c`, so the call-site
+    // assert commits `!e_c ⟹ (x != 0)` and `f`'s post fact — guarded by that
+    // same formula — does not fire unconditionally. Collapsing
+    // `ite(e_c, 10, f(x)) ≡ 10` needs a case split on `e_c`: tier 4 provides
+    // it, closing the `e_c` arm by folding and the `!e_c` arm through the
+    // now-released guard.
     let input = r#"
 function f(x: Int): Int
     requires x != 0
@@ -3305,48 +3293,22 @@ function g(x: Int): Int
 "#;
     let program = lower(input);
     let result = verify_named_function(&program, "g");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "a post whose guard holds only under the branch is not reachable; got {result:?}"
-    );
+    assert!(result.is_ok(), "expected Ok via tier-4, got {result:?}");
 }
 
 #[test]
-fn heap_dep_post_under_a_branch_is_a_known_limitation() {
-    // KNOWN LIMITATION — a heap-dependent call whose `Snap` sits under a path
-    // condition cannot deliver its postcondition to a conclusion needed at a
-    // weaker pc. Nothing to do with recursion (see the branchless-recursive test
-    // below, which passes): `g` here is not recursive at all. It lowers to
-    //
-    //   e4  := <e2>  *[h0] f(e0)                  // the `x.f` arm
-    //   e5  := <!e2> snap[h0] peek#requires(e0)   // the `peek(x)` arm's snapshot
-    //   e6  := peek(e0, e5)
-    //   e7  := e2 ? e4 : e6
-    //   assert g#ensures(e0, e1, e7, e3)          // pc <> — must hold on BOTH branches
-    //
-    // Writing `V` for `unwrap(proj_0(e3))`: `e4 ≡ V` (a `Deref` carries no pc) and
-    // the goal unfolds to `ite(e2, V, e6) ≡ V`, so it needs `e6 ≡ V` — which is
-    // exactly `peek`'s postcondition. But that fact is guarded by `peek`'s
-    // pre-token, and `eval_snap` releases the token only under the `Snap`'s path
-    // condition `<!e2>`. Chaining `!e2 ⟹ token ⟹ (e6 == V)` into an unbranched
-    // goal needs a case split on `e2`, which the e-graph does not do. (Silicon
-    // does not meet this: it forks the path and proves the post once per branch.)
-    //
-    // The token is *opaque* by design — stamped where a `Snap`'s check passed,
-    // never defined — so no rewrite can make it true elsewhere. A heap-free guard
-    // is a defined formula and can be re-derived unconditionally when the caller's
-    // context allows (see `heap_free_post_under_a_branch_hits_the_same_limitation`
-    // for the case where it can't, and fails identically); an opaque token has no
-    // such escape, so heap-dep hits this wall on *every* branch. Two ways out, both
-    // deliberately deferred: bridge the token to the requires-Resource's bool
-    // (`R#bool(args, s) ⟹ R#pre(args, s)`, sound because the callee's proof
-    // assumes only that bool and is total in `(args, s)` — at the price of
-    // `perm(..)` in function preconditions, which purify already rejects), or
-    // teach the prove path to case-split a goal on its `ite` conditions (fixes
-    // both flavours at once).
-    //
-    // Practical bite: this is what keeps *branching* recursive heap-dep functions
-    // (the usual shape — a base case plus a recursive case) out of reach.
+fn heap_dep_post_under_a_branch_via_case_split() {
+    // A heap-dependent call whose `Snap` sits under a path condition delivers
+    // its postcondition through the opaque pre-token, which `eval_snap`
+    // releases only under the `Snap`'s pc `<!e2>`. The goal
+    // `ite(e2, V, e6) ≡ V` is unbranched, so chaining
+    // `!e2 ⟹ token ⟹ (e6 == V)` into it needs a case split on `e2` — the
+    // token is never *defined*, so unlike a heap-free guard it cannot be
+    // re-derived where the pc doesn't hold. Tier 4 splits on `e2`: the `e2`
+    // arm folds, the `!e2` arm releases the token. (Silicon never meets this —
+    // it forks the path and proves the post once per branch.) This is also
+    // what unlocks *branching* recursive heap-dep functions (base case +
+    // recursive case).
     let input = r#"
 field f: Int
 
@@ -3361,16 +3323,14 @@ function g(x: Ref, b: Bool): Int
 "#;
     let program = lower(input);
     let result = verify_named_function(&program, "g");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "a heap-dep post under a branch is not yet reachable; got {result:?}"
-    );
+    assert!(result.is_ok(), "expected Ok via tier-4, got {result:?}");
 }
 
 #[test]
 fn branchless_recursive_heap_dep_function_verifies_by_induction() {
     // Recursion over a snapshot works — it is the *branch*, not the recursion,
-    // that the pre-token cannot cross (see the limitation test above). With the
+    // that the pre-token cannot cross on its own (tier 4 now bridges it — see
+    // `heap_dep_post_under_a_branch_via_case_split`). With the
     // recursive `Snap` at empty pc the token is released unconditionally, so the
     // in-batch post rule (the induction hypothesis, keyed on the full id and
     // installed while the body is checked) gives `rf(x, next(n), s') == x.f`,
@@ -3749,6 +3709,64 @@ method exhaustive(v: s_MaybeInt, _2p: Ref)
     } elseif (s_Int_isize_value(_tmp0) == 1) {
     } else {
         assert false
+    }
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn branch_join_exhale_by_case_split() {
+    // A CFG join leaves the ensured chunk's permission as a sum of
+    // branch-scaled ites (`ite(c,1,0) + ite(c,0,ite(c2,1,0))`); the exit
+    // exhale needs it under the disjunction of the branch flags, with the
+    // third arm excluded by exhaustiveness. No single saturation proves the
+    // sufficiency — tier 4 splits on the branch conditions and each arm folds.
+    let input = r#"
+domain s_Int_isize {
+    function s_Int_isize_cons(arg0: Int): s_Int_isize
+    function s_Int_isize_value(arg0: s_Int_isize): Int
+    axiom ax_value {
+        forall value: Int :: { s_Int_isize_cons(value) }
+            s_Int_isize_value(s_Int_isize_cons(value)) == value
+    }
+}
+
+adt s_MaybeInt {
+    s_MaybeInt_0_cons()
+    s_MaybeInt_1_cons(f: Int)
+}
+
+field p_Bool_val: Bool
+
+predicate p_Bool(self: Ref) {
+    acc(self.p_Bool_val, write)
+}
+
+method p_Bool_assign(self: Ref, value: Bool)
+    ensures acc(p_Bool(self), write)
+
+function s_MaybeInt_discr(self: s_MaybeInt): s_Int_isize
+{
+    (self.iss_MaybeInt_1_cons ? s_Int_isize_cons(1) : s_Int_isize_cons(0))
+}
+
+method exhaustive(v: s_MaybeInt, _0p: Ref)
+    ensures acc(p_Bool(_0p), write)
+{
+    var t: s_Int_isize := s_MaybeInt_discr(v)
+    if (s_Int_isize_value(t) == 0) {
+        p_Bool_assign(_0p, false)
+    } elseif (s_Int_isize_value(t) == 1) {
+        p_Bool_assign(_0p, true)
+    } else {
+        assert false
+        inhale false
     }
 }
 "#;
