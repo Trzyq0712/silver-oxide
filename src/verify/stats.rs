@@ -36,6 +36,11 @@ pub struct VerifyStats {
     /// peak e-graph size observed in any iteration.
     pub egraph_nodes_peak: usize,
     pub egraph_classes_peak: usize,
+    /// Body instructions fully processed (obligations discharged + evaluated)
+    /// across all verification units. A progress marker: a failing member stops
+    /// counting at its failing instruction, so a higher count on the same input
+    /// means the run got further.
+    pub insts_processed: u64,
     /// total rule applications, and a per-rule breakdown.
     pub rule_applications: u64,
     pub per_rule: BTreeMap<String, u64>,

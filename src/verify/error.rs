@@ -18,9 +18,14 @@ pub enum VerifyError {
     /// A call/fold/unfold targets a resource that produced no certificate —
     /// i.e. the resource itself failed its well-formedness verification.
     DependencyFailed,
-    /// Verification failed while executing a specific instruction.
+    /// Verification failed while executing a specific instruction. `at`/`total`
+    /// give the failing instruction's index and the body's instruction count —
+    /// a progress marker, so runs can be compared on how far a failing member
+    /// got, not just pass/fail.
     AtInst {
         inst: String,
+        at: usize,
+        total: usize,
         source: Box<VerifyError>,
     },
 }
@@ -36,19 +41,27 @@ impl std::fmt::Display for VerifyError {
             Self::DependencyFailed => {
                 write!(f, "depends on a resource that failed to verify")
             }
-            Self::AtInst { inst, source } => write!(f, "{source}\n    instruction: {inst}"),
+            Self::AtInst {
+                inst,
+                at,
+                total,
+                source,
+            } => write!(f, "{source}\n    instruction ({at}/{total}): {inst}"),
         }
     }
 }
 
 impl VerifyError {
-    /// Wrap this error with the instruction text it occurred at (idempotent — an
+    /// Wrap this error with the instruction text it occurred at, plus the
+    /// instruction's index and the body's total (idempotent — an
     /// already-wrapped error keeps its innermost source).
-    pub(crate) fn with_inst(self, inst: String) -> Self {
+    pub(crate) fn with_inst(self, inst: String, at: usize, total: usize) -> Self {
         match self {
             Self::AtInst { .. } => self,
             _ => Self::AtInst {
                 inst,
+                at,
+                total,
                 source: Box::new(self),
             },
         }

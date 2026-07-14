@@ -1603,7 +1603,7 @@ fn walk_body(
     eval: EvalFn,
     mut footprint_ops: Option<&mut Vec<(Val, Val)>>,
 ) -> Result<(), VerifyError> {
-    for inst in insts {
+    for (inst_idx, inst) in insts.iter().enumerate() {
         if let (Some(ops), InstKind::Heap(HeapInst::Combine { loc, perm, .. })) =
             (&mut footprint_ops, &inst.kind)
         {
@@ -1632,7 +1632,7 @@ fn walk_body(
                     let heaps = display_heaps(state, &inst.kind, heaps_before);
                     snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), Some(goal));
                 }
-                return Err(err.with_inst(inst_text));
+                return Err(err.with_inst(inst_text, inst_idx, insts.len()));
             }
         }
         // A quantifier's own side conditions, discharged once per syntactic
@@ -1648,7 +1648,7 @@ fn walk_body(
                     let heaps = display_heaps(state, &inst.kind, heaps_before);
                     snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
                 }
-                return Err(err.with_inst(inst_text));
+                return Err(err.with_inst(inst_text, inst_idx, insts.len()));
             }
         }
         if let Err(err) = eval(ctx, program, state, inst, certs) {
@@ -1657,8 +1657,9 @@ fn walk_body(
                 let heaps = display_heaps(state, &inst.kind, heaps_before);
                 snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
             }
-            return Err(err.with_inst(inst_text));
+            return Err(err.with_inst(inst_text, inst_idx, insts.len()));
         }
+        ctx.alloc.stats.insts_processed += 1;
         if snap.enabled() {
             let highlight =
                 (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);

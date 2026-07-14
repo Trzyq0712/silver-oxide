@@ -3690,3 +3690,82 @@ method m(l: List) {
     let result = verify_named_method(&program, "m");
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
+
+#[test]
+fn enum_exhaustiveness_two_variants_via_boxed_discriminator() {
+    // Prusti's enum-match exhaustiveness shape: an opaque discriminator value
+    // (`box(0)`/`box(1)` — *not* e-graph literals) selected by an `ite` over
+    // the variant test. Excluding both tags must derive `false`. Needs the
+    // `eq-ite` unit propagation: `d != box(0)` with `d = isOne ? box(0) : box(1)`
+    // pins `isOne = false`, then `d != box(1)` pins `isOne = true` —
+    // inconsistent, so `assert false` discharges.
+    let input = r#"
+domain BoxedInt {
+    function box(arg: Int): BoxedInt
+    function unbox(arg: BoxedInt): Int
+    axiom ax_box_unbox { forall s: BoxedInt :: { unbox(s) } box(unbox(s)) == s }
+    axiom ax_unbox_box { forall v: Int :: { box(v) } unbox(box(v)) == v }
+}
+
+adt TwoCase {
+    One()
+    Two()
+}
+
+function discrTwoCase(v: TwoCase): BoxedInt {
+    v.isOne ? box(0) : box(1)
+}
+
+method exhaustive(v: TwoCase) {
+    var d: BoxedInt := discrTwoCase(v)
+    assume d != box(0)
+    assume d != box(1)
+    assert false
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
+fn enum_exhaustiveness_three_variants_via_boxed_discriminator() {
+    // Nested-`ite` discriminator (3+ variants): the unit propagation must chain —
+    // pinning the outer condition lets `ite-reduce` collapse `d` onto the inner
+    // `ite`, whose node then sits in `d`'s e-class for the next exclusion.
+    let input = r#"
+domain BoxedInt {
+    function box(arg: Int): BoxedInt
+    function unbox(arg: BoxedInt): Int
+    axiom ax_box_unbox { forall s: BoxedInt :: { unbox(s) } box(unbox(s)) == s }
+    axiom ax_unbox_box { forall v: Int :: { box(v) } unbox(box(v)) == v }
+}
+
+adt ThreeCase {
+    One()
+    Two()
+    Three()
+}
+
+function discrThreeCase(v: ThreeCase): BoxedInt {
+    v.isOne ? box(0) : (v.isTwo ? box(1) : box(2))
+}
+
+method exhaustive(v: ThreeCase) {
+    var d: BoxedInt := discrThreeCase(v)
+    assume d != box(0)
+    assume d != box(1)
+    assume d != box(2)
+    assert false
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}

@@ -343,9 +343,15 @@ fn static_rules() -> Vec<Rule> {
 /// Rules that push down the builtin operators into the ite branches.
 fn distributive_ite_rules() -> Vec<Rule> {
     vec![
-        // // EQ rules
-        // rw!("eq-ite-l"; "(== (ite ?c ?x ?y) ?z)" => "(ite ?c (== ?x ?z) (== ?y ?z))"),
-        // rw!("eq-ite-r"; "(== ?z (ite ?c ?x ?y))" => "(ite ?c (== ?z ?x) (== ?z ?y))"),
+        // EQ distribution lives in the guarded `eq-ite` rule below (unguarded
+        // pattern forms blow the graph up ~75x on real programs: every pair of
+        // ite-towers under an `==` cross-multiplies).
+        Rewrite::new(
+            "eq-ite",
+            EqBucketSearcher,
+            EqIteDistributeApplier { memo: Memo::new() },
+        )
+        .expect("eq-ite rule"),
         // LT rules. The left form is load-bearing: CFG linearization encodes a
         // conditional inhale/exhale as a *scaled permission* `c ? p : 0`, so the
         // permission ≥ 0 obligation of such an instruction is a `<` applied to
@@ -353,7 +359,7 @@ fn distributive_ite_rules() -> Vec<Rule> {
         // after which `ite-same` collapses the result. Terminating: strictly
         // reduces the `ite` nesting above the `<`.
         rw!("lt-ite-l"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
-        // rw!("lt-ite-r"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
+        rw!("lt-ite-r"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
         // // MULT rules
         // rw!("mult-ite-l"; "(* (ite ?c ?x ?y) ?z)" => "(ite ?c (* ?x ?z) (* ?y ?z))"),
         // rw!("mult-ite-r"; "(* ?z (ite ?c ?x ?y))" => "(ite ?c (* ?z ?x) (* ?z ?y))"),
@@ -437,6 +443,151 @@ impl Searcher<Symbolic, ConstFold> for IteBucketSearcher {
                 substs: vec![Subst::default()],
                 ast: None,
             })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Searcher for the guarded eq-over-ite distribution: every e-class holding an
+/// `Eq` node, via the `classes_by_op` bucket (no whole-graph scan). One empty
+/// subst per class; the applier re-reads the nodes.
+struct EqBucketSearcher;
+
+impl Searcher<Symbolic, ConstFold> for EqBucketSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let Some(classes) = egraph.classes_for_op(&Discriminant::Binary(BinOp::Eq)) else {
+            return vec![];
+        };
+        classes
+            .take(limit)
+            .map(|eclass| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+            .collect()
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        egraph[eclass]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::Binary(BinOp::Eq, _)))
+            .then(|| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Applier for `eq-ite`: unit propagation through an `ite` operand of a
+/// **disproven** equality. From `(ite c x y) == z` proven `false` (an assumed
+/// `d != tag`) with one arm already equal to `z`:
+///
+/// - `x ≡ z ⟹ c = false` (taking the true branch would satisfy the equality)
+///   `        ∧ (y == z) = false` (the value is the false branch's)
+/// - `y ≡ z ⟹ c = true ∧ (x == z) = false` (mirrored)
+///
+/// The second consequence recurses down a nested ite tower (a 3+-variant enum
+/// discriminator), and two assumed disequalities that pin `c` both ways make
+/// the graph inconsistent — which is exactly enum-match exhaustiveness
+/// (`assert false` after excluding every tag).
+///
+/// Deliberately **not** implemented as syntactic distribution
+/// (`(ite c x y) == z ⇒ ite c (x==z) (y==z)`): the pattern form cross-multiplies
+/// the ite guard towers `implication()` builds (~75x node blowup, trips egg's
+/// node limit and *loses* previously-proven goals); this derivation adds at
+/// most one `Eq` node per step and otherwise only unions.
+struct EqIteDistributeApplier {
+    /// Cost guard: one derivation per canonical `[c, x, y, z]` quadruple
+    /// (re-deriving is idempotent — the unions no-op).
+    memo: Memo<[Id; 4]>,
+}
+
+impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        if known_bool(egraph, eclass) != Some(false) {
+            return vec![];
+        }
+        // Collect first: node inspection needs `&egraph`.
+        // Each derivation: pin `cond` to `cond_val`, and disprove the other
+        // arm's comparison `other == z`.
+        struct Deriv {
+            cond: Id,
+            cond_val: bool,
+            other: Id,
+            z: Id,
+        }
+        let mut derivs: Vec<Deriv> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
+                continue;
+            };
+            for (ite_side, z) in [(*l, *r), (*r, *l)] {
+                let z = egraph.find(z);
+                for inner in &egraph[ite_side].nodes {
+                    let Symbolic::Ite([c, x, y]) = inner else {
+                        continue;
+                    };
+                    let (c, x, y) = (egraph.find(*c), egraph.find(*x), egraph.find(*y));
+                    if (x != z && y != z) || !self.memo.insert([c, x, y, z]) {
+                        continue;
+                    }
+                    if x == z {
+                        derivs.push(Deriv {
+                            cond: c,
+                            cond_val: false,
+                            other: y,
+                            z,
+                        });
+                    }
+                    if y == z {
+                        derivs.push(Deriv {
+                            cond: c,
+                            cond_val: true,
+                            other: x,
+                            z,
+                        });
+                    }
+                }
+            }
+        }
+        let mut changed = Vec::new();
+        for d in derivs {
+            let lit = egraph.add(Symbolic::Lit(Literal::Bool(d.cond_val)));
+            if egraph.union(d.cond, lit) {
+                changed.push(egraph.find(d.cond));
+            }
+            let other_eq = egraph.add(Symbolic::Binary(BinOp::Eq, [d.other, d.z]));
+            let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+            if egraph.union(other_eq, false_) {
+                changed.push(egraph.find(other_eq));
+            }
+        }
+        changed
     }
 
     fn vars(&self) -> Vec<Var> {
