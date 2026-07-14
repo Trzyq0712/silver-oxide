@@ -49,6 +49,13 @@ impl Snapshotter {
         }
     }
 
+    /// Whether snapshots are being recorded (`SILVER_OXIDE_VIZ` set). Callers
+    /// use this to skip building the snapshot inputs (heap clones, rendered
+    /// instruction text) on the hot path.
+    pub(crate) fn enabled(&self) -> bool {
+        self.dir.is_some()
+    }
+
     /// Record a snapshot of the current e-graph and the given labeled heaps
     /// (e.g. the two operands and result of a heap `add`/`sub`). The `label`
     /// becomes the page's top annotation; `highlight`, if set, is the value

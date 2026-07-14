@@ -61,6 +61,21 @@ pub(crate) struct VerifyContext<'a> {
     /// (`unwrap(proj_i(snap))`). `None` for methods and resources — they never
     /// purify. See `declaration::purify_function`.
     pub(crate) heap_events: Option<Vec<crate::verify::declaration::HeapEvent>>,
+    /// Fixpoint cache: the rule tier the live e-graph is known saturated under,
+    /// with the rule-set sizes that saturation saw (ADT rules and axiom rules
+    /// grow mid-unit; a grown set invalidates the fixpoint). `None` when any
+    /// node/union landed since. Lets `saturate`/`reduce` skip whole runner
+    /// invocations — most are re-runs on an unchanged graph.
+    clean: Option<(CleanLevel, usize, usize)>,
+}
+
+/// How much of the rule set the live e-graph is saturated under. `Reduce`'s
+/// set (terminating reductions + ADT) is a subset of `Full`'s, so `Full`
+/// satisfies a `reduce()` request but not vice versa.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CleanLevel {
+    Reduce,
+    Full,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -84,7 +99,32 @@ impl<'a> VerifyContext<'a> {
             func_ret_types: HashMap::new(),
             fn_certs: None,
             heap_events: None,
+            clean: None,
         }
+    }
+
+    /// The fixpoint-cache tag for the current rule sets (their sizes — growth
+    /// invalidates a recorded fixpoint).
+    fn clean_tag(&self, level: CleanLevel) -> (CleanLevel, usize, usize) {
+        (level, self.alloc.rules().len(), self.axiom_rules.len())
+    }
+
+    /// Whether the live graph is known saturated at `level` (or stronger) under
+    /// the *current* rule sets.
+    fn is_clean(&self, level: CleanLevel) -> bool {
+        matches!(self.clean, Some((l, adt, ax))
+            if l >= level && adt == self.alloc.rules().len() && ax == self.axiom_rules.len())
+    }
+
+    /// Union two e-classes in the live graph — the sanctioned mutation path
+    /// (invalidates the fixpoint cache). Callers still `rebuild()` after a
+    /// batch of unions.
+    pub(crate) fn union(&mut self, a: egg::Id, b: egg::Id) -> bool {
+        let merged = self.egraph.union(a, b);
+        if merged {
+            self.clean = None;
+        }
+        merged
     }
 
     /// Whether the e-graph has reached a contradiction (some e-class merged
@@ -196,10 +236,14 @@ impl<'a> VerifyContext<'a> {
     /// static rules plus the ADT reductions minted so far by the allocator
     /// plus the per-unit axiom/function rules.
     pub(crate) fn saturate(&mut self) {
+        if self.is_clean(CleanLevel::Full) {
+            return;
+        }
         let egraph = std::mem::take(&mut self.egraph);
         crate::verify::rewrite::new_memo_generation();
         self.egraph = self.saturate_flat(egraph);
         self.alloc.stats.saturations += 1;
+        self.clean = Some(self.clean_tag(CleanLevel::Full));
     }
 
     /// One full-rule-set run, shared by [`Self::saturate`] and
@@ -226,6 +270,9 @@ impl<'a> VerifyContext<'a> {
     /// don't grow the e-graph) without the cost/divergence risk of full
     /// saturation.
     pub(crate) fn reduce(&mut self) {
+        if self.is_clean(CleanLevel::Reduce) {
+            return;
+        }
         let egraph = std::mem::take(&mut self.egraph);
         crate::verify::rewrite::new_memo_generation();
         let (egraph, iterations) = run_rules(
@@ -236,10 +283,16 @@ impl<'a> VerifyContext<'a> {
         self.egraph = egraph;
         self.alloc.stats.reduces += 1;
         self.alloc.stats.record_run(&iterations);
+        self.clean = Some(self.clean_tag(CleanLevel::Reduce));
     }
 
     pub(crate) fn add(&mut self, node: Symbolic) -> egg::Id {
-        self.egraph.add(node)
+        let before = self.egraph.total_size();
+        let id = self.egraph.add(node);
+        if self.egraph.total_size() != before {
+            self.clean = None;
+        }
+        id
     }
 
     /// The `true` boolean-literal e-class.
@@ -265,14 +318,14 @@ impl<'a> VerifyContext<'a> {
         args: Box<[egg::Id]>,
     ) -> egg::Id {
         self.func_ret_types.entry(id).or_insert(ret_ty);
-        self.egraph.add(Symbolic::FuncApp(id, type_args, args))
+        self.add(Symbolic::FuncApp(id, type_args, args))
     }
 
     pub(crate) fn fresh_symbolic_value(&mut self, ty: Type) -> egg::Id {
         let id = self.fresh_counter;
         self.fresh_counter += 1;
         self.fresh_types.insert(id, ty);
-        self.egraph.add(Symbolic::Fresh(id))
+        self.add(Symbolic::Fresh(id))
     }
 
     /// Build `antecedents ==> consequent` as a right-associative chain of `Ite`
@@ -314,7 +367,7 @@ impl<'a> VerifyContext<'a> {
     ) {
         let imp = self.implication(fact, guards);
         let true_ = self.true_();
-        self.egraph.union(imp, true_);
+        self.union(imp, true_);
         self.egraph.rebuild();
     }
 
@@ -349,13 +402,14 @@ impl<'a> VerifyContext<'a> {
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
 
+        // Tier 1: already true (memoized / trivial). O(1) — checked before the
+        // O(classes) inconsistency scan, which most calls never need.
+        if self.egraph.find(imp) == self.egraph.find(true_) {
+            return true;
+        }
         // Tier 0: the held facts are contradictory (e.g. a field location holds
         // > 1/1 permission) — every goal is vacuously provable.
         if self.is_inconsistent() {
-            return true;
-        }
-        // Tier 1: already true (memoized / trivial).
-        if self.egraph.find(imp) == self.egraph.find(true_) {
             return true;
         }
         // Tier 2: saturate the live graph and re-check (no clone). Saturation can
@@ -363,6 +417,19 @@ impl<'a> VerifyContext<'a> {
         self.saturate();
         if self.is_inconsistent() || self.egraph.find(imp) == self.egraph.find(true_) {
             return true;
+        }
+
+        // Tier 3 shortcut: if every PC literal already carries its required
+        // polarity in the just-saturated live graph, assuming the PC adds
+        // nothing — the probe would re-saturate an identical graph and reach
+        // the tier-2 verdict again. Fail without paying the clone.
+        if pc_lits.iter().all(|(id, pol)| {
+            matches!(
+                self.egraph[*id].data.known(),
+                Some(Literal::Bool(b)) if *b == matches!(pol, Polarity::Positive)
+            )
+        }) {
+            return false;
         }
 
         // Tier 3: clone, assume the path condition, saturate the clone, check.
@@ -395,7 +462,7 @@ impl<'a> VerifyContext<'a> {
 
         // Persist the result so future identical obligations hit tier 1.
         if proven {
-            self.egraph.union(imp, true_);
+            self.union(imp, true_);
             self.egraph.rebuild();
         }
         proven

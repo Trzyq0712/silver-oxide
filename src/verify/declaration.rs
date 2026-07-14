@@ -310,7 +310,7 @@ fn merge_chunks(
         .into_iter()
         .chain(pc_lits.iter().rev().copied());
     let imp = ctx.implication(eq, antecedents);
-    ctx.egraph.union(imp, true_);
+    ctx.union(imp, true_);
 
     Chunk::new(addr, perm, value)
 }
@@ -397,7 +397,7 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
         let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
         let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [b, c.perm]));
         let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
-        ctx.egraph.union(le, true_);
+        ctx.union(le, true_);
     }
 
     // Non-aliasing: same bounded location, perms sum > bound ⇒ args differ.
@@ -422,7 +422,7 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             ] {
                 let conj = conj_args_eq(ctx, xs, ys, true_, false_);
                 let imp = ctx.add(Symbolic::Ite([gt, false_, conj]));
-                ctx.egraph.union(conj, imp);
+                ctx.union(conj, imp);
             }
         }
     }
@@ -520,7 +520,7 @@ fn heap_subtract(
         return Err(VerifyError::InsufficientPermission);
     }
 
-    ctx.egraph.union(existing.value, chunk2.value);
+    ctx.union(existing.value, chunk2.value);
 
     let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
     // Whether to drop the emptied chunk is a statement about the *heap*, so it has
@@ -1310,7 +1310,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 InstKind::Assume(val) => {
                     let id = state.get_val(ctx, val);
                     let true_ = ctx.true_();
-                    ctx.egraph.union(id, true_);
+                    ctx.union(id, true_);
                     ctx.egraph.rebuild();
                 }
                 // An axiom body is never verified — a stray obligation
@@ -1322,7 +1322,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
         }
         let res = state.get_val(ctx, &ax.body.res);
         let true_ = ctx.true_();
-        ctx.egraph.union(res, true_);
+        ctx.union(res, true_);
         ctx.egraph.rebuild();
     }
     // One lazy unfold rule per already-verified function certificate: `analyze`
@@ -1613,20 +1613,28 @@ fn walk_body(
         }
         let vals_before = state.vals.len();
         let heaps_before = state.heaps.len();
-        let inst_text = format_inst(
-            inst,
-            &program.decls,
-            &program.interner,
-            &program.groups,
-            vals_before,
-            heaps_before,
-        );
+        // Rendering the instruction (and cloning heaps for the viz snapshot) is
+        // pure diagnostics — deferred to the failure paths and the (env-gated)
+        // snapshotter so the hot path pays nothing for it.
+        let inst_text = |program: &vmir::Program| {
+            format_inst(
+                inst,
+                &program.decls,
+                &program.interner,
+                &program.groups,
+                vals_before,
+                heaps_before,
+            )
+        };
         let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
         for (goal, err) in inst_obligations(ctx, state, &inst.kind) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
-                let heaps = display_heaps(state, &inst.kind, heaps_before);
-                snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), Some(goal));
-                return Err(err.with_inst(inst_text.clone()));
+                let inst_text = inst_text(program);
+                if snap.enabled() {
+                    let heaps = display_heaps(state, &inst.kind, heaps_before);
+                    snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), Some(goal));
+                }
+                return Err(err.with_inst(inst_text));
             }
         }
         // A quantifier's own side conditions, discharged once per syntactic
@@ -1637,19 +1645,28 @@ fn walk_body(
         if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
             let caps: Vec<egg::Id> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
             if let Err(err) = check_forall_wd(ctx, q, &caps, &pc_lits) {
-                let heaps = display_heaps(state, &inst.kind, heaps_before);
-                snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
+                let inst_text = inst_text(program);
+                if snap.enabled() {
+                    let heaps = display_heaps(state, &inst.kind, heaps_before);
+                    snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
+                }
                 return Err(err.with_inst(inst_text));
             }
         }
         if let Err(err) = eval(ctx, program, state, inst, certs) {
-            let heaps = display_heaps(state, &inst.kind, heaps_before);
-            snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
+            let inst_text = inst_text(program);
+            if snap.enabled() {
+                let heaps = display_heaps(state, &inst.kind, heaps_before);
+                snap.snapshot(ctx, &heaps, &format!("FAIL: {}", inst_text), None);
+            }
             return Err(err.with_inst(inst_text));
         }
-        let highlight = (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
-        let heaps = display_heaps(state, &inst.kind, heaps_before);
-        snap.snapshot(ctx, &heaps, &inst_text, highlight);
+        if snap.enabled() {
+            let highlight =
+                (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
+            let heaps = display_heaps(state, &inst.kind, heaps_before);
+            snap.snapshot(ctx, &heaps, &inst_text(program), highlight);
+        }
     }
     Ok(())
 }
@@ -3004,7 +3021,7 @@ mod tests {
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         for (a, b) in [(x0, x1), (y0, y1)] {
             let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
-            ctx.egraph.union(eq, true_);
+            ctx.union(eq, true_);
         }
         ctx.egraph.rebuild();
 
@@ -3029,7 +3046,7 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
-        ctx.egraph.union(a, b);
+        ctx.union(a, b);
         ctx.egraph.rebuild();
 
         let merged = heap_union(&mut ctx, &h1, &test_kind(), Chunk::new(b, p2, v2), &[]);
@@ -3162,7 +3179,7 @@ mod tests {
 
         let g = ctx.add(Symbolic::Fresh(0));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-        ctx.egraph.union(g, true_);
+        ctx.union(g, true_);
         ctx.egraph.rebuild();
 
         // Goal already in the `true` eclass → proven under the empty PC.
@@ -3214,7 +3231,7 @@ mod tests {
         assert_ne!(ctx.egraph.find(goal), ctx.egraph.find(true_));
 
         // Once `c` is established, the goal collapses to `true`.
-        ctx.egraph.union(c, true_);
+        ctx.union(c, true_);
         ctx.saturate();
         assert_eq!(ctx.egraph.find(goal), ctx.egraph.find(true_));
     }
@@ -3254,7 +3271,7 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p2, v1));
-        ctx.egraph.union(a, b);
+        ctx.union(a, b);
         ctx.egraph.rebuild();
 
         let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(b, p1, v2), &[])
@@ -3413,7 +3430,7 @@ mod tests {
         let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
         // `assume a == b` is modelled as unioning the equality with `true`.
-        ctx.egraph.union(eq, true_);
+        ctx.union(eq, true_);
         ctx.saturate();
 
         assert_eq!(ctx.egraph.find(a), ctx.egraph.find(b));
@@ -3445,7 +3462,7 @@ mod tests {
         let fb = ctx.add(Symbolic::FuncApp(f, Box::from([]), Box::from([b])));
         let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [a, b]));
         let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-        ctx.egraph.union(eq, true_);
+        ctx.union(eq, true_);
         ctx.saturate();
 
         // Unioning the args lets congruence close `f(a) == f(b)`.
