@@ -349,7 +349,10 @@ fn distributive_ite_rules() -> Vec<Rule> {
         Rewrite::new(
             "eq-ite",
             EqBucketSearcher,
-            EqIteDistributeApplier { memo: Memo::new() },
+            EqIteDistributeApplier {
+                memo: Memo::new(),
+                push_memo: Memo::new(),
+            },
         )
         .expect("eq-ite rule"),
         // LT rules. The left form is load-bearing: CFG linearization encodes a
@@ -518,6 +521,9 @@ struct EqIteDistributeApplier {
     /// Cost guard: one derivation per canonical `[c, x, y, z]` quadruple
     /// (re-deriving is idempotent — the unions no-op).
     memo: Memo<[Id; 4]>,
+    /// Cost guard for the unary push-down (see `apply_one`), keyed by the
+    /// function and the canonical ite triple it was pushed through.
+    push_memo: Memo<(FuncId, [Id; 3])>,
 }
 
 impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
@@ -550,6 +556,46 @@ impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
             let mirrored = egraph.add(Symbolic::Binary(BinOp::Eq, [r, l]));
             if egraph.union(eclass, mirrored) {
                 mirror_changed.push(egraph.find(eclass));
+            }
+        }
+        // Unary push-down: an operand of the disproven equality that is a
+        // unary application over an `ite` — Prusti's domain-boxed enum
+        // discriminator, `value(ite(c, cons(1), cons(0)))` where `value`/`cons`
+        // are *axiom*-defined domain functions (not ADT ctor/proj, so the
+        // projection reduction can't see through) — commutes into the branches:
+        // `f(ite(c, a, b)) ≡ ite(c, f(a), f(b))`. The pushed arms hash-cons
+        // onto the axiom instances (`value(cons(1)) ≡ 1`), which is what lets
+        // the unit propagation below pin the condition. Demand-driven (only
+        // under a disproven equality), so no guard-tower blowup.
+        let mut pushes: Vec<(Id, FuncId, Box<[Type]>, [Id; 3])> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
+                continue;
+            };
+            for side in [egraph.find(*l), egraph.find(*r)] {
+                for app in &egraph[side].nodes {
+                    let Symbolic::FuncApp(f, tys, args) = app else {
+                        continue;
+                    };
+                    let [w] = args.as_ref() else { continue };
+                    for inner in &egraph[*w].nodes {
+                        let Symbolic::Ite([c, a, b]) = inner else {
+                            continue;
+                        };
+                        let key = [egraph.find(*c), egraph.find(*a), egraph.find(*b)];
+                        if self.push_memo.insert((*f, key)) {
+                            pushes.push((side, *f, tys.clone(), key));
+                        }
+                    }
+                }
+            }
+        }
+        for (side, f, tys, [c, a, b]) in pushes {
+            let fa = egraph.add(Symbolic::FuncApp(f, tys.clone(), Box::new([a])));
+            let fb = egraph.add(Symbolic::FuncApp(f, tys, Box::new([b])));
+            let ite = egraph.add(Symbolic::Ite([c, fa, fb]));
+            if egraph.union(side, ite) {
+                mirror_changed.push(egraph.find(side));
             }
         }
         // Collect first: node inspection needs `&egraph`.
@@ -965,6 +1011,72 @@ struct ProjApplier {
     index: usize,
 }
 
+/// A projection's extraction plan over an argument e-class: either the ctor is
+/// directly present (project the field), or the class holds an `ite` whose both
+/// arms extract recursively — the projection then commutes into the `ite`
+/// (`projᵢ(ite(c, cons(a..), cons(b..))) ⇒ ite(c, aᵢ, bᵢ)`). The latter is what
+/// connects an enum discriminator's boxed `ite` body to a switch that compares
+/// the *unboxed* value: without it the `proj∘cons` reduction never fires (the
+/// arg class holds an `Ite`, not the ctor) and exhaustiveness `assert false`
+/// can't see the case split.
+enum ProjPlan {
+    Field(Id),
+    Ite(Id, Box<ProjPlan>, Box<ProjPlan>),
+}
+
+impl ProjApplier {
+    /// Plan the extraction for `class` (read-only pass; building needs `&mut`).
+    /// `seen` guards against e-class cycles.
+    fn plan(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        class: Id,
+        seen: &mut Vec<Id>,
+    ) -> Option<ProjPlan> {
+        let class = egraph.find(class);
+        if seen.contains(&class) {
+            return None;
+        }
+        seen.push(class);
+        // Direct ctor hit wins.
+        for node in &egraph[class].nodes {
+            if let Symbolic::FuncApp(c, _, args) = node
+                && *c == self.ctor
+                && self.index < args.len()
+            {
+                seen.pop();
+                return Some(ProjPlan::Field(args[self.index]));
+            }
+        }
+        // Otherwise: an ite whose both arms extract.
+        for node in &egraph[class].nodes {
+            let Symbolic::Ite([c, t, e]) = node else {
+                continue;
+            };
+            if let (Some(tp), Some(ep)) = (
+                self.plan(egraph, *t, seen),
+                self.plan(egraph, *e, seen),
+            ) {
+                seen.pop();
+                return Some(ProjPlan::Ite(*c, Box::new(tp), Box::new(ep)));
+            }
+        }
+        seen.pop();
+        None
+    }
+
+    fn build(egraph: &mut EGraph<Symbolic, ConstFold>, plan: &ProjPlan) -> Id {
+        match plan {
+            ProjPlan::Field(id) => *id,
+            ProjPlan::Ite(c, t, e) => {
+                let t = Self::build(egraph, t);
+                let e = Self::build(egraph, e);
+                egraph.add(Symbolic::Ite([*c, t, e]))
+            }
+        }
+    }
+}
+
 impl Applier<Symbolic, ConstFold> for ProjApplier {
     fn apply_one(
         &self,
@@ -975,17 +1087,10 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
         _rule_name: Symbol,
     ) -> Vec<Id> {
         let xc = egraph.find(subst[tag_x()]);
-        let mut field = None;
-        for node in &egraph[xc].nodes {
-            if let Symbolic::FuncApp(c, _, args) = node
-                && *c == self.ctor
-                && self.index < args.len()
-            {
-                field = Some(args[self.index]);
-                break;
-            }
-        }
-        let Some(field) = field else { return vec![] };
+        let Some(plan) = self.plan(egraph, xc, &mut Vec::new()) else {
+            return vec![];
+        };
+        let field = Self::build(egraph, &plan);
         if egraph.union(eclass, field) {
             vec![egraph.find(eclass)]
         } else {

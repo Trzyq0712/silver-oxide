@@ -3692,6 +3692,75 @@ method m(l: List) {
 }
 
 #[test]
+fn enum_exhaustiveness_through_domain_boxed_discriminator() {
+    // The structs_enums.vpr fallthrough shape: the discriminator is boxed in a
+    // *domain* (`cons`/`value` are axiom-defined uninterpreted functions, not
+    // ADT ctor/proj — the projection reduction cannot see through), the switch
+    // compares the *unboxed* value, and the flow goes through a heap
+    // predicate. Needs the unary push-down in the disproven-eq applier:
+    // `value(ite(c, cons(1), cons(0)))` commutes into the branches, where the
+    // domain axiom decides each arm.
+    let input = r#"
+domain s_Int_isize {
+    function s_Int_isize_cons(arg0: Int): s_Int_isize
+    function s_Int_isize_value(arg0: s_Int_isize): Int
+    axiom ax_cons {
+        forall s: s_Int_isize :: { s_Int_isize_value(s) }
+            s_Int_isize_cons(s_Int_isize_value(s)) == s
+    }
+    axiom ax_value {
+        forall value: Int :: { s_Int_isize_cons(value) }
+            s_Int_isize_value(s_Int_isize_cons(value)) == value
+    }
+}
+
+adt s_MaybeInt {
+    s_MaybeInt_0_cons()
+    s_MaybeInt_1_cons(f: Int)
+}
+
+field p_Int_isize_val: s_Int_isize
+
+predicate p_Int_isize(self: Ref) {
+    acc(self.p_Int_isize_val, write)
+}
+
+function p_Int_isize_snap(self: Ref): s_Int_isize
+    requires acc(p_Int_isize(self), write)
+{
+    (unfolding acc(p_Int_isize(self), write) in self.p_Int_isize_val)
+}
+
+method p_Int_isize_assign(self: Ref, value: s_Int_isize)
+    ensures acc(p_Int_isize(self), write)
+    ensures p_Int_isize_snap(self) == value
+
+function s_MaybeInt_discr(self: s_MaybeInt): s_Int_isize
+{
+    (self.iss_MaybeInt_1_cons ? s_Int_isize_cons(1) : s_Int_isize_cons(0))
+}
+
+method exhaustive(v: s_MaybeInt, _2p: Ref)
+{
+    p_Int_isize_assign(_2p, s_MaybeInt_discr(v))
+    var _tmp0: s_Int_isize := p_Int_isize_snap(_2p)
+    exhale acc(p_Int_isize(_2p), write)
+    if (s_Int_isize_value(_tmp0) == 0) {
+    } elseif (s_Int_isize_value(_tmp0) == 1) {
+    } else {
+        assert false
+    }
+}
+"#;
+    let program = lower(input);
+    let analyzed = crate::vmir::analyze(program).expect("analyze");
+    let results = crate::verify::verify(&analyzed);
+    for (name, r) in &results {
+        assert!(r.is_ok(), "{name} should verify; got {r:?}");
+    }
+}
+
+#[test]
 fn disequality_holds_in_both_argument_orders() {
     // Prusti writes div preconditions constant-first (`requires 0 != value(b)`)
     // while the div obligation builds `Eq(b, 0)`. `Binary(Eq, ..)` is not
