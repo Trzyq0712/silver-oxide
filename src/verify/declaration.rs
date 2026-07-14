@@ -1498,11 +1498,9 @@ fn check_forall_wd(
     caps: &[egg::Id],
     host_pc: &[(egg::Id, Polarity)],
 ) -> Result<(), VerifyError> {
-    // Keep the live graph aside; `ctx.egraph` is the scratch for the duration.
-    let live = ctx.egraph.clone();
-    let result = check_forall_wd_in_scratch(ctx, q, caps, host_pc);
-    ctx.egraph = live;
-    result
+    // `ctx.egraph` is a scratch clone for the duration; the live graph, its
+    // fixpoint cache and the memo scope are handled by `with_scratch_graph`.
+    ctx.with_scratch_graph(|ctx| check_forall_wd_in_scratch(ctx, q, caps, host_pc))
 }
 
 fn check_forall_wd_in_scratch(

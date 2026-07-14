@@ -86,7 +86,12 @@ impl<'a> VerifyContext<'a> {
         alloc: &'a mut FuncRegistry,
     ) -> Self {
         Self {
-            egraph: egg::EGraph::new(ConstFold::new(alloc.ctor_table())),
+            egraph: {
+                // Fresh graph, fresh id space: remembered instantiations from
+                // the previous unit are meaningless.
+                rewrite::new_memo_unit();
+                egg::EGraph::new(ConstFold::new(alloc.ctor_table()))
+            },
             static_rules: rewrite::rules(),
             static_reduce: rewrite::reduce_rules(),
             axiom_rules: Vec::new(),
@@ -240,15 +245,14 @@ impl<'a> VerifyContext<'a> {
             return;
         }
         let egraph = std::mem::take(&mut self.egraph);
-        crate::verify::rewrite::new_memo_generation();
         self.egraph = self.saturate_flat(egraph);
         self.alloc.stats.saturations += 1;
         self.clean = Some(self.clean_tag(CleanLevel::Full));
     }
 
     /// One full-rule-set run, shared by [`Self::saturate`] and
-    /// [`Self::run_probe`]. The instantiation memo generation is the caller's
-    /// to set.
+    /// [`Self::run_probe`]. Memo scoping is ambient (see `rewrite::Memo`):
+    /// live runs write the persistent base, scratch scopes an overlay.
     fn saturate_flat(
         &mut self,
         egraph: egg::EGraph<Symbolic, ConstFold>,
@@ -274,7 +278,6 @@ impl<'a> VerifyContext<'a> {
             return;
         }
         let egraph = std::mem::take(&mut self.egraph);
-        crate::verify::rewrite::new_memo_generation();
         let (egraph, iterations) = run_rules(
             egraph,
             self.static_reduce.iter().chain(self.alloc.rules()),
@@ -468,13 +471,29 @@ impl<'a> VerifyContext<'a> {
         proven
     }
 
-    /// Saturate a detached probe e-graph with the full rule set.
+    /// Saturate a detached probe e-graph with the full rule set, inside a
+    /// scratch memo scope (its instantiations die with the probe; the live
+    /// base memo lets it skip rebuilding every already-live instance).
     fn run_probe(
         &mut self,
         probe: egg::EGraph<Symbolic, ConstFold>,
     ) -> egg::EGraph<Symbolic, ConstFold> {
-        crate::verify::rewrite::new_memo_generation();
+        let _scope = crate::verify::rewrite::ScratchScope::enter();
         self.saturate_flat(probe)
+    }
+
+    /// Run `f` with `self.egraph` swapped for a scratch clone of the live
+    /// graph, restoring the live graph — and its fixpoint cache, which `f`'s
+    /// scratch runs would otherwise clobber — afterwards. The whole extent is
+    /// a scratch memo scope.
+    pub(crate) fn with_scratch_graph<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let _scope = crate::verify::rewrite::ScratchScope::enter();
+        let live = self.egraph.clone();
+        let clean = self.clean;
+        let out = f(self);
+        self.egraph = live;
+        self.clean = clean;
+        out
     }
 }
 

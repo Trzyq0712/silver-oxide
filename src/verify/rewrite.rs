@@ -20,41 +20,106 @@ fn var(name: &str) -> Var {
     name.parse().expect("valid pattern var")
 }
 
-/// The current memo generation — one per [`egg::Runner`] run.
-///
-/// An applier's memo ("already instantiated this call/σ") is a pure cost guard:
-/// re-instantiating is idempotent (adds hash-cons, unions no-op). But it is
-/// keyed on the e-class ids of *one* e-graph, and a `Rewrite`'s applier lives
-/// behind an `Arc` — cloning the rule list per run shares it. `prove_under_pc`'s
-/// tier 3 saturates a **clone** and throws the result away, so a memo carried
-/// across runs would record instantiations whose unions no longer exist,
-/// starving every later run of them (a completeness bug: goals that hold become
-/// unprovable, depending on what an earlier probe happened to touch). Bumping
-/// the generation before each run scopes the memo to that run.
-static MEMO_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Start a new memo generation. Call before every [`egg::Runner`] run.
-pub(crate) fn new_memo_generation() {
-    MEMO_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+// Applier-memo scoping ("already instantiated this call/σ").
+//
+// The memo is a pure cost guard — re-instantiating is idempotent (adds
+// hash-cons, unions no-op) — keyed on canonical e-class ids. Two facts govern
+// its lifetime:
+//
+// - The **live** e-graph of one verification unit only ever grows, so an
+//   entry recorded by a live run stays valid for the whole unit: the instance
+//   it stands for was built on this very graph and its unions persist. Live
+//   entries therefore go to a **base** set that survives across runs (this is
+//   what makes repeated saturations cheap — instances are not rebuilt per run).
+// - A **scratch** run (a tier-3 probe, a forall-WD check) saturates a clone
+//   that is thrown away. Its instantiations must not reach the base: the
+//   clone's new e-class ids can collide with ids the live graph mints later
+//   (egg ids are sequential), so a leaked entry could silently suppress a
+//   *live* instantiation — a completeness bug. Scratch entries go to an
+//   **overlay** invalidated on every scratch boundary. Reading the base from
+//   a scratch run is fine (the clone contains every live instance).
+//
+// All state is thread-local: rules (and their memos behind `Arc`) never cross
+// threads — one verification runs on one thread; the `Mutex` in [`Memo`] only
+// satisfies egg's `Send + Sync` bounds.
+thread_local! {
+    /// Bumped per verification unit (`VerifyContext::new`): unit boundaries
+    /// switch to a fresh e-graph, so all remembered ids are meaningless.
+    static UNIT_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Scratch nesting depth (scratches nest: a probe inside a WD check).
+    static SCRATCH_DEPTH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Bumped on every scratch entry *and* exit, so an overlay never outlives
+    /// the exact scratch graph it was recorded against.
+    static SCRATCH_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A run-scoped applier memo (see [`MEMO_GEN`]).
-pub(crate) struct Memo<K>(Mutex<(u64, HashSet<K>)>);
+/// Start a new memo unit. Call when a fresh e-graph is created for a unit.
+pub(crate) fn new_memo_unit() {
+    UNIT_GEN.with(|g| g.set(g.get() + 1));
+}
+
+/// RAII marker for a scratch (throwaway-clone) saturation scope.
+pub(crate) struct ScratchScope;
+
+impl ScratchScope {
+    pub(crate) fn enter() -> Self {
+        SCRATCH_DEPTH.with(|d| d.set(d.get() + 1));
+        SCRATCH_GEN.with(|g| g.set(g.get() + 1));
+        ScratchScope
+    }
+}
+
+impl Drop for ScratchScope {
+    fn drop(&mut self) {
+        SCRATCH_DEPTH.with(|d| d.set(d.get() - 1));
+        SCRATCH_GEN.with(|g| g.set(g.get() + 1));
+    }
+}
+
+struct MemoInner<K> {
+    unit: u64,
+    base: HashSet<K>,
+    scratch: u64,
+    overlay: HashSet<K>,
+}
+
+/// A unit-scoped applier memo with a scratch overlay (see module docs above).
+pub(crate) struct Memo<K>(Mutex<MemoInner<K>>);
 
 impl<K: Eq + std::hash::Hash> Memo<K> {
     fn new() -> Self {
-        Self(Mutex::new((u64::MAX, HashSet::new())))
+        Self(Mutex::new(MemoInner {
+            unit: u64::MAX,
+            base: HashSet::new(),
+            scratch: u64::MAX,
+            overlay: HashSet::new(),
+        }))
     }
 
-    /// `true` when `key` has not been seen *in the current generation*.
+    /// `true` when `key` has not been seen in the current scope — the caller
+    /// should build the instance. Records the key in the base (live run) or
+    /// the overlay (scratch run).
     fn insert(&self, key: K) -> bool {
-        let generation = MEMO_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        let unit = UNIT_GEN.with(|g| g.get());
         let mut memo = self.0.lock().unwrap();
-        if memo.0 != generation {
-            memo.0 = generation;
-            memo.1.clear();
+        if memo.unit != unit {
+            memo.unit = unit;
+            memo.base.clear();
+            memo.overlay.clear();
         }
-        memo.1.insert(key)
+        if memo.base.contains(&key) {
+            return false;
+        }
+        if SCRATCH_DEPTH.with(|d| d.get()) > 0 {
+            let scratch = SCRATCH_GEN.with(|g| g.get());
+            if memo.scratch != scratch {
+                memo.scratch = scratch;
+                memo.overlay.clear();
+            }
+            memo.overlay.insert(key)
+        } else {
+            memo.base.insert(key)
+        }
     }
 }
 
