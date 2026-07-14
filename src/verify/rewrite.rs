@@ -133,15 +133,6 @@ fn static_rules() -> Vec<Rule> {
         // full permission `write` folds away)
         rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
         rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
-        // (c ? x : y) < z  =>  c ? (x < z) : (y < z)
-        //
-        // Distributes a comparison over a gated value. CFG linearization encodes
-        // a conditional inhale/exhale as a *scaled permission* `c ? p : 0` rather
-        // than a path condition, so the permission ≥ 0 obligation of such an
-        // instruction is a `<` applied to an `ite`. Pushing the `<` inward lets
-        // `ConstFold` decide each branch, after which `ite-same` collapses the
-        // result. Terminating: strictly reduces the `ite` nesting above the `<`.
-        rw!("lt-ite"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
         // x == x => true   (reflexivity; also fires when congruence has already
         // merged the two operands into one e-class, e.g. a return var copied from
         // a param: `ensures r == a` after `r := a`).
@@ -156,8 +147,47 @@ fn static_rules() -> Vec<Rule> {
         rw!("and-true-decompose"; "(ite ?a ?b false)" => {
             AndTrueDecompose { a: var("?a"), b: var("?b") }
         }),
+        // (a || b) proven false  =>  a and b are each false.
+        // `a || b` is `a ? true : b`; when that e-class is `false`, both
+        // disjuncts are false (e.g. `assume !(a || b)` lets `assert !a` / `assert !b`).
+        rw!("or-false-decompose"; "(ite ?a true ?b)" => {
+            OrFalseDecompose { a: var("?a"), b: var("?b") }
+        }),
+        // (!x) proven true  =>  x is false.
+        rw!("not-true-decompose"; "(ite ?x false true)" => {
+            NotTrueDecompose { x: var("?x") }
+        }),
     ]);
+    rules.extend(distributive_ite_rules());
     rules
+}
+
+/// Rules that push down the builtin operators into the ite branches.
+fn distributive_ite_rules() -> Vec<Rule> {
+    vec![
+        // // EQ rules
+        // rw!("eq-ite-l"; "(== (ite ?c ?x ?y) ?z)" => "(ite ?c (== ?x ?z) (== ?y ?z))"),
+        // rw!("eq-ite-r"; "(== ?z (ite ?c ?x ?y))" => "(ite ?c (== ?z ?x) (== ?z ?y))"),
+        // LT rules. The left form is load-bearing: CFG linearization encodes a
+        // conditional inhale/exhale as a *scaled permission* `c ? p : 0`, so the
+        // permission ≥ 0 obligation of such an instruction is a `<` applied to
+        // an `ite`. Pushing the `<` inward lets `ConstFold` decide each branch,
+        // after which `ite-same` collapses the result. Terminating: strictly
+        // reduces the `ite` nesting above the `<`.
+        rw!("lt-ite-l"; "(< (ite ?c ?x ?y) ?z)" => "(ite ?c (< ?x ?z) (< ?y ?z))"),
+        // rw!("lt-ite-r"; "(< ?z (ite ?c ?x ?y))" => "(ite ?c (< ?z ?x) (< ?z ?y))"),
+        // // MULT rules
+        // rw!("mult-ite-l"; "(* (ite ?c ?x ?y) ?z)" => "(ite ?c (* ?x ?z) (* ?y ?z))"),
+        // rw!("mult-ite-r"; "(* ?z (ite ?c ?x ?y))" => "(ite ?c (* ?z ?x) (* ?z ?y))"),
+        // // PLUS rules
+        // rw!("plus-ite-l"; "(+ (ite ?c ?x ?y) ?z)" => "(ite ?c (+ ?x ?z) (+ ?y ?z))"),
+        // rw!("plus-ite-r"; "(+ ?z (ite ?c ?x ?y))" => "(ite ?c (+ ?z ?x) (+ ?z ?y))"),
+        // // MINUS rules
+        // rw!("minus-ite-l"; "(- (ite ?c ?x ?y) ?z)" => "(ite ?c (- ?x ?z) (- ?y ?z))"),
+        // rw!("minus-ite-r"; "(- ?z (ite ?c ?x ?y))" => "(ite ?c (- ?z ?x) (- ?z ?y))"),
+        // // REAL rules
+        // rw!("real-ite"; "(real (ite ?c ?x ?y))" => "(ite ?c (real ?x) (real ?y))"),
+    ]
 }
 
 /// Terminating `ite` simplifications. Shared by the saturation rule set and the
@@ -268,6 +298,74 @@ impl Applier<Symbolic, ConstFold> for AndTrueDecompose {
 
     fn vars(&self) -> Vec<Var> {
         vec![self.a, self.b]
+    }
+}
+
+/// Applier for `or-false-decompose`: when a matched `a ? true : b` (i.e.
+/// `a || b`) e-class is proven `false`, both disjuncts must be false, so union
+/// each with the `false` literal. Sound and size-bounded.
+struct OrFalseDecompose {
+    a: Var,
+    b: Var,
+}
+
+impl Applier<Symbolic, ConstFold> for OrFalseDecompose {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(false))) {
+            return vec![];
+        }
+        let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+        let mut changed = Vec::new();
+        for v in [self.a, self.b] {
+            let id = subst[v];
+            if egraph.union(id, false_) {
+                changed.push(egraph.find(id));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![self.a, self.b]
+    }
+}
+
+/// Applier for `not-true-decompose`: when a matched `x ? false : true` (i.e.
+/// `!x`) e-class is proven `true`, `x` must be false, so union it with the `false` literal.
+struct NotTrueDecompose {
+    x: Var,
+}
+
+impl Applier<Symbolic, ConstFold> for NotTrueDecompose {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        if !matches!(egraph[eclass].data.known(), Some(Literal::Bool(true))) {
+            return vec![];
+        }
+        let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+        let id = subst[self.x];
+        if egraph.union(id, false_) {
+            vec![egraph.find(id)]
+        } else {
+            vec![]
+        }
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![self.x]
     }
 }
 
