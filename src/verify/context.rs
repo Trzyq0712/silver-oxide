@@ -595,6 +595,56 @@ impl<'a> VerifyContext<'a> {
         self.saturate_flat(probe)
     }
 
+    /// Resolve which of `chunks` sits at address `addr`, consulting aliasing
+    /// that may only hold under the path condition `pc_lits`.
+    ///
+    /// Fast path (what normal framing hits): a canonical match in the **live**
+    /// graph — the address `add`ed for the read is congruent to a held chunk's
+    /// address. Zero extra cost, no clone.
+    ///
+    /// Slow path (a miss, and only then): clone, assume the path condition, and
+    /// saturate. An assumed branch literal such as `x == y` fires
+    /// `eq-true-union`, which merges `x` and `y`; congruence then merges `f(x)`
+    /// and `f(y)`, so the chunk `acc(x.f)` produced answers a read of `y.f`.
+    /// This is what lets a predicate body like `acc(x.f) && x == y && y.f == 10`
+    /// frame its `y.f` deref (guarded by the `x == y` branch literal).
+    ///
+    /// The returned chunk's `perm`/`value` ids are live-graph ids (the probe is
+    /// a clone that never touches live state), so they are valid to use — and
+    /// discharge obligations over — in the live graph.
+    pub(crate) fn chunk_under_pc<'c>(
+        &mut self,
+        chunks: &'c [crate::verify::heap::Chunk],
+        addr: egg::Id,
+        pc_lits: &[(egg::Id, Polarity)],
+    ) -> Option<&'c crate::verify::heap::Chunk> {
+        let canon = self.egraph.find(addr);
+        if let Some(c) = chunks.iter().find(|c| self.egraph.find(c.addr) == canon) {
+            return Some(c);
+        }
+        // No unconditional match. Aliasing under the path condition can only help
+        // if there is one; a truly-unheld location stays a miss.
+        if pc_lits.is_empty() {
+            return None;
+        }
+        let mut probe = self.egraph.clone();
+        for (id, pol) in pc_lits {
+            let want_true = matches!(pol, Polarity::Positive);
+            // An unsatisfiable path condition makes every read vacuous — leave
+            // the resolution to the (vacuous-pc) obligation check, don't invent
+            // a chunk here.
+            if matches!(probe[*id].data.known(), Some(Literal::Bool(b)) if *b != want_true) {
+                return None;
+            }
+            let lit = probe.add(Symbolic::Lit(Literal::Bool(want_true)));
+            probe.union(*id, lit);
+        }
+        probe.rebuild();
+        let probe = self.run_probe(probe);
+        let canon = probe.find(addr);
+        chunks.iter().find(move |c| probe.find(c.addr) == canon)
+    }
+
     /// Run `f` with `self.egraph` swapped for a scratch clone of the live
     /// graph, restoring the live graph — and its fixpoint cache, which `f`'s
     /// scratch runs would otherwise clobber — afterwards. The whole extent is

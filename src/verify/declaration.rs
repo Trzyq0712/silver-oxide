@@ -143,12 +143,16 @@ fn collect_pc_lits(
         .collect()
 }
 
-/// Evaluate a `PureInst` into its symbolic e-class id.
+/// Evaluate a `PureInst` into its symbolic e-class id. `pc_lits` is the path
+/// condition of the owning instruction — a `Deref` consults it to resolve an
+/// address that only aliases a held chunk under the branch (e.g. `y.f` where
+/// `x == y` holds on this path); every other variant ignores it.
 fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     ty: &Type,
     pi: &PureInst,
+    pc_lits: &[(egg::Id, Polarity)],
 ) -> egg::Id {
     match pi {
         PureInst::Fresh => ctx.fresh_symbolic_value(ty.clone()),
@@ -172,7 +176,10 @@ fn eval_pure_inst(
             let addr = state.get_val(ctx, loc);
             state
                 .loc_kind(loc)
-                .and_then(|k| heap.value_at(&k, addr))
+                .and_then(|k| {
+                    ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
+                        .map(|c| c.value)
+                })
                 .unwrap_or_else(|| ctx.fresh_symbolic_value(ty.clone()))
         }
         PureInst::FunctionCall(fc) => {
@@ -218,7 +225,10 @@ fn eval_pure_inst(
             let addr = state.get_val(ctx, loc);
             state
                 .loc_kind(loc)
-                .and_then(|k| heap.perm_at(&k, addr))
+                .and_then(|k| {
+                    ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
+                        .map(|c| c.perm)
+                })
                 .unwrap_or_else(|| zero_real(ctx))
         }
         // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted **concept**
@@ -672,7 +682,8 @@ fn eval_resource_body_inst(
             state.push_val(id, ty.clone());
         }
         InstKind::Pure(ty, pi) => {
-            let id = eval_pure_inst(ctx, state, ty, pi);
+            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+            let id = eval_pure_inst(ctx, state, ty, pi, &pc_lits);
             state.push_val(id, ty.clone());
         }
         // `unfold` inside a resource body verifies identically to a method
@@ -713,7 +724,8 @@ fn eval_method_inst(
             state.push_val(id, ty.clone());
         }
         InstKind::Pure(ty, pi) => {
-            let id = eval_pure_inst(ctx, state, ty, pi);
+            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+            let id = eval_pure_inst(ctx, state, ty, pi, &pc_lits);
             state.push_val(id, ty.clone());
         }
         // `base inhale <resource>(args) perm`: produce the resource's footprint
@@ -1320,7 +1332,9 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
         for inst in &ax.body.insts {
             match &inst.kind {
                 InstKind::Pure(ty, pi) => {
-                    let id = eval_pure_inst(ctx, &state, ty, pi);
+                    // Axiom bodies are heap-free and trusted — no `Deref`, so the
+                    // path condition is irrelevant here.
+                    let id = eval_pure_inst(ctx, &state, ty, pi, &[]);
                     state.push_val(id, ty.clone());
                 }
                 InstKind::Assume(val) => {
@@ -1540,7 +1554,7 @@ fn check_forall_wd_in_scratch(
         let mut pc_lits = host_pc.to_vec();
         pc_lits.extend(collect_pc_lits(ctx, &state, &inst.pc));
 
-        for (goal, err) in inst_obligations(ctx, &state, &inst.kind) {
+        for (goal, err) in inst_obligations(ctx, &state, &inst.kind, &pc_lits) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
                 return Err(err);
             }
@@ -1555,11 +1569,11 @@ fn check_forall_wd_in_scratch(
                     .map(|v| state.get_val(ctx, v))
                     .collect();
                 check_forall_wd(ctx, inner, &inner_caps, &pc_lits)?;
-                let id = eval_pure_inst(ctx, &state, ty, pi);
+                let id = eval_pure_inst(ctx, &state, ty, pi, &pc_lits);
                 state.push_val(id, ty.clone());
             }
             InstKind::Pure(ty, pi) => {
-                let id = eval_pure_inst(ctx, &state, ty, pi);
+                let id = eval_pure_inst(ctx, &state, ty, pi, &pc_lits);
                 state.push_val(id, ty.clone());
             }
             // A callee's postcondition, stitched at the call: assume it under the
@@ -1641,7 +1655,7 @@ fn walk_body(
             )
         };
         let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-        for (goal, err) in inst_obligations(ctx, state, &inst.kind) {
+        for (goal, err) in inst_obligations(ctx, state, &inst.kind, &pc_lits) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
                 let inst_text = inst_text(program);
                 if snap.enabled() {
@@ -2902,17 +2916,24 @@ fn inst_obligations(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     kind: &InstKind,
+    pc_lits: &[(egg::Id, Polarity)],
 ) -> Vec<(egg::Id, VerifyError)> {
     match kind {
         // `0 < perm(heap, loc)` — the location must be framed by the heap being
         // read. In a function body that heap is the one the entry `FromSnap`
         // reconstructs from the snapshot parameter, so this failing means a read
-        // outside the declared precondition.
+        // outside the declared precondition. `chunk_under_pc` lets an address
+        // that only aliases a held chunk under this instruction's branch (e.g.
+        // `y.f` where `x == y` holds here) still frame.
         InstKind::Pure(_, PureInst::Deref(heap, loc)) => {
             let addr = state.get_val(ctx, loc);
+            let held = get_heap(state, heap);
             let perm = state
                 .loc_kind(loc)
-                .and_then(|k| get_heap(state, heap).perm_at(&k, addr))
+                .and_then(|k| {
+                    ctx.chunk_under_pc(held.chunks_of(&k), addr, pc_lits)
+                        .map(|c| c.perm)
+                })
                 .unwrap_or_else(|| zero_real(ctx));
             let zero = zero_real(ctx);
             let goal = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, perm]));

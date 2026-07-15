@@ -82,10 +82,6 @@ impl Heap {
         self.chunk(kind, addr).map(|c| c.perm)
     }
 
-    pub fn value_at(&self, kind: &LocationKind, addr: egg::Id) -> Option<egg::Id> {
-        self.chunk(kind, addr).map(|c| c.value)
-    }
-
     /// Insert `chunk` into `kind`'s group, replacing any chunk already at the
     /// same `addr` (preserving today's one-chunk-per-address semantics).
     pub fn with_chunk(&self, kind: &LocationKind, chunk: Chunk) -> Self {

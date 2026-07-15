@@ -1023,6 +1023,25 @@ method m(x: Ref)
 }
 
 #[test]
+fn predicate_body_derefs_aliased_location_under_branch() {
+    // `acc(x.f) && x == y && y.f == 10`: the `y.f` read is framed only by the
+    // `acc(x.f)` chunk, reachable because the preceding `x == y` conjunct puts
+    // the deref on a branch where `x` and `y` alias. The frame lookup must
+    // resolve the address *under that path condition* — assuming `x == y` merges
+    // `x`/`y` (via `eq-true-union`) and, by congruence, `f(x)`/`f(y)`. Without
+    // it the `y.f` deref reports insufficient permission. (cases/pred_merge.vpr)
+    let input = r#"
+field f: Int
+predicate merge(x: Ref, y: Ref) { acc(x.f) && x == y && y.f == 10 }
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_resource(&program, "merge").is_ok(),
+        "pred_merge.vpr: y.f should frame against acc(x.f) under x == y"
+    );
+}
+
+#[test]
 fn inline_inhale_then_exhale_roundtrips() {
     // Inhale a field + a fact about it (read against the growing heap), then
     // exhale the fact (read against the pre-exhale heap) and the permission.
