@@ -172,13 +172,16 @@ impl<'a> Display for VmirDisplay<'a, &'a Forall> {
             write!(f, "}}")?;
         }
         writeln!(f, " {{")?;
-        // The body's own temps continue after the captures and binders.
+        // The body's own temps continue after the captures and binders,
+        // rendered one nesting level deeper so an inner `forall` indents
+        // further than its parent.
+        let body_indent = self.with_nested(()).indent();
         write!(
             f,
             "{}",
-            self.with((n_caps + q.bound.len(), 0usize, &q.body.insts[..]))
+            self.with_nested((n_caps + q.bound.len(), 0usize, &q.body.insts[..]))
         )?;
-        writeln!(f, "  result: {}", q.body.res)?;
-        write!(f, "  }}")
+        writeln!(f, "{body_indent}result: {}", q.body.res)?;
+        write!(f, "{}}}", self.indent())
     }
 }

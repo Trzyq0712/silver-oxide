@@ -92,6 +92,7 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
         let (val_base, heap_base, insts) = self.item;
         let mut e_idx = val_base;
         let mut h_idx = heap_base;
+        let indent = self.indent();
         for inst in insts {
             // The check-in heap of an obligation, rendered `[h3]` where it belongs
             // (after a `Pure` expression as a suffix, after the `assert`/`refute`
@@ -101,7 +102,7 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                 InstKind::Pure(ty, pi) => {
                     writeln!(
                         f,
-                        "  e{e_idx}: {} := {}{}{heap}",
+                        "{indent}e{e_idx}: {} := {}{}{heap}",
                         self.with(ty),
                         PcPrefix(&inst.pc),
                         self.with(pi)
@@ -114,19 +115,23 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                     if hi.snap_yield(self.decls).is_some() {
                         writeln!(
                             f,
-                            "  h{h_idx}, e{e_idx} := {}{}",
+                            "{indent}h{h_idx}, e{e_idx} := {}{}",
                             PcPrefix(&inst.pc),
                             self.with(hi)
                         )?;
                         e_idx += 1;
                     } else {
-                        writeln!(f, "  h{h_idx} := {}{}", PcPrefix(&inst.pc), self.with(hi))?;
+                        writeln!(f, "{indent}h{h_idx} := {}{}", PcPrefix(&inst.pc), self.with(hi))?;
                     }
                     h_idx += 1;
                 }
-                InstKind::Assume(v) => writeln!(f, "  {}assume {v}", PcPrefix(&inst.pc))?,
-                InstKind::Assert(v) => writeln!(f, "  {}assert {v}{heap}", PcPrefix(&inst.pc))?,
-                InstKind::Refute(v) => writeln!(f, "  {}refute {v}{heap}", PcPrefix(&inst.pc))?,
+                InstKind::Assume(v) => writeln!(f, "{indent}{}assume {v}", PcPrefix(&inst.pc))?,
+                InstKind::Assert(v) => {
+                    writeln!(f, "{indent}{}assert {v}{heap}", PcPrefix(&inst.pc))?
+                }
+                InstKind::Refute(v) => {
+                    writeln!(f, "{indent}{}refute {v}{heap}", PcPrefix(&inst.pc))?
+                }
             }
         }
         Ok(())

@@ -20,6 +20,10 @@ pub struct VmirDisplay<'a, T> {
     pub(super) interner: &'a Rodeo,
     /// Location-group tags (`Type::Addr.group`), for resolving group names.
     pub(super) groups: &'a Rodeo<Spur>,
+    /// Nesting depth of `forall` blocks enclosing this item — 0 outside any
+    /// `forall`. Drives the extra indent of an inline `forall`'s body: each
+    /// nesting level indents two spaces more than its parent.
+    pub(super) depth: usize,
 }
 
 impl<'a, T> VmirDisplay<'a, T> {
@@ -34,6 +38,7 @@ impl<'a, T> VmirDisplay<'a, T> {
             decls,
             interner,
             groups,
+            depth: 0,
         }
     }
 
@@ -43,7 +48,26 @@ impl<'a, T> VmirDisplay<'a, T> {
             decls: self.decls,
             interner: self.interner,
             groups: self.groups,
+            depth: self.depth,
         }
+    }
+
+    /// Like [`Self::with`], but one `forall` nesting level deeper — used when
+    /// rendering an inline `forall`'s body so its indent grows with nesting.
+    pub fn with_nested<U>(&self, item: U) -> VmirDisplay<'a, U> {
+        VmirDisplay {
+            item,
+            decls: self.decls,
+            interner: self.interner,
+            groups: self.groups,
+            depth: self.depth + 1,
+        }
+    }
+
+    /// Indent for a line at the current `depth` (base indent, two spaces per
+    /// level, always at least one level).
+    pub(super) fn indent(&self) -> String {
+        "  ".repeat(self.depth + 1)
     }
 
     /// The display name of a member id.
