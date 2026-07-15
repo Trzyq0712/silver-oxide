@@ -324,6 +324,15 @@ fn static_rules() -> Vec<Rule> {
         // full permission `write` folds away)
         rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
         rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
+        // Permission consolidation: a consume followed by a produce of the
+        // same amount at the same location (the generic/concrete predicate
+        // conversion ping-pong, a carried resource through a call) leaves the
+        // chunk's permission as `(x - p) + p` — cancel it, so the chunk stays
+        // at its simple pre-cycle form instead of accumulating a sum the
+        // sufficiency check can only crack by case-splitting. Sound over
+        // reals (total ops), strictly shrinking.
+        rw!("add-sub-cancel"; "(+ (- ?x ?p) ?p)" => "?x"),
+        rw!("sub-add-cancel"; "(- (+ ?x ?p) ?p)" => "?x"),
         // x == x => true   (reflexivity; also fires when congruence has already
         // merged the two operands into one e-class, e.g. a return var copied from
         // a param: `ensures r == a` after `r := a`).
