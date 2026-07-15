@@ -144,8 +144,133 @@ inhale's assume-guard). Worth fixing independently of the unification.
    e-graph assumption; `Snap` then becomes `exhale`-at-wildcard and `FromSnap`
    the reconstruction outlier.
 
+## Worked example: nested predicate unfold/fold via bind points
+
+```viper
+predicate List(x: Ref) {
+  acc(x.val) && acc(x.next) &&
+  (x.next != null ==> acc(List(x.next)))
+}
+
+method example(x: Ref)
+  requires acc(List(x), 1/1)
+{
+  unfold List(x)
+  if (x.next != null) { unfold List(x.next) }
+}
+```
+
+Unfold desugars to **`Combine`-sub (remove chunk, yielding `Option<Snap>`) →
+`unwrap` (own explicit obligation) → `Inhale` bound to that snap** — not a
+separate `deref` + `Combine`-sub + a hand-unrolled per-field `Combine`+`Assign`
+chain. The body's own guarded structure (the `x.next != null ==>` conjunct) is
+*internal* to `List`'s cached `ResourceCertificate`; the desugaring replays it,
+it doesn't re-derive it:
+
+```
+<>  a1 := List@addr(x)
+<>  h1, s0? := h0 - acc(a1, 1/1)         // Combine, Sub — yields Option<Snap(List)>,
+                                          //   Some iff perm(h0,a1) > 0, else None
+<>  s0 := unwrap(s0?)                     // Pure/Unwrap — explicit obligation
+                                          //   is_some(s0?); NOT free from unwrap's
+                                          //   own semantics (pure ADT destructor,
+                                          //   doesn't "get stuck" — the e-graph would
+                                          //   happily treat unwrap(None) as an arbitrary
+                                          //   uninterpreted term otherwise, unsound).
+                                          //   Discharged here by `requires acc(List(x),1/1)`.
+<>  h2 := h1 inhale List(x) 1/1 @s0      // Inhale, bound to s0 (not fresh) — replays
+                                          //   List's cert body, slots sourced from
+                                          //   proj_val(s0)/proj_next(s0)/proj_tail(s0)
+
+<>  a2 := next@addr(x)
+<>  e1 := deref(h2, a2)                  // legal now — h2 holds it, produced above
+<>  a3 := List@addr(e1)
+<e1 != null>  h3, s1? := h2 - acc(a3, 1/1)
+<e1 != null>  s1 := unwrap(s1?)          // obligation only under e1 — sound, guarded
+<e1 != null>  h4 := h3 inhale List(e1) 1/1 @s1  // s1 should land in same e-class as proj_tail(s0)
+```
+
+Fold is the mirror: `Exhale` (self-framed, same `Option<Snap>` yield —
+consumes the fields, reads real values, no fresh needed on that side) then
+`Combine`-add the predicate chunk bound to that snap, not fresh:
+
+```
+<>  h1, s0? := h0 exhale List(x) 1/1     // Exhale — consumes val/next/(cond) chunks,
+                                          //   asserts body bool, yields Option<Snap>
+<>  s0 := unwrap(s0?)                     // same explicit obligation as above
+<>  h2 := h1 + acc(a1, 1/1)              // Combine, Add
+<>  h2 := assign(h2, a1, s0)             // bind chunk value to s0 — this is the equation
+                                          //   `snap(List(x)) = cons(body)` that first-class
+                                          //   Fold/Unfold need but minted-fresh Inhale loses
+```
+
+**Why the exhale/inhale asymmetry is principled, not arbitrary.** `Exhale` is
+inherently read-shaped — the heap already holds a determinate value, exhale's
+job is to surface it; giving it an input snap would only be a redundant
+equality check. `Inhale` is inherently write-shaped — it has no value by
+default, so its value-source is a genuine parameter: `Fresh` (havoc, legal
+only in method bodies / unobserved cases like wildcard) or `Bound(v)` (case
+(a) legality, legal everywhere including fn/pred bodies). Fold/unfold always
+land in the `Bound` case because the value is always sitting right there from
+the paired exhale.
+
+**The same axis applies one level down, to `Combine`.** `Combine(Add)` (a
+single-slot perm gain, e.g. plain `inhale acc(x.f)`) is the same produce event
+as `Inhale`, just at slot granularity — it should carry the same
+`Fresh | Bound(v)` param instead of being followed by a separate `Assign`.
+This is what lets the per-slot loop above be *literally* `Combine(Add) @s`
+rather than a hand-rolled `Combine`+`Assign` pair — `Fold`/`Unfold`'s
+`walk_footprint` reduces to a loop over one primitive, not two. `Combine(Sub)`
+should symmetrically read+yield the consumed value, same as `Exhale`, for the
+same reason. **`Assign` (standalone, no perm change — plain `x.f := v` on an
+already-held loc) stays genuinely separate**: it's not a produce event at all
+(no perm change, pre-existing slot, caller-supplied value by construction,
+never fresh) — it isn't on this axis.
+
+Unified table, sharpened:
+
+| op | shape | value source |
+|----|-------|--------------|
+| `Combine(Add)` / `Inhale` | produce | `Fresh \| Bound(v)` |
+| `Combine(Sub)` / `Exhale` | consume | always read + yield |
+| `Assign` | overwrite, no perm change | caller value, always bound (orthogonal axis) |
+
 ## Open questions (not settled)
 
+- **The yielded snap must be `Option<Snap>`, not `Snap`, and this is a
+  pre-existing gap, not new.** `inst_obligations` (`declaration.rs:2921`)
+  checks only `perm(amount) >= 0` for `Combine`/`Inhale`/`Exhale` — never
+  strict `> 0`. So `exhale List(x) 0/1` is legal today, and `Exhale`'s
+  existing `snap_yield` (`heap.rs:82`) hands back a snap `Val` regardless —
+  nothing backs it when perm is 0, since nothing was ever required to be
+  held. A hard `perm > 0` obligation at the yielding op would over-constrain
+  (a zero-perm exhale/`Combine(Sub)` is a legitimate vacuous no-op in Silver,
+  e.g. `unfold acc(P(x), 0)`; rejecting it outright is wrong). Correct fix:
+  the yield type is `Option<Snap>` — `Some(s)` iff `perm > 0` else `None`.
+  **Some check must exist before the value is consumed — not inherently
+  "unsound" otherwise, just underspecified.** `unwrap` is a pure ADT
+  destructor and doesn't self-enforce anything (`unwrap(None)` doesn't "get
+  stuck," the e-graph would just treat it as an arbitrary term) — so *some*
+  mechanism has to discharge `is_some`. An explicit `Assert(is_some(opt))` in
+  the IR (reusing the existing `Assert` primitive, not a bespoke
+  `inst_obligations` match arm) is one valid way to provide it.
+- **Performance constraint: that check must NOT become a genuine e-graph
+  proof goal, or the desugar regresses perf vs. today's `Unfold`.** Checked
+  `eval_unfold` (`declaration.rs:1121-1124`): today's sufficiency check is a
+  **direct structural lookup** on the definite-chunk map —
+  `base_h.entries().find_map(...).ok_or(InsufficientPermission)`, congruence
+  via `ctx.egraph.find` (O(1) union-find), no saturation triggered. If
+  `Combine(Sub)`'s `Option` yield is unwrapped via a real e-graph `Assert`
+  goal (the same machinery as e.g. `f#ensures` guard facts), that's strictly
+  more expensive — a proof search where today there's a hashmap lookup. Fix:
+  keep `Option<Snap>` as the *semantic* description, but evaluate
+  `Combine(Sub)` (+ its unwrap) via the same structural lookup path
+  `eval_unfold` already uses — no separate proof-search goal, so the
+  desugared `unfold` costs the same as the first-class one. IR gets the
+  cleaner compositional shape; the evaluator, not the solver, absorbs the
+  check. Confirms the doc's "diff e-graph merges against first-class `Unfold`"
+  sequencing step — that diff should show zero extra proof obligations, not
+  just "same final merges."
 - **Definitional (automatic) unfold must stay lazy.** Explicit fold/unfold
   *statements* are finite and safe to desugar, even for recursive predicates.
   But function definitional unfolding is a lazy on-demand rewrite (memory: "fn
