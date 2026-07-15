@@ -290,6 +290,11 @@ pub(crate) fn lower_method(
     // edges/phis), and the branch condition `Val` of a `Branch` block.
     let n = cfg.blocks.len();
     let mut reach_pc: TiVec<BlockId, PathConds> = (0..n).map(|_| PathConds::default()).collect();
+    // Reach as a minimized cube set (DNF), threaded so successors pool the raw
+    // cubes and reduce further — a chain-decoded n-way `match` only telescopes
+    // to `<>` once the final join also pools the `else` cube (see `block_reach`).
+    let mut reach_dnf: TiVec<BlockId, Vec<PathConds>> =
+        (0..n).map(|_| vec![PathConds::default()]).collect();
     let mut reach_val: TiVec<BlockId, Val> = (0..n).map(|_| TRUE).collect();
     let mut cond_val: TiVec<BlockId, Option<Val>> = (0..n).map(|_| None).collect();
     let mut exit_env: HashMap<BlockId, HashMap<Spur, Val>> = HashMap::new();
@@ -299,42 +304,51 @@ pub(crate) fn lower_method(
             continue;
         }
 
-        let (pc, rval, env) = if bid == cfg.entry {
-            (PathConds::default(), TRUE, init_env.clone())
+        let (pc, dnf, rval, env) = if bid == cfg.entry {
+            (
+                PathConds::default(),
+                vec![PathConds::default()],
+                TRUE,
+                init_env.clone(),
+            )
         } else {
-            // Incoming edges from reachable predecessors: (pred, edge_val, edge_pc).
-            let edges: Vec<(BlockId, Val, PathConds)> = preds[bid]
-                .iter()
-                .filter(|(p, _)| reachable.contains(p))
-                .map(|(p, side)| {
-                    let rpc = reach_pc[*p].clone();
-                    let rv = reach_val[*p].clone();
-                    match side {
-                        EdgeSide::Goto => (*p, rv, rpc),
-                        EdgeSide::Then => {
-                            let c = cond_val[*p].clone().expect("branch pred has a condition");
-                            let mut epc = rpc;
-                            epc.conds.push((c.clone(), Polarity::Positive));
-                            (*p, and_val(&mut sink, rv, c), epc)
-                        }
-                        EdgeSide::Else => {
-                            let c = cond_val[*p].clone().expect("branch pred has a condition");
-                            let mut epc = rpc;
-                            epc.conds.push((c.clone(), Polarity::Negative));
-                            let nc = not_val(&mut sink, c);
-                            (*p, and_val(&mut sink, rv, nc), epc)
-                        }
+            // Pool every reachable predecessor's reach cubes (each extended by the
+            // taken branch literal) for `block_reach`, and in the same pass build
+            // the per-pred materialized `Val` that phis reconcile over.
+            let mut pool: Vec<PathConds> = Vec::new();
+            let mut edge_vals: Vec<(BlockId, Val)> = Vec::new();
+            for (p, side) in preds[bid].iter().filter(|(p, _)| reachable.contains(p)) {
+                let rv = reach_val[*p].clone();
+                let (lit, ev) = match side {
+                    EdgeSide::Goto => (None, rv),
+                    EdgeSide::Then => {
+                        let c = cond_val[*p].clone().expect("branch pred has a condition");
+                        (Some((c.clone(), Polarity::Positive)), and_val(&mut sink, rv, c))
                     }
-                })
-                .collect();
+                    EdgeSide::Else => {
+                        let c = cond_val[*p].clone().expect("branch pred has a condition");
+                        let nc = not_val(&mut sink, c.clone());
+                        (Some((c, Polarity::Negative)), and_val(&mut sink, rv, nc))
+                    }
+                };
+                for cube in &reach_dnf[*p] {
+                    let mut cube = cube.clone();
+                    if let Some(l) = &lit {
+                        cube.conds.push(l.clone());
+                    }
+                    if !pool.contains(&cube) {
+                        pool.push(cube);
+                    }
+                }
+                edge_vals.push((*p, ev));
+            }
 
-            let (pc, rval) = block_reach(&mut sink, &edges);
-            let edge_vals: Vec<(BlockId, Val)> =
-                edges.iter().map(|(p, ev, _)| (*p, ev.clone())).collect();
+            let (dnf, pc, rval) = block_reach(&mut sink, &pool);
             let env = build_entry_env(&mut sink, &edge_vals, &exit_env, &var_types);
-            (pc, rval, env)
+            (pc, dnf, rval, env)
         };
         reach_pc[bid] = pc.clone();
+        reach_dnf[bid] = dnf;
         reach_val[bid] = rval;
 
         // `label L` captures the heap at block entry for later `old[L]`.

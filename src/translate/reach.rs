@@ -66,32 +66,42 @@ fn reach_val_of(sink: &mut Sink, pc: &PathConds) -> Val {
     acc
 }
 
-/// The reaching condition of a block, as a `(pc, reach_val)` pair, from its
-/// incoming `(pred, edge_val, edge_pc)` edges. The reach is the `OR` of the edge
-/// path conditions (cubes); [`merge_cubes`] minimizes them by adjacency
-/// (`P∧x ∨ P∧!x ⇒ P`). If they collapse to one cube it becomes the conjunctive
-/// pc (a diamond → its prefix; a full `n`-way split → `<>`); otherwise the
-/// residual cubes are OR'd into a single materialized reach literal. Always
-/// exactly the block's reach condition, hence sound.
+/// The reaching condition of a block, from the `pool` of incoming edge cubes
+/// (each predecessor's reach DNF, with the taken branch literal already pushed
+/// onto every cube). Returns `(dnf, pc, reach_val)`:
+///
+/// - `dnf` — the reach as a **minimized cube set**, kept so successors can pool
+///   the raw cubes and reduce further. This is the whole point of threading a
+///   DNF instead of a single pc: a chain-decoded `n`-way `match` reaches a join
+///   with unequal-length cubes that [`merge_cubes`] cannot merge in isolation,
+///   but once a later join also pools the `else` cube the partition completes
+///   and telescopes to `<>`. Materializing the reach into one literal here would
+///   destroy that structure (a length-1 literal no longer adjacency-merges with
+///   the length-`k` `else` cube), stranding the exit under a tautological-but-
+///   opaque pc.
+/// - `pc` — the block's own lowering guard for `with_conds`. When the DNF is one
+///   cube that cube *is* the conjunctive pc (a diamond → its prefix; a full
+///   split → `<>`); otherwise the cubes are OR'd into a single materialized
+///   literal (a conjunctive pc cannot express a genuine disjunction).
+/// - `reach_val` — the materialized boolean, for edge/phi construction.
+///
+/// [`merge_cubes`] only applies the value-preserving adjacency law
+/// (`P∧x ∨ P∧!x ⇒ P`), so the result is always exactly the block's reach
+/// condition, hence sound.
 pub(crate) fn block_reach(
     sink: &mut Sink,
-    edges: &[(BlockId, Val, PathConds)],
-) -> (PathConds, Val) {
-    if edges.is_empty() {
+    pool: &[PathConds],
+) -> (Vec<PathConds>, PathConds, Val) {
+    if pool.is_empty() {
         // Unreachable (filtered out before lowering); keep it fully gated.
-        return (
-            PathConds {
-                conds: vec![(FALSE, Polarity::Positive)],
-            },
-            FALSE,
-        );
-    }
-    if let [(_, ev, epc)] = edges {
-        return (epc.clone(), ev.clone());
+        let pc = PathConds {
+            conds: vec![(FALSE, Polarity::Positive)],
+        };
+        return (vec![pc.clone()], pc, FALSE);
     }
 
     let mut cubes: Vec<PathConds> = Vec::new();
-    for (_, _, epc) in edges {
+    for epc in pool {
         if !cubes.contains(epc) {
             cubes.push(epc.clone());
         }
@@ -101,19 +111,17 @@ pub(crate) fn block_reach(
     if let [only] = cubes.as_slice() {
         let pc = only.clone();
         let rv = reach_val_of(sink, &pc);
-        return (pc, rv);
+        return (cubes, pc, rv);
     }
     let mut rv = FALSE;
     for cube in &cubes {
         let cv = reach_val_of(sink, cube);
         rv = or_val(sink, rv, cv);
     }
-    (
-        PathConds {
-            conds: vec![(rv.clone(), Polarity::Positive)],
-        },
-        rv,
-    )
+    let pc = PathConds {
+        conds: vec![(rv.clone(), Polarity::Positive)],
+    };
+    (cubes, pc, rv)
 }
 
 /// Boolean cube minimization: while two cubes are *adjacent* (identical literals
