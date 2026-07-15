@@ -491,12 +491,28 @@ fn heap_subtract(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
     let mut out = h1.clone();
-    let addr = ctx.egraph.find(chunk2.addr);
-    let existing = out
+    let mut addr = ctx.egraph.find(chunk2.addr);
+    let mut existing = out
         .chunks_of(kind)
         .iter()
         .find(|c| ctx.egraph.find(c.addr) == addr)
         .cloned();
+    if existing.is_none() {
+        // Miss: the subtracted address may be a recipe-rebuilt snapshot spine
+        // (`@addr(cons.0(f(.., Some(unwrap(proj_0(s))))))`) that only meets
+        // the held chunk's address after the terminating reductions collapse
+        // the snapshot towers. The rebuild-time reduce is conditional on new
+        // e-nodes, which misses when an earlier (e.g. dead-branch) occurrence
+        // already created them — so normalize once here and retry before
+        // failing.
+        ctx.reduce();
+        addr = ctx.egraph.find(chunk2.addr);
+        existing = out
+            .chunks_of(kind)
+            .iter()
+            .find(|c| ctx.egraph.find(c.addr) == addr)
+            .cloned();
+    }
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
         // conditional footprint slot whose guard is false — a nested predicate
