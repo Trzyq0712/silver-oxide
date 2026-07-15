@@ -4059,3 +4059,68 @@ method exhaustive(v: ThreeCase) {
         assert!(r.is_ok(), "{name} should verify; got {r:?}");
     }
 }
+
+#[test]
+fn fold_with_unprovable_perm_sign_fails() {
+    // A fold's multiplier must be provably non-negative: a negative scale
+    // would flip the footprint subtraction into permission fabrication.
+    // `p` is unconstrained, so the sign side condition must fail.
+    let input = r#"
+field f: Int
+predicate Cell(x: Ref) { acc(x.f, write) }
+method m(x: Ref, p: Perm)
+  requires acc(x.f, write)
+{
+  fold acc(Cell(x), p)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))),
+        "expected the perm-sign side condition to fail, got {result:?}"
+    );
+}
+
+#[test]
+fn unfold_with_unprovable_perm_sign_fails() {
+    // Same side condition on unfold: consuming the predicate chunk at an
+    // unconstrained (possibly negative) multiplier must be rejected.
+    let input = r#"
+field f: Int
+predicate Cell(x: Ref) { acc(x.f, write) }
+method m(x: Ref, p: Perm)
+  requires acc(x.f, write)
+{
+  fold acc(Cell(x), write)
+  unfold acc(Cell(x), p)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::SideCondition(_))),
+        "expected the perm-sign side condition to fail, got {result:?}"
+    );
+}
+
+#[test]
+fn fold_with_constrained_nonneg_perm_verifies() {
+    // With the multiplier's sign pinned by the precondition, the side
+    // condition discharges and the fractional fold verifies.
+    let input = r#"
+field f: Int
+predicate Cell(x: Ref) { acc(x.f, write) }
+method m(x: Ref, p: Perm)
+  requires acc(x.f, write) && p == 1/2
+{
+  fold acc(Cell(x), p)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        result.is_ok(),
+        "constrained non-negative fold should verify, got {result:?}"
+    );
+}

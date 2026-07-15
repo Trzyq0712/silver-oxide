@@ -492,6 +492,37 @@ fn heap_union(
     out
 }
 
+/// SIDECOND: prove `not(perm < 0)` under `pc` — the multiplier of a consuming
+/// op (`fold`/`unfold`/`exhale`). `heap_subtract`'s own sufficiency check
+/// compares against the *scaled* slot permission, so a negative multiplier
+/// flips the subtraction into permission fabrication; the multiplier's sign
+/// must be pinned before the footprint walk.
+fn assert_perm_nonneg(
+    ctx: &mut VerifyContext<'_>,
+    perm: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Result<(), VerifyError> {
+    // Fast path: a const-folded amount (the common literal `1/1` etc.) settles
+    // the sign in O(1) — no prover call, matching the empty-chunk drop's
+    // "heap hygiene stays O(1)" rule.
+    if let Some(Literal::Real(r)) = ctx.egraph[perm].data.known() {
+        if *r >= num::BigRational::from(num::BigInt::from(0)) {
+            return Ok(());
+        }
+    }
+    let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+    let neg = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));
+    let false_ = ctx.false_();
+    let true_ = ctx.true_();
+    let goal = ctx.add(Symbolic::Ite([neg, false_, true_]));
+    if !ctx.prove_under_pc(goal, pc_lits) {
+        return Err(VerifyError::SideCondition(
+            "consumed permission amount must be non-negative",
+        ));
+    }
+    Ok(())
+}
+
 /// Heap subtraction for a single location chunk of kind `kind`.
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
@@ -753,6 +784,9 @@ fn eval_method_inst(
                     vec![(pos, Polarity::Positive)],
                 )
             } else {
+                // A consuming multiplier must be non-negative (a negative scale
+                // would flip `heap_subtract` into fabrication).
+                assert_perm_nonneg(ctx, scale, &pc_lits)?;
                 (
                     ValueSource::ReadHeap(base_h.clone()),
                     Direction::Consume,
@@ -788,6 +822,9 @@ fn eval_method_inst(
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let perm_id = state.get_val(ctx, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+            // A consuming multiplier must be non-negative (a negative scale
+            // would flip `heap_subtract` into fabrication).
+            assert_perm_nonneg(ctx, perm_id, &pc_lits)?;
 
             // Consume the footprint from the current heap (reading its values),
             // asserting the predicate body; then place the predicate chunk holding
@@ -1114,6 +1151,9 @@ fn eval_unfold(
     let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
     let perm_id = state.get_val(ctx, perm);
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+    // A consuming multiplier must be non-negative (a negative scale would flip
+    // the predicate-chunk subtraction into fabrication).
+    assert_perm_nonneg(ctx, perm_id, &pc_lits)?;
 
     // Consume the predicate chunk, recovering the snapshot `s` it holds.
     let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
