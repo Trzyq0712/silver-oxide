@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
-        cert::{BodyRecipe, FunctionDefinition, ResourceDefinition},
+        cert::{FunctionDefinition, ResourceDefinition},
         context::VerifyContext,
         error::VerifyError,
         heap::{Chunk, Heap, LocationKind},
@@ -22,6 +22,12 @@ struct EvalState {
     /// of an address operand is read straight from here (`loc_kind`) — no e-graph
     /// inference. Params seed the initial slots; every `Pure` inst pushes its type.
     val_types: Vec<Type>,
+    /// Recipe provenance of each `vals` entry, kept in lockstep: the
+    /// recipe-space `Val` a certificate walk associates with the body temp
+    /// (`None` when no recipe is built — method bodies — or the value has no
+    /// pure recipe). One counter with `vals`, so the recipe column cannot
+    /// desync from the eval column.
+    recipes: Vec<Option<Val>>,
     heaps: Vec<Heap>,
 }
 
@@ -30,15 +36,19 @@ impl EvalState {
         Self {
             vals: Vec::new(),
             val_types: Vec::new(),
+            recipes: Vec::new(),
             heaps: Vec::new(),
         }
     }
 
     fn with_args(args: Vec<egg::Id>, arg_types: Vec<Type>) -> Self {
         debug_assert_eq!(args.len(), arg_types.len());
+        // Params are the identity in recipe space.
+        let recipes = (0..args.len()).map(|i| Some(Val::Temp(i))).collect();
         Self {
             vals: args,
             val_types: arg_types,
+            recipes,
             heaps: Vec::new(),
         }
     }
@@ -50,6 +60,32 @@ impl EvalState {
         }
     }
 
+    /// The recipe-space term of a body operand: a temp's tracked provenance
+    /// (`None` if it has none), a literal as itself.
+    fn recipe_of(&self, val: &Val) -> Option<Val> {
+        match val {
+            Val::Temp(n) => self.recipes[*n].clone(),
+            Val::Literal(lit) => Some(Val::Literal(lit.clone())),
+        }
+    }
+
+    /// `recipe_of` for a certificate-walk operand that must have a recipe.
+    fn require_recipe(&self, val: &Val, what: &'static str) -> Result<Val, VerifyError> {
+        self.recipe_of(val).ok_or(VerifyError::Unimplemented(what))
+    }
+
+    /// The path condition translated into recipe space (guards of an exported
+    /// fact). Errors if a guard value has no recipe.
+    fn recipe_pc(&self, pc: &PathConds) -> Result<Vec<(Val, Polarity)>, VerifyError> {
+        pc.conds
+            .iter()
+            .map(|(v, p)| {
+                self.require_recipe(v, "purify: path-condition value without a recipe")
+                    .map(|r| (r, *p))
+            })
+            .collect()
+    }
+
     /// The location kind of an address operand, from its tracked VMIR type. A
     /// non-`Temp` or non-`Addr`-typed operand has no kind (`None`).
     fn loc_kind(&self, val: &Val) -> Option<LocationKind> {
@@ -59,9 +95,10 @@ impl EvalState {
         }
     }
 
-    fn push_val(&mut self, id: egg::Id, ty: Type) {
+    fn push_val(&mut self, id: egg::Id, ty: Type, recipe: Option<Val>) {
         self.vals.push(id);
         self.val_types.push(ty);
+        self.recipes.push(recipe);
     }
     fn push_heap(&mut self, heap: Heap) {
         self.heaps.push(heap);
@@ -143,44 +180,99 @@ fn collect_pc_lits(
         .collect()
 }
 
-/// Evaluate a `PureInst` into its symbolic e-class id. `pc_lits` is the path
-/// condition of the owning instruction — a `Deref` consults it to resolve an
-/// address that only aliases a held chunk under the branch (e.g. `y.f` where
-/// `x == y` holds on this path); every other variant ignores it.
+/// Error tag for a certificate-walk operand whose recipe is missing — cannot
+/// happen for a value produced by a purifiable inst, so hitting it means an
+/// unsupported source leaked into a function/resource body.
+const OPERAND_RECIPE: &str = "purify: operand without a recipe";
+
+/// Evaluate a `PureInst` into its symbolic e-class id, plus — when a
+/// certificate recipe is being built (`ctx.recipe`) — the recipe-space `Val`
+/// mirroring it (the single-walk replacement of the old purify pass). `pc_lits`
+/// is the path condition of the owning instruction — a `Deref` consults it to
+/// resolve an address that only aliases a held chunk under the branch (e.g.
+/// `y.f` where `x == y` holds on this path); every other variant ignores it.
 fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     ty: &Type,
     pi: &PureInst,
     pc_lits: &[(egg::Id, Polarity)],
-) -> egg::Id {
-    match pi {
-        PureInst::Fresh => ctx.fresh_symbolic_value(ty.clone()),
+) -> Result<(egg::Id, Option<Val>), VerifyError> {
+    use crate::verify::rewrite::AxiomPure;
+    Ok(match pi {
+        PureInst::Fresh => (ctx.fresh_symbolic_value(ty.clone()), None),
         PureInst::Binary(op, l, r) => {
             let lhs = state.get_val(ctx, l);
             let rhs = state.get_val(ctx, r);
-            ctx.add(Symbolic::Binary(*op, [lhs, rhs]))
+            let id = ctx.add(Symbolic::Binary(*op, [lhs, rhs]));
+            let recipe = if ctx.recipe.is_some() {
+                let l = state.require_recipe(l, OPERAND_RECIPE)?;
+                let r = state.require_recipe(r, OPERAND_RECIPE)?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(AxiomPure::Binary(*op, l, r)))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         PureInst::Ternary(c, t, e) => {
             let cond = state.get_val(ctx, c);
             let then_ = state.get_val(ctx, t);
             let else_ = state.get_val(ctx, e);
-            ctx.add(Symbolic::Ite([cond, then_, else_]))
+            let id = ctx.add(Symbolic::Ite([cond, then_, else_]));
+            let recipe = if ctx.recipe.is_some() {
+                let c = state.require_recipe(c, OPERAND_RECIPE)?;
+                let t = state.require_recipe(t, OPERAND_RECIPE)?;
+                let e = state.require_recipe(e, OPERAND_RECIPE)?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(AxiomPure::Ternary(c, t, e)))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         PureInst::RealCast(v) => {
             let inner = state.get_val(ctx, v);
-            ctx.add(Symbolic::RealCast(inner))
+            let id = ctx.add(Symbolic::RealCast(inner));
+            let recipe = if ctx.recipe.is_some() {
+                let v = state.require_recipe(v, OPERAND_RECIPE)?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(AxiomPure::RealCast(v)))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         PureInst::Deref(hv, loc) => {
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
-            state
-                .loc_kind(loc)
-                .and_then(|k| {
-                    ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
-                        .map(|c| c.value)
-                })
-                .unwrap_or_else(|| ctx.fresh_symbolic_value(ty.clone()))
+            let chunk = state.loc_kind(loc).and_then(|k| {
+                ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
+                    .cloned()
+            });
+            match chunk {
+                Some(c) => {
+                    // The chunk's recipe provenance is the deref's pure term —
+                    // per heap state, so a two-state resource reading the same
+                    // address in `h0` and `h1` stays distinct.
+                    let recipe = if ctx.recipe.is_some() {
+                        Some(c.recipe.clone().ok_or(VerifyError::Unimplemented(
+                            "purify: deref outside footprint",
+                        ))?)
+                    } else {
+                        None
+                    };
+                    (c.value, recipe)
+                }
+                None => {
+                    if ctx.recipe.is_some() {
+                        return Err(VerifyError::Unimplemented(
+                            "purify: deref outside footprint",
+                        ));
+                    }
+                    (ctx.fresh_symbolic_value(ty.clone()), None)
+                }
+            }
         }
         PureInst::FunctionCall(fc) => {
             // A (possibly generic) Silver `function`: `type_args` are the
@@ -195,41 +287,97 @@ fn eval_pure_inst(
             // `assume_axioms` from `ctx.fn_certs`) the next time saturation runs
             // over this occurrence, not eagerly here.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add_func_app_id(
+            let id = ctx.add_func_app_id(
                 crate::verify::func_registry::func_id_for_member(fc.function),
                 fc.type_args.clone().into(),
                 ty.clone(),
                 args.into(),
-            )
+            );
+            let recipe = if ctx.recipe.is_some() {
+                let args: Vec<Val> = fc
+                    .args
+                    .iter()
+                    .map(|a| state.require_recipe(a, OPERAND_RECIPE))
+                    .collect::<Result<_, _>>()?;
+                // A recursive call (callee in this function's SCC) targets the
+                // limited twin `f'` — uninterpreted, so unfolding this recipe
+                // at a call site stops after one level. Every other callee
+                // keeps its full id and unfolds normally.
+                let func = if ctx
+                    .recipe
+                    .as_ref()
+                    .unwrap()
+                    .is_recursive_callee(fc.function)
+                {
+                    let name = ctx.member_name(fc.function);
+                    ctx.alloc.limited(fc.function, &name)
+                } else {
+                    crate::verify::func_registry::func_id_for_member(fc.function)
+                };
+                // Record the callee under the body temp this inst will occupy,
+                // to spot the exit `assert f#ensures(..)`.
+                let body_temp = state.vals.len();
+                let rb = ctx.recipe.as_mut().unwrap();
+                rb.record_callee(body_temp, fc.function);
+                Some(rb.emit(AxiomPure::App {
+                    func,
+                    type_args: fc.type_args.clone(),
+                    args,
+                }))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         // A `forall` is a single e-node: the compiled body (its `RecipeId`, interned
         // program-wide) as payload, the captured terms as children. Nothing is
         // instantiated here — the one generic rule (`rewrite::forall_rule`) does that
-        // at the next saturation, guarded on this node merging `true`.
+        // at the next saturation, guarded on this node merging `true`. In a recipe
+        // it is a `Forall` step: replayed at each call site, it rebuilds the
+        // quantifier e-node with the caller's arguments as capture children.
         PureInst::Forall(q) => {
             let table = std::sync::Arc::clone(ctx.alloc.quant_table());
-            let recipe = table
+            let recipe_id = table
                 .id_of(q)
                 .expect("every syntactic forall is interned by FuncRegistry::new");
             let caps: Box<[egg::Id]> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add(Symbolic::Forall(recipe, caps))
+            let id = ctx.add(Symbolic::Forall(recipe_id, caps));
+            let recipe = if ctx.recipe.is_some() {
+                let caps: Vec<Val> = q
+                    .captures
+                    .iter()
+                    .map(|v| state.require_recipe(v, OPERAND_RECIPE))
+                    .collect::<Result<_, _>>()?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit_forall(recipe_id, caps))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         // `Snap` needs the program + certificates; every inst walker intercepts
         // it and dispatches to `eval_snap` before reaching this function.
         PureInst::Snap { .. } => {
             unreachable!("Snap is handled by eval_snap in the inst walkers")
         }
-        // perm(loc): permission amount held at `loc` in the given heap.
+        // perm(loc): permission amount held at `loc` in the given heap. Has no
+        // pure recipe — a certificate walk rejects it.
         PureInst::Perm(hv, loc) => {
+            if ctx.recipe.is_some() {
+                return Err(VerifyError::Unimplemented(
+                    "purify: perm in a function or resource body",
+                ));
+            }
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
-            state
+            let id = state
                 .loc_kind(loc)
                 .and_then(|k| {
                     ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
                         .map(|c| c.perm)
                 })
-                .unwrap_or_else(|| zero_real(ctx))
+                .unwrap_or_else(|| zero_real(ctx));
+            (id, None)
         }
         // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted **concept**
         // id (one per `(head, variant[, field])`, see `verify::mono`); the ground
@@ -243,8 +391,24 @@ fn eval_pure_inst(
             args,
         } => {
             let cons = ctx.alloc.cons(*adt, *variant);
-            let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
-            ctx.add_func_app_id(cons, type_args.clone().into(), ty.clone(), args.into())
+            let arg_ids: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+            let id =
+                ctx.add_func_app_id(cons, type_args.clone().into(), ty.clone(), arg_ids.into());
+            let recipe = if ctx.recipe.is_some() {
+                let args: Vec<Val> = args
+                    .iter()
+                    .map(|a| state.require_recipe(a, OPERAND_RECIPE))
+                    .collect::<Result<_, _>>()?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(AxiomPure::App {
+                    func: cons,
+                    type_args: type_args.clone(),
+                    args,
+                }))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         PureInst::AdtProj {
             adt,
@@ -254,8 +418,25 @@ fn eval_pure_inst(
             base,
         } => {
             let proj = ctx.alloc.proj(*adt, *variant, *field);
-            let base = state.get_val(ctx, base);
-            ctx.add_func_app_id(proj, type_args.clone().into(), ty.clone(), Box::new([base]))
+            let base_id = state.get_val(ctx, base);
+            let id = ctx.add_func_app_id(
+                proj,
+                type_args.clone().into(),
+                ty.clone(),
+                Box::new([base_id]),
+            );
+            let recipe = if ctx.recipe.is_some() {
+                let base = state.require_recipe(base, OPERAND_RECIPE)?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(AxiomPure::App {
+                    func: proj,
+                    type_args: type_args.clone(),
+                    args: vec![base],
+                }))
+            } else {
+                None
+            };
+            (id, recipe)
         }
         PureInst::AdtTag {
             adt,
@@ -263,10 +444,27 @@ fn eval_pure_inst(
             base,
         } => {
             let tag = ctx.alloc.tag(*adt);
-            let base = state.get_val(ctx, base);
-            ctx.add_func_app_id(tag, type_args.clone().into(), Type::Int, Box::new([base]))
+            let base_id = state.get_val(ctx, base);
+            let id = ctx.add_func_app_id(
+                tag,
+                type_args.clone().into(),
+                Type::Int,
+                Box::new([base_id]),
+            );
+            let recipe = if ctx.recipe.is_some() {
+                let base = state.require_recipe(base, OPERAND_RECIPE)?;
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(AxiomPure::App {
+                    func: tag,
+                    type_args: type_args.clone(),
+                    args: vec![base],
+                }))
+            } else {
+                None
+            };
+            (id, recipe)
         }
-    }
+    })
 }
 
 fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalState) -> Heap {
@@ -578,7 +776,12 @@ fn heap_subtract(
     if empty {
         out = out.without_chunk(kind, existing.addr);
     } else {
-        out = out.with_chunk(kind, Chunk::new(existing.addr, remainder, existing.value));
+        // The value (and so its recipe provenance) is unchanged by a subtract.
+        out = out.with_chunk(
+            kind,
+            Chunk::new(existing.addr, remainder, existing.value)
+                .with_recipe(existing.recipe.clone()),
+        );
     }
     Ok(out)
 }
@@ -607,17 +810,35 @@ fn eval_heap_inst(
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
             let (kind, ch) = chunk.entries().next().unwrap();
-            let (kind, ch) = (kind.clone(), ch.clone());
+            let (kind, mut ch) = (kind.clone(), ch.clone());
             match sign {
                 Sign::Add => {
-                    // Log the acc's minted value for resource purification (keyed
-                    // by value e-class so two-state derefs stay distinct).
-                    if let Some(events) = ctx.heap_events.as_mut() {
-                        events.push(HeapEvent::Acc { value: ch.value });
+                    // A resource body's `acc` records a footprint slot in the
+                    // certificate under construction: its value is the seed
+                    // placeholder `SlotValue(i)` (supplied at graft time), its
+                    // address/permission recipes are sliced at the end of the
+                    // walk. The seed doubles as the chunk's recipe provenance,
+                    // so a later `Deref` purifies to the slot value.
+                    if ctx.recipe.is_some() {
+                        let addr_r = state.require_recipe(loc, OPERAND_RECIPE)?;
+                        let perm_r = state.require_recipe(perm, OPERAND_RECIPE)?;
+                        let elem = kind.value.clone();
+                        let rb = ctx.recipe.as_mut().unwrap();
+                        let i = rb.pending_slots.len();
+                        let seed = rb.emit_seed(crate::verify::cert::SeedRef::SlotValue(i));
+                        rb.pending_slots.push((kind.clone(), elem, addr_r, perm_r));
+                        ch = ch.with_recipe(Some(seed));
                     }
                     Ok(heap_union(ctx, &base_h, &kind, ch, &pc_lits))
                 }
-                Sign::Sub => heap_subtract(ctx, &base_h, &kind, ch, &pc_lits),
+                Sign::Sub => {
+                    if ctx.recipe.is_some() {
+                        return Err(VerifyError::Unimplemented(
+                            "purify: unsupported heap inst in a resource body",
+                        ));
+                    }
+                    heap_subtract(ctx, &base_h, &kind, ch, &pc_lits)
+                }
             }
         }
         // Resource inhale/exhale need the program + certificates; method-only.
@@ -678,13 +899,13 @@ fn eval_resource_body_inst(
         // A heap-dependent function call inside a resource body narrows the
         // body's footprint heap with `Snap` — shared with method bodies.
         InstKind::Pure(ty, PureInst::Snap { .. }) => {
-            let id = eval_snap(ctx, program, state, inst, certs)?;
-            state.push_val(id, ty.clone());
+            let (id, recipe) = eval_snap(ctx, program, state, inst, certs)?;
+            state.push_val(id, ty.clone(), recipe);
         }
         InstKind::Pure(ty, pi) => {
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-            let id = eval_pure_inst(ctx, state, ty, pi, &pc_lits);
-            state.push_val(id, ty.clone());
+            let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits)?;
+            state.push_val(id, ty.clone(), recipe);
         }
         // `unfold` inside a resource body verifies identically to a method
         // body (shared `eval_unfold`); only `Unfold` is emitted here.
@@ -720,13 +941,13 @@ fn eval_method_inst(
         // `Snap` needs the program + certificates (footprint graft), so it is
         // handled here rather than in `eval_pure_inst`.
         InstKind::Pure(ty, PureInst::Snap { .. }) => {
-            let id = eval_snap(ctx, program, state, inst, certs)?;
-            state.push_val(id, ty.clone());
+            let (id, recipe) = eval_snap(ctx, program, state, inst, certs)?;
+            state.push_val(id, ty.clone(), recipe);
         }
         InstKind::Pure(ty, pi) => {
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-            let id = eval_pure_inst(ctx, state, ty, pi, &pc_lits);
-            state.push_val(id, ty.clone());
+            let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits)?;
+            state.push_val(id, ty.clone(), recipe);
         }
         // `base inhale <resource>(args) perm`: produce the resource's footprint
         // (fresh values), scaled by `perm`, into `base` and **assume** its
@@ -777,13 +998,21 @@ fn eval_method_inst(
             state.push_heap(out);
             if let Some(res_id) = hi.snap_yield(&program.decls) {
                 let s = build_snapshot(ctx, res_id, members);
-                state.push_val(s, Type::Snap(res_id));
+                // Inhale/exhale are method-only, so no recipe is in flight.
+                state.push_val(s, Type::Snap(res_id), None);
             }
         }
         // `fold`: consume the predicate footprint (scaled by `perm`), assert the
         // body's pure facts, and produce a predicate chunk holding the snapshot
         // (`cons`) of the consumed field values.
         InstKind::Heap(HeapInst::Fold { base, call, perm }) => {
+            // A function body may `fold` (via `folding … in …`); its recipe
+            // shape is not implemented yet, so a certificate walk rejects it.
+            if ctx.recipe.is_some() {
+                return Err(VerifyError::Unimplemented(
+                    "purify: fold in a function body",
+                ));
+            }
             let base_h = get_heap(state, base);
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let perm_id = state.get_val(ctx, perm);
@@ -854,6 +1083,37 @@ fn eval_method_inst(
             if !ctx.prove_under_pc(id, &pc_lits) {
                 return Err(VerifyError::AssertionFailed);
             }
+            // A certificate walk re-exports the assert as a guarded fact —
+            // it was *proven* under `pre ∧ pc`, so replaying it guarded at
+            // every occurrence of the function is unconditionally sound
+            // (Silicon's `bodyProp`; the exit post assert is its `post` axiom).
+            if ctx.recipe.is_some() {
+                let pc_r = state.recipe_pc(&inst.pc)?;
+                if ctx.recipe.as_ref().unwrap().is_post_assert(val) {
+                    let pm_args = ctx
+                        .recipe
+                        .as_ref()
+                        .unwrap()
+                        .post_meta
+                        .as_ref()
+                        .unwrap()
+                        .args
+                        .clone();
+                    let args: Vec<Option<Val>> = pm_args
+                        .iter()
+                        .map(|a| match a {
+                            vmir::ContractArg::Val(v) => {
+                                state.require_recipe(v, OPERAND_RECIPE).map(Some)
+                            }
+                            vmir::ContractArg::Result => Ok(None),
+                        })
+                        .collect::<Result<_, _>>()?;
+                    ctx.recipe.as_mut().unwrap().export_post_fact(pc_r, args);
+                } else {
+                    let cond = state.require_recipe(val, OPERAND_RECIPE)?;
+                    ctx.recipe.as_mut().unwrap().export_fact(pc_r, cond, false);
+                }
+            }
         }
         InstKind::Refute(val) => {
             // `refute A` succeeds iff `A` is NOT provable in this state.
@@ -876,10 +1136,13 @@ fn eval_method_inst(
 enum ValueSource {
     /// Read the chunk value at the slot's address from this heap (fresh if
     /// absent). Used by `fold`/`snap`/`exhale`, which read a heap they hold.
+    /// A certificate walk propagates the hit chunk's recipe provenance.
     ReadHeap(Heap),
     /// Recover it from the snapshot `s` as `unwrap(proj_i(s))`. Used by
     /// `unfold`/`from_snap`, which reconstruct the footprint from a snapshot.
-    ProjectSnap(egg::Id),
+    /// The second field is `s`'s recipe term (certificate walks only) — each
+    /// slot's recipe mirrors the projection: `unwrap(proj_i(s_recipe))`.
+    ProjectSnap(egg::Id, Option<Val>),
     /// A fresh unconstrained value per slot. Used by `inhale`, which produces a
     /// resource's footprint with unknown location values.
     Fresh,
@@ -895,39 +1158,14 @@ enum Direction {
 
 /// The result of a footprint walk: the accumulator heap after all slot effects,
 /// the snapshot members `present ? Some(v) : None` per slot (for a `Consume`
-/// walk; empty for `Produce`), and the grafted slot **addresses** in slot order
-/// (for function purification's recipe log — see [`HeapEvent`]).
+/// walk; empty for `Produce`), and — during a certificate walk — each slot
+/// value's recipe term.
 struct FootprintResult {
     heap: Heap,
     members: Vec<egg::Id>,
-    /// Grafted slot values in slot order (for the purification event log).
-    slot_values: Vec<egg::Id>,
-}
-
-/// A heap-reconstruction event logged during a **function or resource** body
-/// walk (`ctx.heap_events`), in body order, so purification can rebuild each
-/// `Deref`'s value as a pure recipe term. Events are keyed by the **value**
-/// e-class each produces (not the address), so a two-state resource that reads
-/// the same address in two heap states (`old(x.f)` vs `x.f`) stays distinct.
-pub(crate) enum HeapEvent {
-    /// An `acc(loc, perm)`: the freshly-minted location value.
-    Acc { value: egg::Id },
-    /// A `FromSnap`: the per-slot reconstructed values (`unwrap(proj_i(snap))`).
-    FromSnap { values: Vec<egg::Id> },
-    /// An `Unfold`: the consumed predicate chunk's value (the snapshot the new
-    /// slots project from) and the per-slot reproduced values.
-    Unfold {
-        consumed: egg::Id,
-        values: Vec<egg::Id>,
-    },
-    /// A `Snap` (nested heap-dependent call): the resource whose snapshot is
-    /// taken and the per-slot values read from the current heap. The recipe term
-    /// is `cons(Some(v_i))` — a self-framed footprint is fully held, so each slot
-    /// is present.
-    Snap {
-        resource: MemberId,
-        values: Vec<egg::Id>,
-    },
+    /// Recipe provenance of each slot value, in slot order (certificate walks
+    /// only; all `None` otherwise).
+    slot_recipes: Vec<Option<Val>>,
 }
 
 /// The single per-slot footprint loop behind `fold`, `unfold`, `snap` and
@@ -964,6 +1202,7 @@ fn walk_footprint(
 
     let mut heap = base;
     let mut values: Vec<egg::Id> = Vec::with_capacity(def.footprint.len());
+    let mut recipes: Vec<Option<Val>> = Vec::with_capacity(def.footprint.len());
     let mut members = Vec::with_capacity(def.footprint.len());
     let mut changed = Vec::new();
     for (i, slot) in def.footprint.iter().enumerate() {
@@ -1000,24 +1239,46 @@ fn walk_footprint(
         let addr = ctx.egraph.find(addr);
         let bperm = ctx.egraph.find(bperm);
         let elem = slot.elem.clone();
-        let value = match &source {
-            // Values are read from the *original* heap (aliased slots agree).
+        let (value, recipe) = match &source {
+            // Values are read from the *original* heap (aliased slots agree);
+            // the hit chunk's recipe provenance rides along.
             ValueSource::ReadHeap(h) => h
                 .entries()
                 .find_map(|(_, c)| {
-                    (ctx.egraph.find(c.addr) == ctx.egraph.find(addr)).then_some(c.value)
+                    (ctx.egraph.find(c.addr) == ctx.egraph.find(addr))
+                        .then(|| (c.value, c.recipe.clone()))
                 })
-                .unwrap_or_else(|| ctx.fresh_symbolic_value(elem.clone())),
+                .unwrap_or_else(|| (ctx.fresh_symbolic_value(elem.clone()), None)),
             // `proj_i(s)` recovers the optional member (collapsing to the `cons`
             // argument when `s` is concrete); `unwrap` peels to the field value.
-            ValueSource::ProjectSnap(s) => {
+            // A certificate walk mirrors the projection into the recipe.
+            ValueSource::ProjectSnap(s, s_recipe) => {
                 let proj_id = ctx.alloc.proj(resource, 0, i);
                 let opt_ty = ctx.alloc.option_type(elem.clone());
                 let opt = ctx.add_func_app_id(proj_id, Box::new([]), opt_ty, Box::new([*s]));
-                ctx.option_unwrap(elem.clone(), opt)
+                let value = ctx.option_unwrap(elem.clone(), opt);
+                let recipe = match (ctx.recipe.is_some(), s_recipe) {
+                    (true, Some(sr)) => {
+                        use crate::verify::rewrite::AxiomPure;
+                        let unwrap_id = ctx.alloc.option_value();
+                        let rb = ctx.recipe.as_mut().unwrap();
+                        let opt = rb.emit(AxiomPure::App {
+                            func: proj_id,
+                            type_args: Vec::new(),
+                            args: vec![sr.clone()],
+                        });
+                        Some(rb.emit(AxiomPure::App {
+                            func: unwrap_id,
+                            type_args: vec![elem.clone()],
+                            args: vec![opt],
+                        }))
+                    }
+                    _ => None,
+                };
+                (value, recipe)
             }
             // Inhale: an unconstrained fresh value per slot.
-            ValueSource::Fresh => ctx.fresh_symbolic_value(elem.clone()),
+            ValueSource::Fresh => (ctx.fresh_symbolic_value(elem.clone()), None),
         };
         // The heap effect uses the (optionally scaled) permission; the snapshot
         // membership discriminant uses the *unscaled* recipe perm.
@@ -1025,7 +1286,7 @@ fn walk_footprint(
             Some(pm) => ctx.add(Symbolic::Binary(BinOp::Mult, [pm, bperm])),
             None => bperm,
         };
-        let chunk = Chunk::new(addr, p, value);
+        let chunk = Chunk::new(addr, p, value).with_recipe(recipe.clone());
         heap = match direction {
             Direction::Consume => heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits)?,
             Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
@@ -1035,6 +1296,7 @@ fn walk_footprint(
         let present = ctx.perm_positive(bperm);
         members.push(ctx.option_member(elem, present, value));
         values.push(value);
+        recipes.push(recipe);
     }
     // The body boolean over params ++ all slot values.
     let resolve = |r: &SeedRef| -> egg::Id {
@@ -1059,7 +1321,7 @@ fn walk_footprint(
     Ok(FootprintResult {
         heap,
         members,
-        slot_values: values,
+        slot_recipes: recipes,
     })
 }
 
@@ -1115,13 +1377,19 @@ fn eval_unfold(
     let perm_id = state.get_val(ctx, perm);
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-    // Consume the predicate chunk, recovering the snapshot `s` it holds.
+    // Consume the predicate chunk, recovering the snapshot `s` it holds (and,
+    // in a certificate walk, its recipe — the term the new slots project from).
     let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
     let a = ctx.egraph.find(pred_addr);
-    let s = base_h
+    let (s, s_recipe) = base_h
         .entries()
-        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then_some(c.value))
+        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then(|| (c.value, c.recipe.clone())))
         .ok_or(VerifyError::InsufficientPermission)?;
+    if ctx.recipe.is_some() && s_recipe.is_none() {
+        return Err(VerifyError::Unimplemented(
+            "purify: unfold of an unheld predicate",
+        ));
+    }
     let out = heap_subtract(
         ctx,
         &base_h,
@@ -1133,31 +1401,19 @@ fn eval_unfold(
     // Reproduce the footprint from `s` (`unwrap(proj_i(s))` per slot), assuming
     // the predicate body. `reduce()` afterward collapses any snapshot tower a
     // repeated fold/unfold round-trip created.
-    let FootprintResult {
-        heap: out,
-        slot_values,
-        ..
-    } = walk_footprint(
+    let FootprintResult { heap: out, .. } = walk_footprint(
         ctx,
         program,
         certs,
         call.resource,
         &args,
         out,
-        ValueSource::ProjectSnap(s),
+        ValueSource::ProjectSnap(s, s_recipe),
         Direction::Produce,
         Some(perm_id),
         &pc_lits,
         &pc_lits,
     )?;
-    // Log for purification: the new slots reconstruct as `unwrap(proj_j(s))`
-    // where `s` is the recipe term of the consumed predicate value.
-    if let Some(events) = ctx.heap_events.as_mut() {
-        events.push(HeapEvent::Unfold {
-            consumed: s,
-            values: slot_values,
-        });
-    }
     state.push_heap(out);
     ctx.reduce();
     Ok(())
@@ -1178,7 +1434,8 @@ fn eval_snap(
     state: &EvalState,
     inst: &Inst,
     certs: &HashMap<MemberId, ResourceDefinition>,
-) -> Result<egg::Id, VerifyError> {
+) -> Result<(egg::Id, Option<Val>), VerifyError> {
+    use crate::verify::rewrite::AxiomPure;
     let InstKind::Pure(
         _,
         PureInst::Snap {
@@ -1191,7 +1448,7 @@ fn eval_snap(
         unreachable!("eval_snap called on a non-Snap instruction");
     };
     let h = get_heap(state, heap);
-    let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+    let arg_ids: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
     // Non-consuming: the sufficiency subtraction runs on a scratch clone of `h`
@@ -1200,14 +1457,14 @@ fn eval_snap(
     // boolean is asserted. The snapshot is the `cons` of the per-slot members.
     let FootprintResult {
         members,
-        slot_values,
+        slot_recipes,
         ..
     } = walk_footprint(
         ctx,
         program,
         certs,
         *resource,
-        &args,
+        &arg_ids,
         h.clone(),
         ValueSource::ReadHeap(h),
         Direction::Consume,
@@ -1215,15 +1472,58 @@ fn eval_snap(
         &pc_lits,
         &pc_lits,
     )?;
-    // Log for purification: the snapshot reconstructs as `cons(Some(v_i))` over
-    // these read values.
-    if let Some(events) = ctx.heap_events.as_mut() {
-        events.push(HeapEvent::Snap {
-            resource: *resource,
-            values: slot_values,
-        });
-    }
     let s = build_snapshot(ctx, *resource, members);
+
+    // A certificate walk mirrors the snapshot as `cons(Some(v_i))` over the
+    // read values' recipes (a self-framed footprint is fully held, so each
+    // slot is `Some`), and exports the nested callee's pre-token as a fact:
+    // the precondition was *checked here* by this `Snap`'s implicit exhale,
+    // but that check lives in the inst, not in an `Assert`, so deriving facts
+    // from asserts would miss it. A caller who rebuilds this recipe (and
+    // thereby materializes the nested `g(args, s)`) can then discharge the
+    // guard on `g`'s own post fact without re-running the check — Silicon's
+    // `bodyPreconditionPropagationAxiom` (`FunctionData.scala:302`).
+    let recipe = if ctx.recipe.is_some() {
+        let def = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
+        let elems: Vec<Type> = def.footprint.iter().map(|sl| sl.elem.clone()).collect();
+        let args_r: Vec<Val> = args
+            .iter()
+            .map(|a| state.require_recipe(a, OPERAND_RECIPE))
+            .collect::<Result<_, _>>()?;
+        let pc_r = state.recipe_pc(&inst.pc)?;
+        let some_id = ctx.alloc.option_some();
+        let cons_id = ctx.alloc.cons(*resource, 0);
+        let name = program.name(*resource).to_string();
+        let tok_id = ctx.alloc.pre_token(*resource, &name);
+        let rb = ctx.recipe.as_mut().unwrap();
+        let mut members_r = Vec::with_capacity(slot_recipes.len());
+        for (i, r) in slot_recipes.iter().enumerate() {
+            let v = r.clone().ok_or(VerifyError::Unimplemented(
+                "purify: snap value outside footprint",
+            ))?;
+            members_r.push(rb.emit(AxiomPure::App {
+                func: some_id,
+                type_args: vec![elems[i].clone()],
+                args: vec![v],
+            }));
+        }
+        let s_r = rb.emit(AxiomPure::App {
+            func: cons_id,
+            type_args: Vec::new(),
+            args: members_r,
+        });
+        let mut tok_args = args_r;
+        tok_args.push(s_r.clone());
+        let cond = rb.emit(AxiomPure::App {
+            func: tok_id,
+            type_args: Vec::new(),
+            args: tok_args,
+        });
+        rb.export_fact(pc_r, cond, false);
+        Some(s_r)
+    } else {
+        None
+    };
 
     // The precondition held here — `walk_footprint` proved footprint
     // sufficiency and the resource's bool. **Release the pre-token**: assume
@@ -1234,13 +1534,13 @@ fn eval_snap(
     // makes the guarded facts sound.
     let name = program.name(*resource).to_string();
     let tok = ctx.alloc.pre_token(*resource, &name);
-    let mut tok_args = args;
+    let mut tok_args = arg_ids;
     tok_args.push(s);
     let tok = ctx.add_func_app_id(tok, Box::new([]), Type::Bool, tok_args.into());
     ctx.assume_guarded(tok, pc_lits.iter().rev().copied());
 
     ctx.reduce();
-    Ok(s)
+    Ok((s, recipe))
 }
 
 /// Evaluate a `FromSnap`: widen a snapshot value back into a heap — the entry
@@ -1264,36 +1564,33 @@ fn eval_from_snap(
     else {
         unreachable!("eval_from_snap called on a non-FromSnap instruction");
     };
-    let args: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
+    let arg_ids: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
     let s = state.get_val(ctx, snap);
+    // The snapshot parameter's recipe — each reconstructed slot's provenance
+    // becomes `unwrap(proj_i(s))` over it (certificate walks only).
+    let s_recipe = if ctx.recipe.is_some() {
+        Some(state.require_recipe(snap, OPERAND_RECIPE)?)
+    } else {
+        None
+    };
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
     // Reconstruct the precondition heap: produce one chunk per footprint slot
     // valued `unwrap(proj_i(s))` into the empty heap, assuming the resource body
     // (guarded by the path condition — a `FromSnap` may sit under a branch).
-    let FootprintResult {
-        heap: out,
-        slot_values,
-        ..
-    } = walk_footprint(
+    let FootprintResult { heap: out, .. } = walk_footprint(
         ctx,
         program,
         certs,
         *resource,
-        &args,
+        &arg_ids,
         Heap::empty(),
-        ValueSource::ProjectSnap(s),
+        ValueSource::ProjectSnap(s, s_recipe),
         Direction::Produce,
         None,
         &pc_lits,
         &pc_lits,
     )?;
-    // Log for purification: these values reconstruct as `unwrap(proj_i(snap))`.
-    if let Some(events) = ctx.heap_events.as_mut() {
-        events.push(HeapEvent::FromSnap {
-            values: slot_values,
-        });
-    }
     ctx.reduce();
     Ok(out)
 }
@@ -1334,8 +1631,8 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 InstKind::Pure(ty, pi) => {
                     // Axiom bodies are heap-free and trusted — no `Deref`, so the
                     // path condition is irrelevant here.
-                    let id = eval_pure_inst(ctx, &state, ty, pi, &[]);
-                    state.push_val(id, ty.clone());
+                    let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &[])?;
+                    state.push_val(id, ty.clone(), None);
                 }
                 InstKind::Assume(val) => {
                     let id = state.get_val(ctx, val);
@@ -1530,7 +1827,12 @@ fn check_forall_wd(
 ) -> Result<(), VerifyError> {
     // `ctx.egraph` is a scratch clone for the duration; the live graph, its
     // fixpoint cache and the memo scope are handled by `with_scratch_graph`.
-    ctx.with_scratch_graph(|ctx| check_forall_wd_in_scratch(ctx, q, caps, host_pc))
+    // The certificate recipe (if one is being built) is paused: the WD walk's
+    // scratch evaluation must not mirror steps into the host's recipe.
+    let recipe = ctx.recipe.take();
+    let res = ctx.with_scratch_graph(|ctx| check_forall_wd_in_scratch(ctx, q, caps, host_pc));
+    ctx.recipe = recipe;
+    res
 }
 
 fn check_forall_wd_in_scratch(
@@ -1541,11 +1843,11 @@ fn check_forall_wd_in_scratch(
 ) -> Result<(), VerifyError> {
     let mut state = EvalState::new();
     for (id, ty) in caps.iter().zip(q.cap_types.iter()) {
-        state.push_val(*id, ty.clone());
+        state.push_val(*id, ty.clone(), None);
     }
     for ty in q.bound.iter() {
         let fresh = ctx.fresh_symbolic_value(ty.clone());
-        state.push_val(fresh, ty.clone());
+        state.push_val(fresh, ty.clone(), None);
     }
 
     for inst in &q.body.insts {
@@ -1569,12 +1871,12 @@ fn check_forall_wd_in_scratch(
                     .map(|v| state.get_val(ctx, v))
                     .collect();
                 check_forall_wd(ctx, inner, &inner_caps, &pc_lits)?;
-                let id = eval_pure_inst(ctx, &state, ty, pi, &pc_lits);
-                state.push_val(id, ty.clone());
+                let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits)?;
+                state.push_val(id, ty.clone(), None);
             }
             InstKind::Pure(ty, pi) => {
-                let id = eval_pure_inst(ctx, &state, ty, pi, &pc_lits);
-                state.push_val(id, ty.clone());
+                let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits)?;
+                state.push_val(id, ty.clone(), None);
             }
             // A callee's postcondition, stitched at the call: assume it under the
             // guards it was emitted with.
@@ -1748,8 +2050,16 @@ pub(crate) fn verify_resource(
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
-    ctx.heap_events = Some(Vec::new()); // record FromSnap/Unfold for purification
     assume_axioms(&mut ctx, program)?;
+    // The certificate recipe is built by the walk itself: each `acc` records a
+    // footprint slot, `Deref`s resolve through chunk provenance. Installed
+    // after `assume_axioms` so axiom bodies don't mirror into the recipe.
+    ctx.recipe = Some(crate::verify::cert::RecipeBuilder::new(
+        resource.params.len(),
+        None,
+        None,
+        None,
+    ));
     let params: Vec<egg::Id> = resource
         .params
         .iter()
@@ -1778,9 +2088,31 @@ pub(crate) fn verify_resource(
     // Capture the body as a pure recipe (add-only; imports no e-classes). Each
     // call site rebuilds the footprint addresses/permissions and the body boolean
     // from the recipe and re-derives any merge it needs itself (Finding C).
-    let events = ctx.heap_events.take().unwrap_or_default();
-    let def = purify_resource(&mut ctx, resource, body, &state, &events)?;
-    Ok(Some(def))
+    // Slot address/permission recipes and the body boolean are sliced out of
+    // the shared step stream the walk built.
+    use crate::verify::cert::SlotRecipe;
+    let rb = ctx.recipe.take().expect("resource walk builds a recipe");
+    let footprint = rb
+        .pending_slots
+        .iter()
+        .map(|(kind, elem, addr, perm)| {
+            Ok(SlotRecipe {
+                kind: kind.clone(),
+                elem: elem.clone(),
+                addr: rb.slice(addr)?,
+                perm: rb.slice(perm)?,
+            })
+        })
+        .collect::<Result<Vec<_>, VerifyError>>()?;
+    let bool_r = state
+        .recipe_of(&body.res.1)
+        .ok_or(VerifyError::Unimplemented(
+            "purify: resource bool without a recipe",
+        ))?;
+    Ok(Some(ResourceDefinition {
+        footprint,
+        bool: rb.slice(&bool_r)?,
+    }))
 }
 
 /// Verify a non-recursive function and capture its body as a **pure term
@@ -1836,8 +2168,31 @@ pub(crate) fn verify_function(
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
-    ctx.heap_events = Some(Vec::new()); // record FromSnap/Unfold for purification
     assume_axioms(&mut ctx, program)?;
+    // The certificate recipe is built by the walk itself (single pass): the
+    // pre-token guard, the limited-twin substitution set, and the exit-post
+    // shape are fixed up front.
+    let guard_app = pre_token(ctx.alloc, program, function);
+    let post_meta = function.ensures.as_ref().map(|en| {
+        let self_func = if recursive_scc.is_some() {
+            let name = ctx.member_name(self_id);
+            ctx.alloc.limited(self_id, &name)
+        } else {
+            crate::verify::func_registry::func_id_for_member(self_id)
+        };
+        crate::verify::cert::PostMeta {
+            ensures_member: en.member,
+            ensures_func: crate::verify::func_registry::func_id_for_member(en.member),
+            self_func,
+            args: en.args.clone(),
+        }
+    });
+    ctx.recipe = Some(crate::verify::cert::RecipeBuilder::new(
+        function.params.len(),
+        guard_app,
+        recursive_scc.cloned(),
+        post_meta,
+    ));
     // Recursive batch: every SCC member's spec-derived post axiom is available
     // while this body is checked (Silicon emits `post` in phase 1, before the
     // phase-2 body check) — this is what lets the exit assert use a recursive
@@ -1881,20 +2236,18 @@ pub(crate) fn verify_function(
         None,
     )?;
 
-    // Turn the walked body into a pure, add-only recipe (params → args at call
-    // sites via `build_instance`), using the event log to reconstruct `Deref`
-    // values as `unwrap(proj_i(snap))` terms.
-    let events = ctx.heap_events.take().unwrap_or_default();
-    let (steps, res, facts) = purify_function(
-        &mut ctx,
-        program,
-        self_id,
-        function,
-        body,
-        &state,
-        &events,
-        recursive_scc,
-    )?;
+    // The walk mirrored the body into a pure, add-only recipe (params → args
+    // at call sites via `build_instance`); `Deref` values became the pure
+    // terms their chunks carry as provenance (`unwrap(proj_i(snap))`), and the
+    // entry `assume f#requires` was dropped (Finding B — `Assume` emits no
+    // recipe step, so the precondition cannot leak into callers).
+    let rb = ctx.recipe.take().expect("function walk builds a recipe");
+    let (steps, facts) = rb.into_function_parts()?;
+    let res = state
+        .recipe_of(&body.res)
+        .ok_or(VerifyError::Unimplemented(
+            "purify: function result without a recipe",
+        ))?;
     // A recursive function records its limited twin so the unfold rule frames
     // `f(x) == f'(x)`. Minted here (not in the recipe) so the id exists even if
     // the body has no reachable recursive call under some path.
@@ -2032,876 +2385,6 @@ fn contract_post_definition(
             post: true,
         }],
     }))
-}
-
-/// Turn a walked function body into a pure recipe `(steps, res)` in dense
-/// recipe-temp space (params `Temp(0..n_params)`, one slot per emitted step).
-/// Re-walks `body.insts` maintaining `map: body-temp → recipe Val` (seeded with
-/// the params) and `at: canonical address → recipe value term`, consuming the
-/// ordered `events` for the `FromSnap`/`Unfold` slot addresses. Reads the live
-/// `state.vals` (finalized after the walk) to resolve each `Deref`'s address to a
-/// footprint slot by congruence.
-#[allow(clippy::too_many_arguments)]
-fn purify_function(
-    ctx: &mut VerifyContext<'_>,
-    program: &vmir::Program,
-    self_id: MemberId,
-    function: &Function,
-    body: &vmir::FunctionBody,
-    state: &EvalState,
-    events: &[HeapEvent],
-    // In-SCC callees (a recursion cycle's members) are lowered to their limited
-    // twin so a downstream unfold of this recipe halts after one level; `None`
-    // (non-recursive) keeps every callee as its full id.
-    recursive_scc: Option<&std::collections::HashSet<MemberId>>,
-) -> Result<
-    (
-        Vec<crate::verify::rewrite::AxiomInst>,
-        Val,
-        Vec<crate::verify::cert::Fact>,
-    ),
-    VerifyError,
-> {
-    use crate::verify::cert::Fact;
-    use crate::verify::rewrite::{AxiomInst, AxiomPure};
-
-    let n_params = function.params.len();
-    let mut steps: Vec<AxiomInst> = Vec::new();
-    // body-temp → recipe Val, seeded with the params (identity).
-    let mut map: Vec<Val> = (0..n_params).map(Val::Temp).collect();
-    let mut at: HashMap<egg::Id, Val> = HashMap::new();
-    let mut events = events.iter();
-    // ---- facts export (see `cert::Fact`): every body `Assert` was proven
-    // under `pre ∧ pc`, so it re-exports as a guarded fact at call sites.
-    let mut facts: Vec<Fact> = Vec::new();
-    // Body `Val::Temp` index of each FunctionCall → callee, to spot the exit
-    // `assert f#ensures(..)` (which exports in `f'(params)` shape instead).
-    let mut callee_of: HashMap<usize, MemberId> = HashMap::new();
-    // This function's pre-token (`f#requires(params)` when heap-free,
-    // `R#pre(params, s)` when heap-dependent — see `pre_token`), as a recipe
-    // step, emitted on first use.
-    let guard_app = pre_token(ctx.alloc, program, function);
-    let mut pre_guard: Option<Val> = None;
-
-    // Emit a pure step, returning its dense recipe temp.
-    let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
-        let v = Val::Temp(n_params + steps.len());
-        steps.push(AxiomInst::Val(pure));
-        v
-    };
-    // This function's pre-token as a recipe step, emitted once on first use.
-    // Its args are over the params, which are the identity in recipe space, so
-    // they need no `tr`.
-    let guard = |steps: &mut Vec<AxiomInst>,
-                 app: &Option<(crate::verify::lang::FuncId, Vec<Val>)>,
-                 cache: &mut Option<Val>|
-     -> Option<Val> {
-        let (func, args) = app.as_ref()?;
-        if cache.is_none() {
-            *cache = Some(emit(
-                steps,
-                AxiomPure::App {
-                    func: *func,
-                    type_args: Vec::new(),
-                    args: args.clone(),
-                },
-            ));
-        }
-        cache.clone()
-    };
-    // Translate a body-space operand into recipe space.
-    let tr = |map: &[Val], v: &Val| -> Val {
-        match v {
-            Val::Temp(n) => map[*n].clone(),
-            Val::Literal(l) => Val::Literal(l.clone()),
-        }
-    };
-    // The `option_value` accessor (`unwrap`) is monomorphic-per-elem.
-    let project_unwrap = |ctx: &mut VerifyContext<'_>,
-                          steps: &mut Vec<AxiomInst>,
-                          resource: MemberId,
-                          index: usize,
-                          elem: Type,
-                          snap: Val|
-     -> Val {
-        let proj = ctx.alloc.proj(resource, 0, index);
-        let opt = emit(
-            steps,
-            AxiomPure::App {
-                func: proj,
-                type_args: Vec::new(),
-                args: vec![snap],
-            },
-        );
-        let value = ctx.alloc.option_value();
-        emit(
-            steps,
-            AxiomPure::App {
-                func: value,
-                type_args: vec![elem],
-                args: vec![opt],
-            },
-        )
-    };
-
-    // Per-resource footprint element types (`option_inner` of each snapshot field).
-    let slot_elems = |resource: MemberId| -> Result<Vec<Type>, VerifyError> {
-        let vmir::Declaration::Resource(r) = &ctx.decls[resource] else {
-            return Err(VerifyError::DependencyFailed);
-        };
-        let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
-            return Err(VerifyError::Unimplemented(
-                "purify: abstract resource footprint",
-            ));
-        };
-        Ok(snap
-            .variants
-            .into_iter()
-            .next()
-            .unwrap()
-            .field_types
-            .iter()
-            .map(|t| t.option_inner().unwrap_or(t).clone())
-            .collect())
-    };
-
-    for inst in &body.insts {
-        match &inst.kind {
-            InstKind::Pure(_, PureInst::Deref(..)) => {
-                // The deref's own live value e-class keys the recipe term (keying
-                // by value, not address, keeps two-state derefs distinct).
-                let ec = ctx.egraph.find(state.vals[map.len()]);
-                let v = at.get(&ec).cloned().ok_or(VerifyError::Unimplemented(
-                    "purify: deref outside footprint",
-                ))?;
-                map.push(v);
-            }
-            InstKind::Pure(_, PureInst::Perm(..)) => {
-                return Err(VerifyError::Unimplemented("purify: perm in function"));
-            }
-            // A nested heap-dependent call's `Snap`: the snapshot of the callee's
-            // footprint, `cons(Some(v_i))` over the values read from the current
-            // heap (a self-framed footprint is fully held, so each slot is Some).
-            InstKind::Pure(_, PureInst::Snap { args, .. }) => {
-                let Some(HeapEvent::Snap { resource, values }) = events.next() else {
-                    unreachable!("Snap inst without a logged Snap event");
-                };
-                let elems = slot_elems(*resource)?;
-                let some_id = ctx.alloc.option_some();
-                let cons_id = ctx.alloc.cons(*resource, 0);
-                let mut members = Vec::with_capacity(values.len());
-                for (i, &value) in values.iter().enumerate() {
-                    let v = at.get(&ctx.egraph.find(value)).cloned().ok_or(
-                        VerifyError::Unimplemented("purify: snap value outside footprint"),
-                    )?;
-                    members.push(emit(
-                        &mut steps,
-                        AxiomPure::App {
-                            func: some_id,
-                            type_args: vec![elems[i].clone()],
-                            args: vec![v],
-                        },
-                    ));
-                }
-                let s = emit(
-                    &mut steps,
-                    AxiomPure::App {
-                        func: cons_id,
-                        type_args: Vec::new(),
-                        args: members,
-                    },
-                );
-                // The nested callee's precondition was *checked here*, by this
-                // `Snap`'s implicit exhale — but that check lives in the inst,
-                // not in an `Assert`, so deriving facts from asserts misses it.
-                // Export the callee's pre-token over the snapshot we just built,
-                // so a caller who rebuilds this recipe (and thereby materializes
-                // the nested `g(args, s)`) can discharge the guard on `g`'s own
-                // post fact without re-running the check. This is Silicon's
-                // `bodyPreconditionPropagationAxiom`
-                // (`FunctionData.scala:302`): `f%pre ⟹ pres of everything f calls`.
-                let name = program.name(*resource).to_string();
-                let tok = ctx.alloc.pre_token(*resource, &name);
-                let mut tok_args: Vec<Val> = args.iter().map(|a| tr(&map, a)).collect();
-                tok_args.push(s.clone());
-                let cond = emit(
-                    &mut steps,
-                    AxiomPure::App {
-                        func: tok,
-                        type_args: Vec::new(),
-                        args: tok_args,
-                    },
-                );
-                let mut guards: Vec<(Val, Polarity)> = Vec::new();
-                if let Some(g) = guard(&mut steps, &guard_app, &mut pre_guard) {
-                    guards.push((g, Polarity::Positive));
-                }
-                for (val, pol) in &inst.pc.conds {
-                    guards.push((tr(&map, val), *pol));
-                }
-                facts.push(Fact {
-                    guards,
-                    cond,
-                    post: false,
-                });
-                map.push(s);
-            }
-            InstKind::Pure(_, PureInst::Fresh) => {
-                unreachable!("function body may not contain Fresh (method-only)");
-            }
-            // A `forall` in the body purifies to a `Forall` step: replayed at each
-            // call site, it rebuilds the quantifier e-node with the caller's
-            // arguments as capture children. This is how a quantifier reaches a
-            // caller through a certificate — impossible while quantifiers were
-            // rules rather than data.
-            InstKind::Pure(_, PureInst::Forall(q)) => {
-                let recipe = ctx.alloc.quant_table().id_of(q)?;
-                let caps = q.captures.iter().map(|v| tr(&map, v)).collect();
-                let v = Val::Temp(n_params + steps.len());
-                steps.push(AxiomInst::Forall { recipe, caps });
-                map.push(v);
-            }
-            InstKind::Pure(_, pi) => {
-                let v = match pi {
-                    PureInst::Binary(op, l, r) => {
-                        emit(&mut steps, AxiomPure::Binary(*op, tr(&map, l), tr(&map, r)))
-                    }
-                    PureInst::Ternary(c, t, e) => emit(
-                        &mut steps,
-                        AxiomPure::Ternary(tr(&map, c), tr(&map, t), tr(&map, e)),
-                    ),
-                    PureInst::RealCast(x) => emit(&mut steps, AxiomPure::RealCast(tr(&map, x))),
-                    PureInst::FunctionCall(fc) => {
-                        callee_of.insert(map.len(), fc.function);
-                        // A recursive call (callee in this function's SCC) targets
-                        // the limited twin `f'` — uninterpreted, so unfolding this
-                        // recipe at a call site stops after one level. Every other
-                        // callee keeps its full id and unfolds normally.
-                        let func = if recursive_scc.is_some_and(|s| s.contains(&fc.function)) {
-                            let name = ctx.member_name(fc.function);
-                            ctx.alloc.limited(fc.function, &name)
-                        } else {
-                            crate::verify::func_registry::func_id_for_member(fc.function)
-                        };
-                        emit(
-                            &mut steps,
-                            AxiomPure::App {
-                                func,
-                                type_args: fc.type_args.clone(),
-                                args: fc.args.iter().map(|a| tr(&map, a)).collect(),
-                            },
-                        )
-                    }
-                    PureInst::AdtCons {
-                        adt,
-                        type_args,
-                        variant,
-                        args,
-                    } => {
-                        let func = ctx.alloc.cons(*adt, *variant);
-                        emit(
-                            &mut steps,
-                            AxiomPure::App {
-                                func,
-                                type_args: type_args.clone(),
-                                args: args.iter().map(|a| tr(&map, a)).collect(),
-                            },
-                        )
-                    }
-                    PureInst::AdtProj {
-                        adt,
-                        type_args,
-                        variant,
-                        field,
-                        base,
-                    } => {
-                        let func = ctx.alloc.proj(*adt, *variant, *field);
-                        emit(
-                            &mut steps,
-                            AxiomPure::App {
-                                func,
-                                type_args: type_args.clone(),
-                                args: vec![tr(&map, base)],
-                            },
-                        )
-                    }
-                    PureInst::AdtTag {
-                        adt,
-                        type_args,
-                        base,
-                    } => {
-                        let func = ctx.alloc.tag(*adt);
-                        emit(
-                            &mut steps,
-                            AxiomPure::App {
-                                func,
-                                type_args: type_args.clone(),
-                                args: vec![tr(&map, base)],
-                            },
-                        )
-                    }
-                    PureInst::Fresh
-                    | PureInst::Deref(..)
-                    | PureInst::Perm(..)
-                    | PureInst::Snap { .. }
-                    | PureInst::Forall(_) => unreachable!("handled above"),
-                };
-                map.push(v);
-            }
-            // `FromSnap R(args), snap`: each slot value reconstructs as
-            // `unwrap(proj_i(snap))`, keyed by the slot's live value e-class.
-            InstKind::Heap(HeapInst::FromSnap { resource, snap, .. }) => {
-                let Some(HeapEvent::FromSnap { values }) = events.next() else {
-                    unreachable!("FromSnap inst without a logged FromSnap event");
-                };
-                let snap_recipe = tr(&map, snap);
-                let elems = slot_elems(*resource)?;
-                for (i, &value) in values.iter().enumerate() {
-                    let v = project_unwrap(
-                        ctx,
-                        &mut steps,
-                        *resource,
-                        i,
-                        elems[i].clone(),
-                        snap_recipe.clone(),
-                    );
-                    at.insert(ctx.egraph.find(value), v);
-                }
-            }
-            // `Unfold P(args)`: the consumed predicate chunk's recipe term `s` is
-            // the snapshot the new footprint slots project from.
-            InstKind::Heap(HeapInst::Unfold { call, .. }) => {
-                let Some(HeapEvent::Unfold { consumed, values }) = events.next() else {
-                    unreachable!("Unfold inst without a logged Unfold event");
-                };
-                let s = at.get(&ctx.egraph.find(*consumed)).cloned().ok_or(
-                    VerifyError::Unimplemented("purify: unfold of unheld predicate"),
-                )?;
-                let elems = slot_elems(call.resource)?;
-                for (j, &value) in values.iter().enumerate() {
-                    let v = project_unwrap(
-                        ctx,
-                        &mut steps,
-                        call.resource,
-                        j,
-                        elems[j].clone(),
-                        s.clone(),
-                    );
-                    at.insert(ctx.egraph.find(value), v);
-                }
-            }
-            // A function body may `fold` (via `folding … in …`); not yet purified.
-            InstKind::Heap(HeapInst::Fold { .. }) => {
-                return Err(VerifyError::Unimplemented("purify: fold in function body"));
-            }
-            InstKind::Heap(_) => {
-                unreachable!("function body may not contain inhale/exhale/combine/assign");
-            }
-            // The entry `assume f#requires` is dropped — that is what keeps the
-            // precondition out of the recipe (Finding B). Produces no body
-            // temp, so `map` stays aligned.
-            InstKind::Assume(_) => {}
-            // An `Assert` was *proven* under `pre ∧ pc`, so it exports as a
-            // guarded fact (Silicon's `bodyProp`; the exit post assert is its
-            // `post` axiom) — replayed at every occurrence of this function.
-            InstKind::Assert(v) => {
-                let mut guards: Vec<(Val, Polarity)> = Vec::new();
-                if let Some(g) = guard(&mut steps, &guard_app, &mut pre_guard) {
-                    guards.push((g, Polarity::Positive));
-                }
-                for (val, pol) in &inst.pc.conds {
-                    guards.push((tr(&map, val), *pol));
-                }
-                let is_post = matches!(v, Val::Temp(n)
-                    if function.ensures.as_ref().is_some_and(|en| callee_of.get(n) == Some(&en.member)));
-                if is_post {
-                    // The post fact expresses the result as the (limited)
-                    // application itself — `ens(params, f'(params))` — not the
-                    // rebuilt body: at a recursive unroll's `f'(smaller)`
-                    // occurrence the fact must talk about that very node
-                    // (Silicon's `post` axiom `let r = f'(s,args) in …`).
-                    let self_fid = if recursive_scc.is_some() {
-                        let name = ctx.member_name(self_id);
-                        ctx.alloc.limited(self_id, &name)
-                    } else {
-                        crate::verify::func_registry::func_id_for_member(self_id)
-                    };
-                    let self_app = emit(
-                        &mut steps,
-                        AxiomPure::App {
-                            func: self_fid,
-                            type_args: Vec::new(),
-                            args: (0..n_params).map(Val::Temp).collect(),
-                        },
-                    );
-                    let en = function.ensures.as_ref().unwrap();
-                    let args: Vec<Val> = en
-                        .args
-                        .iter()
-                        .map(|a| match a {
-                            vmir::ContractArg::Val(v) => tr(&map, v),
-                            vmir::ContractArg::Result => self_app.clone(),
-                        })
-                        .collect();
-                    let cond = emit(
-                        &mut steps,
-                        AxiomPure::App {
-                            func: crate::verify::func_registry::func_id_for_member(en.member),
-                            type_args: Vec::new(),
-                            args,
-                        },
-                    );
-                    facts.push(Fact {
-                        guards,
-                        cond,
-                        post: true,
-                    });
-                } else {
-                    facts.push(Fact {
-                        guards,
-                        cond: tr(&map, v),
-                        post: false,
-                    });
-                }
-            }
-            InstKind::Refute(_) => unreachable!("function body may not contain refute"),
-        }
-    }
-
-    let res = tr(&map, &body.res);
-    Ok((steps, res, facts))
-}
-
-/// An expression tree over params and footprint slot values, the intermediate
-/// form a resource body purifies into. A resource emits *several* outputs (each
-/// footprint slot's address and permission, and the body boolean), and an
-/// address may depend on an earlier slot's value (`list(this.next)`), so each
-/// output is [`flatten`]ed independently into a self-contained [`BodyRecipe`]
-/// carrying only the seed slots it uses.
-enum RTree {
-    Param(usize),
-    SlotValue(usize),
-    Lit(vmir::Literal),
-    Binary(BinOp, Box<RTree>, Box<RTree>),
-    Ternary(Box<RTree>, Box<RTree>, Box<RTree>),
-    RealCast(Box<RTree>),
-    App(crate::verify::lang::FuncId, Vec<Type>, Vec<RTree>),
-    /// A `forall` in a resource body (e.g. a predicate body's quantified
-    /// conjunct): the recipe plus one subtree per capture. Rebuilt at each graft
-    /// site like any other step.
-    Forall(crate::verify::lang::RecipeId, Vec<RTree>),
-}
-
-/// Flatten an [`RTree`] into a [`BodyRecipe`]: collect the distinct seed leaves
-/// (in first-encounter order) as `seed_refs`, then emit one step per interior
-/// node in dense recipe-temp space (`Temp(0..seed_refs.len())` are the seed,
-/// steps after). No common-subexpression elimination — `build_instance`
-/// hash-conses at rebuild time, so duplicate steps collapse in the e-graph.
-fn flatten(tree: &RTree) -> BodyRecipe {
-    use crate::verify::cert::SeedRef;
-    use crate::verify::rewrite::{AxiomInst, AxiomPure};
-
-    // Pass 1: collect distinct seed refs in first-encounter order.
-    fn collect(tree: &RTree, seeds: &mut Vec<SeedRef>) {
-        let key = match tree {
-            RTree::Param(i) => Some(SeedRef::Param(*i)),
-            RTree::SlotValue(i) => Some(SeedRef::SlotValue(*i)),
-            _ => None,
-        };
-        if let Some(k) = key {
-            if !seeds.iter().any(|s| {
-                matches!((s, &k),
-                (SeedRef::Param(a), SeedRef::Param(b)) if a == b)
-                    || matches!((s, &k), (SeedRef::SlotValue(a), SeedRef::SlotValue(b)) if a == b)
-            }) {
-                seeds.push(k);
-            }
-            return;
-        }
-        match tree {
-            RTree::Binary(_, l, r) => {
-                collect(l, seeds);
-                collect(r, seeds);
-            }
-            RTree::Ternary(c, t, e) => {
-                collect(c, seeds);
-                collect(t, seeds);
-                collect(e, seeds);
-            }
-            RTree::RealCast(x) => collect(x, seeds),
-            RTree::App(_, _, args) | RTree::Forall(_, args) => {
-                args.iter().for_each(|a| collect(a, seeds))
-            }
-            RTree::Param(_) | RTree::SlotValue(_) | RTree::Lit(_) => {}
-        }
-    }
-    let mut seed_refs = Vec::new();
-    collect(tree, &mut seed_refs);
-
-    let seed_temp = |k: &SeedRef| -> Val {
-        let idx = seed_refs
-            .iter()
-            .position(|s| match (s, k) {
-                (SeedRef::Param(a), SeedRef::Param(b)) => a == b,
-                (SeedRef::SlotValue(a), SeedRef::SlotValue(b)) => a == b,
-                _ => false,
-            })
-            .expect("seed ref collected in pass 1");
-        Val::Temp(idx)
-    };
-
-    // Pass 2: emit steps, temps numbered after the seed.
-    let base = seed_refs.len();
-    let mut steps: Vec<AxiomInst> = Vec::new();
-    let mut emit = |steps: &mut Vec<AxiomInst>, p: AxiomInst| -> Val {
-        let v = Val::Temp(base + steps.len());
-        steps.push(p);
-        v
-    };
-    fn go(
-        tree: &RTree,
-        steps: &mut Vec<AxiomInst>,
-        seed_temp: &impl Fn(&SeedRef) -> Val,
-        emit: &mut impl FnMut(&mut Vec<AxiomInst>, AxiomInst) -> Val,
-    ) -> Val {
-        match tree {
-            RTree::Param(i) => seed_temp(&SeedRef::Param(*i)),
-            RTree::SlotValue(i) => seed_temp(&SeedRef::SlotValue(*i)),
-            RTree::Lit(l) => Val::Literal(l.clone()),
-            RTree::Binary(op, l, r) => {
-                let l = go(l, steps, seed_temp, emit);
-                let r = go(r, steps, seed_temp, emit);
-                emit(steps, AxiomInst::Val(AxiomPure::Binary(*op, l, r)))
-            }
-            RTree::Ternary(c, t, e) => {
-                let c = go(c, steps, seed_temp, emit);
-                let t = go(t, steps, seed_temp, emit);
-                let e = go(e, steps, seed_temp, emit);
-                emit(steps, AxiomInst::Val(AxiomPure::Ternary(c, t, e)))
-            }
-            RTree::RealCast(x) => {
-                let x = go(x, steps, seed_temp, emit);
-                emit(steps, AxiomInst::Val(AxiomPure::RealCast(x)))
-            }
-            RTree::Forall(recipe, caps) => {
-                let caps = caps.iter().map(|c| go(c, steps, seed_temp, emit)).collect();
-                emit(
-                    steps,
-                    AxiomInst::Forall {
-                        recipe: *recipe,
-                        caps,
-                    },
-                )
-            }
-            RTree::App(func, tys, args) => {
-                let args = args.iter().map(|a| go(a, steps, seed_temp, emit)).collect();
-                emit(
-                    steps,
-                    AxiomInst::Val(AxiomPure::App {
-                        func: *func,
-                        type_args: tys.clone(),
-                        args,
-                    }),
-                )
-            }
-        }
-    }
-    let res = go(tree, &mut steps, &seed_temp, &mut emit);
-    BodyRecipe {
-        seed_refs,
-        steps,
-        res,
-    }
-}
-
-/// Build an [`RTree`] for a pure inst from the body-temp → `RTree` map. `Deref`,
-/// `Perm`, `Snap`, and `Fresh` are handled by the caller (they consult the
-/// footprint slot table or are illegal), so this covers only the structural ops.
-fn rtree_pure(ctx: &mut VerifyContext<'_>, map: &[RTree], pi: &PureInst) -> RTree {
-    let tr = |v: &Val| -> RTree {
-        match v {
-            Val::Temp(n) => map[*n].clone_tree(),
-            Val::Literal(l) => RTree::Lit(l.clone()),
-        }
-    };
-    match pi {
-        PureInst::Binary(op, l, r) => RTree::Binary(*op, Box::new(tr(l)), Box::new(tr(r))),
-        PureInst::Ternary(c, t, e) => {
-            RTree::Ternary(Box::new(tr(c)), Box::new(tr(t)), Box::new(tr(e)))
-        }
-        PureInst::RealCast(x) => RTree::RealCast(Box::new(tr(x))),
-        PureInst::FunctionCall(fc) => RTree::App(
-            crate::verify::func_registry::func_id_for_member(fc.function),
-            fc.type_args.clone(),
-            fc.args.iter().map(&tr).collect(),
-        ),
-        // A quantified conjunct of a predicate body. Its captures are body values,
-        // so they purify like any other argument; the recipe itself is ground.
-        PureInst::Forall(q) => RTree::Forall(
-            ctx.alloc
-                .quant_table()
-                .id_of(q)
-                .expect("every syntactic forall is interned by FuncRegistry::new"),
-            q.captures.iter().map(&tr).collect(),
-        ),
-        PureInst::AdtCons {
-            adt,
-            type_args,
-            variant,
-            args,
-        } => RTree::App(
-            ctx.alloc.cons(*adt, *variant),
-            type_args.clone(),
-            args.iter().map(&tr).collect(),
-        ),
-        PureInst::AdtProj {
-            adt,
-            type_args,
-            variant,
-            field,
-            base,
-        } => RTree::App(
-            ctx.alloc.proj(*adt, *variant, *field),
-            type_args.clone(),
-            vec![tr(base)],
-        ),
-        PureInst::AdtTag {
-            adt,
-            type_args,
-            base,
-        } => RTree::App(ctx.alloc.tag(*adt), type_args.clone(), vec![tr(base)]),
-        PureInst::Fresh | PureInst::Deref(..) | PureInst::Perm(..) | PureInst::Snap { .. } => {
-            unreachable!("handled by purify_resource before rtree_pure")
-        }
-    }
-}
-
-impl RTree {
-    fn clone_tree(&self) -> RTree {
-        match self {
-            RTree::Param(i) => RTree::Param(*i),
-            RTree::SlotValue(i) => RTree::SlotValue(*i),
-            RTree::Lit(l) => RTree::Lit(l.clone()),
-            RTree::Binary(op, l, r) => {
-                RTree::Binary(*op, Box::new(l.clone_tree()), Box::new(r.clone_tree()))
-            }
-            RTree::Ternary(c, t, e) => RTree::Ternary(
-                Box::new(c.clone_tree()),
-                Box::new(t.clone_tree()),
-                Box::new(e.clone_tree()),
-            ),
-            RTree::RealCast(x) => RTree::RealCast(Box::new(x.clone_tree())),
-            RTree::App(f, tys, args) => RTree::App(
-                *f,
-                tys.clone(),
-                args.iter().map(|a| a.clone_tree()).collect(),
-            ),
-            RTree::Forall(r, caps) => {
-                RTree::Forall(*r, caps.iter().map(|c| c.clone_tree()).collect())
-            }
-        }
-    }
-
-    /// `unwrap(proj_i(self))` — the value a footprint slot projects from a
-    /// snapshot recipe (`FromSnap`/`Unfold`), mirroring `eval`'s
-    /// `option_unwrap(proj_i(s))`.
-    fn project_unwrap(
-        self,
-        ctx: &mut VerifyContext<'_>,
-        resource: MemberId,
-        i: usize,
-        elem: Type,
-    ) -> RTree {
-        let proj = ctx.alloc.proj(resource, 0, i);
-        let opt = RTree::App(proj, Vec::new(), vec![self]);
-        let value = ctx.alloc.option_value();
-        RTree::App(value, vec![elem], vec![opt])
-    }
-}
-
-/// Turn a walked resource body into a pure [`ResourceDefinition`] recipe. Like
-/// [`purify_function`] (params → recipe temps; `Deref` resolves to the value at
-/// its address; `FromSnap`/`Unfold` reconstruct via the `HeapEvent` log), but
-/// each `Combine` (`acc`) records a footprint slot whose value is a placeholder
-/// (`SlotValue(i)`), and the body boolean plus each slot address/permission are
-/// flattened into independent recipes.
-fn purify_resource(
-    ctx: &mut VerifyContext<'_>,
-    resource: &Resource,
-    body: &vmir::ResourceBody,
-    state: &EvalState,
-    events: &[HeapEvent],
-) -> Result<crate::verify::cert::ResourceDefinition, VerifyError> {
-    use crate::verify::cert::{ResourceDefinition, SlotRecipe};
-
-    let n_params = resource.params.len();
-    let mut map: Vec<RTree> = (0..n_params).map(RTree::Param).collect();
-    // Address e-class → the value held there, as an RTree.
-    let mut at: HashMap<egg::Id, RTree> = HashMap::new();
-    let mut footprint: Vec<SlotRecipe> = Vec::new();
-    let mut events = events.iter();
-
-    let slot_elems =
-        |ctx: &VerifyContext<'_>, resource: MemberId| -> Result<Vec<Type>, VerifyError> {
-            let vmir::Declaration::Resource(r) = &ctx.decls[resource] else {
-                return Err(VerifyError::DependencyFailed);
-            };
-            let Some(vmir::Snapshot::Concrete(snap)) = r.derive_snapshot() else {
-                return Err(VerifyError::Unimplemented(
-                    "purify: abstract resource footprint",
-                ));
-            };
-            Ok(snap
-                .variants
-                .into_iter()
-                .next()
-                .unwrap()
-                .field_types
-                .iter()
-                .map(|t| t.option_inner().unwrap_or(t).clone())
-                .collect())
-        };
-
-    for inst in &body.insts {
-        match &inst.kind {
-            InstKind::Pure(_, PureInst::Deref(..)) => {
-                // The deref's own live value e-class keys the recipe term (keying
-                // by value, not address, keeps two-state derefs — `x.f` vs
-                // `old(x.f)` — distinct).
-                let ec = ctx.egraph.find(state.vals[map.len()]);
-                let rt = at.get(&ec).ok_or(VerifyError::Unimplemented(
-                    "purify: deref outside footprint",
-                ))?;
-                map.push(rt.clone_tree());
-            }
-            InstKind::Pure(_, PureInst::Perm(..)) => {
-                return Err(VerifyError::Unimplemented("purify: perm in resource"));
-            }
-            // A nested heap-dependent call's `Snap`: the snapshot of the callee's
-            // footprint, `cons(Some(v_i))` over the values read from the current
-            // heap (a self-framed footprint is fully held, so each slot is Some).
-            InstKind::Pure(_, PureInst::Snap { .. }) => {
-                let Some(HeapEvent::Snap { resource, values }) = events.next() else {
-                    unreachable!("Snap inst without a logged event");
-                };
-                let elems = slot_elems(ctx, *resource)?;
-                let some_id = ctx.alloc.option_some();
-                let cons_id = ctx.alloc.cons(*resource, 0);
-                let mut members = Vec::with_capacity(values.len());
-                for (i, &value) in values.iter().enumerate() {
-                    let v_rt = at
-                        .get(&ctx.egraph.find(value))
-                        .ok_or(VerifyError::Unimplemented(
-                            "purify: snap value outside footprint",
-                        ))?
-                        .clone_tree();
-                    members.push(RTree::App(some_id, vec![elems[i].clone()], vec![v_rt]));
-                }
-                map.push(RTree::App(cons_id, Vec::new(), members));
-            }
-            InstKind::Pure(_, PureInst::Fresh) => {
-                unreachable!("resource body may not contain Fresh (method-only)");
-            }
-            InstKind::Pure(_, pi) => {
-                let rt = rtree_pure(ctx, &map, pi);
-                map.push(rt);
-            }
-            // `acc(loc, perm)`: a footprint slot. Its value is the placeholder
-            // `SlotValue(i)` (supplied at graft time); the slot records recipes for
-            // its address and permission.
-            InstKind::Heap(HeapInst::Combine {
-                sign: Sign::Add,
-                loc,
-                perm,
-                ..
-            }) => {
-                let i = footprint.len();
-                // The address is always a `FunctionCall` result (a temp); the
-                // permission may be a literal (`1/1`).
-                let Val::Temp(loc_t) = loc else {
-                    unreachable!("acc address is a temp");
-                };
-                let kind = state
-                    .loc_kind(loc)
-                    .expect("acc location must be Addr-typed");
-                let elem = kind.value.clone();
-                let addr = flatten(&map[*loc_t]);
-                let perm_rt = match perm {
-                    Val::Temp(n) => map[*n].clone_tree(),
-                    Val::Literal(l) => RTree::Lit(l.clone()),
-                };
-                let perm = flatten(&perm_rt);
-                // Key the slot value by the acc's minted value e-class (logged),
-                // so a later `Deref` of it resolves to this `SlotValue(i)`.
-                let Some(HeapEvent::Acc { value }) = events.next() else {
-                    unreachable!("acc inst without a logged Acc event");
-                };
-                at.insert(ctx.egraph.find(*value), RTree::SlotValue(i));
-                footprint.push(SlotRecipe {
-                    kind,
-                    elem,
-                    addr,
-                    perm,
-                });
-            }
-            // Two-state resource entry / nested reconstruction: slot values project
-            // from the snapshot recipe (as in `purify_function`).
-            InstKind::Heap(HeapInst::FromSnap { resource, snap, .. }) => {
-                let Some(HeapEvent::FromSnap { values }) = events.next() else {
-                    unreachable!("FromSnap inst without a logged event");
-                };
-                let snap_rt = match snap {
-                    Val::Temp(n) => map[*n].clone_tree(),
-                    Val::Literal(l) => RTree::Lit(l.clone()),
-                };
-                let elems = slot_elems(ctx, *resource)?;
-                for (i, &value) in values.iter().enumerate() {
-                    let rt =
-                        snap_rt
-                            .clone_tree()
-                            .project_unwrap(ctx, *resource, i, elems[i].clone());
-                    at.insert(ctx.egraph.find(value), rt);
-                }
-            }
-            InstKind::Heap(HeapInst::Unfold { call, .. }) => {
-                let Some(HeapEvent::Unfold { consumed, values }) = events.next() else {
-                    unreachable!("Unfold inst without a logged event");
-                };
-                let s = at
-                    .get(&ctx.egraph.find(*consumed))
-                    .ok_or(VerifyError::Unimplemented(
-                        "purify: unfold of unheld predicate",
-                    ))?
-                    .clone_tree();
-                let elems = slot_elems(ctx, call.resource)?;
-                for (j, &value) in values.iter().enumerate() {
-                    let rt = s
-                        .clone_tree()
-                        .project_unwrap(ctx, call.resource, j, elems[j].clone());
-                    at.insert(ctx.egraph.find(value), rt);
-                }
-            }
-            InstKind::Heap(_) => {
-                return Err(VerifyError::Unimplemented(
-                    "purify: unsupported heap inst in resource",
-                ));
-            }
-            // Contract-stitched assume/assert produce no value and don't affect the
-            // body result; drop them.
-            InstKind::Assume(_) | InstKind::Assert(_) => {}
-            InstKind::Refute(_) => unreachable!("resource body may not contain refute"),
-        }
-    }
-
-    // The body boolean is the second component of the result tuple.
-    let bool_rt = match &body.res.1 {
-        Val::Temp(n) => map[*n].clone_tree(),
-        Val::Literal(l) => RTree::Lit(l.clone()),
-    };
-    Ok(ResourceDefinition {
-        footprint,
-        bool: flatten(&bool_rt),
-    })
 }
 
 /// Proof obligations implied by an instruction's kind, as `(goal, error)` pairs

@@ -56,12 +56,11 @@ pub(crate) struct VerifyContext<'a> {
     /// (see `rewrite::function_rule`). `None` in isolated contexts (unit tests)
     /// that never evaluate a `FunctionCall`.
     pub(crate) fn_certs: Option<&'a HashMap<MemberId, std::sync::Arc<FunctionDefinition>>>,
-    /// Ordered log of heap-reconstruction events (`FromSnap`/`Unfold` slot
-    /// addresses), recorded during a **function** body walk so the post-walk
-    /// purification pass can rebuild each `Deref`'s value as a pure recipe term
-    /// (`unwrap(proj_i(snap))`). `None` for methods and resources — they never
-    /// purify. See `declaration::purify_function`.
-    pub(crate) heap_events: Option<Vec<crate::verify::declaration::HeapEvent>>,
+    /// The certificate recipe under construction, mirrored step-by-step by the
+    /// eval walk of a **function or resource** body (single walk — see
+    /// `cert::RecipeBuilder`). `None` for methods — they produce no
+    /// certificate, so the recipe machinery costs them nothing.
+    pub(crate) recipe: Option<crate::verify::cert::RecipeBuilder>,
     /// Fixpoint cache: the rule tier the live e-graph is known saturated under,
     /// with the rule-set sizes that saturation saw (ADT rules and axiom rules
     /// grow mid-unit; a grown set invalidates the fixpoint). `None` when any
@@ -104,7 +103,7 @@ impl<'a> VerifyContext<'a> {
             fresh_types: HashMap::new(),
             func_ret_types: HashMap::new(),
             fn_certs: None,
-            heap_events: None,
+            recipe: None,
             clean: None,
         }
     }

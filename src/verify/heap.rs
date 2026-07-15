@@ -39,11 +39,27 @@ pub struct Chunk {
     pub(crate) addr: egg::Id,
     pub(crate) perm: egg::Id,
     pub(crate) value: egg::Id,
+    /// Recipe provenance of `value` — the recipe-space temp a certificate walk
+    /// (function/resource verification) associates with the held value, so a
+    /// later `Deref` purifies to the pure term this chunk was produced from.
+    /// `None` in method bodies (no recipe is built) and for values without a
+    /// pure recipe (fresh, merged).
+    pub(crate) recipe: Option<crate::vmir::Val>,
 }
 
 impl Chunk {
     pub fn new(addr: egg::Id, perm: egg::Id, value: egg::Id) -> Self {
-        Self { addr, perm, value }
+        Self {
+            addr,
+            perm,
+            value,
+            recipe: None,
+        }
+    }
+
+    pub fn with_recipe(mut self, recipe: Option<crate::vmir::Val>) -> Self {
+        self.recipe = recipe;
+        self
     }
 }
 
