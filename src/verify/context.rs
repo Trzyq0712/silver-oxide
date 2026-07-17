@@ -435,7 +435,7 @@ impl<'a> VerifyContext<'a> {
             )
         }) {
             let probe = self.egraph.clone();
-            let proven = self.split_prove(&probe, goal, &[goal]);
+            let proven = self.tier35(&probe, goal) || self.split_prove(&probe, goal, &[goal]);
             if proven {
                 self.union(imp, true_);
                 self.egraph.rebuild();
@@ -470,6 +470,9 @@ impl<'a> VerifyContext<'a> {
             let probe = self.run_probe(probe);
             if probe.find(goal) == probe.find(true_p) {
                 true
+            } else if self.tier35(&probe, goal) {
+                // Tier 3.5: non-forking ite-goal decomposition.
+                true
             } else {
                 // Tier 4: prove by case analysis on an ite condition.
                 let roots: Vec<egg::Id> = std::iter::once(goal)
@@ -485,6 +488,93 @@ impl<'a> VerifyContext<'a> {
             self.egraph.rebuild();
         }
         proven
+    }
+
+    /// Tier 3.5 — **non-forking `ite`-goal decomposition**. When the goal's
+    /// class holds an `ite` with a *`true` constant arm*, that arm's world is
+    /// already discharged, so the goal reduces to proving the **other** arm
+    /// under the corresponding condition polarity — **one** probe, never a fork:
+    ///
+    /// - `ite(c, true, e)  ⟸  e` proven under `¬c`
+    /// - `ite(c, e, true)  ⟸  e` proven under `c`   (this is `c ⟹ e`, i.e. a
+    ///   guarded fact / implication under a branch)
+    ///
+    /// Unlike a syntactic reader (which `ite-reduce` already subsumes), this
+    /// *assumes* the one condition and re-saturates the single surviving arm —
+    /// half of a tier-4 split, with the split variable read off the goal rather
+    /// than searched, and only one branch explored. It then loops on the
+    /// surviving arm, so a nested guard chain `c₁ ⟹ c₂ ⟹ … ⟹ φ` telescopes
+    /// by accumulating assumptions, one per iteration. The two `false`-constant
+    /// shapes are omitted: they need `¬c`/`c` to hold outright (a conjunction,
+    /// not an assumption), which `ite-reduce` + saturation already deliver.
+    ///
+    /// Terminates without a depth cap: each iteration assumes one
+    /// *previously-unknown* condition, and the e-graph has finitely many; the
+    /// `assumed` set makes that explicit and stops a re-pick that would not make
+    /// progress. `SILVER_OXIDE_NO_TIER35=1` disables it.
+    fn tier35(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
+        if std::env::var_os("SILVER_OXIDE_NO_TIER35").is_some() {
+            return false;
+        }
+        // One working graph threaded across the chain, so its ids stay stable
+        // and `assumed` (a set of condition classes) is a sound progress guard.
+        let mut work = probe.clone();
+        let mut goal = goal;
+        let mut assumed: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
+        loop {
+            let g = work.find(goal);
+            if Self::known_bool_class(&work, g, true) {
+                self.alloc.stats.prove_tier35 += 1;
+                return true;
+            }
+            // Pick a `true`-constant-arm ite: the surviving arm is the *other*
+            // branch, to be proven under the condition that reaches it.
+            let mut plan: Option<(egg::Id, bool, egg::Id)> = None;
+            for node in &work[g].nodes {
+                let Symbolic::Ite([c, x, y]) = node else {
+                    continue;
+                };
+                let (c, x, y) = (work.find(*c), work.find(*x), work.find(*y));
+                // Prefer the positive implication `c ⟹ e` (assume `c`, the
+                // as-written direction) over its negated dual `¬c ⟹ e`.
+                if Self::known_bool_class(&work, y, true) {
+                    plan = Some((c, true, x)); // ite(c, e, true) ⟸ e under c
+                    break;
+                }
+                if Self::known_bool_class(&work, x, true) {
+                    plan = Some((c, false, y)); // ite(c, true, e) ⟸ e under ¬c
+                    break;
+                }
+            }
+            let Some((cond, want, branch)) = plan else {
+                return false;
+            };
+            // If the condition already can't take `want`, the constant-`true`
+            // arm is the only reachable one — the goal holds outright.
+            if Self::known_bool_class(&work, cond, !want) {
+                self.alloc.stats.prove_tier35 += 1;
+                return true;
+            }
+            // Progress guard: assuming a condition already assumed on this chain
+            // would re-saturate an identical graph — give up instead of looping.
+            if !assumed.insert(work.find(cond)) {
+                return false;
+            }
+            let lit = work.add(Symbolic::Lit(Literal::Bool(want)));
+            work.union(cond, lit);
+            work.rebuild();
+            work = self.run_probe(work);
+            goal = branch;
+        }
+    }
+
+    /// Whether e-class `id` folds to the boolean literal `b` in `probe`.
+    fn known_bool_class(
+        probe: &egg::EGraph<Symbolic, ConstFold>,
+        id: egg::Id,
+        b: bool,
+    ) -> bool {
+        matches!(probe[probe.find(id)].data.known(), Some(Literal::Bool(v)) if *v == b)
     }
 
     /// Whether a saturated probe discharges `goal`: either the goal is merged

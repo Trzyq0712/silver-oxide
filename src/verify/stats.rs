@@ -48,6 +48,9 @@ pub struct VerifyStats {
     /// clone+saturate path (the clearest deterioration signal).
     pub prove_calls: u64,
     pub prove_tier3: u64,
+    /// Goals discharged by tier 3.5 — non-forking `ite`-goal decomposition
+    /// (a constant branch reduces the goal to its other branch, no case split).
+    pub prove_tier35: u64,
     /// Goals that escalated to the tier-4 case split, and how many were proven
     /// by it.
     pub prove_tier4: u64,

@@ -1,0 +1,21 @@
+// Tier 3.5 — non-forking ite-goal decomposition (verify/context.rs `tier35`).
+//
+// The goal `x == y ==> f(x) == f(y)` desugars to `ite(x==y, f(x)==f(y), true)`.
+// Plain saturation cannot close it: with `x==y` an unknown boolean the `ite`
+// stays (condition unknown, arms differ), and `f(x)`, `f(y)` sit in separate
+// classes. Proving it needs the antecedent *assumed* — then congruence merges
+// `x`,`y`, hence `f(x) ≡ f(y)`, and the consequent holds.
+//
+// Tier 3.5 does exactly that WITHOUT a fork: it reads the `true` else-arm off
+// the goal, assumes the condition `x==y` (the positive `c ⟹ e` direction),
+// re-saturates the single surviving arm, and closes it — `prove_tier35: 1`,
+// `prove_tier4: 0`. Disable both tiers (`SILVER_OXIDE_NO_TIER35=1
+// SILVER_OXIDE_NO_TIER4=1`) and this no longer verifies.
+domain D {
+  function f(x: Int): Int
+}
+
+method m(x: Int, y: Int)
+{
+  assert x == y ==> f(x) == f(y)
+}
