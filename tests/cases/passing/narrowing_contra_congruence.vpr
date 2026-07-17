@@ -1,0 +1,22 @@
+// Narrowing contrapositive congruence (verify/rewrite.rs `contra-congruence`).
+//
+// Congruence gives `a⃗ ≡ b⃗ ⟹ f(a⃗) ≡ f(b⃗)`. From a *disproven* n-ary
+// application equality whose argument pairs are all proven equal but ONE, the
+// contrapositive disjunction `a₁≠b₁ ∨ … ∨ aₙ≠bₙ` collapses to a unit — the lone
+// remaining pair must differ:
+//
+//   mk(p, q) != mk(p, r)   with p ≡ p (shared)   ⟹   q != r
+//
+// Sound for any function, injective or not (the contrapositive of congruence
+// needs no injectivity — unlike `inj_rule`, the forward proven-equal direction).
+// The old unary rule could not see through a 2-ary application; this is the
+// n-ary generalization that fires only when the disjunction is a unit clause.
+domain D {
+  function mk(a: Int, b: Int): D
+}
+
+method m(p: Int, q: Int, r: Int)
+{
+  inhale mk(p, q) != mk(p, r)
+  assert q != r
+}

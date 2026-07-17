@@ -345,25 +345,49 @@ fn static_rules() -> Vec<Rule> {
         // fused `ite-reduce` pass — they are `Ite`-bucket shapes conditioned on
         // the class's proven boolean, exactly what its applier already inspects.
     ]);
+    // Disequality reasoning over disproven `==` classes — pulled out of the old
+    // fused `eq-ite` applier into standalone rules (all share the `Eq` bucket +
+    // the `Known(false)` gate). Env gates for A/B measurement.
+    if std::env::var_os("SILVER_OXIDE_NO_MIRROR").is_none() {
+        rules.push(
+            Rewrite::new("eq-false-mirror", EqBucketSearcher, EqFalseMirrorApplier)
+                .expect("eq-false-mirror rule"),
+        );
+    }
+    if std::env::var_os("SILVER_OXIDE_NO_CONTRA").is_none() {
+        rules.push(
+            Rewrite::new(
+                "contra-congruence",
+                EqBucketSearcher,
+                ContraCongruenceApplier { memo: Memo::new() },
+            )
+            .expect("contra-congruence rule"),
+        );
+    }
     rules.extend(distributive_ite_rules());
     rules
 }
 
 /// Rules that push down the builtin operators into the ite branches.
 fn distributive_ite_rules() -> Vec<Rule> {
-    vec![
-        // EQ distribution lives in the guarded `eq-ite` rule below (unguarded
-        // pattern forms blow the graph up ~75x on real programs: every pair of
-        // ite-towers under an `==` cross-multiplies).
-        Rewrite::new(
-            "eq-ite",
-            EqBucketSearcher,
-            EqIteDistributeApplier {
-                memo: Memo::new(),
-                contra_memo: Memo::new(),
-            },
-        )
-        .expect("eq-ite rule"),
+    // EXPERIMENT: distributive ite rules disabled to measure their effect.
+    // NO_DISTRIB kills both; NO_EQITE / NO_LTITE kill one each.
+    let no_distrib = std::env::var_os("SILVER_OXIDE_NO_DISTRIB").is_some();
+    let mut rules = vec![];
+    if !no_distrib && std::env::var_os("SILVER_OXIDE_NO_EQITE").is_none() {
+        // EQ unit-propagation through ite towers (unguarded pattern forms blow
+        // the graph up ~75x on real programs: every pair of ite-towers under an
+        // `==` cross-multiplies — see the applier doc).
+        rules.push(
+            Rewrite::new(
+                "eq-ite",
+                EqBucketSearcher,
+                EqIteDistributeApplier { memo: Memo::new() },
+            )
+            .expect("eq-ite rule"),
+        );
+    }
+    if !no_distrib && std::env::var_os("SILVER_OXIDE_NO_LTITE").is_none() {
         // LT distribution. Load-bearing: CFG linearization encodes a
         // conditional inhale/exhale as a *scaled permission* `c ? p : 0`, so
         // the permission ≥ 0 obligation of such an instruction is a `<`
@@ -371,8 +395,12 @@ fn distributive_ite_rules() -> Vec<Rule> {
         // to the tower's leaves in ONE application (each leaf comparison
         // const-folds, then `ite-reduce` collapses the rebuilt tower), instead
         // of one level per saturation iteration.
-        Rewrite::new("lt-ite", LtBucketSearcher, LtIteDistributeApplier { memo: Memo::new() })
-            .expect("lt-ite rule"),
+        rules.push(
+            Rewrite::new("lt-ite", LtBucketSearcher, LtIteDistributeApplier { memo: Memo::new() })
+                .expect("lt-ite rule"),
+        );
+    }
+    rules.extend(vec![
         // // MULT rules
         // rw!("mult-ite-l"; "(* (ite ?c ?x ?y) ?z)" => "(ite ?c (* ?x ?z) (* ?y ?z))"),
         // rw!("mult-ite-r"; "(* ?z (ite ?c ?x ?y))" => "(ite ?c (* ?z ?x) (* ?z ?y))"),
@@ -384,7 +412,8 @@ fn distributive_ite_rules() -> Vec<Rule> {
         // rw!("minus-ite-r"; "(- ?z (ite ?c ?x ?y))" => "(ite ?c (- ?z ?x) (- ?z ?y))"),
         // // REAL rules
         // rw!("real-ite"; "(real (ite ?c ?x ?y))" => "(ite ?c (real ?x) (real ?y))"),
-    ]
+    ]);
+    rules
 }
 
 /// Terminating `ite` simplifications. Shared by the saturation rule set and the
@@ -675,7 +704,150 @@ impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
     }
 }
 
-/// Applier for `eq-ite`: unit propagation through an `ite` operand of a
+/// Applier for `eq-false-mirror`: **disequality symmetry**. A disproven
+/// `a == b` implies the mirrored `b == a` is false too — land it in the same
+/// class so a goal built in the other operand order (Prusti's
+/// `requires 0 != value(arg2)` vs a div obligation's `Eq(b, 0)`) sees the known
+/// boolean. Proven equalities need no mirror — `eq-true-union` merges the args
+/// and congruence collapses both orders. Standalone (was fused into `eq-ite`);
+/// shares the `Eq`-bucket searcher and the `Known(false)` gate.
+struct EqFalseMirrorApplier;
+
+impl Applier<Symbolic, ConstFold> for EqFalseMirrorApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        if known_bool(egraph, eclass) != Some(false) {
+            return vec![];
+        }
+        let mirrors: Vec<[Id; 2]> = egraph[eclass]
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Symbolic::Binary(BinOp::Eq, [l, r]) if l != r => Some([*r, *l]),
+                _ => None,
+            })
+            .collect();
+        let mut changed = Vec::new();
+        for [r, l] in mirrors {
+            let mirrored = egraph.add(Symbolic::Binary(BinOp::Eq, [r, l]));
+            if egraph.union(eclass, mirrored) {
+                changed.push(egraph.find(eclass));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Applier for `contra-congruence`: **narrowing contrapositive congruence**.
+/// Congruence gives `a⃗ ≡ b⃗ ⟹ f(a⃗) ≡ f(b⃗)`; its contrapositive, from a
+/// *disproven* `f(a⃗) == f(b⃗)` with `f` **n-ary**, is the disjunction
+/// `a₁≠b₁ ∨ … ∨ aₙ≠bₙ`. An e-graph cannot hold a disjunction of disequalities
+/// (it would have to case-split on *which* argument differs — the true/false
+/// asymmetry), so we fire **only when the disjunction collapses to a unit**:
+/// when every argument pair but one is already proven equal (`aᵢ ≡ bᵢ`), the
+/// lone remaining pair must differ — `aⱼ == bⱼ` is false. The unary rule is the
+/// zero-other-args case of this. Sound for **any** `f`, injective or not — the
+/// contrapositive of congruence needs no injectivity (that is what distinguishes
+/// it from [`inj_rule`], which runs the *forward*, proven-equal direction and so
+/// requires a free constructor).
+///
+/// This is the only sound disequality inference through a function, and it flows
+/// backward only. Connects an unboxed comparison to its boxed source:
+/// `value(v) != 0` with the axiom instance `value(cons(0)) ≡ 0` in `0`'s class
+/// disproves `v == cons(0)`, which then (a) feeds `eq-ite`'s ite unit
+/// propagation when `v` is an ite of constructions, and (b) collapses a
+/// predicate-body disjunction tower `ite(v == cons(0), true, rest) ≡ true` down
+/// to its live arm via `ite-reduce`. Standalone (was fused into `eq-ite`);
+/// demand-driven — only same-function applications straddling an
+/// already-disproven equality, and only when exactly one argument pair differs.
+struct ContraCongruenceApplier {
+    /// Cost guard, keyed by the function and the canonical argument pair it
+    /// disproved (re-deriving is idempotent — the unions no-op).
+    memo: Memo<(FuncId, [Id; 2])>,
+}
+
+impl Applier<Symbolic, ConstFold> for ContraCongruenceApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        if known_bool(egraph, eclass) != Some(false) {
+            return vec![];
+        }
+        let mut contras: Vec<[Id; 2]> = Vec::new();
+        for node in &egraph[eclass].nodes {
+            let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
+                continue;
+            };
+            let (l, r) = (egraph.find(*l), egraph.find(*r));
+            for lapp in &egraph[l].nodes {
+                let Symbolic::FuncApp(lf, ltys, largs) = lapp else {
+                    continue;
+                };
+                for rapp in &egraph[r].nodes {
+                    let Symbolic::FuncApp(rf, rtys, rargs) = rapp else {
+                        continue;
+                    };
+                    if lf != rf || ltys != rtys || largs.len() != rargs.len() {
+                        continue;
+                    }
+                    // Narrowing: collect the argument positions that are not yet
+                    // proven equal. If exactly one differs, the disjunction is a
+                    // unit — that pair must be disequal. Zero differing means the
+                    // apps are congruent (`ConstFold` handles the resulting
+                    // `Known(false)` == congruent-true conflict); two or more is a
+                    // genuine disjunction the e-graph cannot represent, so skip.
+                    let mut diff: Option<[Id; 2]> = None;
+                    let mut multiple = false;
+                    for (la, ra) in largs.iter().zip(rargs.iter()) {
+                        let (a, b) = (egraph.find(*la), egraph.find(*ra));
+                        if a != b {
+                            if diff.is_some() {
+                                multiple = true;
+                                break;
+                            }
+                            diff = Some([a, b]);
+                        }
+                    }
+                    if let (false, Some([a, b])) = (multiple, diff)
+                        && self.memo.insert((*lf, [a, b]))
+                    {
+                        contras.push([a, b]);
+                    }
+                }
+            }
+        }
+        let mut changed = Vec::new();
+        for [a, b] in contras {
+            let eq = egraph.add(Symbolic::Binary(BinOp::Eq, [a, b]));
+            let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+            if egraph.union(eq, false_) {
+                changed.push(egraph.find(eq));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Applier for `eq-ite`: **unit propagation through an `ite` operand** of a
 /// **disproven** equality. From `(ite c x y) == z` proven `false` (an assumed
 /// `d != tag`) with one arm already equal to `z`:
 ///
@@ -686,7 +858,8 @@ impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
 /// The second consequence recurses down a nested ite tower (a 3+-variant enum
 /// discriminator), and two assumed disequalities that pin `c` both ways make
 /// the graph inconsistent — which is exactly enum-match exhaustiveness
-/// (`assert false` after excluding every tag).
+/// (`assert false` after excluding every tag). The disproven inputs are fed by
+/// `contra-congruence` (boxed discriminators) or an assumed `d != tag` directly.
 ///
 /// Deliberately **not** implemented as syntactic distribution
 /// (`(ite c x y) == z ⇒ ite c (x==z) (y==z)`): the pattern form cross-multiplies
@@ -697,9 +870,6 @@ struct EqIteDistributeApplier {
     /// Cost guard: one derivation per canonical `[c, x, y, z]` quadruple
     /// (re-deriving is idempotent — the unions no-op).
     memo: Memo<[Id; 4]>,
-    /// Cost guard for the contrapositive-congruence derivation, keyed by the
-    /// function and the canonical argument pair it disproved.
-    contra_memo: Memo<(FuncId, [Id; 2])>,
 }
 
 impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
@@ -713,79 +883,6 @@ impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
     ) -> Vec<Id> {
         if known_bool(egraph, eclass) != Some(false) {
             return vec![];
-        }
-        // Symmetry for *disproven* equalities: land the mirrored node in the
-        // same class, so a goal built in the other argument order (Prusti's
-        // `requires 0 != value(arg2)` vs the div obligation's `Eq(b, 0)`) sees
-        // the known boolean. Proven equalities need no mirror — `eq-true-union`
-        // merges the args and congruence collapses both orders.
-        let mirrors: Vec<[Id; 2]> = egraph[eclass]
-            .nodes
-            .iter()
-            .filter_map(|n| match n {
-                Symbolic::Binary(BinOp::Eq, [l, r]) if l != r => Some([*r, *l]),
-                _ => None,
-            })
-            .collect();
-        let mut mirror_changed = Vec::new();
-        for [r, l] in mirrors {
-            let mirrored = egraph.add(Symbolic::Binary(BinOp::Eq, [r, l]));
-            if egraph.union(eclass, mirrored) {
-                mirror_changed.push(egraph.find(eclass));
-            }
-        }
-        // Unary push-down: an operand of the disproven equality that is a
-        // unary application over an `ite` — Prusti's domain-boxed enum
-        // discriminator, `value(ite(c, cons(1), cons(0)))` where `value`/`cons`
-        // are *axiom*-defined domain functions (not ADT ctor/proj, so the
-        // projection reduction can't see through) — commutes into the branches:
-        // `f(ite(c, a, b)) ≡ ite(c, f(a), f(b))`. The pushed arms hash-cons
-        // onto the axiom instances (`value(cons(1)) ≡ 1`), which is what lets
-        // the unit propagation below pin the condition. Demand-driven (only
-        // under a disproven equality), so no guard-tower blowup.
-        // Contrapositive congruence: congruence says `a ≡ b ⟹ f(a) ≡ f(b)`,
-        // so from a *disproven* `f(a) == f(b)` (with `f` unary — the single
-        // argument is the only thing that can differ) conclude `a == b` is
-        // false. This is what connects an unboxed comparison to its boxed
-        // source: `value(v) != 0` with the axiom instance `value(cons(0)) ≡ 0`
-        // in `0`'s class disproves `v == cons(0)`, which (a) feeds the ite
-        // unit propagation below when `v` is an ite of constructions, and
-        // (b) collapses a predicate-body disjunction tower
-        // `ite(v == cons(0), true, rest) ≡ true` down to its live arm via
-        // `ite-reduce`. Demand-driven: only pairs of same-function unary
-        // applications straddling an already-disproven equality.
-        let mut contras: Vec<[Id; 2]> = Vec::new();
-        for node in &egraph[eclass].nodes {
-            let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
-                continue;
-            };
-            let (l, r) = (egraph.find(*l), egraph.find(*r));
-            for lapp in &egraph[l].nodes {
-                let Symbolic::FuncApp(lf, ltys, largs) = lapp else {
-                    continue;
-                };
-                let [a] = largs.as_ref() else { continue };
-                for rapp in &egraph[r].nodes {
-                    let Symbolic::FuncApp(rf, rtys, rargs) = rapp else {
-                        continue;
-                    };
-                    let [b] = rargs.as_ref() else { continue };
-                    if lf != rf || ltys != rtys {
-                        continue;
-                    }
-                    let (a, b) = (egraph.find(*a), egraph.find(*b));
-                    if a != b && self.contra_memo.insert((*lf, [a, b])) {
-                        contras.push([a, b]);
-                    }
-                }
-            }
-        }
-        for [a, b] in contras {
-            let eq = egraph.add(Symbolic::Binary(BinOp::Eq, [a, b]));
-            let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
-            if egraph.union(eq, false_) {
-                mirror_changed.push(egraph.find(eq));
-            }
         }
         // Unit propagation, driven **to the bottom of the tower in one
         // application**: disproving one arm's comparison exposes the next
@@ -801,7 +898,7 @@ impl Applier<Symbolic, ConstFold> for EqIteDistributeApplier {
             work.push((egraph.find(*l), egraph.find(*r)));
             work.push((egraph.find(*r), egraph.find(*l)));
         }
-        let mut changed = mirror_changed;
+        let mut changed = Vec::new();
         while let Some((ite_side, z)) = work.pop() {
             // Collect this level's derivations (node inspection needs `&egraph`).
             let mut derivs: Vec<(Id, bool, Id)> = Vec::new();

@@ -1,0 +1,22 @@
+// Soundness guard for narrowing contrapositive congruence
+// (verify/rewrite.rs `contra-congruence`).
+//
+// When TWO argument pairs may differ, a disproven application equality yields
+// only the DISJUNCTION, not any individual disequality:
+//
+//   mk(p, q) != mk(s, t)   ⟹   p != s  ∨  q != t     (NOT `q != t`)
+//
+// Concluding `q != t` here would need a case split the e-graph cannot do — the
+// true/false asymmetry. `contra-congruence` fires only when exactly one pair is
+// not yet proven equal, so it must NOT derive this assert. This case therefore
+// MUST be rejected; if it ever verifies, the narrowing guard has broken and the
+// rule has become unsound.
+domain D {
+  function mk(a: Int, b: Int): D
+}
+
+method m2(p: Int, q: Int, s: Int, t: Int)
+{
+  inhale mk(p, q) != mk(s, t)
+  assert q != t
+}
