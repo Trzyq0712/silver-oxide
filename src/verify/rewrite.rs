@@ -345,6 +345,23 @@ fn static_rules() -> Vec<Rule> {
         // fused `ite-reduce` pass — they are `Ite`-bucket shapes conditioned on
         // the class's proven boolean, exactly what its applier already inspects.
     ]);
+    // General same-condition context pruning. Unconditional identities (the inner
+    // `?c` is the outer condition's e-class): inside the then-branch the condition
+    // is true, inside the else-branch it is false. Strictly reduce ite nesting
+    // depth → terminating. They generalize the ad-hoc nested shapes in `ite-reduce`
+    // and collapse a *select*-shaped permission (heap-join model) to `1/1` with no
+    // case split — turning a tier-4 split into ~5 local rewrites on the select
+    // tower. But they search every ite-bucket class each iteration and roughly
+    // *double* wall time on the additive-thread benchmarks we run today (~2s → ~4s
+    // on `structs_enums.vpr`), which never produce the select shape, so they are
+    // **opt-in** (`SILVER_OXIDE_PRUNE_ITE`) until the heap-join lowering that emits
+    // selects lands. See `presentation/why_switch_architecture.typ`.
+    if std::env::var_os("SILVER_OXIDE_PRUNE_ITE").is_some() {
+        rules.extend(vec![
+            rw!("ite-then-context"; "(ite ?c (ite ?c ?a ?b) ?e)" => "(ite ?c ?a ?e)"),
+            rw!("ite-else-context"; "(ite ?c ?t (ite ?c ?a ?b))" => "(ite ?c ?t ?b)"),
+        ]);
+    }
     // Disequality reasoning over disproven `==` classes — pulled out of the old
     // fused `eq-ite` applier into standalone rules (all share the `Eq` bucket +
     // the `Known(false)` gate). Env gates for A/B measurement.
