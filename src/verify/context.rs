@@ -644,7 +644,14 @@ impl<'a> VerifyContext<'a> {
         if depth == 0 {
             return false;
         }
-        for cond in split_candidates(probe, roots) {
+        let candidates = split_candidates(probe, roots);
+        if crate::verify::viz::dump_perm_enabled() {
+            eprintln!(
+                "[split-dump] depth {depth}: {} candidates, budget {budget}",
+                candidates.len()
+            );
+        }
+        for cond in candidates {
             if *budget < 2 {
                 return false;
             }
@@ -667,6 +674,12 @@ impl<'a> VerifyContext<'a> {
                 }
             }
             if all_closed {
+                if crate::verify::viz::dump_perm_enabled() {
+                    eprintln!(
+                        "[split-dump] goal closed by splitting on:\n{}",
+                        crate::verify::viz::dump_term(self, cond, 4),
+                    );
+                }
                 return true;
             }
         }
@@ -682,6 +695,153 @@ impl<'a> VerifyContext<'a> {
     ) -> egg::EGraph<Symbolic, ConstFold> {
         let _scope = crate::verify::rewrite::ScratchScope::enter();
         self.saturate_flat(probe)
+    }
+
+    /// Collapse a permission **sum of `ite`s that share conditions** into a
+    /// single nested `ite`, by repeatedly applying the sound identity
+    /// `ite(c, a, x) + ite(c, b, y) ≡ ite(c, a+b, x+y)` (and the const-folding
+    /// `k + ite(...)`). This is what a CFG join over an N-arm `match` needs: the
+    /// held permission is a nested **indicator partition**
+    /// `ite(c_0, 1, ite(c_1, 1, … 0))`-shaped sum with one summand per arm, and
+    /// merging the same-condition summands collapses it to `ite(∨c_k, 1, 0)` in
+    /// O(N) steps — the exact permission the exit exhale needs, discharged
+    /// **without any case split** and scaling to any arm count.
+    ///
+    /// Returns a value-equal e-class built fresh (not unioned into `id`), so it
+    /// is used only where asked (the failure path of a permission comparison),
+    /// never perturbing the live graph on passing code. `budget` caps added
+    /// nodes.
+    pub(crate) fn merge_ite_sum(&mut self, id: egg::Id, budget: &mut usize) -> egg::Id {
+        // Flatten the `+` spine into a list of summands (only `+`, not `-` —
+        // a partition is all-additive; a `-` summand is left opaque).
+        let mut summands = Vec::new();
+        self.flatten_plus(self.egraph.find(id), &mut summands, &mut Vec::new());
+        self.merge_summands(summands, budget)
+    }
+
+    fn flatten_plus(&self, id: egg::Id, out: &mut Vec<egg::Id>, seen: &mut Vec<egg::Id>) {
+        let id = self.egraph.find(id);
+        if seen.contains(&id) {
+            out.push(id);
+            return;
+        }
+        if self.egraph[id].data.known().is_some() {
+            out.push(id);
+            return;
+        }
+        seen.push(id);
+        // A class holding an `ite` node is a partition **summand leaf** — do not
+        // descend a `+` node it may also hold (that `+` is cancellation residue,
+        // e.g. `x = (x - p) + p`, often self-referential; descending it pulls a
+        // spurious zero-valued term into the sum and defeats the collapse).
+        let has_ite = self
+            .egraph[id]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::Ite(_)));
+        let plus = if has_ite {
+            None
+        } else {
+            self.egraph[id].nodes.iter().find_map(|n| match n {
+                Symbolic::Binary(BinOp::Plus, k) => Some(*k),
+                _ => None,
+            })
+        };
+        match plus {
+            Some([a, b]) => {
+                self.flatten_plus(a, out, seen);
+                self.flatten_plus(b, out, seen);
+            }
+            None => out.push(id),
+        }
+        seen.pop();
+    }
+
+    /// Sum a list of summands, merging any two that share an outer `ite`
+    /// condition via `ite(c,a,x)+ite(c,b,y) => ite(c, a+b, x+y)`, then recursing
+    /// into the merged arms. Const summands fold together.
+    fn merge_summands(&mut self, summands: Vec<egg::Id>, budget: &mut usize) -> egg::Id {
+        use num::BigRational;
+        // The outer `ite` condition of a class, if any (const classes = leaf).
+        let cond_of = |cx: &Self, x: egg::Id| -> Option<egg::Id> {
+            if cx.egraph[x].data.known().is_some() {
+                return None;
+            }
+            cx.egraph[x].nodes.iter().find_map(|n| match n {
+                Symbolic::Ite([c, _, _]) => Some(cx.egraph.find(*c)),
+                _ => None,
+            })
+        };
+        // Partition summands by their outer condition; const/opaque ones pool.
+        let mut const_sum = BigRational::from(num::BigInt::from(0));
+        let mut has_const = false;
+        let mut opaque: Vec<egg::Id> = Vec::new();
+        // Preserve first-seen order of conditions for a stable rebuild.
+        let mut groups: Vec<(egg::Id, Vec<egg::Id>)> = Vec::new();
+        for s in summands {
+            let s = self.egraph.find(s);
+            if let Some(Literal::Real(r)) = self.egraph[s].data.known() {
+                const_sum += r;
+                has_const = true;
+                continue;
+            }
+            match cond_of(self, s) {
+                Some(c) => match groups.iter_mut().find(|(gc, _)| *gc == c) {
+                    Some((_, v)) => v.push(s),
+                    None => groups.push((c, vec![s])),
+                },
+                None => opaque.push(s),
+            }
+        }
+        // Rebuild: sum of (per-condition merged ites) + opaque + const.
+        let mut terms: Vec<egg::Id> = Vec::new();
+        for (c, members) in groups {
+            if members.len() == 1 {
+                terms.push(members[0]);
+                continue;
+            }
+            if *budget == 0 {
+                // Out of budget: fall back to a plain (unmerged) sum of the
+                // members themselves — value-equal by construction. (Summing
+                // their *then* arms is NOT: it drops the conditions and the
+                // else sides.)
+                let mut acc = members[0];
+                for &m in &members[1..] {
+                    acc = self.add(Symbolic::Binary(BinOp::Plus, [acc, m]));
+                }
+                terms.push(acc);
+                continue;
+            }
+            // Merge all same-condition members: collect their then/else arms,
+            // recurse on each side.
+            let mut thens = Vec::new();
+            let mut elses = Vec::new();
+            for m in members {
+                if let Some((_, t, e)) = self.egraph[m].nodes.iter().find_map(|n| match n {
+                    Symbolic::Ite([mc, t, e]) if self.egraph.find(*mc) == c => Some((*mc, *t, *e)),
+                    _ => None,
+                }) {
+                    thens.push(t);
+                    elses.push(e);
+                }
+            }
+            *budget = budget.saturating_sub(1);
+            let t = self.merge_summands(thens, budget);
+            let e = self.merge_summands(elses, budget);
+            terms.push(self.add(Symbolic::Ite([c, t, e])));
+        }
+        terms.extend(opaque);
+        if has_const {
+            terms.push(self.add(Symbolic::Lit(Literal::Real(const_sum))));
+        }
+        if terms.is_empty() {
+            return self.add(Symbolic::Lit(Literal::Real(BigRational::from(num::BigInt::from(0)))));
+        }
+        let mut acc = terms[0];
+        for &t in &terms[1..] {
+            acc = self.add(Symbolic::Binary(BinOp::Plus, [acc, t]));
+        }
+        acc
     }
 
     /// Resolve which of `chunks` sits at address `addr`, consulting aliasing
@@ -782,6 +942,16 @@ fn split_candidates(probe: &egg::EGraph<Symbolic, ConstFold>, roots: &[egg::Id])
         if !visited.insert(id) {
             continue;
         }
+        // A class with a known constant value is opaque to the split search:
+        // its nodes are equalities/arithmetic *residue* (e.g. the `1/1` class
+        // accretes every cancelled borrow/give-back pair `(x−p)+p`), and no
+        // condition reachable only through it can change the goal — the value
+        // here is already decided. Descending it floods the candidate list
+        // (its residue grows with program size, pushing the useful candidate
+        // past the split budget — the N=20 match-arm cliff).
+        if probe[id].data.known().is_some() {
+            continue;
+        }
         for node in &probe[id].nodes {
             if let Symbolic::Ite([c, _, _]) = node {
                 let c = probe.find(*c);
@@ -804,12 +974,16 @@ fn run_rules<'r>(
     rules: impl IntoIterator<Item = &'r egg::Rewrite<Symbolic, ConstFold>>,
     iter_limit: Option<usize>,
 ) -> (egg::EGraph<Symbolic, ConstFold>, Vec<egg::Iteration<()>>) {
+    // Explicit limits: egg's defaults (30 iterations, 10k nodes) are SILENT
+    // truncation points — a run that hits one simply stops mid-saturation and
+    // the caller sees an ordinary "not proven", which surfaced as a false
+    // insufficient-permission at ~20 match arms (one tower level collapses per
+    // iteration, so deep-but-terminating collapses need iterations ∝ depth).
     let mut runner = egg::Runner::default()
         .with_scheduler(egg::SimpleScheduler)
+        .with_node_limit(100_000)
+        .with_iter_limit(iter_limit.unwrap_or(100))
         .with_egraph(egraph);
-    if let Some(limit) = iter_limit {
-        runner = runner.with_iter_limit(limit);
-    }
     let runner = runner.run(rules);
     (runner.egraph, runner.iterations)
 }

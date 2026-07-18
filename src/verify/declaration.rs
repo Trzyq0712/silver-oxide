@@ -501,6 +501,27 @@ fn merge_chunks(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Chunk {
     let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p0, p1]));
+    // Eagerly collapse an indicator-partition sum (`ite(c,a,x) + ite(c,b,y)`)
+    // instead of letting the tower accrete one level per merge — a borrow /
+    // give-back cycle per match arm otherwise leaves the held permission as a
+    // depth-N sum that every later check has to repair on its failure path.
+    // The collapsed form is unioned in, so the stored class const-folds back
+    // to the flat amount (e.g. `1/1`) as soon as the parts are known. Only
+    // attempted when a branch-scaled (`ite`) fraction is in play — a plain
+    // constant/opaque sum has nothing to merge.
+    let has_ite = |cx: &VerifyContext<'_>, x: egg::Id| {
+        cx.egraph[x]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Symbolic::Ite(_)))
+    };
+    if has_ite(ctx, p0) || has_ite(ctx, p1) {
+        let mut budget = 256;
+        let flat = ctx.merge_ite_sum(perm, &mut budget);
+        if flat != perm {
+            ctx.union(perm, flat);
+        }
+    }
 
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
         num::BigInt::from(0),
@@ -655,6 +676,73 @@ fn conj_args_eq(
     acc
 }
 
+/// The consolidating chunk lookup shared by [`heap_union`] and
+/// [`heap_subtract`]: find the chunk at `addr` (canonical-address match) in
+/// `kind`'s group, first re-merging any stored chunks whose addresses have
+/// *become* one e-class since insertion (a union learned later — e.g. an
+/// aliasing fact — splits the held permission invisibly across chunks; the
+/// permission checks only ever see one chunk, so the split loses permission).
+/// On a lookup miss, normalize once (`reduce`) and retry: a recipe-rebuilt
+/// snapshot address spine may only meet the held chunk's class after the
+/// terminating reductions collapse the snapshot towers, and the rebuild-time
+/// reduce is conditional on new e-nodes (see the dead-branch note below).
+///
+/// Returns the (possibly consolidated) heap and the chunk found at `addr`.
+///
+/// `retry_on_miss` gates the normalize-and-retry: a subtract miss is an error
+/// about to be reported (rare — always worth one `reduce`), while a union miss
+/// is the ordinary "first chunk at this location" case, where a per-inhale
+/// `reduce` is pure overhead.
+fn find_chunk_consolidated(
+    ctx: &mut VerifyContext<'_>,
+    h: &Heap,
+    kind: &LocationKind,
+    addr: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+    retry_on_miss: bool,
+) -> (Heap, Option<Chunk>) {
+    let mut canon = ctx.egraph.find(addr);
+    let matches = |ctx: &VerifyContext<'_>, h: &Heap, canon: egg::Id| -> Vec<Chunk> {
+        h.chunks_of(kind)
+            .iter()
+            .filter(|c| ctx.egraph.find(c.addr) == canon)
+            .cloned()
+            .collect()
+    };
+    let mut found = matches(ctx, h, canon);
+    if found.is_empty() && retry_on_miss {
+        // Miss: the subtracted address may be a recipe-rebuilt snapshot spine
+        // (`@addr(cons.0(f(.., Some(unwrap(proj_0(s))))))`) that only meets
+        // the held chunk's address after the terminating reductions collapse
+        // the snapshot towers. The rebuild-time reduce is conditional on new
+        // e-nodes, which misses when an earlier (e.g. dead-branch) occurrence
+        // already created them — so normalize once here and retry before
+        // reporting a miss.
+        ctx.reduce();
+        canon = ctx.egraph.find(addr);
+        found = matches(ctx, h, canon);
+    }
+    let Some(first) = found.first().cloned() else {
+        return (h.clone(), None);
+    };
+    if found.len() == 1 {
+        return (h.clone(), Some(first));
+    }
+    // Several stored chunks collapsed into one address class: fold them into
+    // one chunk (sound — they genuinely alias, so their fractions add and the
+    // golden-rule value agreement applies) and rewrite the group.
+    let mut out = h.clone();
+    let mut acc = first;
+    for next in &found[1..] {
+        out = out.without_chunk(kind, next.addr);
+        acc = merge_chunks(
+            ctx, acc.addr, acc.perm, acc.value, next.perm, next.value, pc_lits,
+        );
+    }
+    out = out.with_chunk(kind, acc.clone());
+    (out, Some(acc))
+}
+
 /// Heap addition for a single location chunk of kind `kind`.
 fn heap_union(
     ctx: &mut VerifyContext<'_>,
@@ -663,14 +751,7 @@ fn heap_union(
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Heap {
-    let mut out = h1.clone();
-    let addr = ctx.egraph.find(chunk2.addr);
-    // Find any congruent chunk already in this group (canonical-address match).
-    let existing = out
-        .chunks_of(kind)
-        .iter()
-        .find(|c| ctx.egraph.find(c.addr) == addr)
-        .cloned();
+    let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, false);
     if let Some(existing) = existing {
         // Replace the existing chunk in place (keep its stored address key).
         let merged = merge_chunks(
@@ -690,6 +771,77 @@ fn heap_union(
     out
 }
 
+/// Prove a permission comparison goal `Ite(Lt(a, b), false, true)` — i.e.
+/// `a ≥ b` (used both for exhale sufficiency, `held ≥ needed`, and for the
+/// `perm ≥ 0` side condition with `b = 0`). Tries the ordinary prover first;
+/// on failure, **collapses a nested indicator-partition sum** in each operand
+/// (`ite(c,a,x)+ite(c,b,y) => ite(c,a+b,x+y)`, [`VerifyContext::merge_ite_sum`])
+/// and retries.
+///
+/// This is the CFG-join fix: an N-arm `match` that converts a `&mut` back and
+/// forth threads all (mutually-exclusive) arms through one linearized heap, so
+/// a permission there is a sum of branch-scaled `ite` terms, one summand per
+/// arm. Its top node is `+`, which `lt-ite` cannot descend, and a tier-4 case
+/// split needs depth N (exponential in the arm count). Merging the
+/// same-condition summands collapses the whole partition to `ite(∨c_k, 1, 0)`
+/// in O(N) steps, and the comparison then discharges without a per-arm split,
+/// scaling to any arm count. Done only on the failure path so passing checks
+/// never add these nodes to the live graph.
+fn prove_perm_ineq(
+    ctx: &mut VerifyContext<'_>,
+    goal: egg::Id,
+    a: egg::Id,
+    b: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> bool {
+    if ctx.prove_under_pc(goal, pc_lits) {
+        return true;
+    }
+    let mut budget = 4096;
+    let a2 = ctx.merge_ite_sum(a, &mut budget);
+    let b2 = ctx.merge_ite_sum(b, &mut budget);
+    if a2 == a && b2 == b {
+        return false;
+    }
+    let false_ = ctx.false_();
+    let true_ = ctx.true_();
+    let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [a2, b2]));
+    let goal2 = ctx.add(Symbolic::Ite([lt, false_, true_]));
+    ctx.prove_under_pc(goal2, pc_lits)
+}
+
+/// Prove an obligation `goal` under `pc_lits`. If the goal is a permission
+/// comparison `Ite(Lt(a, b), false, true)` (the shape of every `perm ≥ 0` and
+/// sufficiency side condition) and the ordinary prover fails, retry with the
+/// nested indicator-partition sums in `a`/`b` collapsed — see
+/// [`prove_perm_ineq`]. For any other goal shape this is just `prove_under_pc`.
+fn prove_obligation(
+    ctx: &mut VerifyContext<'_>,
+    goal: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> bool {
+    if ctx.prove_under_pc(goal, pc_lits) {
+        return true;
+    }
+    // Destructure `Ite(Lt(a, b), false, true)` and retry via the merge fallback.
+    let lt = ctx.egraph[goal].nodes.iter().find_map(|n| match n {
+        Symbolic::Ite([c, t, e]) => {
+            let (t, e) = (ctx.egraph.find(*t), ctx.egraph.find(*e));
+            let is_false = matches!(ctx.egraph[t].data.known(), Some(Literal::Bool(false)));
+            let is_true = matches!(ctx.egraph[e].data.known(), Some(Literal::Bool(true)));
+            (is_false && is_true).then_some(ctx.egraph.find(*c))
+        }
+        _ => None,
+    });
+    let Some(lt) = lt else { return false };
+    let operands = ctx.egraph[lt].nodes.iter().find_map(|n| match n {
+        Symbolic::Binary(BinOp::Lt, [a, b]) => Some((*a, *b)),
+        _ => None,
+    });
+    let Some((a, b)) = operands else { return false };
+    prove_perm_ineq(ctx, goal, a, b, pc_lits)
+}
+
 /// Heap subtraction for a single location chunk of kind `kind`.
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
@@ -698,29 +850,7 @@ fn heap_subtract(
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
-    let mut out = h1.clone();
-    let mut addr = ctx.egraph.find(chunk2.addr);
-    let mut existing = out
-        .chunks_of(kind)
-        .iter()
-        .find(|c| ctx.egraph.find(c.addr) == addr)
-        .cloned();
-    if existing.is_none() {
-        // Miss: the subtracted address may be a recipe-rebuilt snapshot spine
-        // (`@addr(cons.0(f(.., Some(unwrap(proj_0(s))))))`) that only meets
-        // the held chunk's address after the terminating reductions collapse
-        // the snapshot towers. The rebuild-time reduce is conditional on new
-        // e-nodes, which misses when an earlier (e.g. dead-branch) occurrence
-        // already created them — so normalize once here and retry before
-        // failing.
-        ctx.reduce();
-        addr = ctx.egraph.find(chunk2.addr);
-        existing = out
-            .chunks_of(kind)
-            .iter()
-            .find(|c| ctx.egraph.find(c.addr) == addr)
-            .cloned();
-    }
+    let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
         // conditional footprint slot whose guard is false — a nested predicate
@@ -736,11 +866,21 @@ fn heap_subtract(
         return Err(VerifyError::InsufficientPermission);
     };
 
-    let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
     let false_ = ctx.false_();
     let true_ = ctx.true_();
+    let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
     let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-    if !ctx.prove_under_pc(goal, pc_lits) {
+    let proven = prove_perm_ineq(ctx, goal, existing.perm, chunk2.perm, pc_lits);
+    if !proven {
+        if crate::verify::viz::dump_perm_enabled() {
+            eprintln!(
+                "[perm-dump] insufficient at subtract in group {:?}\n\
+                 held.perm:\n{}needed.perm:\n{}",
+                kind.group,
+                crate::verify::viz::dump_term(ctx, existing.perm, 64),
+                crate::verify::viz::dump_term(ctx, chunk2.perm, 64),
+            );
+        }
         return Err(VerifyError::InsufficientPermission);
     }
 
@@ -1857,7 +1997,7 @@ fn check_forall_wd_in_scratch(
         pc_lits.extend(collect_pc_lits(ctx, &state, &inst.pc));
 
         for (goal, err) in inst_obligations(ctx, &state, &inst.kind, &pc_lits) {
-            if !ctx.prove_under_pc(goal, &pc_lits) {
+            if !prove_obligation(ctx, goal, &pc_lits) {
                 return Err(err);
             }
         }
@@ -1958,7 +2098,13 @@ fn walk_body(
         };
         let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
         for (goal, err) in inst_obligations(ctx, state, &inst.kind, &pc_lits) {
-            if !ctx.prove_under_pc(goal, &pc_lits) {
+            if !prove_obligation(ctx, goal, &pc_lits) {
+                if crate::verify::viz::dump_perm_enabled() {
+                    eprintln!(
+                        "[perm-dump] failed obligation goal:\n{}",
+                        crate::verify::viz::dump_term(ctx, goal, 64),
+                    );
+                }
                 let inst_text = inst_text(program);
                 if snap.enabled() {
                     let heaps = display_heaps(state, &inst.kind, heaps_before);
@@ -2586,6 +2732,66 @@ mod tests {
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
         assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v1));
         assert_eq!(merged.entries().count(), 1);
+    }
+
+    // Two chunks inserted at *distinct* addresses whose classes collapse
+    // later (an aliasing union learned after insertion): the consolidating
+    // lookup must re-merge them so a subtract sees the full held amount —
+    // first-match lookup only ever saw one 1/2 fragment and failed.
+    #[test]
+    fn subtract_consolidates_post_hoc_aliased_chunks() {
+        let interner = lasso::Rodeo::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0));
+        let b = ctx.add(Symbolic::Fresh(1));
+        let half = real(&mut ctx, 1, 2);
+        let (v0, v1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
+        let h = Heap::empty()
+            .with_chunk(&test_kind(), Chunk::new(a, half, v0))
+            .with_chunk(&test_kind(), Chunk::new(b, half, v1));
+        assert_eq!(h.entries().count(), 2);
+
+        // The aliasing fact arrives after both chunks are in the heap.
+        ctx.union(a, b);
+        ctx.egraph.rebuild();
+
+        let one = real(&mut ctx, 1, 1);
+        let out = heap_subtract(&mut ctx, &h, &test_kind(), Chunk::new(a, one, v0), &[])
+            .expect("full permission is held across the two aliased fragments");
+        // 1/2 + 1/2 − 1/1 = 0 const-folds → the emptied chunk is dropped.
+        assert_eq!(out.entries().count(), 0);
+    }
+
+    // The borrow / give-back cycle: a chunk whose permission was reduced to
+    // `1 − p` gets `p` unioned back in. The merged permission `(1 − p) + p`
+    // must land back in `1/1`'s class (the cancellation rewrite), so the next
+    // full-permission check is O(1) — the "regain full perm after a match arm"
+    // shape, with `p = ite(c, 1, 0)` a branch-scaled borrow.
+    #[test]
+    fn give_back_restores_full_permission() {
+        let interner = lasso::Rodeo::new();
+        let mut ctx = fresh_ctx(&interner);
+
+        let a = ctx.add(Symbolic::Fresh(0));
+        let c = ctx.add(Symbolic::Fresh(1));
+        let one = real(&mut ctx, 1, 1);
+        let zero = real(&mut ctx, 0, 1);
+        let p = ctx.add(Symbolic::Ite([c, one, zero]));
+        let rest = ctx.add(Symbolic::Binary(BinOp::Minus, [one, p]));
+        let (v0, v1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
+
+        let h = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, rest, v0));
+        let out = heap_union(&mut ctx, &h, &test_kind(), Chunk::new(a, p, v1), &[]);
+        let chunk = out
+            .chunk(&test_kind(), ctx.egraph.find(a))
+            .expect("merged chunk missing");
+        ctx.saturate();
+        assert_eq!(
+            ctx.egraph.find(chunk.perm),
+            ctx.egraph.find(one),
+            "(1 - p) + p must collapse back to the full permission"
+        );
     }
 
     #[test]
