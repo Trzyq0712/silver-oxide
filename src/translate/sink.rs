@@ -3,6 +3,8 @@
 //! uniform; how the resulting stream is interpreted is the caller's concern
 //! (resource delta+bool, method effects, function result).
 
+use std::collections::HashMap;
+
 use crate::vmir::{
     self, BinOp, HeapInst, HeapVal, Inst, InstKind, PathConds, Polarity, PureInst, ResourceCall,
     Sign, Type, Val, none,
@@ -39,6 +41,14 @@ pub(crate) struct Sink {
     /// onto a heapless obligation's `Inst` by the emitters. `None` outside any
     /// heap-bearing region (e.g. before the first heap is threaded).
     pub heap: Option<HeapVal>,
+    /// Value-numbering memo for **total** pure insts: an identical `(ty, inst)`
+    /// pair reuses the earlier temp instead of re-emitting. Keeps the VMIR for
+    /// nested control flow linear: a block's reach-cube conjunction left-folds,
+    /// so its prefix is a memo hit and each deeper block adds O(1) insts, and
+    /// the per-heap-op perm/value gating chains dedupe to once per block.
+    /// `Fresh` (nondeterministic) and the guarded emitters (pc-dependent
+    /// obligations) are never memoized.
+    memo: HashMap<(Type, PureInst), Val>,
 }
 
 impl Sink {
@@ -50,6 +60,7 @@ impl Sink {
             heap_count: heap_base,
             pc: Vec::new(),
             heap: None,
+            memo: HashMap::new(),
         }
     }
 
@@ -169,8 +180,20 @@ impl Sink {
     }
 
     /// Emit a **total** pure instruction (no side condition) — flat, no pc.
+    /// Deterministic insts are value-numbered (see [`Sink::memo`]): a repeat
+    /// `(ty, inst)` returns the earlier temp without emitting.
     pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
+        if inst == PureInst::Fresh {
+            let v = self.next_val_temp();
+            self.insts
+                .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
+            return v;
+        }
+        if let Some(v) = self.memo.get(&(ty.clone(), inst.clone())) {
+            return v.clone();
+        }
         let v = self.next_val_temp();
+        self.memo.insert((ty.clone(), inst.clone()), v.clone());
         self.insts
             .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
         v

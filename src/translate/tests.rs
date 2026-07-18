@@ -1297,3 +1297,24 @@ domain D {
         "the sibling has no nested forall"
     );
 }
+
+#[test]
+fn sink_value_numbers_total_pure_insts() {
+    use crate::translate::sink::Sink;
+    use vmir::{PureInst, Type, Val};
+
+    let mut sink = Sink::new(0, 0);
+    let a = sink.emit_pure(Type::Bool, PureInst::Fresh);
+    let b = sink.emit_pure(Type::Bool, PureInst::Fresh);
+    assert_ne!(a, b, "each fresh is a distinct value");
+
+    let t1 = sink.emit_pure(
+        Type::Bool,
+        PureInst::Ternary(a.clone(), b.clone(), vmir::FALSE),
+    );
+    let n = sink.insts.len();
+    let t2 = sink.emit_pure(Type::Bool, PureInst::Ternary(a, b, vmir::FALSE));
+    assert_eq!(t1, t2, "identical total pure insts share a temp");
+    assert_eq!(sink.insts.len(), n, "the repeat emits nothing");
+    assert!(matches!(t1, Val::Temp(2)), "temp numbering stays sequential");
+}
