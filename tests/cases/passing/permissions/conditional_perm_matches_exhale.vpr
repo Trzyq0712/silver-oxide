@@ -1,0 +1,10 @@
+// A conditionally-inhaled permission amount can be exhaled back by the same
+// condition -- the two `ite`s must cancel regardless of which branch b takes.
+field f: Int
+
+method client(x: Ref, b: Bool)
+{
+    inhale b ? acc(x.f, 1/1) : acc(x.f, 1/2)
+
+    exhale b ? acc(x.f, 1/1) : acc(x.f, 1/2)
+}

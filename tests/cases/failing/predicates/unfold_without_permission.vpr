@@ -1,0 +1,11 @@
+// Unfolding a predicate instance the method never inhaled must fail --
+// there is no permission to consume.
+field f: Int
+
+predicate cell(r: Ref)
+{ acc(r.f) }
+
+method client(r: Ref)
+{
+    unfold cell(r)
+}

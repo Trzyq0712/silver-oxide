@@ -1,0 +1,11 @@
+// Exhaling the OTHER branch's amount unconditionally must fail: when b is
+// true only 1/1 was inhaled, but this always demands 1/2 more than that
+// branch holds once b is true (asking for the else-amount while known true).
+field f: Int
+
+method client(x: Ref)
+{
+    inhale acc(x.f, 1/2)
+
+    exhale acc(x.f, 1/1)
+}

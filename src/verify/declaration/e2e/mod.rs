@@ -2,6 +2,18 @@
 //! full pipeline (parse → … → translate) and verify, asserting pass/fail and
 //! specific `VerifyError` variants. The e-graph unit tests stay in `super`'s
 //! `mod tests`.
+//!
+//! The bulk of the existing (~2026-07-14 and earlier) tests stay in this
+//! file by historical accident of not having been moved yet — new topic-
+//! focused tests go in the submodules below instead, which share this
+//! file's `lower()`/`verify_named_*` helpers via `use super::*;` (private
+//! items are visible to descendant modules in Rust, no `pub(super)` needed).
+
+mod branching;
+mod functions;
+mod interplay;
+mod permissions;
+mod predicates;
 
 use std::sync::Arc;
 

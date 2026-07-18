@@ -1,0 +1,11 @@
+// Two sequential partial exhales that together exceed the held permission
+// must be rejected on the second exhale, not silently clamped.
+field f: Int
+
+method client(x: Ref)
+{
+    inhale acc(x.f, 3/4)
+
+    exhale acc(x.f, 1/2)
+    exhale acc(x.f, 1/2)
+}

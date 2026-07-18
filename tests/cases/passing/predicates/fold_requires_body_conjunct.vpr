@@ -1,0 +1,17 @@
+// A predicate whose body pairs a heap chunk with a pure constraint on its
+// value: folding must check the constraint, not just the field's presence.
+field f: Int
+
+predicate zeroed(r: Ref)
+{ acc(r.f) && r.f == 0 }
+
+method client(r: Ref)
+{
+    inhale acc(r.f)
+    r.f := 0
+
+    fold zeroed(r)
+    unfold zeroed(r)
+
+    assert r.f == 0
+}

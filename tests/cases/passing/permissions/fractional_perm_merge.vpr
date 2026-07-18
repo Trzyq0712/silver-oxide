@@ -1,0 +1,11 @@
+// Two inhales of disjoint fractions of the same chunk must merge additively:
+// 1/4 + 1/2 == 3/4, read back via perm().
+field f: Int
+
+method client(x: Ref)
+{
+    inhale acc(x.f, 1/4)
+    inhale acc(x.f, 1/2)
+
+    assert perm(x.f) == 3/4
+}

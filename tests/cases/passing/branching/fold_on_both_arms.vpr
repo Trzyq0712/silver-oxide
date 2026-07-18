@@ -1,0 +1,18 @@
+// A predicate folded on BOTH arms of an if must be available past the join.
+field f: Int
+
+predicate cell(r: Ref)
+{ acc(r.f) }
+
+method client(r: Ref, c: Bool)
+{
+    inhale acc(r.f)
+
+    if (c) {
+        fold cell(r)
+    } else {
+        fold cell(r)
+    }
+
+    unfold cell(r)
+}

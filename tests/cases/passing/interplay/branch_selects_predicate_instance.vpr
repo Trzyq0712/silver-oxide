@@ -1,0 +1,26 @@
+// Which predicate instance gets folded depends on the branch; using
+// whichever one the taken branch actually established must work, and must
+// not accidentally borrow permission from the other instance.
+field f: Int
+
+predicate cell(r: Ref)
+{ acc(r.f) }
+
+method client(x: Ref, y: Ref, c: Bool)
+{
+    inhale acc(x.f) && acc(y.f)
+
+    if (c) {
+        fold cell(x)
+    } else {
+        fold cell(y)
+    }
+
+    if (c) {
+        unfold cell(x)
+        assert perm(x.f) == write
+    } else {
+        unfold cell(y)
+        assert perm(y.f) == write
+    }
+}

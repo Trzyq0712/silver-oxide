@@ -1,0 +1,19 @@
+// Regression for the deref-alias-under-pc incompleteness (fixed 87c56b3):
+// `merged`'s body asserts `x == y` as a pure conjunct. After `unfold`, that
+// equality must be usable to resolve `y.f`'s chunk against the `acc(x.f)`
+// held under the branch literal `x == y` — a syntactic-equality-only framer
+// misses this because the chunk sits at `x.f`, not `y.f`, and the two are
+// only equal via the unfolded fact, not by construction.
+field f: Int
+
+predicate merged(x: Ref, y: Ref)
+{ acc(x.f) && x == y && y.f == 10 }
+
+method client(x: Ref, y: Ref)
+{
+    inhale acc(merged(x, y))
+
+    unfold merged(x, y)
+
+    assert x == y
+}

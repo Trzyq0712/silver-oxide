@@ -11,14 +11,23 @@ fn cases_dir() -> PathBuf {
 }
 
 fn vpr_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|_| panic!("cannot read dir {}", dir.display()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("vpr"))
-        .collect();
+    let mut files = Vec::new();
+    collect_vpr_files(dir, &mut files);
     files.sort();
     files
+}
+
+fn collect_vpr_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|_| panic!("cannot read dir {}", dir.display()));
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_vpr_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("vpr") {
+            out.push(path);
+        }
+    }
 }
 
 fn file_name(p: &Path) -> &str {
@@ -119,5 +128,44 @@ fn failing_cases_are_rejected() {
         "{} failing case(s) unexpectedly verified:\n{}",
         surprises.len(),
         surprises.join("\n")
+    );
+}
+
+/// Known-limitation canaries: cases that *should* verify but currently don't,
+/// due to a characterized incompleteness (not a soundness rejection — those
+/// belong in `failing/`). Each file documents its root cause in a header
+/// comment. This test asserts the CURRENT (undesired) failure so a fix that
+/// makes one start passing breaks the build here, prompting a promotion into
+/// `passing/` and an update to whatever doc the file's header points at,
+/// rather than silently going stale.
+#[test]
+fn known_limitations_still_fail() {
+    let dir = cases_dir().join("known_limitations");
+    if !dir.exists() {
+        return;
+    }
+    let files = vpr_files(&dir);
+
+    let mut newly_passing: Vec<String> = Vec::new();
+
+    for path in &files {
+        let name = file_name(path);
+        let still_fails = match pipeline::run_file(path) {
+            Err(_) => true,
+            Ok(results) => results.iter().any(|(_, r)| r.is_err()),
+        };
+        if still_fails {
+            println!("  [STILL-FAILING-OK] {name}");
+        } else {
+            newly_passing.push(name.to_string());
+        }
+    }
+
+    assert!(
+        newly_passing.is_empty(),
+        "{} known-limitation case(s) now verify — promote to tests/cases/passing/ \
+         and update the tracking doc referenced in the file's header:\n{}",
+        newly_passing.len(),
+        newly_passing.join("\n")
     );
 }

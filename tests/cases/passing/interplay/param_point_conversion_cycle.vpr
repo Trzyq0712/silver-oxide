@@ -1,0 +1,169 @@
+// v2: flags from a heap-field discriminant (p_Dir-style disjunction), two
+// real branches with guarded p_Param <-> p_Point conversion cycles around a
+// heap write, one unreachable arm, exit ensures at the old-snapshot address.
+
+domain Type {
+  function s_Point_type(): Type
+}
+
+domain s_Param {}
+
+domain s_Int_isize {
+  function s_Int_isize_cons(arg0: Int): s_Int_isize
+  function s_Int_isize_value(arg0: s_Int_isize): Int
+  axiom ax_cons {
+    forall s: s_Int_isize :: { s_Int_isize_value(s) }
+      s_Int_isize_cons(s_Int_isize_value(s)) == s
+  }
+  axiom ax_value {
+    forall value: Int :: { s_Int_isize_cons(value) }
+      s_Int_isize_value(s_Int_isize_cons(value)) == value
+  }
+}
+
+adt s_Ref_mutable {
+  s_Ref_mutable_cons(s_Ref_mutable_0: Ref, s_Ref_mutable_1: s_Param)
+}
+
+adt s_Point {
+  s_Point_cons(x: Int)
+}
+
+function make_generic_s_Point(self: s_Point): s_Param
+  ensures make_concrete_s_Point(result) == self
+
+function make_concrete_s_Point(snap: s_Param): s_Point
+  ensures make_generic_s_Point(result) == snap
+
+field p_Ref_mutable_val: s_Ref_mutable
+field p_Point_val: s_Point
+field p_Int_isize_val: s_Int_isize
+
+predicate p_Param(self: Ref, T$0: Type)
+
+predicate p_Ref_mutable(self: Ref, U$1: Type) {
+  acc(self.p_Ref_mutable_val, write)
+}
+
+predicate p_Point(self: Ref) {
+  acc(self.p_Point_val, write)
+}
+
+predicate p_Int_isize(self: Ref) {
+  acc(self.p_Int_isize_val, write)
+}
+
+function p_Dir_field_discr(self: Ref): Ref
+  ensures (self == null) == (result == null)
+
+predicate p_Dir(self: Ref) {
+  acc(p_Int_isize(p_Dir_field_discr(self)), write) &&
+  (p_Int_isize_snap(p_Dir_field_discr(self)) == s_Int_isize_cons(0) ||
+   p_Int_isize_snap(p_Dir_field_discr(self)) == s_Int_isize_cons(1))
+}
+
+function p_Int_isize_snap(self: Ref): s_Int_isize
+  requires acc(p_Int_isize(self), write)
+{
+  (unfolding acc(p_Int_isize(self), write) in self.p_Int_isize_val)
+}
+
+function p_Ref_mutable_snap(self: Ref, U$1: Type): s_Ref_mutable
+  requires acc(p_Ref_mutable(self, U$1), write)
+{
+  (unfolding acc(p_Ref_mutable(self, U$1), write) in self.p_Ref_mutable_val)
+}
+
+function p_Point_snap(self: Ref): s_Point
+  requires acc(p_Point(self), write)
+{
+  (unfolding acc(p_Point(self), write) in self.p_Point_val)
+}
+
+function p_Param_snap(self: Ref, T$0: Type): s_Param
+  requires acc(p_Param(self, T$0), write)
+
+method p_Int_isize_assign(self: Ref, value: s_Int_isize)
+  ensures acc(p_Int_isize(self), write)
+  ensures p_Int_isize_snap(self) == value
+
+method make_generic_Point(self: Ref)
+  requires acc(p_Point(self), write)
+  ensures acc(p_Param(self, s_Point_type()), write)
+  ensures old(make_generic_s_Point(p_Point_snap(self))) ==
+    p_Param_snap(self, s_Point_type())
+
+method make_concrete_Point(self: Ref)
+  requires acc(p_Param(self, s_Point_type()), write)
+  ensures acc(p_Point(self), write)
+  ensures old(p_Param_snap(self, s_Point_type())) ==
+    make_generic_s_Point(p_Point_snap(self))
+
+method step(_1p: Ref, _2p: Ref, _3p: Ref)
+  requires acc(p_Ref_mutable(_1p, s_Point_type()), write)
+  requires acc(p_Dir(_2p), write)
+  requires acc(p_Param(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0,
+    s_Point_type()), write)
+  ensures acc(p_Param(old(p_Ref_mutable_snap(_1p, s_Point_type())).s_Ref_mutable_0,
+    s_Point_type()), write)
+{
+  var _from_bb0_to_bb2: Bool
+  var _from_bb0_to_bb3: Bool
+  var _from_bb0_to_bb1: Bool
+  var _tmp0: s_Int_isize
+  label start
+  _from_bb0_to_bb2 := false
+  _from_bb0_to_bb3 := false
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  p_Int_isize_assign(_3p, (unfolding acc(p_Dir(_2p)) in
+      p_Int_isize_snap(p_Dir_field_discr(_2p))))
+  _tmp0 := p_Int_isize_snap(_3p)
+  exhale acc(p_Int_isize(_3p), write)
+  if (s_Int_isize_value(_tmp0) == 0) {
+    _from_bb0_to_bb2 := true
+    goto bb_2
+  } elseif (s_Int_isize_value(_tmp0) == 1) {
+    _from_bb0_to_bb3 := true
+    goto bb_3
+  } else {
+    _from_bb0_to_bb1 := true
+    goto bb_1
+  }
+  label bb_2
+  if (_from_bb0_to_bb2) {
+    make_concrete_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0)
+  }
+  if (_from_bb0_to_bb2) {
+    unfold acc(p_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0), write)
+  }
+  if (_from_bb0_to_bb2) {
+    fold acc(p_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0), write)
+  }
+  if (_from_bb0_to_bb2) {
+    make_generic_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0)
+  }
+  goto bb_join
+  label bb_3
+  if (_from_bb0_to_bb3) {
+    make_concrete_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0)
+  }
+  if (_from_bb0_to_bb3) {
+    unfold acc(p_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0), write)
+  }
+  if (_from_bb0_to_bb3) {
+    fold acc(p_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0), write)
+  }
+  if (_from_bb0_to_bb3) {
+    make_generic_Point(p_Ref_mutable_snap(_1p, s_Point_type()).s_Ref_mutable_0)
+  }
+  goto bb_join
+  label bb_1
+  exhale false
+  inhale false
+  goto end
+  label bb_join
+  goto end
+  label end
+}

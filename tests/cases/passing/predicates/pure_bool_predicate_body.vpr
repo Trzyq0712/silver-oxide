@@ -1,0 +1,14 @@
+// A predicate body with NO heap access, just a pure boolean -- inhale/unfold
+// must still track the conjunct: inhaling `q(false)` assumes `false` in the
+// path even though there's no chunk to produce, so unfolding must deliver
+// that fact (not silently drop it because nothing was on the heap).
+predicate q(b: Bool)
+{ b }
+
+method client()
+{
+    inhale acc(q(false))
+    unfold q(false)
+
+    assert false
+}
