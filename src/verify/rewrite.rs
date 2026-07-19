@@ -620,7 +620,10 @@ impl LtPlan {
         depth: usize,
     ) -> LtPlan {
         let class = egraph.find(class);
-        if depth == 0 || seen.contains(&class) {
+        // A class that already folds to a literal is a leaf even if it also
+        // holds an `Ite` node (ConstFold lands the literal in the same class):
+        // `lt(lit, z)` at the leaf folds directly, mirroring the tower is waste.
+        if depth == 0 || seen.contains(&class) || egraph[class].data.known().is_some() {
             return LtPlan::Leaf(class);
         }
         seen.push(class);
@@ -690,6 +693,11 @@ impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
         _searcher_ast: Option<&PatternAst<Symbolic>>,
         _rule_name: Symbol,
     ) -> Vec<Id> {
+        // Already folded to a literal: distributing over the tower cannot add
+        // information.
+        if egraph[eclass].data.known().is_some() {
+            return vec![];
+        }
         let mut plans: Vec<(LtPlan, Id, bool)> = Vec::new();
         for node in &egraph[eclass].nodes {
             let Symbolic::Binary(BinOp::Lt, [l, r]) = node else {
