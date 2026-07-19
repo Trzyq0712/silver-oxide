@@ -3981,7 +3981,7 @@ method exhaustive(v: s_MaybeInt, _0p: Ref)
 fn disequality_holds_in_both_argument_orders() {
     // Prusti writes div preconditions constant-first (`requires 0 != value(b)`)
     // while the div obligation builds `Eq(b, 0)`. `Binary(Eq, ..)` is not
-    // commutative as an e-node; the disproven-eq mirror in the `eq-ite` applier
+    // commutative as an e-node; the disproven-eq mirror in the `eq-false-then/else` applier
     // lands the flipped node in the same (false) class.
     let input = r#"
 function d_flip(a: Int, b: Int): Int
@@ -3998,7 +3998,7 @@ fn enum_exhaustiveness_two_variants_via_boxed_discriminator() {
     // Prusti's enum-match exhaustiveness shape: an opaque discriminator value
     // (`box(0)`/`box(1)` — *not* e-graph literals) selected by an `ite` over
     // the variant test. Excluding both tags must derive `false`. Needs the
-    // `eq-ite` unit propagation: `d != box(0)` with `d = isOne ? box(0) : box(1)`
+    // `eq-false-then/else` unit propagation: `d != box(0)` with `d = isOne ? box(0) : box(1)`
     // pins `isOne = false`, then `d != box(1)` pins `isOne = true` —
     // inconsistent, so `assert false` discharges.
     let input = r#"
