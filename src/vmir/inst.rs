@@ -121,7 +121,12 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                         )?;
                         e_idx += 1;
                     } else {
-                        writeln!(f, "{indent}h{h_idx} := {}{}", PcPrefix(&inst.pc), self.with(hi))?;
+                        writeln!(
+                            f,
+                            "{indent}h{h_idx} := {}{}",
+                            PcPrefix(&inst.pc),
+                            self.with(hi)
+                        )?;
                     }
                     h_idx += 1;
                 }
