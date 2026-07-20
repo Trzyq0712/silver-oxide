@@ -631,10 +631,14 @@ impl LtPlan {
         depth: usize,
     ) -> LtPlan {
         let class = egraph.find(class);
-        // A class that already folds to a literal is a leaf even if it also
-        // holds an `Ite` node (ConstFold lands the literal in the same class):
-        // `lt(lit, z)` at the leaf folds directly, mirroring the tower is waste.
-        if depth == 0 || seen.contains(&class) || egraph[class].data.known().is_some() {
+        // NB: do *not* stop at a class that const-folds to a literal. Such a
+        // class can hold a literal and a deep `Ite` tower at once — `true` and
+        // `1/1` both do — and inside a tier-4 pinned probe the tower is exactly
+        // what relates the arm permissions. Treating it as a leaf here cost
+        // 15s on an 18-arm enum match (12s → 27s) while saving ~4ms on
+        // structs_enums.vpr; the cheap half of that idea is the `known()` early
+        // return in `apply_one` below, which is kept.
+        if depth == 0 || seen.contains(&class) {
             return LtPlan::Leaf(class);
         }
         seen.push(class);
