@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 
 use std::collections::{HashMap, HashSet};
 
+use egg::Language;
+
 use crate::verify::context::VerifyContext;
 use crate::verify::heap::Heap;
 use crate::verify::lang::Symbolic;
@@ -328,6 +330,72 @@ fn run(program: &str, args: &[&std::ffi::OsStr]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Whether the perm-term diagnostic dump is enabled (`SILVER_OXIDE_DUMP_PERM`).
+pub(crate) fn dump_perm_enabled() -> bool {
+    std::env::var_os("SILVER_OXIDE_DUMP_PERM").is_some()
+}
+
+/// Diagnostic: render the term DAG rooted at `root` as a flat class listing,
+/// one line per e-class, each showing its e-nodes with children referenced by
+/// `@class`. Shared subterms print once (BFS over canonical classes). `depth`
+/// bounds the frontier; a class first reached deeper than `depth` is listed
+/// (so the root's shape is complete) but its children are not expanded.
+///
+/// This is the on-switch form of the by-hand perm dumps in
+/// `findings_2026-07-15.md` §6.2/§7 — used to read the permission tower at a
+/// failing sufficiency check.
+pub(crate) fn dump_term(ctx: &VerifyContext<'_>, root: egg::Id, depth: usize) -> String {
+    use std::collections::VecDeque;
+    let eg = &ctx.egraph;
+    let root = eg.find(root);
+    let mut seen: HashSet<egg::Id> = HashSet::new();
+    let mut order: Vec<egg::Id> = Vec::new();
+    let mut q: VecDeque<(egg::Id, usize)> = VecDeque::new();
+    seen.insert(root);
+    q.push_back((root, 0));
+    while let Some((c, d)) = q.pop_front() {
+        order.push(c);
+        if d >= depth {
+            continue;
+        }
+        for node in &eg[c].nodes {
+            for &ch in node.children() {
+                let ch = eg.find(ch);
+                if seen.insert(ch) {
+                    q.push_back((ch, d + 1));
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for c in order {
+        let nodes: Vec<String> = eg[c].nodes.iter().map(|n| render_node(ctx, n)).collect();
+        out.push_str(&format!("  @{:<5} = [{}]\n", usize::from(c), nodes.join(", ")));
+    }
+    out
+}
+
+/// One e-node rendered as `op(@child, ...)`, resolving `FuncApp` to its source
+/// name. Children are canonical class ids (`@n`).
+fn render_node(ctx: &VerifyContext<'_>, node: &Symbolic) -> String {
+    let kid = |c: &egg::Id| format!("@{}", usize::from(ctx.egraph.find(*c)));
+    let kids: Vec<String> = node.children().iter().map(kid).collect();
+    match node {
+        Symbolic::Fresh(_) | Symbolic::Lit(_) => node.to_string(),
+        Symbolic::FuncApp(m, tys, _) => {
+            let name = ctx.func_name(*m);
+            let head = if tys.is_empty() {
+                name
+            } else {
+                let ts: Vec<String> = tys.iter().map(|t| ctx.type_name(t)).collect();
+                format!("{name}<{}>", ts.join(", "))
+            };
+            format!("{head}({})", kids.join(", "))
+        }
+        _ => format!("{node}({})", kids.join(", ")),
+    }
 }
 
 /// Background color for an e-class cluster, keyed by its (inferred) type.
