@@ -9,6 +9,56 @@ pub enum HeapVal {
     Temp(usize),
 }
 
+/// A permission amount attached to a heap operation.
+///
+/// A `wildcard` is a symbolic positive-but-unspecified share; it is legal
+/// **only** here (never as a first-class [`Val`]), matching Viper. `Ite` gates a
+/// permission by a boolean `Val` — this carries both `Sink::gate_perm`'s branch
+/// gating and the `p > 0 ? wildcard : 0` lowering of function-context
+/// permissions (so a dead branch reduces to `0`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Perm {
+    /// A concrete permission value (`1/1`, `1/2`, a symbolic real, …). This is
+    /// the only variant a non-wildcard program ever produces, and it lowers to
+    /// exactly the same e-graph term as before the `Perm` split.
+    Amount(Val),
+    /// Viper's `wildcard`: a fresh positive-but-unspecified share.
+    Wildcard,
+    /// `cond ? then : else` over permissions.
+    Ite(Val, Box<Perm>, Box<Perm>),
+}
+
+impl Perm {
+    /// The zero permission (`none`).
+    pub fn none() -> Self {
+        Perm::Amount(crate::vmir::none())
+    }
+    /// The full permission (`write`, `1/1`).
+    pub fn write() -> Self {
+        Perm::Amount(crate::vmir::write())
+    }
+    /// Whether any leaf of this permission is a [`Perm::Wildcard`].
+    pub fn has_wildcard(&self) -> bool {
+        match self {
+            Perm::Amount(_) => false,
+            Perm::Wildcard => true,
+            Perm::Ite(_, t, e) => t.has_wildcard() || e.has_wildcard(),
+        }
+    }
+}
+
+impl Display for VmirDisplay<'_, &Perm> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.item {
+            Perm::Amount(v) => write!(f, "{v}"),
+            Perm::Wildcard => write!(f, "wildcard"),
+            Perm::Ite(c, t, e) => {
+                write!(f, "{c} ? {} : {}", self.with(&**t), self.with(&**e))
+            }
+        }
+    }
+}
+
 /// Heap instructions. All heap instructions produce new heaps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HeapInst {
@@ -19,7 +69,7 @@ pub enum HeapInst {
         base: HeapVal,
         sign: Sign,
         loc: Val,
-        perm: Val,
+        perm: Perm,
     },
     /// `h[, s] := base inhale <call> <perm>`. Add the resource's delta (scaled by
     /// `perm`) to `base` **and assume** its boolean condition. When the callee is
@@ -29,7 +79,7 @@ pub enum HeapInst {
     Inhale {
         base: HeapVal,
         call: ResourceCall,
-        perm: Val,
+        perm: Perm,
     },
     /// `h[, s] := base exhale <call> <perm>`. Subtract the resource's delta (scaled by
     /// `perm`) from `base` **and assert** its boolean condition. Yields a snapshot
@@ -37,7 +87,7 @@ pub enum HeapInst {
     Exhale {
         base: HeapVal,
         call: ResourceCall,
-        perm: Val,
+        perm: Perm,
     },
     /// Assign a value to a heap location in a given heap.
     /// SIDECOND: the location must have at least `write` permission.
@@ -48,7 +98,7 @@ pub enum HeapInst {
     Fold {
         base: HeapVal,
         call: ResourceCall,
-        perm: Val,
+        perm: Perm,
     },
     /// `h := unfold call[base] perm`. Inverse of `Fold`: consume the predicate
     /// chunk from `base`, reproduce its footprint (fields recovered from the
@@ -56,7 +106,7 @@ pub enum HeapInst {
     Unfold {
         base: HeapVal,
         call: ResourceCall,
-        perm: Val,
+        perm: Perm,
     },
     /// `h := heap_of R(args), snap` — widen a snapshot value back into a heap:
     /// one chunk per footprint slot of the self-framed resource `R(args)`, at
@@ -148,10 +198,10 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
         };
         // Render `base <kw> call perm` for a resource inhale/exhale.
         let resource_combine =
-            |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &Val| {
+            |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &Perm| {
                 write!(f, "{base} {kw} ")?;
                 call_head(f, call)?;
-                write!(f, " {perm}")
+                write!(f, " {}", self.with(perm))
             };
         match self.item {
             HeapInst::Combine {
@@ -159,7 +209,7 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 sign,
                 loc,
                 perm,
-            } => write!(f, "{base} {sign} acc {loc} {perm}"),
+            } => write!(f, "{base} {sign} acc {loc} {}", self.with(perm)),
             HeapInst::Inhale { base, call, perm } => {
                 resource_combine(f, base, "inhale", call, perm)
             }
@@ -172,12 +222,12 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             HeapInst::Fold { base, call, perm } => {
                 write!(f, "{base} fold ")?;
                 call_head(f, call)?;
-                write!(f, " {perm}")
+                write!(f, " {}", self.with(perm))
             }
             HeapInst::Unfold { base, call, perm } => {
                 write!(f, "{base} unfold ")?;
                 call_head(f, call)?;
-                write!(f, " {perm}")
+                write!(f, " {}", self.with(perm))
             }
             HeapInst::FromSnap {
                 resource,

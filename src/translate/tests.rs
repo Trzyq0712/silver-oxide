@@ -909,17 +909,19 @@ method m() {
 
 #[test]
 fn translation_error_returns_err_without_panicking() {
-    // A predicate body using a `wildcard` permission is valid Silver (parses
-    // and typechecks) but not yet lowerable —
-    // `TranslationError::Unsupported("wildcard literal")` in `pure_exp.rs`'s
-    // `lower_literal`. `PredicateTranslator::define` bails with `?`, leaving its
+    // A bare `wildcard` permission is now lowerable (→ `Perm::Wildcard`), but a
+    // `wildcard` used *arithmetically* (not directly as the permission amount) is
+    // still rejected — `lower_acc`'s `is_wildcard` sees a `Binary`, not a bare
+    // `wildcard`, so it routes through `pure_exp::lower` →
+    // `TranslationError::Unsupported("wildcard literal")` in `lower_literal`.
+    // `PredicateTranslator::define` bails with `?`, leaving its
     // `DeclSlot<vmir::Resource>` unfilled; the slot is simply dropped and the
     // whole `Builder` discarded as the error propagates — no panic, no cleanup.
     let input = r#"
 field f: Int
 
 predicate broken(this: Ref) {
-    acc(this.f, wildcard)
+    acc(this.f, wildcard + 1/2)
 }
 "#;
     let mut program = viper_parser::vpr_program(input).expect("parse failed");

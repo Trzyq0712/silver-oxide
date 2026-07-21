@@ -179,6 +179,8 @@ impl FunctionTranslator<'_, Metaed> {
                         n_params,
                         vmir::HeapVal::Empty,
                         0,
+                        // Function precondition: weaken permissions to wildcard.
+                        true,
                     )?;
                     definer.define_resource(
                         slot,

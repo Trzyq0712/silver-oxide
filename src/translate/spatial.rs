@@ -10,7 +10,7 @@ use crate::translate::resource::lower_resource_addr;
 use crate::translate::sink::{PcKind, Sink};
 use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
-use crate::vmir::{self, FALSE, HeapInst, HeapVal, Polarity, PureInst, Sign, TRUE, Type, Val};
+use crate::vmir::{self, FALSE, HeapInst, HeapVal, Perm, Polarity, PureInst, Sign, TRUE, Type, Val};
 
 /// Direction and heap semantics of a spatial lowering.
 ///
@@ -55,7 +55,10 @@ impl SpatialMode {
 /// reference; pass `HeapVal::Empty` when the owning `Resource.requires`
 /// is `None`, and `HeapVal::Temp(0)` (with `heap_base = 1`) once the
 /// resource has its own precondition resource. `heap_base` is the first
-/// heap counter the body's emitted heap insts will use.
+/// heap counter the body's emitted heap insts will use. `read_only` weakens
+/// every `acc` permission to a wildcard — set for a **function** precondition
+/// resource (a function only needs *some* positive share), not for a predicate
+/// body or a method contract.
 pub(crate) fn lower_spatial_never(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
@@ -63,8 +66,10 @@ pub(crate) fn lower_spatial_never(
     val_base: usize,
     initial_heap: HeapVal,
     heap_base: usize,
+    read_only: bool,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, heap_base);
+    sink.read_only = read_only;
     let (h, bv) = lower_spatial(
         b,
         env,
@@ -280,8 +285,10 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
     }
 }
 
-/// Lower `acc(res, perm)` to its location and (pc-gated) permission amount. The
-/// caller emits the `HeapInst::Combine` that adds/subtracts the chunk.
+/// Lower `acc(res, perm)` to its location and (pc-gated) permission. The caller
+/// emits the `HeapInst::Combine` that adds/subtracts the chunk. A source-level
+/// `wildcard` maps directly to [`Perm::Wildcard`]; otherwise the amount is
+/// lowered and passed through the read-only policy (see [`Sink::perm_amount`]).
 fn lower_acc<Ext: PureExt>(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
@@ -289,11 +296,24 @@ fn lower_acc<Ext: PureExt>(
     hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
-) -> Result<(Val, Val), TranslationError> {
-    let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
-    let perm_val = sink.gate_perm(perm_val);
+) -> Result<(Val, Perm), TranslationError> {
+    let perm = if is_wildcard(perm) {
+        Perm::Wildcard
+    } else {
+        let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
+        sink.perm_amount(perm_val)
+    };
+    let perm = sink.gate_perm(perm);
     let addr = lower_resource_addr(b, env, sink, hctx, res)?;
-    Ok((addr, perm_val))
+    Ok((addr, perm))
+}
+
+/// Whether a permission expression is the `wildcard` literal.
+pub(crate) fn is_wildcard<Ext>(perm: &typed::TypedPureExp<Ext>) -> bool {
+    matches!(
+        &*perm.exp,
+        typed::PureExpKind::Const(typed::Literal::Wildcard)
+    )
 }
 
 /// Lower an assertion used by source-level `assert`/`assume` into a single

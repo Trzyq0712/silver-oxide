@@ -467,9 +467,8 @@ fn eval_pure_inst(
     })
 }
 
-fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalState) -> Heap {
+fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: egg::Id, state: &EvalState) -> Heap {
     let addr = state.get_val(ctx, loc);
-    let perm = state.get_val(ctx, perm);
     // The location kind (group + held value type + bound) comes straight from the
     // address operand's VMIR `Type::Addr` — no e-graph inference.
     let kind = state
@@ -477,6 +476,43 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: &Val, state: &EvalStat
         .expect("acc location must be Addr-typed");
     let value = ctx.fresh_symbolic_value(kind.value.clone());
     Heap::empty().with_chunk(&kind, Chunk::new(addr, perm, value))
+}
+
+/// Resolve a [`vmir::Perm`] to its e-class id, minting a fresh positive
+/// [`Symbolic::Wildcard`] for each `Perm::Wildcard`. A concrete `Amount` is
+/// exactly the value it wraps, so a non-wildcard program builds the same term as
+/// before the `Perm` split.
+fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::Perm) -> egg::Id {
+    match perm {
+        vmir::Perm::Amount(v) => state.get_val(ctx, v),
+        vmir::Perm::Wildcard => ctx.fresh_wildcard(),
+        vmir::Perm::Ite(c, t, e) => {
+            let c = state.get_val(ctx, c);
+            let t = eval_perm(ctx, state, t);
+            let e = eval_perm(ctx, state, e);
+            ctx.add(Symbolic::Ite([c, t, e]))
+        }
+    }
+}
+
+/// The recipe-space term of a [`vmir::Perm`] footprint-slot permission (resource
+/// certificate build). A `Wildcard` emits an [`AxiomPure::Wildcard`] step so
+/// each graft mints a fresh share; `Amount`/`Ite` map to their operand recipes.
+fn perm_recipe(
+    rb: &mut crate::verify::cert::RecipeBuilder,
+    state: &EvalState,
+    perm: &vmir::Perm,
+) -> Result<Val, VerifyError> {
+    match perm {
+        vmir::Perm::Amount(v) => state.require_recipe(v, OPERAND_RECIPE),
+        vmir::Perm::Wildcard => Ok(rb.emit(crate::verify::rewrite::AxiomPure::Wildcard)),
+        vmir::Perm::Ite(c, t, e) => {
+            let c = state.require_recipe(c, OPERAND_RECIPE)?;
+            let t = perm_recipe(rb, state, t)?;
+            let e = perm_recipe(rb, state, e)?;
+            Ok(rb.emit(crate::verify::rewrite::AxiomPure::Ternary(c, t, e)))
+        }
+    }
 }
 
 /// Merge two fractional chunks at the same address. Decouples the operational
@@ -842,6 +878,38 @@ fn prove_obligation(
     prove_perm_ineq(ctx, goal, a, b, pc_lits)
 }
 
+/// Whether a permission term is — or, through `ite` gating or `*`/`+`/`-`
+/// scaling, contains — a [`Symbolic::Wildcard`]. Selects the wildcard exhale
+/// rule (require `held > 0`, assume `needed < held`) over the concrete one
+/// (prove `held ≥ needed`). Bounded by a visited set; a non-wildcard perm term
+/// (a literal / small gating `ite`) is walked in O(size).
+fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
+    fn go(ctx: &VerifyContext<'_>, id: egg::Id, seen: &mut std::collections::HashSet<egg::Id>) -> bool {
+        let id = ctx.egraph.find(id);
+        if !seen.insert(id) {
+            return false;
+        }
+        for n in &ctx.egraph[id].nodes {
+            match n {
+                Symbolic::Wildcard(_) => return true,
+                Symbolic::Ite(ch) => {
+                    if ch.iter().any(|c| go(ctx, *c, seen)) {
+                        return true;
+                    }
+                }
+                Symbolic::Binary(BinOp::Mult | BinOp::Plus | BinOp::Minus, ch) => {
+                    if ch.iter().any(|c| go(ctx, *c, seen)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    go(ctx, id, &mut std::collections::HashSet::new())
+}
+
 /// Heap subtraction for a single location chunk of kind `kind`.
 fn heap_subtract(
     ctx: &mut VerifyContext<'_>,
@@ -854,7 +922,9 @@ fn heap_subtract(
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
         // conditional footprint slot whose guard is false — a nested predicate
-        // `b ==> P(..)` with `b` false) is a no-op, so it need not be held.
+        // `b ==> P(..)` with `b` false) is a no-op, so it need not be held. A
+        // wildcard is provably positive, so this (correctly) fails — a wildcard
+        // cannot be exhaled from an empty location.
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         let pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, chunk2.perm]));
         let false_ = ctx.false_();
@@ -865,6 +935,36 @@ fn heap_subtract(
         }
         return Err(VerifyError::InsufficientPermission);
     };
+
+    // Wildcard exhale: instead of proving `held ≥ needed` (a wildcard has no
+    // fixed value), require the location hold *some* permission (`held > 0`) and
+    // **assume** the taken share is strictly smaller (`needed < held`) under the
+    // pc — Silicon's constrainable-ARP rule. The `held − needed` remainder stays
+    // positive, so the chunk is never emptied.
+    if ctx.has_wildcard && contains_wildcard(ctx, chunk2.perm) {
+        let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+        let held_pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, existing.perm]));
+        if !ctx.prove_under_pc(held_pos, pc_lits) {
+            return Err(VerifyError::InsufficientPermission);
+        }
+        let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [chunk2.perm, existing.perm]));
+        ctx.union(existing.value, chunk2.value);
+        let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+        // Assume `needed < held` and, because the e-graph has no real-order
+        // arithmetic to derive `held − needed > 0` from it, the remainder's
+        // positivity explicitly — otherwise a later `perm > 0` framing check on
+        // the leftover share (a field read after a wildcard exhale, or a nested
+        // consume of the same predicate) could not discharge. Batched into one
+        // rebuild.
+        let rem_pos = ctx.perm_positive(remainder);
+        ctx.assume_all_guarded([lt, rem_pos], pc_lits);
+        out = out.with_chunk(
+            kind,
+            Chunk::new(existing.addr, remainder, existing.value)
+                .with_recipe(existing.recipe.clone()),
+        );
+        return Ok(out);
+    }
 
     let false_ = ctx.false_();
     let true_ = ctx.true_();
@@ -943,7 +1043,8 @@ fn eval_heap_inst(
             perm,
         } => {
             let base_h = get_heap(state, base);
-            let chunk = heap_acc(ctx, loc, perm, state);
+            let perm_id = eval_perm(ctx, state, perm);
+            let chunk = heap_acc(ctx, loc, perm_id, state);
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
                 .iter()
@@ -961,7 +1062,8 @@ fn eval_heap_inst(
                     // so a later `Deref` purifies to the slot value.
                     if ctx.recipe.is_some() {
                         let addr_r = state.require_recipe(loc, OPERAND_RECIPE)?;
-                        let perm_r = state.require_recipe(perm, OPERAND_RECIPE)?;
+                        let rb = ctx.recipe.as_mut().unwrap();
+                        let perm_r = perm_recipe(rb, state, perm)?;
                         let elem = kind.value.clone();
                         let rb = ctx.recipe.as_mut().unwrap();
                         let i = rb.pending_slots.len();
@@ -1101,7 +1203,7 @@ fn eval_method_inst(
             let is_inhale = matches!(hi, HeapInst::Inhale { .. });
             let base_h = get_heap(state, base);
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            let scale = state.get_val(ctx, perm);
+            let scale = eval_perm(ctx, state, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
             // Inhale: produce fresh chunks, assume the bool guarded by `0 < scale`
             // (it carries no path condition — the branch lives in the perm scale).
@@ -1155,7 +1257,7 @@ fn eval_method_inst(
             }
             let base_h = get_heap(state, base);
             let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            let perm_id = state.get_val(ctx, perm);
+            let perm_id = eval_perm(ctx, state, perm);
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
             // Consume the footprint from the current heap (reading its values),
@@ -1514,7 +1616,7 @@ fn eval_unfold(
     };
     let base_h = get_heap(state, base);
     let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-    let perm_id = state.get_val(ctx, perm);
+    let perm_id = eval_perm(ctx, state, perm);
     let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
     // Consume the predicate chunk, recovering the snapshot `s` it holds (and,
@@ -2073,7 +2175,7 @@ fn walk_body(
     insts: &[Inst],
     certs: &HashMap<MemberId, ResourceDefinition>,
     eval: EvalFn,
-    mut footprint_ops: Option<&mut Vec<(Val, Val)>>,
+    mut footprint_ops: Option<&mut Vec<(Val, vmir::Perm)>>,
 ) -> Result<(), VerifyError> {
     for (inst_idx, inst) in insts.iter().enumerate() {
         if let (Some(ops), InstKind::Heap(HeapInst::Combine { loc, perm, .. })) =
@@ -2572,6 +2674,18 @@ fn inst_obligations(
         // a resource inhale/exhale, and fold/unfold (their permission scale must
         // be ≥ 0 — a consuming op with a negative scale would flip
         // `heap_subtract` into permission fabrication).
+        // A wildcard is positive by construction (assumed `0 < w` at creation),
+        // and the e-graph has no real-order reasoning to *prove* `¬(w < 0)`.
+        // Silicon likewise skips the non-negativity assertion for a constrainable
+        // ARP (`PermissionSupporter.assertNotNegative`), so a wildcard-bearing
+        // permission carries no `perm ≥ 0` obligation.
+        InstKind::Heap(
+            HeapInst::Combine { perm, .. }
+            | HeapInst::Inhale { perm, .. }
+            | HeapInst::Exhale { perm, .. }
+            | HeapInst::Fold { perm, .. }
+            | HeapInst::Unfold { perm, .. },
+        ) if perm.has_wildcard() => vec![],
         InstKind::Heap(
             HeapInst::Combine { perm, .. }
             | HeapInst::Inhale { perm, .. }
@@ -2581,7 +2695,7 @@ fn inst_obligations(
         ) => {
             let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
             let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
-            let perm = state.get_val(ctx, perm);
+            let perm = eval_perm(ctx, state, perm);
             let zero = zero_real(ctx);
             let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));
             let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));

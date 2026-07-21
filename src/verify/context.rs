@@ -67,6 +67,36 @@ pub(crate) struct VerifyContext<'a> {
     /// node/union landed since. Lets `saturate`/`reduce` skip whole runner
     /// invocations — most are re-runs on an unchanged graph.
     clean: Option<(CleanLevel, usize, usize)>,
+    /// Whether the program uses `wildcard` permissions anywhere (any heap-op
+    /// `Perm` with a wildcard leaf, in any body). Computed once from `decls`; a
+    /// program without wildcards skips the per-subtract `contains_wildcard` scan
+    /// entirely, so non-wildcard verification pays nothing for the feature.
+    pub(crate) has_wildcard: bool,
+}
+
+/// Whether any declaration uses a `wildcard` permission (a heap-op `Perm` with
+/// a wildcard leaf). Scanned once per unit at [`VerifyContext::new`]; lets a
+/// wildcard-free program skip the per-subtract `contains_wildcard` walk.
+fn decls_have_wildcard(decls: &TiVec<MemberId, Declaration>) -> bool {
+    use crate::vmir::{HeapInst, Inst, InstKind};
+    fn insts_wild(insts: &[Inst]) -> bool {
+        insts.iter().any(|i| match &i.kind {
+            InstKind::Heap(
+                HeapInst::Combine { perm, .. }
+                | HeapInst::Inhale { perm, .. }
+                | HeapInst::Exhale { perm, .. }
+                | HeapInst::Fold { perm, .. }
+                | HeapInst::Unfold { perm, .. },
+            ) => perm.has_wildcard(),
+            _ => false,
+        })
+    }
+    decls.iter().any(|d| match d {
+        Declaration::Method(m) => insts_wild(&m.insts),
+        Declaration::Function(f) => f.body.as_ref().is_some_and(|b| insts_wild(&b.insts)),
+        Declaration::Resource(r) => r.body.as_ref().is_some_and(|b| insts_wild(&b.insts)),
+        _ => false,
+    })
 }
 
 /// How much of the rule set the live e-graph is saturated under. `Reduce`'s
@@ -105,6 +135,7 @@ impl<'a> VerifyContext<'a> {
             fn_certs: None,
             recipe: None,
             clean: None,
+            has_wildcard: decls_have_wildcard(decls),
         }
     }
 
@@ -331,6 +362,23 @@ impl<'a> VerifyContext<'a> {
         self.add(Symbolic::Fresh(id))
     }
 
+    /// Mint a fresh `wildcard` permission: a [`Symbolic::Wildcard`] (a symbolic
+    /// `Real`) assumed strictly positive (`0 < w`). Viper's `wildcard` — an
+    /// unspecified positive share. Its upper bound (`w ≤ 1` for a field via the
+    /// location axiom, `w < held` at exhale) is imposed elsewhere. The distinct
+    /// node lets an exhale recognise a wildcard-bearing permission (see
+    /// `heap_subtract`).
+    pub(crate) fn fresh_wildcard(&mut self) -> egg::Id {
+        let w = self.add(Symbolic::Wildcard(crate::verify::lang::fresh_wildcard_id()));
+        let pos = self.perm_positive(w);
+        let true_ = self.true_();
+        self.union(pos, true_);
+        // No eager `rebuild()`: the wildcard is minted mid-heap-op and every heap
+        // op rebuilds downstream (obligation proving / `assume_location_axioms`)
+        // before `0 < w` is queried. Rebuilding per mint dominated the cost.
+        w
+    }
+
     /// Build `antecedents ==> consequent` as a right-associative chain of `Ite`
     /// muxers with fallback `true` (vacuous truth). No boolean AND tree.
     /// `antecedents` must be in innermost-first fold order. A positive literal
@@ -371,6 +419,23 @@ impl<'a> VerifyContext<'a> {
         let imp = self.implication(fact, guards);
         let true_ = self.true_();
         self.union(imp, true_);
+        self.egraph.rebuild();
+    }
+
+    /// [`Self::assume_guarded`] for several facts sharing one `guards`, with a
+    /// single `rebuild()` at the end (rebuild dominates, so batching matters when
+    /// a heap op assumes more than one fact — e.g. a wildcard exhale's
+    /// `needed < held` and `0 < held − needed`).
+    pub(crate) fn assume_all_guarded(
+        &mut self,
+        facts: impl IntoIterator<Item = egg::Id>,
+        guards: &[(egg::Id, Polarity)],
+    ) {
+        let true_ = self.true_();
+        for fact in facts {
+            let imp = self.implication(fact, guards.iter().copied());
+            self.union(imp, true_);
+        }
         self.egraph.rebuild();
     }
 

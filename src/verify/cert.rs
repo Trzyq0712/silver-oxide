@@ -406,6 +406,8 @@ fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
             }
             AxiomPure::RealCast(v) => f(v),
             AxiomPure::App { args, .. } => args.iter().for_each(f),
+            // A fresh wildcard has no operands.
+            AxiomPure::Wildcard => {}
         },
         AxiomInst::Forall { caps, .. } => caps.iter().for_each(f),
         AxiomInst::Assume(v) => f(v),
@@ -428,6 +430,7 @@ fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomInst {
                 type_args: type_args.clone(),
                 args: args.iter().map(&tr).collect(),
             },
+            AxiomPure::Wildcard => AxiomPure::Wildcard,
         }),
         AxiomInst::Forall { recipe, caps } => AxiomInst::Forall {
             recipe: *recipe,

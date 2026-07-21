@@ -75,6 +75,8 @@ impl PredicateTranslator<'_, Metaed> {
                     params.len(),
                     vmir::HeapVal::Empty,
                     0,
+                    // Predicate body: real permissions, not wildcards.
+                    false,
                 )?)
             }
         };

@@ -56,15 +56,17 @@ impl<'a> HeapCtx<'a> {
 }
 
 /// Lower a predicate-with-perm (`P(args)` + permission) into a self-framed
-/// `ResourceCall` plus the lowered permission `Val`. Shared by `unfolding`
-/// expressions and method-body `fold`/`unfold` statements.
+/// `ResourceCall` plus the permission (a source `wildcard` → [`Perm::Wildcard`],
+/// otherwise the amount through the read-only policy — see [`Sink::perm_amount`];
+/// **not** pc-gated — the caller gates). Shared by `unfolding` expressions and
+/// method-body `fold`/`unfold` statements.
 pub(crate) fn lower_pred_call<Ext: PureExt>(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
     pwp: &typed::PredicateWithPerm<Ext>,
-) -> Result<(ResourceCall, Val), TranslationError> {
+) -> Result<(ResourceCall, vmir::Perm), TranslationError> {
     let pred_id = *b.name_map.get(&pwp.pred_call.name.0).ok_or_else(|| {
         TranslationError::UnknownIdent(b.interner.resolve(&pwp.pred_call.name.0).to_string())
     })?;
@@ -72,7 +74,12 @@ pub(crate) fn lower_pred_call<Ext: PureExt>(
     for a in &pwp.pred_call.args {
         args.push(lower(b, env, sink, hctx, a)?);
     }
-    let perm = lower(b, env, sink, hctx, &pwp.perm)?;
+    let perm = if crate::translate::spatial::is_wildcard(&pwp.perm) {
+        vmir::Perm::Wildcard
+    } else {
+        let perm_val = lower(b, env, sink, hctx, &pwp.perm)?;
+        sink.perm_amount(perm_val)
+    };
     let call = ResourceCall {
         resource: pred_id,
         args,
@@ -973,6 +980,9 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     snap_entry: Option<SnapEntry>,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
+    // Function bodies are read-only: every `unfolding`/`acc` permission is
+    // weakened to a wildcard (a function only needs *some* positive share).
+    sink.read_only = true;
     // A heap-dependent body reads the heap reconstructed from its snapshot
     // parameter; a heap-free body reads the inert `heap` (`Empty`).
     let heap = match snap_entry {

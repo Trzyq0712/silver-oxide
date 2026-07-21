@@ -14,6 +14,7 @@ mod functions;
 mod interplay;
 mod permissions;
 mod predicates;
+mod wildcards;
 
 use std::sync::Arc;
 

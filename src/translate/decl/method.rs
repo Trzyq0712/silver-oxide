@@ -131,6 +131,8 @@ impl MethodTranslator<'_, Metaed> {
                 params.len(),
                 vmir::HeapVal::Empty,
                 0,
+                // Method precondition: real permissions.
+                false,
             )?;
             let name =
                 definer.intern_name(&format!("{}#requires", ctx.interner.resolve(&silver_name)));
@@ -732,7 +734,7 @@ fn lower_new(
             let mut heap = current_heap;
             for f in fields {
                 let (loc, perm) = resource::field_acc(b, sink, v.clone(), f.0, vmir::write())?;
-                let perm = sink.gate_perm(perm);
+                let perm = sink.gate_perm(vmir::Perm::Amount(perm));
                 heap = sink.emit_heap(HeapInst::Combine {
                     base: heap,
                     sign: vmir::Sign::Add,
@@ -866,7 +868,7 @@ fn emit_resource_combine(
     // Gate the permission by the current branch path condition so a contract
     // inhaled/exhaled inside an `if` arm contributes nothing on the other path
     // (the empty top-level pc leaves `write` unchanged).
-    let perm = sink.gate_perm(vmir::write());
+    let perm = sink.gate_perm(vmir::Perm::write());
     sink.emit_resource_combine(
         base,
         sign,

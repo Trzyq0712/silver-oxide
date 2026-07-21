@@ -1434,6 +1434,9 @@ pub(crate) enum AxiomPure {
         type_args: Vec<Type>,
         args: Vec<Val>,
     },
+    /// A fresh `wildcard` permission share (a resource footprint slot lowered
+    /// from a function precondition). Each graft mints a new positive symbolic.
+    Wildcard,
 }
 
 /// One instruction of a prepared body: a value-producing pure step, an
@@ -1574,6 +1577,20 @@ pub(crate) fn build_instance_vals(
                         let tys: Box<[Type]> = type_args.iter().cloned().collect();
                         let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
                         egraph.add(Symbolic::FuncApp(*func, tys, args))
+                    }
+                    AxiomPure::Wildcard => {
+                        // Mint a fresh positive wildcard: `w` with `0 < w` assumed.
+                        let w = egraph.add(Symbolic::Wildcard(
+                            crate::verify::lang::fresh_wildcard_id(),
+                        ));
+                        let zero = egraph
+                            .add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+                        let pos = egraph.add(Symbolic::Binary(BinOp::Lt, [zero, w]));
+                        let t = true_of(egraph);
+                        if egraph.union(pos, t) {
+                            changed.push(egraph.find(pos));
+                        }
+                        w
                     }
                 };
                 vals.push(id);

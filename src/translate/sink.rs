@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use crate::vmir::{
-    self, BinOp, HeapInst, HeapVal, Inst, InstKind, PathConds, Polarity, PureInst, ResourceCall,
-    Sign, Type, Val, none,
+    self, BinOp, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Perm, Polarity, PureInst,
+    ResourceCall, Sign, Type, Val, none,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -49,6 +49,12 @@ pub(crate) struct Sink {
     /// `Fresh` (nondeterministic) and the guarded emitters (pc-dependent
     /// obligations) are never memoized.
     memo: HashMap<(Type, PureInst), Val>,
+    /// Read-only (function/pure) lowering: every `acc`/unfolding permission is
+    /// weakened to a `wildcard` (or `0`), since a function only ever needs *some*
+    /// positive share to read. Set on the sinks of function bodies and function
+    /// precondition resources; `false` for methods and predicate bodies. See
+    /// [`Sink::perm_amount`].
+    pub(crate) read_only: bool,
 }
 
 impl Sink {
@@ -61,6 +67,7 @@ impl Sink {
             pc: Vec::new(),
             heap: None,
             memo: HashMap::new(),
+            read_only: false,
         }
     }
 
@@ -121,14 +128,34 @@ impl Sink {
             .collect()
     }
 
-    /// Gate a permission amount by the current branch path condition: each branch
-    /// literal wraps `perm` in a ternary, with `none` (0) on the *dead* side. A
-    /// positive literal `b` yields `b ? perm : none`; a negative literal (the else
-    /// arm) yields `b ? none : perm` — flipped branches instead of a materialized
-    /// `!b`. The empty path condition (top level) returns `perm` unchanged. Only
-    /// *branch* conditions gate: a separating-conjunction `Fact` is an assertion
-    /// (abort if false), so its `acc` keeps the bare permission.
-    pub(crate) fn gate_perm(&mut self, perm: Val) -> Val {
+    /// Gate a permission by the current branch path condition: each branch literal
+    /// wraps `perm` with `none` (0) on the *dead* side. A positive literal `b`
+    /// yields `b ? perm : none`; a negative literal `b ? none : perm`. The empty
+    /// (top-level) path condition returns `perm` unchanged. Only *branch*
+    /// conditions gate; a separating-conjunction `Fact` keeps the bare permission.
+    ///
+    /// A concrete [`Perm::Amount`] gates by emitting a `Val` ternary via
+    /// [`Sink::gate_perm_val`] — byte-for-byte the pre-`Perm` behavior, so every
+    /// non-wildcard program's e-graph term and purify recipe are unchanged. A
+    /// wildcard-bearing permission gates *structurally* as [`Perm::Ite`] so the
+    /// wildcard survives to the verifier.
+    pub(crate) fn gate_perm(&mut self, perm: Perm) -> Perm {
+        if let Perm::Amount(v) = perm {
+            return Perm::Amount(self.gate_perm_val(v));
+        }
+        let mut p = perm;
+        for (lit, pol) in self.branch_conds().into_iter().rev() {
+            p = match pol {
+                Polarity::Positive => Perm::Ite(lit, Box::new(p), Box::new(Perm::none())),
+                Polarity::Negative => Perm::Ite(lit, Box::new(Perm::none()), Box::new(p)),
+            };
+        }
+        p
+    }
+
+    /// Gate a concrete permission *value* — the original `gate_perm`, kept for the
+    /// [`Perm::Amount`] fast path.
+    fn gate_perm_val(&mut self, perm: Val) -> Val {
         let mut v = perm;
         // Innermost literal first, so the outermost guard ends outermost.
         for (lit, pol) in self.branch_conds().into_iter().rev() {
@@ -139,6 +166,31 @@ impl Sink {
             v = self.emit_pure(Type::Real, PureInst::Ternary(lit, then_, else_));
         }
         v
+    }
+
+    /// Map a lowered permission *value* to a [`Perm`], applying the read-only
+    /// (function) policy when [`Sink::read_only`] is set: a constant `0` stays
+    /// `0`; a constant nonzero amount becomes `wildcard`; any other (symbolic)
+    /// amount `p` becomes `p > 0 ? wildcard : 0`. Outside read-only context the
+    /// amount is kept exactly ([`Perm::Amount`]).
+    pub(crate) fn perm_amount(&mut self, p: Val) -> Perm {
+        if !self.read_only {
+            return Perm::Amount(p);
+        }
+        match &p {
+            Val::Literal(Literal::Real(r)) => {
+                if *r == num::BigRational::from(num::BigInt::from(0)) {
+                    Perm::none()
+                } else {
+                    Perm::Wildcard
+                }
+            }
+            _ => {
+                // p > 0  ==  0 < p
+                let gt = self.emit_pure(Type::Bool, PureInst::Binary(BinOp::Lt, none(), p));
+                Perm::Ite(gt, Box::new(Perm::Wildcard), Box::new(Perm::none()))
+            }
+        }
     }
 
     /// Gate a written *value* by the current branch path condition, keeping the
@@ -263,7 +315,7 @@ impl Sink {
         base: HeapVal,
         sign: Sign,
         call: ResourceCall,
-        perm: Val,
+        perm: Perm,
         yields_snap: bool,
     ) -> (HeapVal, Option<Val>) {
         let h = match sign {

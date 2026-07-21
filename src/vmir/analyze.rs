@@ -328,7 +328,7 @@ mod tests {
             kind: InstKind::Heap(HeapInst::Inhale {
                 base: HeapVal::Empty,
                 call,
-                perm: write(),
+                perm: crate::vmir::Perm::write(),
             }),
         };
         Declaration::Method(Method {

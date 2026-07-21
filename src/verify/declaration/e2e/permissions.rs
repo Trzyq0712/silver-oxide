@@ -87,11 +87,14 @@ method client(x: Ref)
 }
 
 #[test]
-fn heap_dep_call_with_fractional_deficit_fails() {
-    // A heap-dependent function's implicit `Snap` precondition demands full
-    // fractional sufficiency; holding only 1/2 when the callee needs the
-    // default (full) amount must fail, distinct from holding no permission
-    // at all (`heap_dep_call_without_permission_fails`).
+fn heap_dep_call_with_fractional_share_suffices() {
+    // Function preconditions are lowered to **wildcards** (a function only needs
+    // *some* positive share to read), so a heap-dependent call requires only a
+    // positive fraction at the call site — not the written amount. Holding 1/2
+    // when the callee's `requires acc(x.f)` names the full amount now suffices
+    // (the wildcard exhale assumes `w < 1/2`). Contrast
+    // `heap_dep_call_without_permission_fails`: holding *no* permission still
+    // fails, since a wildcard cannot be taken from an empty location.
     let input = r#"
 field f: Int
 
@@ -108,7 +111,7 @@ method m(y: Ref)
     let program = lower(input);
     let result = verify_named_method(&program, "m");
     assert!(
-        matches!(result, Err(ref err) if matches!(err.root_cause(), VerifyError::InsufficientPermission)),
-        "expected InsufficientPermission, got {result:?}"
+        result.is_ok(),
+        "a positive fractional share satisfies a wildcard precondition, got {result:?}"
     );
 }
