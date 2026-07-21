@@ -1424,15 +1424,35 @@ struct FootprintResult {
 /// The caller owns everything *around* the slots: the predicate-chunk add/remove
 /// (bracketing differs — `fold` adds after, `unfold` removes before) and what to
 /// do with `heap` (`snap` discards it — functions frame, they don't consume).
-/// Whether a permission recipe is a single bare `wildcard` (no gating, no
-/// scaling) — the shape of an *unconditional* function-precondition footprint
-/// slot (`requires acc(P(x))` → the one predicate slot). At a `Snap` such a slot
-/// needs no permission term at all: presence is unconditional and sufficiency is
-/// just "the caller holds a positive share here". Building the wildcard would
-/// leave un-collapsible `ite` residue in the persistent graph.
-fn is_bare_wildcard(perm: &crate::verify::cert::BodyRecipe) -> bool {
+/// Whether a permission recipe mentions a `wildcard` (bare or gated) — the shape
+/// of a function-precondition footprint slot. At a `Snap` such a slot needs no
+/// permission *amount*: presence is the gating guard (`true` when bare) and
+/// sufficiency is just "the caller holds a positive share where the slot is
+/// required". Building the wildcard would leave un-collapsible `ite` residue in
+/// the persistent graph that `ite-reduce` then churns on.
+fn recipe_has_wildcard(perm: &crate::verify::cert::BodyRecipe) -> bool {
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
-    perm.steps.len() == 1 && matches!(perm.steps[0], AxiomInst::Val(AxiomPure::Wildcard))
+    perm.steps
+        .iter()
+        .any(|s| matches!(s, AxiomInst::Val(AxiomPure::Wildcard)))
+}
+
+/// A footprint slot's permission as built for the current walk: either the real
+/// `Amount` (drives the heap effect), or, for a wildcard slot at a `Snap`, a
+/// `Presence` indicator `ite(guard, 1, 0)` standing in for the wildcard (drives
+/// only the snapshot member + a "holds a positive share" sufficiency prove).
+enum SlotPerm {
+    Amount(egg::Id),
+    Presence(egg::Id),
+}
+
+impl SlotPerm {
+    fn map_id(self, f: impl FnOnce(egg::Id) -> egg::Id) -> SlotPerm {
+        match self {
+            SlotPerm::Amount(i) => SlotPerm::Amount(f(i)),
+            SlotPerm::Presence(i) => SlotPerm::Presence(f(i)),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1491,18 +1511,28 @@ fn walk_footprint(
         // call sites (the common case: one resource, many uses) free; reducing
         // unconditionally per slot re-runs the ADT rule set over the whole e-graph
         // every time and costs ~3.5x end to end.
-        // A bare-wildcard slot at a `Snap`: don't build the wildcard perm (its
-        // amount is irrelevant to the snapshot and would pollute the graph).
-        let bare_wc = is_snap && is_bare_wildcard(&slot.perm);
+        // A wildcard slot at a `Snap` (bare or gated): don't build the wildcard
+        // perm (its amount is irrelevant to the snapshot and would pollute the
+        // graph). Build its **presence** indicator instead — the same recipe with
+        // the wildcard leaf replaced by full permission `1`, so `ite(guard, 1, 0)`
+        // whose `0 < …` folds to the gating guard (`true` when unconditional).
+        let wc_slot = is_snap && recipe_has_wildcard(&slot.perm);
         let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
-        let bperm =
-            (!bare_wc).then(|| slot.perm.build(&mut ctx.egraph, resolve, &mut changed));
+        let bperm = if wc_slot {
+            let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+            let pp = slot
+                .perm
+                .build_wildcard_as(&mut ctx.egraph, resolve, &mut changed, one);
+            SlotPerm::Presence(pp)
+        } else {
+            SlotPerm::Amount(slot.perm.build(&mut ctx.egraph, resolve, &mut changed))
+        };
         if ctx.egraph.total_number_of_nodes() != before {
             ctx.reduce();
         }
         let addr = ctx.egraph.find(addr);
-        let bperm = bperm.map(|b| ctx.egraph.find(b));
+        let bperm = bperm.map_id(|b| ctx.egraph.find(b));
         let elem = slot.elem.clone();
         let (value, recipe) = match &source {
             // Values are read from the *original* heap (aliased slots agree);
@@ -1549,7 +1579,7 @@ fn walk_footprint(
         let present = match bperm {
             // Normal path: apply the (optionally scaled) permission to the heap
             // (subtract/union), presence is `0 < perm`.
-            Some(bperm) => {
+            SlotPerm::Amount(bperm) => {
                 let p = match scale {
                     Some(pm) => ctx.add(Symbolic::Binary(BinOp::Mult, [pm, bperm])),
                     None => bperm,
@@ -1561,24 +1591,35 @@ fn walk_footprint(
                 };
                 ctx.perm_positive(bperm)
             }
-            // Bare-wildcard `Snap` slot: no heap effect (Snap frames, and a bare
-            // wildcard is unconditional so presence is `true`). Sufficiency is
-            // just that the caller holds *some* positive share here — proven
-            // against the caller's (concrete) held permission, no wildcard built.
-            None => {
+            // Wildcard `Snap` slot: no heap effect (Snap frames). Presence is the
+            // gating guard `0 < ite(guard, 1, 0)` (folds to `guard`, `true` when
+            // unconditional). Sufficiency: where the slot is required, the caller
+            // must hold a positive share — prove `guard ⇒ 0 < held` against the
+            // caller's (concrete) held permission; no wildcard is ever built.
+            SlotPerm::Presence(pp) => {
+                let guard = ctx.perm_positive(pp);
                 let (_, existing) =
                     find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
-                let held_ok = match existing {
+                let suff = match existing {
                     Some(c) => {
-                        let pos = ctx.perm_positive(c.perm);
-                        ctx.prove_under_pc(pos, pc_lits)
+                        let hpos = ctx.perm_positive(c.perm);
+                        let imp = ctx
+                            .implication(hpos, std::iter::once((guard, Polarity::Positive)));
+                        ctx.prove_under_pc(imp, pc_lits)
                     }
-                    None => false,
+                    // No chunk held here: sound only if the slot is not required
+                    // on this path (`guard` is false).
+                    None => {
+                        let f = ctx.false_();
+                        let t = ctx.true_();
+                        let not_guard = ctx.add(Symbolic::Ite([guard, f, t]));
+                        ctx.prove_under_pc(not_guard, pc_lits)
+                    }
                 };
-                if !held_ok {
+                if !suff {
                     return Err(VerifyError::InsufficientPermission);
                 }
-                ctx.true_()
+                guard
             }
         };
         members.push(ctx.option_member(elem, present, value));

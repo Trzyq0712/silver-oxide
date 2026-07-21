@@ -96,6 +96,28 @@ impl BodyRecipe {
         let seed: Vec<Id> = self.seed_refs.iter().map(resolve).collect();
         crate::verify::rewrite::build_instance(egraph, &self.steps, &self.res, &seed, changed)
     }
+
+    /// [`Self::build`], but every `wildcard` leaf is replaced by `wildcard_repl`
+    /// (a positive constant) rather than a fresh wildcard. Used to build a
+    /// wildcard footprint slot's **presence** indicator without polluting the
+    /// persistent graph — see [`build_instance_subst`](crate::verify::rewrite::build_instance_subst).
+    pub(crate) fn build_wildcard_as(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        resolve: impl Fn(&SeedRef) -> Id,
+        changed: &mut Vec<Id>,
+        wildcard_repl: Id,
+    ) -> Id {
+        let seed: Vec<Id> = self.seed_refs.iter().map(resolve).collect();
+        crate::verify::rewrite::build_instance_subst(
+            egraph,
+            &self.steps,
+            &self.res,
+            &seed,
+            changed,
+            wildcard_repl,
+        )
+    }
 }
 
 /// One footprint slot of a [`ResourceDefinition`]: its location kind and element

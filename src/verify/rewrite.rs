@@ -1527,6 +1527,23 @@ pub(crate) fn build_instance(
     resolve_val(egraph, &vals, res)
 }
 
+/// [`build_instance`], but every `AxiomPure::Wildcard` step is replaced by the
+/// fixed id `wildcard_repl` instead of a fresh positive wildcard. Used to build a
+/// footprint slot's **presence** term (`wildcard → 1`, so `ite(guard, 1, 0)`
+/// whose `0 < …` folds to `guard`) without ever minting a `Symbolic::Wildcard` —
+/// keeping the un-collapsible wildcard `ite` out of the persistent graph.
+pub(crate) fn build_instance_subst(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    insts: &[AxiomInst],
+    res: &Val,
+    vals_seed: &[Id],
+    changed: &mut Vec<Id>,
+    wildcard_repl: Id,
+) -> Id {
+    let vals = build_instance_vals_impl(egraph, insts, vals_seed, changed, Some(wildcard_repl));
+    resolve_val(egraph, &vals, res)
+}
+
 /// Resolve a recipe-space `Val` against a built instance's temp slots.
 fn resolve_val(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
     match v {
@@ -1543,6 +1560,18 @@ pub(crate) fn build_instance_vals(
     insts: &[AxiomInst],
     vals_seed: &[Id],
     changed: &mut Vec<Id>,
+) -> Vec<Id> {
+    build_instance_vals_impl(egraph, insts, vals_seed, changed, None)
+}
+
+/// [`build_instance_vals`] with an optional wildcard substitution (see
+/// [`build_instance_subst`]). `wildcard_repl = None` mints fresh wildcards.
+fn build_instance_vals_impl(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    insts: &[AxiomInst],
+    vals_seed: &[Id],
+    changed: &mut Vec<Id>,
+    wildcard_repl: Option<Id>,
 ) -> Vec<Id> {
     let mut vals: Vec<Id> = vals_seed.to_vec();
     fn get(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
@@ -1578,20 +1607,25 @@ pub(crate) fn build_instance_vals(
                         let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
                         egraph.add(Symbolic::FuncApp(*func, tys, args))
                     }
-                    AxiomPure::Wildcard => {
+                    AxiomPure::Wildcard => match wildcard_repl {
+                        // Presence build: use the fixed replacement (a positive
+                        // constant), no fresh wildcard.
+                        Some(repl) => repl,
                         // Mint a fresh positive wildcard: `w` with `0 < w` assumed.
-                        let w = egraph.add(Symbolic::Wildcard(
-                            crate::verify::lang::fresh_wildcard_id(),
-                        ));
-                        let zero = egraph
-                            .add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-                        let pos = egraph.add(Symbolic::Binary(BinOp::Lt, [zero, w]));
-                        let t = true_of(egraph);
-                        if egraph.union(pos, t) {
-                            changed.push(egraph.find(pos));
+                        None => {
+                            let w = egraph.add(Symbolic::Wildcard(
+                                crate::verify::lang::fresh_wildcard_id(),
+                            ));
+                            let zero = egraph
+                                .add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+                            let pos = egraph.add(Symbolic::Binary(BinOp::Lt, [zero, w]));
+                            let t = true_of(egraph);
+                            if egraph.union(pos, t) {
+                                changed.push(egraph.find(pos));
+                            }
+                            w
                         }
-                        w
-                    }
+                    },
                 };
                 vals.push(id);
             }

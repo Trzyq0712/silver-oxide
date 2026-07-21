@@ -108,6 +108,37 @@ function get(x: Ref): Int
 }
 
 #[test]
+fn function_gated_wildcard_precondition() {
+    // A *conditional* (gated) wildcard footprint: the precondition only grants
+    // `acc(x.f)` when `b`, so the `Snap` footprint permission is `ite(b, w, 0)`.
+    // The call site holds `acc(y.f, 1/2)` unconditionally, so it satisfies the
+    // gated precondition on either value of `b`.
+    let input = r#"
+field f: Int
+
+function get(x: Ref, b: Bool): Int
+    requires b ==> acc(x.f)
+{ b ? x.f : 0 }
+
+method m(y: Ref, c: Bool)
+    requires acc(y.f, 1/2)
+{
+    var a: Int := get(y, c)
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_function(&program, "get").is_ok(),
+        "gated-wildcard-precondition function must verify"
+    );
+    let result = verify_named_method(&program, "m");
+    assert!(
+        result.is_ok(),
+        "call satisfying a gated wildcard precondition must verify, got {result:?}"
+    );
+}
+
+#[test]
 fn function_nested_unfold_succeeds_with_wildcard() {
     // THE wildcard win. `get2` unfolds `P(this)` and, *inside* that unfold, calls
     // `get(this)` which itself requires `P(this)`. Because function preconditions
