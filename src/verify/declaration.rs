@@ -1236,6 +1236,7 @@ fn eval_method_inst(
                 Some(scale),
                 &pc_lits,
                 &bool_guard,
+                false,
             )?;
             state.push_heap(out);
             if let Some(res_id) = hi.snap_yield(&program.decls) {
@@ -1277,6 +1278,7 @@ fn eval_method_inst(
                 Some(perm_id),
                 &pc_lits,
                 &pc_lits,
+                false,
             )?;
             let snap = build_snapshot(ctx, call.resource, members);
             let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
@@ -1422,6 +1424,17 @@ struct FootprintResult {
 /// The caller owns everything *around* the slots: the predicate-chunk add/remove
 /// (bracketing differs — `fold` adds after, `unfold` removes before) and what to
 /// do with `heap` (`snap` discards it — functions frame, they don't consume).
+/// Whether a permission recipe is a single bare `wildcard` (no gating, no
+/// scaling) — the shape of an *unconditional* function-precondition footprint
+/// slot (`requires acc(P(x))` → the one predicate slot). At a `Snap` such a slot
+/// needs no permission term at all: presence is unconditional and sufficiency is
+/// just "the caller holds a positive share here". Building the wildcard would
+/// leave un-collapsible `ite` residue in the persistent graph.
+fn is_bare_wildcard(perm: &crate::verify::cert::BodyRecipe) -> bool {
+    use crate::verify::rewrite::{AxiomInst, AxiomPure};
+    perm.steps.len() == 1 && matches!(perm.steps[0], AxiomInst::Val(AxiomPure::Wildcard))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_footprint(
     ctx: &mut VerifyContext<'_>,
@@ -1438,6 +1451,12 @@ fn walk_footprint(
     // `Consume`, assumed for `Produce`). Usually `pc_lits`; an `inhale` passes
     // `[0 < scale]` since it carries no path condition.
     bool_guard: &[(egg::Id, Polarity)],
+    // A `Snap` (non-consuming precondition check): a bare-wildcard footprint slot
+    // skips building the wildcard perm and subtracting — sufficiency becomes a
+    // "holds a positive share" prove, presence is unconditional. Keeps the
+    // wildcard `ite` residue (which `ite-reduce` churns on) out of the persistent
+    // e-graph. `false` for the consuming/producing walks (fold/unfold/in/exhale).
+    is_snap: bool,
 ) -> Result<FootprintResult, VerifyError> {
     use crate::verify::cert::SeedRef;
     let def = certs.get(&resource).ok_or(VerifyError::DependencyFailed)?;
@@ -1472,14 +1491,18 @@ fn walk_footprint(
         // call sites (the common case: one resource, many uses) free; reducing
         // unconditionally per slot re-runs the ADT rule set over the whole e-graph
         // every time and costs ~3.5x end to end.
+        // A bare-wildcard slot at a `Snap`: don't build the wildcard perm (its
+        // amount is irrelevant to the snapshot and would pollute the graph).
+        let bare_wc = is_snap && is_bare_wildcard(&slot.perm);
         let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
-        let bperm = slot.perm.build(&mut ctx.egraph, resolve, &mut changed);
+        let bperm =
+            (!bare_wc).then(|| slot.perm.build(&mut ctx.egraph, resolve, &mut changed));
         if ctx.egraph.total_number_of_nodes() != before {
             ctx.reduce();
         }
         let addr = ctx.egraph.find(addr);
-        let bperm = ctx.egraph.find(bperm);
+        let bperm = bperm.map(|b| ctx.egraph.find(b));
         let elem = slot.elem.clone();
         let (value, recipe) = match &source {
             // Values are read from the *original* heap (aliased slots agree);
@@ -1522,20 +1545,42 @@ fn walk_footprint(
             // Inhale: an unconstrained fresh value per slot.
             ValueSource::Fresh => (ctx.fresh_symbolic_value(elem.clone()), None),
         };
-        // The heap effect uses the (optionally scaled) permission; the snapshot
-        // membership discriminant uses the *unscaled* recipe perm.
-        let p = match scale {
-            Some(pm) => ctx.add(Symbolic::Binary(BinOp::Mult, [pm, bperm])),
-            None => bperm,
+        // Snapshot member `present ? Some(v) : None`, plus the slot's heap effect.
+        let present = match bperm {
+            // Normal path: apply the (optionally scaled) permission to the heap
+            // (subtract/union), presence is `0 < perm`.
+            Some(bperm) => {
+                let p = match scale {
+                    Some(pm) => ctx.add(Symbolic::Binary(BinOp::Mult, [pm, bperm])),
+                    None => bperm,
+                };
+                let chunk = Chunk::new(addr, p, value).with_recipe(recipe.clone());
+                heap = match direction {
+                    Direction::Consume => heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits)?,
+                    Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
+                };
+                ctx.perm_positive(bperm)
+            }
+            // Bare-wildcard `Snap` slot: no heap effect (Snap frames, and a bare
+            // wildcard is unconditional so presence is `true`). Sufficiency is
+            // just that the caller holds *some* positive share here — proven
+            // against the caller's (concrete) held permission, no wildcard built.
+            None => {
+                let (_, existing) =
+                    find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
+                let held_ok = match existing {
+                    Some(c) => {
+                        let pos = ctx.perm_positive(c.perm);
+                        ctx.prove_under_pc(pos, pc_lits)
+                    }
+                    None => false,
+                };
+                if !held_ok {
+                    return Err(VerifyError::InsufficientPermission);
+                }
+                ctx.true_()
+            }
         };
-        let chunk = Chunk::new(addr, p, value).with_recipe(recipe.clone());
-        heap = match direction {
-            Direction::Consume => heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits)?,
-            Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
-        };
-        // Snapshot member `present ? Some(v) : None` (built for both directions —
-        // `fold`/`snap` and snapshot-yielding `inhale`/`exhale` all need it).
-        let present = ctx.perm_positive(bperm);
         members.push(ctx.option_member(elem, present, value));
         values.push(value);
         recipes.push(recipe);
@@ -1655,6 +1700,7 @@ fn eval_unfold(
         Some(perm_id),
         &pc_lits,
         &pc_lits,
+        false,
     )?;
     state.push_heap(out);
     ctx.reduce();
@@ -1713,6 +1759,7 @@ fn eval_snap(
         None,
         &pc_lits,
         &pc_lits,
+        true,
     )?;
     let s = build_snapshot(ctx, *resource, members);
 
@@ -1832,6 +1879,7 @@ fn eval_from_snap(
         None,
         &pc_lits,
         &pc_lits,
+        false,
     )?;
     ctx.reduce();
     Ok(out)
