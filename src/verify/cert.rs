@@ -196,6 +196,13 @@ pub(crate) struct RecipeBuilder {
     /// address and permission (sliced into standalone [`SlotRecipe`]s at the
     /// end of the walk).
     pub(crate) pending_slots: Vec<(LocationKind, Type, Val, Val)>,
+    /// This recipe is a **spec** body — a contract function (`#requires` /
+    /// `#ensures`), i.e. a lowered pre/postcondition. Its nested function calls
+    /// are spec-position occurrences (Silicon's limited symbol), so they emit **no**
+    /// precondition-propagation token: when this body is unfolded at a client the
+    /// callees stay dormant, discharged by congruence rather than by unfolding.
+    /// A regular function body (value position) sets this `false` and propagates.
+    spec: bool,
 }
 
 impl RecipeBuilder {
@@ -215,7 +222,19 @@ impl RecipeBuilder {
             recursive_scc,
             post_meta,
             pending_slots: Vec::new(),
+            spec: false,
         }
+    }
+
+    /// Mark this recipe as a spec (contract-function) body — suppresses
+    /// precondition-propagation token emission (see [`Self::spec`]).
+    pub(crate) fn mark_spec(&mut self) {
+        self.spec = true;
+    }
+
+    /// Whether this is a spec (contract-function) recipe body.
+    pub(crate) fn is_spec(&self) -> bool {
+        self.spec
     }
 
     fn next_temp(&self) -> Val {

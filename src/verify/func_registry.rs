@@ -50,6 +50,13 @@ pub struct FuncRegistry {
     /// Precondition-token id per heap-dependent function's `#requires` Resource
     /// (see [`FuncRegistry::pre_token`]).
     pre_token: HashMap<MemberId, FuncId>,
+    /// Uniform precondition-token id keyed on the **function member** itself
+    /// (see [`FuncRegistry::fn_pre_token`]). Unlike [`Self::pre_token`] (keyed on
+    /// the heap-dep `#requires` Resource, over the resource's args) this one is
+    /// over the *function's own args* `fargs` and is minted for every function
+    /// flavour identically — it is the `forall`-style presence trigger that gates
+    /// the definitional body-unfold (`rewrite::function_rule`).
+    fn_pre_token: HashMap<MemberId, FuncId>,
     /// Display names for minted ids (which are outside the interner).
     names: HashMap<FuncId, String>,
     rules: Vec<Rule>,
@@ -151,6 +158,7 @@ impl FuncRegistry {
             tag: HashMap::new(),
             limited: HashMap::new(),
             pre_token: HashMap::new(),
+            fn_pre_token: HashMap::new(),
             names,
             rules,
             shapes,
@@ -209,6 +217,7 @@ impl FuncRegistry {
             tag: HashMap::new(),
             limited: HashMap::new(),
             pre_token: HashMap::new(),
+            fn_pre_token: HashMap::new(),
             names,
             rules,
             quant_table: Default::default(),
@@ -284,6 +293,21 @@ impl FuncRegistry {
         }
         let id = self.mint(format!("{name}#pre"));
         self.pre_token.insert(resource, id);
+        id
+    }
+
+    /// The uniform **function** precondition token `f%pre` (minting it on first
+    /// use), keyed on the function member and applied to the function's own args
+    /// `fargs`. Uninterpreted — no unfold rule — it is only ever *added* (present)
+    /// at a genuine value-position call line; its presence is the trigger that
+    /// lets [`crate::verify::rewrite::function_rule`] unfold `f(fargs)==body`.
+    /// Identical for heap-free, heap-dep, and precondition-free functions.
+    pub fn fn_pre_token(&mut self, func: MemberId, name: &str) -> FuncId {
+        if let Some(&id) = self.fn_pre_token.get(&func) {
+            return id;
+        }
+        let id = self.mint(format!("{name}%pre"));
+        self.fn_pre_token.insert(func, id);
         id
     }
 

@@ -287,12 +287,26 @@ fn eval_pure_inst(
             // `assume_axioms` from `ctx.fn_certs`) the next time saturation runs
             // over this occurrence, not eagerly here.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
+            let func_id = crate::verify::func_registry::func_id_for_member(fc.function);
             let id = ctx.add_func_app_id(
-                crate::verify::func_registry::func_id_for_member(fc.function),
+                func_id,
                 fc.type_args.clone().into(),
                 ty.clone(),
-                args.into(),
+                args.clone().into(),
             );
+            // Presence trigger (Silicon's `f%pre`, assumed only at call sites):
+            // every genuine value-position call — in a method body OR a regular
+            // function body (both must compute the callee's value) — mints the
+            // callee's `f%pre(args)` token node, whose presence lets
+            // `rewrite::function_rule` unfold the body at this occurrence. The one
+            // non-value position is a **contract-function body** (a lowered
+            // pre/post): its calls are handled below (no propagation), and its own
+            // token is never minted by a client, so it stays dormant there.
+            {
+                let name = ctx.member_name(fc.function);
+                let tok = ctx.alloc.fn_pre_token(fc.function, &name);
+                ctx.add(Symbolic::FuncApp(tok, Box::new([]), args.into()));
+            }
             let recipe = if ctx.recipe.is_some() {
                 let args: Vec<Val> = fc
                     .args
@@ -303,27 +317,47 @@ fn eval_pure_inst(
                 // limited twin `f'` — uninterpreted, so unfolding this recipe
                 // at a call site stops after one level. Every other callee
                 // keeps its full id and unfolds normally.
-                let func = if ctx
+                let recursive = ctx
                     .recipe
                     .as_ref()
                     .unwrap()
-                    .is_recursive_callee(fc.function)
-                {
+                    .is_recursive_callee(fc.function);
+                let func = if recursive {
                     let name = ctx.member_name(fc.function);
                     ctx.alloc.limited(fc.function, &name)
                 } else {
-                    crate::verify::func_registry::func_id_for_member(fc.function)
+                    func_id
                 };
+                // Precondition propagation (Silicon's `bodyPreconditionPropagation`):
+                // in a **value** (non-spec) body, emit the non-recursive callee's
+                // `g%pre(gargs)` token as an orphan recipe step so that when *this*
+                // body is unfolded (its own token present), the nested token
+                // re-materializes and `g` may unfold in turn — the cascade proceeds
+                // down genuine value chains. A **spec** (contract) body emits none,
+                // so its callees stay dormant when it is unfolded at a client.
+                let propagate = !recursive && !ctx.recipe.as_ref().unwrap().is_spec();
+                let g_pre = propagate.then(|| {
+                    let name = ctx.member_name(fc.function);
+                    ctx.alloc.fn_pre_token(fc.function, &name)
+                });
                 // Record the callee under the body temp this inst will occupy,
                 // to spot the exit `assert f#ensures(..)`.
                 let body_temp = state.vals.len();
                 let rb = ctx.recipe.as_mut().unwrap();
                 rb.record_callee(body_temp, fc.function);
-                Some(rb.emit(AxiomPure::App {
+                let call = rb.emit(AxiomPure::App {
                     func,
                     type_args: fc.type_args.clone(),
-                    args,
-                }))
+                    args: args.clone(),
+                });
+                if let Some(g_pre) = g_pre {
+                    rb.emit(AxiomPure::App {
+                        func: g_pre,
+                        type_args: Vec::new(),
+                        args,
+                    });
+                }
+                Some(call)
             } else {
                 None
             };
@@ -1324,6 +1358,9 @@ fn eval_method_inst(
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
+            // For an opaque heap-free `#requires` token this proves the callee-cert
+            // formula and releases the token (mirrors `eval_snap`); otherwise a
+            // plain `prove_under_pc`.
             if !ctx.prove_under_pc(id, &pc_lits) {
                 return Err(VerifyError::AssertionFailed);
             }
@@ -1993,13 +2030,23 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
     // saturation (see `rewrite::function_rule`), instead of eagerly grafting it
     // once at translation-walk time.
     if let Some(fn_certs) = ctx.fn_certs {
+        let contracts = contract_members(program);
         for (&id, def) in fn_certs.iter() {
             let name = ctx.member_name(id);
             let func = crate::verify::func_registry::func_id_for_member(id);
+            // The uniform `f%pre` presence trigger gates the body-unfold of a
+            // **genuine** function: the rule only fires where a `FuncApp(f%pre,
+            // args)` node was minted (a value-position call, or a propagation step
+            // in an unfolded value body). A **contract** function (`#requires` /
+            // `#ensures`) is left ungated (`None`) — it must inline its formula
+            // freely, as before, or a `f#ensures` occurrence stays opaque and its
+            // post never reaches `f(args)`.
+            let pre_token = (!contracts.contains(&id)).then(|| ctx.alloc.fn_pre_token(id, &name));
             ctx.axiom_rules.push(crate::verify::rewrite::function_rule(
                 &name,
                 func,
                 std::sync::Arc::clone(def),
+                pre_token,
             ));
             // A recursive function's post fact also triggers on its limited
             // twin `f'` — that is what delivers the postcondition at a
@@ -2524,12 +2571,21 @@ pub(crate) fn verify_function(
             args: en.args.clone(),
         }
     });
-    ctx.recipe = Some(crate::verify::cert::RecipeBuilder::new(
+    let mut recipe = crate::verify::cert::RecipeBuilder::new(
         function.params.len(),
         guard_app,
         recursive_scc.cloned(),
         post_meta,
-    ));
+    );
+    // A **contract** function (some other function's `#requires`/`#ensures`, i.e. a
+    // lowered pre/postcondition) is a spec body: its nested calls emit no
+    // precondition-propagation token, so unfolding it at a client leaves the
+    // callees dormant (discharged by congruence, not by unfolding) — the pcguard
+    // validator-ladder win. A regular function body stays a value position.
+    if contract_members(program).contains(&self_id) {
+        recipe.mark_spec();
+    }
+    ctx.recipe = Some(recipe);
     // Recursive batch: every SCC member's spec-derived post axiom is available
     // while this body is checked (Silicon emits `post` in phase 1, before the
     // phase-2 body check) — this is what lets the exit assert use a recursive
@@ -2616,6 +2672,26 @@ pub(crate) fn verify_function(
 ///   token is stamped by [`eval_snap`] where the check passed.
 ///
 /// `None` for a function without a precondition (its facts are unguarded).
+/// The set of **contract** functions — every function's lowered
+/// `#requires`/`#ensures` (booleans carrying a pre/postcondition), collected from
+/// the contract links. Contract-function bodies are spec positions: they are left
+/// ungated (must inline freely) and suppress precondition propagation.
+fn contract_members(program: &vmir::Program) -> std::collections::HashSet<MemberId> {
+    let mut set = std::collections::HashSet::new();
+    for decl in program.decls.iter() {
+        let vmir::Declaration::Function(f) = decl else {
+            continue;
+        };
+        if let Some(r) = f.requires.as_ref() {
+            set.insert(r.member());
+        }
+        if let Some(e) = f.ensures.as_ref() {
+            set.insert(e.member);
+        }
+    }
+    set
+}
+
 fn pre_token(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     program: &vmir::Program,

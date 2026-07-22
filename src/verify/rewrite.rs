@@ -1960,7 +1960,22 @@ struct FunctionUnfoldApplier {
     /// body yields `f'(smaller)`, and this is what delivers the postcondition
     /// there (Silicon's `post` axiom triggering on the limited symbol).
     limited_post: bool,
+    /// Guards the (expensive) body build + fact replay: done at most once per call.
     memo: Memo<CallKey>,
+    /// Guards the definitional union separately from the build: a call first built
+    /// facts-only (no token yet) and later reached by a propagation-minted token
+    /// must still union `f==body`, which `memo` alone would suppress.
+    union_memo: Memo<CallKey>,
+    /// The function's uniform pre-token `f%pre` (`FuncRegistry::fn_pre_token`),
+    /// used as a `forall`-style **presence** trigger: the definitional
+    /// `f(fargs)==body` union+build fires only when a `FuncApp(f%pre, fargs)` node
+    /// is present in the e-graph for the *same* `fargs` — i.e. this occurrence was
+    /// reached from a genuine value-position call (which is the only place the
+    /// token node is ever added). A spec-only occurrence never has the token node,
+    /// so its body is neither built nor unioned (Silicon's `f%pre ⟹ f==body`,
+    /// with `f%pre` assumed only at call sites). `None` on the facts-only rule,
+    /// where there is no definitional union to gate.
+    pre_token: Option<FuncId>,
 }
 
 /// Replay a definition's exported facts against one built instance: for each
@@ -2002,6 +2017,8 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
         _searcher_ast: Option<&PatternAst<Symbolic>>,
         _rule_name: Symbol,
     ) -> Vec<Id> {
+        // Candidate calls in this e-class (deduped locally; the persistent `memo`
+        // is only consulted once we commit to building — see below).
         let mut calls: Vec<(Box<[Type]>, Vec<Id>)> = Vec::new();
         for node in &egraph[eclass].nodes {
             let Symbolic::FuncApp(f, tys, args) = node else {
@@ -2012,21 +2029,55 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             }
             let args: Vec<Id> = args.iter().map(|&a| egraph.find(a)).collect();
             let key = (tys.clone(), args);
-            if self.memo.insert(key.clone()) {
+            if !calls.contains(&key) {
                 calls.push(key);
             }
         }
         let mut changed = Vec::new();
         for (tys, args) in calls {
             debug_assert_eq!(args.len(), self.def.n_params, "function unfold arity");
+            // Presence trigger: the definitional union fires only when a
+            // `FuncApp(f%pre, args)` node is present for the *same* args — i.e.
+            // this occurrence was reached from a genuine value-position call (the
+            // only place the token node is minted). Presence, NOT truth: the token
+            // is released `assume_guarded` under the call-site PC, so its class is
+            // an `ite(pc, tok, ..)` shape, never unconditionally `true`. A
+            // spec-only occurrence has no token node → its body stays folded
+            // (Silicon's limited symbol). Type args are not in the `FuncApp`
+            // congruence key, so `[]` matches any instantiation.
+            // `pre_token = None` ⇒ ungated (a contract `#requires`/`#ensures`
+            // defined boolean, whose whole role is to inline its formula — it must
+            // unfold freely, as before). `Some(tok)` ⇒ gated on token presence.
+            let has_token = self.pre_token.is_none_or(|tok| {
+                egraph
+                    .lookup(Symbolic::FuncApp(tok, Box::new([]), args.clone().into()))
+                    .is_some()
+            });
+            // The body instance is needed for the definitional union (token
+            // present, non-limited) and for fact replay (facts reference body
+            // temps). A call with neither needs no build — and must NOT be memoized,
+            // so it can fire later once propagation mints its token mid-saturation.
+            let do_union = !self.limited_post && has_token;
+            let need_build = do_union || !self.def.facts.is_empty();
+            if !need_build {
+                continue;
+            }
+            let key = (tys.clone(), args.clone());
+            let first_build = self.memo.insert(key.clone());
+            // `do_union` is short-circuited first so the union memo is only ever
+            // touched when the token is present: a fresh union, or a call built
+            // facts-only earlier and now reached by a propagation-minted token.
+            let do_union_now = do_union && self.union_memo.insert(key);
+            // Nothing new to do: already built and no (new) union due.
+            if !first_build && !do_union_now {
+                continue;
+            }
             let vals = build_instance_vals(egraph, &self.def.steps, &args, &mut changed);
-            // Definitional union `f(args) == body` — unconditional: the
-            // purified body is a total function of the args (Deref became
-            // `unwrap∘proj`, div is total in the e-graph), so the equation
-            // holds even at pre-violating args. Sound only while nothing else
-            // constrains `f` there — which Viper's ban on program functions in
-            // domain axioms guarantees. Absent for an abstract function.
-            if !self.limited_post {
+            // Definitional union `f(args) == body` — unconditional once triggered:
+            // the purified body is a total function of the args (Deref became
+            // `unwrap∘proj`, div is total in the e-graph), so the equation holds
+            // even at pre-violating args. Absent for an abstract function.
+            if do_union_now {
                 if let Some(res) = &self.def.res {
                     let result = resolve_val(egraph, &vals, res);
                     if egraph.union(eclass, result) {
@@ -2045,7 +2096,10 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
                     }
                 }
             }
-            replay_facts(egraph, &self.def, self.limited_post, &vals, &mut changed);
+            // Replay facts only on the first build (idempotent; guarded internally).
+            if first_build {
+                replay_facts(egraph, &self.def, self.limited_post, &vals, &mut changed);
+            }
         }
         changed
     }
@@ -2058,13 +2112,20 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
 /// Mint the lazy-unfolding rule for one verified function's definition recipe.
 /// Reuses [`AxiomTriggerSearcher`] as-is — it only checks `FuncApp(f, ..)`
 /// presence, independent of arity/type-args, exactly what's needed here too.
-pub(crate) fn function_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>) -> Rule {
+pub(crate) fn function_rule(
+    name: &str,
+    func: FuncId,
+    def: Arc<FunctionDefinition>,
+    pre_token: Option<FuncId>,
+) -> Rule {
     let searcher = AxiomTriggerSearcher { func };
     let applier = FunctionUnfoldApplier {
         func,
         def,
         limited_post: false,
         memo: Memo::new(),
+        union_memo: Memo::new(),
+        pre_token,
     };
     timed(Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule"))
 }
@@ -2083,6 +2144,9 @@ pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>)
         def,
         limited_post: true,
         memo: Memo::new(),
+        union_memo: Memo::new(),
+        // Facts-only rule: no definitional union, so no token gate.
+        pre_token: None,
     };
     timed(Rewrite::new(format!("fn-post-{name}"), searcher, applier).expect("function post rule"))
 }

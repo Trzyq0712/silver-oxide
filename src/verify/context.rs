@@ -72,6 +72,21 @@ pub(crate) struct VerifyContext<'a> {
     /// program without wildcards skips the per-subtract `contains_wildcard` scan
     /// entirely, so non-wildcard verification pays nothing for the feature.
     pub(crate) has_wildcard: bool,
+    /// `SILVER_OXIDE_OOB_MEMO`: keep proven **conditional** obligations in an
+    /// out-of-band set instead of unioning `pc ⇒ goal` into the `true` e-class.
+    /// The union memoized the proof but dragged the whole `ite(pc.., goal, true)`
+    /// chain permanently into `true` (the measured #1 growth driver — the graph
+    /// has no GC). The set memoizes the *verdict* without materializing the
+    /// scaffolding. Empty-pc goals still union (that path is productive:
+    /// `eq-true-union`/congruence off a proven `Eq`).
+    oob_memo: bool,
+    /// Canonical class ids of implications already proven `true`, consulted at
+    /// tier 1 when `oob_memo` is on. Keyed by `egraph.find(imp)`: two distinct
+    /// obligations only share a class via congruence — which means their goals
+    /// and pcs are pairwise equal, i.e. the *same* obligation — so a hit is
+    /// sound; a stale leader after an unrelated merge only causes a safe
+    /// re-prove.
+    proven_imps: std::collections::HashSet<egg::Id>,
 }
 
 /// Whether any declaration uses a `wildcard` permission (a heap-op `Perm` with
@@ -136,6 +151,8 @@ impl<'a> VerifyContext<'a> {
             recipe: None,
             clean: None,
             has_wildcard: decls_have_wildcard(decls),
+            oob_memo: std::env::var_os("SILVER_OXIDE_OOB_MEMO").is_some(),
+            proven_imps: std::collections::HashSet::new(),
         }
     }
 
@@ -471,8 +488,12 @@ impl<'a> VerifyContext<'a> {
         let true_ = self.true_();
 
         // Tier 1: already true (memoized / trivial). O(1) — checked before the
-        // O(classes) inconsistency scan, which most calls never need.
-        if self.egraph.find(imp) == self.egraph.find(true_) {
+        // O(classes) inconsistency scan, which most calls never need. Under
+        // `oob_memo` a proven *conditional* obligation lives in `proven_imps`
+        // rather than the `true` class, so consult it too.
+        if self.egraph.find(imp) == self.egraph.find(true_)
+            || (self.oob_memo && self.proven_imps.contains(&self.egraph.find(imp)))
+        {
             return true;
         }
         // Tier 0: the held facts are contradictory (e.g. a field location holds
@@ -502,8 +523,7 @@ impl<'a> VerifyContext<'a> {
             let probe = self.egraph.clone();
             let proven = self.tier35(&probe, goal) || self.split_prove(&probe, goal, &[goal]);
             if proven {
-                self.union(imp, true_);
-                self.egraph.rebuild();
+                self.record_proven(imp, true_, pc_lits.is_empty());
             }
             return proven;
         }
@@ -549,10 +569,32 @@ impl<'a> VerifyContext<'a> {
 
         // Persist the result so future identical obligations hit tier 1.
         if proven {
+            self.record_proven(imp, true_, pc_lits.is_empty());
+        }
+        proven
+    }
+
+    /// Persist a proven obligation so future identical ones hit tier 1.
+    ///
+    /// Default (and always for an **empty-pc** goal, where `imp == goal`): union
+    /// `imp` with `true`. That path is *productive* — a proven `Eq`/discriminator
+    /// goal must collapse its argument classes via `eq-true-union` /
+    /// `contra-congruence` — and it is not the growth problem.
+    ///
+    /// Under `oob_memo`, a **conditional** obligation (`imp` is an
+    /// `ite(pc.., goal, true)` chain) is instead recorded out of band. Unioning
+    /// it would drag the whole chain permanently into the `true` class — the
+    /// measured #1 growth driver — while the verdict is all we need for the memo.
+    /// We lose auto-propagation of `goal` once its pc later lands unconditionally,
+    /// at the cost of a re-prove; soundness/completeness are unaffected.
+    fn record_proven(&mut self, imp: egg::Id, true_: egg::Id, pc_empty: bool) {
+        if self.oob_memo && !pc_empty {
+            let canon = self.egraph.find(imp);
+            self.proven_imps.insert(canon);
+        } else {
             self.union(imp, true_);
             self.egraph.rebuild();
         }
-        proven
     }
 
     /// Tier 3.5 — **non-forking `ite`-goal decomposition**. When the goal's
