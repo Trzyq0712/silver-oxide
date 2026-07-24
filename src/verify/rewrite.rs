@@ -1124,7 +1124,15 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
             if t_lit == Some(false) && e == c {
                 unions.push((eclass, Target::False));
             }
-            // Nested same-condition ite in the true branch:
+            // Nested same-condition ite in one branch — `c ? (c ? x : y) : e` and
+            // its mirror. Every arm here collapses the *whole* class (to `t` or
+            // `e`), so the first hit makes any further match in this `apply_one`
+            // redundant: stop scanning `t`'s nodes on the first collapse, and skip
+            // the else-branch scan entirely if the then-branch already produced
+            // one. (There is no per-class index of "nodes conditioned on `c`", so
+            // the scan of a branch class's nodes itself cannot be avoided — but it
+            // is one class's nodes, and it ends early.)
+            let mut collapsed = false;
             //   c ? (c ? x : y) : e
             for inner in &egraph[t].nodes {
                 let Symbolic::Ite([c2, x, y]) = inner else {
@@ -1136,28 +1144,36 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
                 // c ? (c ? x : y) : x => x
                 if egraph.find(*x) == e {
                     unions.push((eclass, Target::Class(e)));
+                    collapsed = true;
+                    break;
                 }
                 // c ? (c ? x : y) : y => c ? x : y
                 if egraph.find(*y) == e {
                     unions.push((eclass, Target::Class(t)));
+                    collapsed = true;
+                    break;
                 }
             }
             // Nested same-condition ite in the false branch:
             //   c ? t : (c ? x : y)
-            for inner in &egraph[e].nodes {
-                let Symbolic::Ite([c2, x, y]) = inner else {
-                    continue;
-                };
-                if egraph.find(*c2) != c {
-                    continue;
-                }
-                // c ? x : (c ? y : x) => x
-                if egraph.find(*y) == t {
-                    unions.push((eclass, Target::Class(t)));
-                }
-                // c ? x : (c ? x : y) => c ? x : y
-                if egraph.find(*x) == t {
-                    unions.push((eclass, Target::Class(e)));
+            if !collapsed {
+                for inner in &egraph[e].nodes {
+                    let Symbolic::Ite([c2, x, y]) = inner else {
+                        continue;
+                    };
+                    if egraph.find(*c2) != c {
+                        continue;
+                    }
+                    // c ? x : (c ? y : x) => x
+                    if egraph.find(*y) == t {
+                        unions.push((eclass, Target::Class(t)));
+                        break;
+                    }
+                    // c ? x : (c ? x : y) => c ? x : y
+                    if egraph.find(*x) == t {
+                        unions.push((eclass, Target::Class(e)));
+                        break;
+                    }
                 }
             }
         }
