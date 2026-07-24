@@ -325,21 +325,49 @@ fn static_rules() -> Vec<Rule> {
         rw!("add-zero-int-l"; "(+i 0 ?x)" => "?x"),
         rw!("add-zero-real-r"; "(+r ?x 0/1)" => "?x"),
         rw!("add-zero-real-l"; "(+r 0/1 ?x)" => "?x"),
+        // x - 0 => x
+        rw!("sub-zero-int"; "(-i ?x 0)" => "?x"),
+        rw!("sub-zero-real"; "(-r ?x 0/1)" => "?x"),
         // x * 1 => x  (resource-delta perm scaling by a full permission `write`
         // folds away)
         rw!("mul-one-real-r"; "(*r ?x 1/1)" => "?x"),
         rw!("mul-one-real-l"; "(*r 1/1 ?x)" => "?x"),
+        rw!("mul-one-int-r"; "(*i ?x 1)" => "?x"),
+        rw!("mul-one-int-l"; "(*i 1 ?x)" => "?x"),
+        // x * 0 => 0  (a resource delta scaled by `none`). Kept for completeness
+        // of the identity set, at a small measured cost: the `0/1` it introduces
+        // gives `lt-ite` more tower to distribute over (26 → 41 applications on
+        // `enum_clike__match_flat`) without shrinking the graph — peak nodes are
+        // unchanged — which costs ~2% on `nscale_20` and ~3.6% on the small
+        // cases. Well inside the net win of this rule set.
+        rw!("mul-zero-real-r"; "(*r ?x 0/1)" => "0/1"),
+        rw!("mul-zero-real-l"; "(*r 0/1 ?x)" => "0/1"),
+        rw!("mul-zero-int-r"; "(*i ?x 0)" => "0"),
+        rw!("mul-zero-int-l"; "(*i 0 ?x)" => "0"),
+        // x / 1 => x. Note there is deliberately no `x / x => 1` or `0 / x => 0`:
+        // division by zero is unspecified (see `eval_binary`), so neither holds
+        // at `x = 0`.
+        rw!("div-one-real"; "(/r ?x 1/1)" => "?x"),
+        rw!("div-one-int"; "(/i ?x 1)" => "?x"),
         // Permission consolidation: a consume followed by a produce of the
         // same amount at the same location (the generic/concrete predicate
         // conversion ping-pong, a carried resource through a call) leaves the
         // chunk's permission as `(x - p) + p` — cancel it, so the chunk stays
         // at its simple pre-cycle form instead of accumulating a sum the
         // sufficiency check can only crack by case-splitting. Sound over
-        // reals (total ops), strictly shrinking.
-        rw!("add-sub-cancel-int"; "(+i (-i ?x ?p) ?p)" => "?x"),
-        rw!("add-sub-cancel-real"; "(+r (-r ?x ?p) ?p)" => "?x"),
-        rw!("sub-add-cancel-int"; "(-i (+i ?x ?p) ?p)" => "?x"),
-        rw!("sub-add-cancel-real"; "(-r (+r ?x ?p) ?p)" => "?x"),
+        // reals (total ops), strictly shrinking. Both operand orders are spelled
+        // out: there is deliberately no commutativity rule (it blows the graph
+        // up; `flatten_plus`/`merge_summands` normalize sums procedurally
+        // instead), so a give-back landing on the other side of the `+` would
+        // otherwise never cancel.
+        rw!("add-sub-cancel-int-r"; "(+i (-i ?x ?p) ?p)" => "?x"),
+        rw!("add-sub-cancel-int-l"; "(+i ?p (-i ?x ?p))" => "?x"),
+        rw!("add-sub-cancel-real-r"; "(+r (-r ?x ?p) ?p)" => "?x"),
+        rw!("add-sub-cancel-real-l"; "(+r ?p (-r ?x ?p))" => "?x"),
+        rw!("sub-add-cancel-int-r"; "(-i (+i ?x ?p) ?p)" => "?x"),
+        rw!("sub-add-cancel-int-l"; "(-i (+i ?p ?x) ?p)" => "?x"),
+        rw!("sub-add-cancel-real-r"; "(-r (+r ?x ?p) ?p)" => "?x"),
+        rw!("sub-add-cancel-real-l"; "(-r (+r ?p ?x) ?p)" => "?x"),
         // x - x => 0. The cancel rules above need a `-` and a `+` nested in each
         // other; neither reaches a bare self-subtraction. That shape is what a
         // give-back leaves when the returned share is not syntactically the outer
@@ -348,6 +376,10 @@ fn static_rules() -> Vec<Rule> {
         // leaf, so a sufficiency check could only crack it by case-splitting.
         rw!("sub-self-int"; "(-i ?x ?x)" => "0"),
         rw!("sub-self-real"; "(-r ?x ?x)" => "0/1"),
+        // x < x => false   (irreflexivity; the `<` companion to `eq-refl`, and
+        // like it, it also fires once congruence has merged the two operands)
+        rw!("lt-irrefl-real"; "(<r ?x ?x)" => "false"),
+        rw!("lt-irrefl-int"; "(<i ?x ?x)" => "false"),
         // x == x => true   (reflexivity; also fires when congruence has already
         // merged the two operands into one e-class, e.g. a return var copied from
         // a param: `ensures r == a` after `r := a`).
