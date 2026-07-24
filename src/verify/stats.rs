@@ -55,6 +55,10 @@ pub struct VerifyStats {
     /// by it.
     pub prove_tier4: u64,
     pub prove_splits: u64,
+    /// Permission-comparison goals closed by the `merge_ite_sum` fallback
+    /// *before* any tier-4 escalation (see `prove_perm_ineq`). Each one is a
+    /// case split we no longer pay for.
+    pub prove_merge_fallback: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
     /// Per-rule search/apply wall clock (excluded from `Eq` / the snapshot).

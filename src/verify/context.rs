@@ -483,6 +483,23 @@ impl<'a> VerifyContext<'a> {
         goal: egg::Id,
         pc_lits: &[(egg::Id, Polarity)],
     ) -> bool {
+        self.prove_under_pc_esc(goal, pc_lits, Escalate::Full)
+    }
+
+    /// [`Self::prove_under_pc`], but with explicit control over whether the
+    /// ladder may escalate to the tier-4 case split.
+    ///
+    /// `Escalate::NoSplit` runs tiers 1/0/2/3/3.5 and stops. A caller that has
+    /// its own cheaper fallback (today: the `merge_ite_sum` collapse in
+    /// `prove_perm_ineq`) uses it to try *that* before paying for a split, so
+    /// tier-4 stays a genuine last resort rather than winning a race against a
+    /// linear-cost alternative.
+    pub(crate) fn prove_under_pc_esc(
+        &mut self,
+        goal: egg::Id,
+        pc_lits: &[(egg::Id, Polarity)],
+        esc: Escalate,
+    ) -> bool {
         self.alloc.stats.prove_calls += 1;
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
@@ -521,7 +538,8 @@ impl<'a> VerifyContext<'a> {
             )
         }) {
             let probe = self.egraph.clone();
-            let proven = self.tier35(&probe, goal) || self.split_prove(&probe, goal, &[goal]);
+            let proven = self.tier35(&probe, goal)
+                || (esc.may_split() && self.split_prove(&probe, goal, &[goal]));
             if proven {
                 self.record_proven(imp, true_, pc_lits.is_empty());
             }
@@ -558,12 +576,14 @@ impl<'a> VerifyContext<'a> {
             } else if self.tier35(&probe, goal) {
                 // Tier 3.5: non-forking ite-goal decomposition.
                 true
-            } else {
+            } else if esc.may_split() {
                 // Tier 4: prove by case analysis on an ite condition.
                 let roots: Vec<egg::Id> = std::iter::once(goal)
                     .chain(pc_lits.iter().map(|(id, _)| *id))
                     .collect();
                 self.split_prove(&probe, goal, &roots)
+            } else {
+                false
             }
         };
 
@@ -1013,6 +1033,28 @@ impl<'a> VerifyContext<'a> {
         self.egraph = live;
         self.clean = clean;
         out
+    }
+}
+
+/// Whether a prove call may fall through to the tier-4 case split.
+///
+/// Tier 4 is exponential in the arm count, so it must be the *last* thing tried
+/// for a given obligation — including after any cheaper alternative the caller
+/// itself owns. Because the tier ladder lives inside `prove_under_pc` while
+/// `prove_perm_ineq`'s linear `merge_ite_sum` collapse lives one layer above it,
+/// a plain call would let tier 4 preempt the cheaper route. `NoSplit` stops the
+/// ladder at tier 3.5 so the caller can interleave its own fallback first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Escalate {
+    /// Full ladder: tiers 1/0/2/3/3.5, then the tier-4 case split.
+    Full,
+    /// Cheap tiers only (1/0/2/3/3.5). Never reaches tier 4.
+    NoSplit,
+}
+
+impl Escalate {
+    fn may_split(self) -> bool {
+        matches!(self, Escalate::Full)
     }
 }
 

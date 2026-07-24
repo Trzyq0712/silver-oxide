@@ -4,7 +4,7 @@ use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
         cert::{FunctionDefinition, ResourceDefinition},
-        context::VerifyContext,
+        context::{Escalate, VerifyContext},
         error::VerifyError,
         heap::{Chunk, Heap, LocationKind},
         lang::Symbolic,
@@ -855,42 +855,77 @@ fn heap_union(
 /// split needs depth N (exponential in the arm count). Merging the
 /// same-condition summands collapses the whole partition to `ite(∨c_k, 1, 0)`
 /// in O(N) steps, and the comparison then discharges without a per-arm split,
-/// scaling to any arm count. Done only on the failure path so passing checks
-/// never add these nodes to the live graph.
+/// scaling to any arm count.
+///
+/// **Tier-4 is tried last.** The collapse is linear where a split is
+/// exponential, so both goal forms get the cheap ladder (tiers 1/0/2/3/3.5,
+/// [`Escalate::NoSplit`]) before either is allowed to escalate:
+///
+/// 1. cheap ladder on `goal`
+/// 2. collapse the operands; cheap ladder on the collapsed `goal2`
+/// 3. tier 4 on `goal`
+/// 4. tier 4 on `goal2`
+///
+/// Steps 3/4 preserve exactly the coverage of the old order (full ladder on
+/// `goal`, then on `goal2`), so nothing provable becomes unprovable — the change
+/// is a reordering, not a restriction. `goal` keeps priority over `goal2` at
+/// tier 4 because that is the form that closes today's load-bearing splits.
+///
+/// Cost note: the collapse adds nodes to the live graph, so unlike the previous
+/// ordering it now runs on paths where tier 4 used to succeed first. It stays
+/// budget-capped, and paths that discharge at tiers 1–3.5 are untouched.
+///
+/// `cheap_tried` says the caller already ran step 1 on `goal` (so it is not
+/// repeated — a failed prove is not memoized, and re-running it would pay a
+/// second tier-3 clone+saturate for nothing).
 fn prove_perm_ineq(
     ctx: &mut VerifyContext<'_>,
     goal: egg::Id,
     a: egg::Id,
     b: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
+    cheap_tried: bool,
 ) -> bool {
-    if ctx.prove_under_pc(goal, pc_lits) {
+    // 1. Cheap tiers on the original goal.
+    if !cheap_tried && ctx.prove_under_pc_esc(goal, pc_lits, Escalate::NoSplit) {
         return true;
     }
+    // 2. Collapse the indicator partition and retry cheaply. If the collapse is
+    //    a no-op there is no second form, so the original goal is all we have.
     let mut budget = 4096;
     let a2 = ctx.merge_ite_sum(a, &mut budget);
     let b2 = ctx.merge_ite_sum(b, &mut budget);
     if a2 == a && b2 == b {
-        return false;
+        return ctx.prove_under_pc(goal, pc_lits);
     }
     let false_ = ctx.false_();
     let true_ = ctx.true_();
     let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [a2, b2]));
     let goal2 = ctx.add(Symbolic::Ite([lt, false_, true_]));
-    ctx.prove_under_pc(goal2, pc_lits)
+    if ctx.prove_under_pc_esc(goal2, pc_lits, Escalate::NoSplit) {
+        ctx.alloc.stats.prove_merge_fallback += 1;
+        return true;
+    }
+    // 3./4. Only now escalate, original form first.
+    ctx.prove_under_pc(goal, pc_lits) || ctx.prove_under_pc(goal2, pc_lits)
 }
 
 /// Prove an obligation `goal` under `pc_lits`. If the goal is a permission
 /// comparison `Ite(Lt(a, b), false, true)` (the shape of every `perm ≥ 0` and
-/// sufficiency side condition) and the ordinary prover fails, retry with the
+/// sufficiency side condition) and the cheap tiers fail, retry with the
 /// nested indicator-partition sums in `a`/`b` collapsed — see
 /// [`prove_perm_ineq`]. For any other goal shape this is just `prove_under_pc`.
+///
+/// The first attempt deliberately stops short of tier 4 ([`Escalate::NoSplit`]):
+/// otherwise the split would fire here and the caller's linear collapse would
+/// never be reached. Goal shapes with no collapse available escalate immediately
+/// below, so their behaviour is unchanged.
 fn prove_obligation(
     ctx: &mut VerifyContext<'_>,
     goal: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
-    if ctx.prove_under_pc(goal, pc_lits) {
+    if ctx.prove_under_pc_esc(goal, pc_lits, Escalate::NoSplit) {
         return true;
     }
     // Destructure `Ite(Lt(a, b), false, true)` and retry via the merge fallback.
@@ -903,13 +938,18 @@ fn prove_obligation(
         }
         _ => None,
     });
-    let Some(lt) = lt else { return false };
+    // Not a permission comparison: no collapse exists, so escalate now.
+    let Some(lt) = lt else {
+        return ctx.prove_under_pc(goal, pc_lits);
+    };
     let operands = ctx.egraph[lt].nodes.iter().find_map(|n| match n {
         Symbolic::Binary(BinOp::Lt, [a, b]) => Some((*a, *b)),
         _ => None,
     });
-    let Some((a, b)) = operands else { return false };
-    prove_perm_ineq(ctx, goal, a, b, pc_lits)
+    let Some((a, b)) = operands else {
+        return ctx.prove_under_pc(goal, pc_lits);
+    };
+    prove_perm_ineq(ctx, goal, a, b, pc_lits, true)
 }
 
 /// Whether a permission term is — or, through `ite` gating or `*`/`+`/`-`
@@ -1004,7 +1044,7 @@ fn heap_subtract(
     let true_ = ctx.true_();
     let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
     let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-    let proven = prove_perm_ineq(ctx, goal, existing.perm, chunk2.perm, pc_lits);
+    let proven = prove_perm_ineq(ctx, goal, existing.perm, chunk2.perm, pc_lits, false);
     if !proven {
         if crate::verify::viz::dump_perm_enabled() {
             eprintln!(
