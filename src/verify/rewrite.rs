@@ -333,6 +333,21 @@ fn static_rules() -> Vec<Rule> {
         // reals (total ops), strictly shrinking.
         rw!("add-sub-cancel"; "(+ (- ?x ?p) ?p)" => "?x"),
         rw!("sub-add-cancel"; "(- (+ ?x ?p) ?p)" => "?x"),
+        // x - x => 0. The two cancel rules above need a `-` and a `+` nested in
+        // each other; neither reaches a bare self-subtraction. That shape is what
+        // a give-back leaves when the returned share is not syntactically the
+        // outer addend — e.g. a predicate re-fold arriving as `(p - p) + 1/1`,
+        // which *is* `1/1` but whose leading summand stays an opaque leaf, so a
+        // sufficiency check can only crack it by case-splitting.
+        //
+        // Emitted by an applier rather than a plain `=> "0/1"` because `-` is
+        // shared by integer and permission arithmetic (the Viper parser maps
+        // both to `BinOp::Minus`) and the pattern carries no literal to key the
+        // zero's sort on. Unioning an integer `n - n` with the real `0/1` would
+        // put two differently-typed literals in one class and trip ConstFold's
+        // homogeneous-operand assertion. The applier infers the sort from the
+        // operand's own literals and declines when it cannot tell.
+        rw!("sub-self"; "(- ?x ?x)" => { SubSelfApplier { x: var("?x") } }),
         // x == x => true   (reflexivity; also fires when congruence has already
         // merged the two operands into one e-class, e.g. a return var copied from
         // a param: `ensures r == a` after `r := a`).
@@ -983,6 +998,102 @@ fn known_bool(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Option<bool> {
     match egraph[class].data.known() {
         Some(Literal::Bool(b)) => Some(*b),
         _ => None,
+    }
+}
+
+/// The zero literal matching the **sort** of `class`'s value, if it can be told
+/// from the class's own cone.
+///
+/// `BinOp::Minus` is shared by integer and permission arithmetic, so a rule that
+/// rewrites to a zero must pick `Int(0)` or `Real(0)` correctly — a wrong pick
+/// unions two differently-typed literals into one class and trips ConstFold's
+/// `non-homogeneous operands` assertion. A folded literal answers directly;
+/// otherwise the arithmetic/`ite` cone is walked for a leaf literal (an opaque
+/// permission like `ite(c, 0/1, 1/1)` is settled by its arms). Returns `None`
+/// when nothing in reach names a sort — the caller then declines to fire.
+fn zero_like(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Option<Literal> {
+    fn int_zero() -> Literal {
+        Literal::Int(num::BigInt::from(0))
+    }
+    fn real_zero() -> Literal {
+        Literal::Real(num::BigRational::from(num::BigInt::from(0)))
+    }
+    fn of_lit(lit: &Literal) -> Option<Literal> {
+        match lit {
+            Literal::Int(_) => Some(int_zero()),
+            Literal::Real(_) => Some(real_zero()),
+            _ => None,
+        }
+    }
+    fn go(
+        egraph: &EGraph<Symbolic, ConstFold>,
+        class: Id,
+        seen: &mut HashSet<Id>,
+        depth: usize,
+    ) -> Option<Literal> {
+        let class = egraph.find(class);
+        if depth == 0 || !seen.insert(class) {
+            return None;
+        }
+        if let Some(lit) = egraph[class].data.known()
+            && let Some(z) = of_lit(lit)
+        {
+            return Some(z);
+        }
+        for node in &egraph[class].nodes {
+            match node {
+                Symbolic::Lit(lit) => {
+                    if let Some(z) = of_lit(lit) {
+                        return Some(z);
+                    }
+                }
+                // Both arms have the expression's sort; either settles it.
+                Symbolic::Ite([_, t, e]) => {
+                    for arm in [t, e] {
+                        if let Some(z) = go(egraph, *arm, seen, depth - 1) {
+                            return Some(z);
+                        }
+                    }
+                }
+                // Arithmetic is homogeneous, so either operand settles it.
+                Symbolic::Binary(BinOp::Plus | BinOp::Minus | BinOp::Mult, [a, b]) => {
+                    for op in [a, b] {
+                        if let Some(z) = go(egraph, *op, seen, depth - 1) {
+                            return Some(z);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    go(egraph, class, &mut HashSet::new(), 16)
+}
+
+/// `x - x => 0`, with the zero's sort inferred from `x` (see [`zero_like`]).
+struct SubSelfApplier {
+    x: Var,
+}
+
+impl Applier<Symbolic, ConstFold> for SubSelfApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        let Some(zero) = zero_like(egraph, subst[self.x]) else {
+            return Vec::new();
+        };
+        let zero = egraph.add(Symbolic::Lit(zero));
+        if egraph.union(eclass, zero) {
+            vec![eclass]
+        } else {
+            Vec::new()
+        }
     }
 }
 
