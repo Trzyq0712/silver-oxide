@@ -282,7 +282,7 @@ impl<'a> VerifyContext<'a> {
         let zero = self.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
             num::BigInt::from(0),
         ))));
-        self.add(Symbolic::Binary(BinOp::Lt, [zero, perm]))
+        self.add(Symbolic::Binary(BinOp::LtR, [zero, perm]))
     }
 
     /// Run rewrite saturation over the e-graph in place. The rule set is the
@@ -696,11 +696,7 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Whether e-class `id` folds to the boolean literal `b` in `probe`.
-    fn known_bool_class(
-        probe: &egg::EGraph<Symbolic, ConstFold>,
-        id: egg::Id,
-        b: bool,
-    ) -> bool {
+    fn known_bool_class(probe: &egg::EGraph<Symbolic, ConstFold>, id: egg::Id, b: bool) -> bool {
         matches!(probe[probe.find(id)].data.known(), Some(Literal::Bool(v)) if *v == b)
     }
 
@@ -861,8 +857,7 @@ impl<'a> VerifyContext<'a> {
         // descend a `+` node it may also hold (that `+` is cancellation residue,
         // e.g. `x = (x - p) + p`, often self-referential; descending it pulls a
         // spurious zero-valued term into the sum and defeats the collapse).
-        let has_ite = self
-            .egraph[id]
+        let has_ite = self.egraph[id]
             .nodes
             .iter()
             .any(|n| matches!(n, Symbolic::Ite(_)));
@@ -870,7 +865,7 @@ impl<'a> VerifyContext<'a> {
             None
         } else {
             self.egraph[id].nodes.iter().find_map(|n| match n {
-                Symbolic::Binary(BinOp::Plus, k) => Some(*k),
+                Symbolic::Binary(BinOp::AddR, k) => Some(*k),
                 _ => None,
             })
         };
@@ -934,7 +929,7 @@ impl<'a> VerifyContext<'a> {
                 // else sides.)
                 let mut acc = members[0];
                 for &m in &members[1..] {
-                    acc = self.add(Symbolic::Binary(BinOp::Plus, [acc, m]));
+                    acc = self.add(Symbolic::Binary(BinOp::AddR, [acc, m]));
                 }
                 terms.push(acc);
                 continue;
@@ -962,11 +957,13 @@ impl<'a> VerifyContext<'a> {
             terms.push(self.add(Symbolic::Lit(Literal::Real(const_sum))));
         }
         if terms.is_empty() {
-            return self.add(Symbolic::Lit(Literal::Real(BigRational::from(num::BigInt::from(0)))));
+            return self.add(Symbolic::Lit(Literal::Real(BigRational::from(
+                num::BigInt::from(0),
+            ))));
         }
         let mut acc = terms[0];
         for &t in &terms[1..] {
-            acc = self.add(Symbolic::Binary(BinOp::Plus, [acc, t]));
+            acc = self.add(Symbolic::Binary(BinOp::AddR, [acc, t]));
         }
         acc
     }

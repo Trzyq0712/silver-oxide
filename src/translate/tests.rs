@@ -195,7 +195,10 @@ method m(x: Int, y: Int)
         .find(|i| {
             matches!(
                 &i.kind,
-                vmir::InstKind::Pure(_, vmir::PureInst::Binary(vmir::BinOp::Div, _, _))
+                vmir::InstKind::Pure(
+                    _,
+                    vmir::PureInst::Binary(vmir::BinOp::DivI | vmir::BinOp::DivR, _, _)
+                )
             )
         })
         .expect("requires body must contain a Div");
@@ -230,7 +233,7 @@ method m(x: Int, y: Int)
                 &i.kind,
                 vmir::InstKind::Pure(
                     vmir::Type::Int,
-                    vmir::PureInst::Binary(vmir::BinOp::Div, _, _)
+                    vmir::PureInst::Binary(vmir::BinOp::DivI | vmir::BinOp::DivR, _, _)
                 )
             )
         })
@@ -513,7 +516,7 @@ method m(x: Ref, y: Int)
     let mut saw_deref = false;
     for inst in &method.insts {
         match &inst.kind {
-            InstKind::Pure(_, PureInst::Binary(BinOp::Div, _, _)) => {
+            InstKind::Pure(_, PureInst::Binary(BinOp::DivI | BinOp::DivR, _, _)) => {
                 saw_div = true;
                 assert!(inst.heap.is_some(), "division must carry a check-in heap");
             }
@@ -1318,5 +1321,8 @@ fn sink_value_numbers_total_pure_insts() {
     let t2 = sink.emit_pure(Type::Bool, PureInst::Ternary(a, b, vmir::FALSE));
     assert_eq!(t1, t2, "identical total pure insts share a temp");
     assert_eq!(sink.insts.len(), n, "the repeat emits nothing");
-    assert!(matches!(t1, Val::Temp(2)), "temp numbering stays sequential");
+    assert!(
+        matches!(t1, Val::Temp(2)),
+        "temp numbering stays sequential"
+    );
 }

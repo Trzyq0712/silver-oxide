@@ -41,7 +41,7 @@ pub(crate) fn infer_type(
             // records its `Addr{..}` return type in `func_ret_types` like any other.
             Symbolic::FuncApp(f, _, _) => func_ret_types.get(f).cloned(),
             Symbolic::Binary(op, [l, _]) => match op {
-                BinOp::Eq | BinOp::Lt => Some(Type::Bool),
+                BinOp::Eq | BinOp::LtI | BinOp::LtR => Some(Type::Bool),
                 _ => infer_type(egraph, fresh_types, func_ret_types, *l, memo),
             },
             Symbolic::Ite([_, then, _]) => {

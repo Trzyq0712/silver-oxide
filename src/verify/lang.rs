@@ -222,13 +222,26 @@ impl FromOp for Symbolic {
             ("null", 0) => Ok(Lit(Literal::Null)),
             ("ite", 3) => Ok(Ite([children[0], children[1], children[2]])),
             ("real", 1) => Ok(RealCast(children[0])),
-            ("+", _) => bin(BinOp::Plus),
-            ("-", _) => bin(BinOp::Minus),
-            ("*", _) => bin(BinOp::Mult),
-            ("/", _) => bin(BinOp::Div),
+            // Sort-tagged arithmetic and comparison (`i` = Int, `r` = Real). The
+            // bare forms are rejected below: a pattern like `(- ?x ?x)` that does
+            // not say which sort it means cannot decide whether to produce `0` or
+            // `0/1`, and guessing merges an `Int` literal with a `Real` one.
+            ("+i", _) => bin(BinOp::AddI),
+            ("+r", _) => bin(BinOp::AddR),
+            ("-i", _) => bin(BinOp::SubI),
+            ("-r", _) => bin(BinOp::SubR),
+            ("*i", _) => bin(BinOp::MulI),
+            ("*r", _) => bin(BinOp::MulR),
+            ("/i", _) => bin(BinOp::DivI),
+            ("/r", _) => bin(BinOp::DivR),
             ("mod", _) => bin(BinOp::Mod),
+            ("<i", _) => bin(BinOp::LtI),
+            ("<r", _) => bin(BinOp::LtR),
+            // Polymorphic: no sort to name.
             ("==", _) => bin(BinOp::Eq),
-            ("<", _) => bin(BinOp::Lt),
+            ("+" | "-" | "*" | "/" | "<", _) => Err(FromOpError(format!(
+                "`{op}` is sort-ambiguous — write `{op}i` (Int) or `{op}r` (Real)"
+            ))),
             // A bare integer is `Lit(Int)`; a fraction (`0/1`, `1/2`) is `Lit(Real)`.
             (lit, 0) => {
                 if let Ok(n) = lit.parse::<num::BigInt>() {

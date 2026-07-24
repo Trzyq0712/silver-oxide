@@ -120,7 +120,7 @@ pub(crate) fn lower<Ext: PureExt>(
                 // -v  =  0 - v
                 typed::UnOp::Neg => Ok(sink.emit_pure(
                     ty.clone(),
-                    PureInst::Binary(vmir::BinOp::Minus, zero_literal(&ty), v),
+                    PureInst::Binary(vmir::BinOp::sub(&ty), zero_literal(&ty), v),
                 )),
                 typed::UnOp::Cardinality => Err(TranslationError::Unsupported("cardinality")),
             }
@@ -323,23 +323,31 @@ fn lower_binary<Ext: PureExt>(
     }
     // Homogenize: a `Real`-result arithmetic op with an `Int` operand gets that
     // operand wrapped in `real(..)` so the e-graph operands share a type.
-    let lv = real_cast_if(sink, lv, &b.lower_type(&l.ty), &ty);
+    let lty = b.lower_type(&l.ty);
+    let lv = real_cast_if(sink, lv, &lty, &ty);
     let rv = real_cast_if(sink, rv, &b.lower_type(&r.ty), &ty);
+    // Operand sort for the sort-tagged operators. An arithmetic op's result type
+    // *is* its operand sort (that is what the casts above just established), but
+    // a comparison produces `Bool`, so its sort comes from an operand instead —
+    // either one, since the typechecker equates the two
+    // (`viper::typecheck`, `Lt | Le | Gt | Ge` imposes `lk.equate_with(rk)`).
+    let cmp = &lty;
     Ok(match op {
-        B::Plus => sink.emit_pure(ty, PureInst::Binary(V::Plus, lv, rv)),
-        B::Minus => sink.emit_pure(ty, PureInst::Binary(V::Minus, lv, rv)),
-        B::Mult => sink.emit_pure(ty, PureInst::Binary(V::Mult, lv, rv)),
+        B::Plus => sink.emit_pure(ty.clone(), PureInst::Binary(V::add(&ty), lv, rv)),
+        B::Minus => sink.emit_pure(ty.clone(), PureInst::Binary(V::sub(&ty), lv, rv)),
+        B::Mult => sink.emit_pure(ty.clone(), PureInst::Binary(V::mul(&ty), lv, rv)),
         // The divisor≠0 obligation is checked in the current value heap.
-        // `IntDiv` (`\`) collapses into the same VMIR `Div`: the op is already
-        // polymorphic, and `\`'s operands are `Int` by type checking.
+        // `IntDiv` (`\`) collapses into the `Int` VMIR division: `\`'s operands
+        // are `Int` by type checking, so it lands on the same variant `/` does
+        // over integers.
         B::Div | B::IntDiv => sink.with_heap(hctx.value, |sink| {
-            sink.emit_pure_guarded(ty, PureInst::Binary(V::Div, lv, rv))
+            sink.emit_pure_guarded(ty.clone(), PureInst::Binary(V::div(&ty), lv, rv))
         }),
         B::Mod => sink.with_heap(hctx.value, |sink| {
             sink.emit_pure_guarded(ty, PureInst::Binary(V::Mod, lv, rv))
         }),
         B::Eq => sink.emit_pure(ty, PureInst::Binary(V::Eq, lv, rv)),
-        B::Lt => sink.emit_pure(ty, PureInst::Binary(V::Lt, lv, rv)),
+        B::Lt => sink.emit_pure(ty, PureInst::Binary(V::lt(cmp), lv, rv)),
         // Desugarings:
         B::Neq => {
             let eq = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Eq, lv, rv));
@@ -347,13 +355,13 @@ fn lower_binary<Ext: PureExt>(
         }
         B::Le => {
             // l <= r  <=>  !(r < l)
-            let gt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, rv, lv));
+            let gt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::lt(cmp), rv, lv));
             sink.emit_pure(ty, PureInst::Ternary(gt, FALSE, TRUE))
         }
-        B::Gt => sink.emit_pure(ty, PureInst::Binary(V::Lt, rv, lv)),
+        B::Gt => sink.emit_pure(ty, PureInst::Binary(V::lt(cmp), rv, lv)),
         B::Ge => {
             // l >= r  <=>  !(l < r)
-            let lt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::Lt, lv, rv));
+            let lt = sink.emit_pure(vmir::Type::Bool, PureInst::Binary(V::lt(cmp), lv, rv));
             sink.emit_pure(ty, PureInst::Ternary(lt, FALSE, TRUE))
         }
         B::And | B::Or | B::Implies => unreachable!("handled above"),

@@ -314,16 +314,21 @@ pub fn tag_rule(tag_fn: FuncId, ctor_tags: HashMap<FuncId, usize>) -> Rule {
 fn static_rules() -> Vec<Rule> {
     let mut rules = terminating_ite_rules();
     rules.extend(vec![
-        // x + 0 => x  (Int)
-        rw!("add-zero-int-r"; "(+ ?x 0)" => "?x"),
-        rw!("add-zero-int-l"; "(+ 0 ?x)" => "?x"),
-        // x + 0 => x  (Real zero literal `0/1`; `real(0)` const-folds to it)
-        rw!("add-zero-real-r"; "(+ ?x 0/1)" => "?x"),
-        rw!("add-zero-real-l"; "(+ 0/1 ?x)" => "?x"),
-        // x * 1 => x  (Real one literal `1/1`; resource-delta perm scaling by a
-        // full permission `write` folds away)
-        rw!("mul-one-real-r"; "(* ?x 1/1)" => "?x"),
-        rw!("mul-one-real-l"; "(* 1/1 ?x)" => "?x"),
+        // Arithmetic identities. Every operator names its operand sort (`+i` /
+        // `+r`), so each identity is written once per sort and a rule that
+        // *produces* a literal knows which one to produce — an integer `0` and a
+        // permission `0/1` are different literals, and merging them into one
+        // e-class is a type error the analysis panics on.
+        //
+        // x + 0 => x
+        rw!("add-zero-int-r"; "(+i ?x 0)" => "?x"),
+        rw!("add-zero-int-l"; "(+i 0 ?x)" => "?x"),
+        rw!("add-zero-real-r"; "(+r ?x 0/1)" => "?x"),
+        rw!("add-zero-real-l"; "(+r 0/1 ?x)" => "?x"),
+        // x * 1 => x  (resource-delta perm scaling by a full permission `write`
+        // folds away)
+        rw!("mul-one-real-r"; "(*r ?x 1/1)" => "?x"),
+        rw!("mul-one-real-l"; "(*r 1/1 ?x)" => "?x"),
         // Permission consolidation: a consume followed by a produce of the
         // same amount at the same location (the generic/concrete predicate
         // conversion ping-pong, a carried resource through a call) leaves the
@@ -331,23 +336,18 @@ fn static_rules() -> Vec<Rule> {
         // at its simple pre-cycle form instead of accumulating a sum the
         // sufficiency check can only crack by case-splitting. Sound over
         // reals (total ops), strictly shrinking.
-        rw!("add-sub-cancel"; "(+ (- ?x ?p) ?p)" => "?x"),
-        rw!("sub-add-cancel"; "(- (+ ?x ?p) ?p)" => "?x"),
-        // x - x => 0. The two cancel rules above need a `-` and a `+` nested in
-        // each other; neither reaches a bare self-subtraction. That shape is what
-        // a give-back leaves when the returned share is not syntactically the
-        // outer addend — e.g. a predicate re-fold arriving as `(p - p) + 1/1`,
-        // which *is* `1/1` but whose leading summand stays an opaque leaf, so a
-        // sufficiency check can only crack it by case-splitting.
-        //
-        // Emitted by an applier rather than a plain `=> "0/1"` because `-` is
-        // shared by integer and permission arithmetic (the Viper parser maps
-        // both to `BinOp::Minus`) and the pattern carries no literal to key the
-        // zero's sort on. Unioning an integer `n - n` with the real `0/1` would
-        // put two differently-typed literals in one class and trip ConstFold's
-        // homogeneous-operand assertion. The applier infers the sort from the
-        // operand's own literals and declines when it cannot tell.
-        rw!("sub-self"; "(- ?x ?x)" => { SubSelfApplier { x: var("?x") } }),
+        rw!("add-sub-cancel-int"; "(+i (-i ?x ?p) ?p)" => "?x"),
+        rw!("add-sub-cancel-real"; "(+r (-r ?x ?p) ?p)" => "?x"),
+        rw!("sub-add-cancel-int"; "(-i (+i ?x ?p) ?p)" => "?x"),
+        rw!("sub-add-cancel-real"; "(-r (+r ?x ?p) ?p)" => "?x"),
+        // x - x => 0. The cancel rules above need a `-` and a `+` nested in each
+        // other; neither reaches a bare self-subtraction. That shape is what a
+        // give-back leaves when the returned share is not syntactically the outer
+        // addend — e.g. a predicate re-fold arriving as `(p - p) + 1/1`, which
+        // *is* `1/1` but whose leading summand would otherwise stay an opaque
+        // leaf, so a sufficiency check could only crack it by case-splitting.
+        rw!("sub-self-int"; "(-i ?x ?x)" => "0"),
+        rw!("sub-self-real"; "(-r ?x ?x)" => "0/1"),
         // x == x => true   (reflexivity; also fires when congruence has already
         // merged the two operands into one e-class, e.g. a return var copied from
         // a param: `ensures r == a` after `r := a`).
@@ -417,7 +417,10 @@ fn distributive_ite_rules() -> Vec<Rule> {
             Rewrite::new(
                 "eq-false-then",
                 EqBucketSearcher,
-                EqFalseUnitApplier { then_side: true, memo: Memo::new() },
+                EqFalseUnitApplier {
+                    then_side: true,
+                    memo: Memo::new(),
+                },
             )
             .expect("eq-false-then rule"),
         );
@@ -425,7 +428,10 @@ fn distributive_ite_rules() -> Vec<Rule> {
             Rewrite::new(
                 "eq-false-else",
                 EqBucketSearcher,
-                EqFalseUnitApplier { then_side: false, memo: Memo::new() },
+                EqFalseUnitApplier {
+                    then_side: false,
+                    memo: Memo::new(),
+                },
             )
             .expect("eq-false-else rule"),
         );
@@ -439,8 +445,12 @@ fn distributive_ite_rules() -> Vec<Rule> {
         // const-folds, then `ite-reduce` collapses the rebuilt tower), instead
         // of one level per saturation iteration.
         rules.push(
-            Rewrite::new("lt-ite", LtBucketSearcher, LtIteDistributeApplier { memo: Memo::new() })
-                .expect("lt-ite rule"),
+            Rewrite::new(
+                "lt-ite",
+                LtBucketSearcher,
+                LtIteDistributeApplier { memo: Memo::new() },
+            )
+            .expect("lt-ite rule"),
         );
     }
     rules.extend(vec![
@@ -591,17 +601,24 @@ impl Searcher<Symbolic, ConstFold> for LtBucketSearcher {
         egraph: &EGraph<Symbolic, ConstFold>,
         limit: usize,
     ) -> Vec<SearchMatches<'_, Symbolic>> {
-        let Some(classes) = egraph.classes_for_op(&Discriminant::Binary(BinOp::Lt)) else {
-            return vec![];
-        };
-        classes
-            .take(limit)
-            .map(|eclass| SearchMatches {
-                eclass,
-                substs: vec![Subst::default()],
-                ast: None,
-            })
-            .collect()
+        // One bucket per sort now, and `<` distributes over an ite tower the
+        // same way in both — scan them together.
+        let mut out: Vec<SearchMatches<'_, Symbolic>> = Vec::new();
+        for op in [BinOp::LtI, BinOp::LtR] {
+            let Some(classes) = egraph.classes_for_op(&Discriminant::Binary(op)) else {
+                continue;
+            };
+            out.extend(
+                classes
+                    .take(limit.saturating_sub(out.len()))
+                    .map(|eclass| SearchMatches {
+                        eclass,
+                        substs: vec![Subst::default()],
+                        ast: None,
+                    }),
+            );
+        }
+        out
     }
 
     fn search_eclass_with_limit(
@@ -613,7 +630,7 @@ impl Searcher<Symbolic, ConstFold> for LtBucketSearcher {
         egraph[eclass]
             .nodes
             .iter()
-            .any(|n| matches!(n, Symbolic::Binary(BinOp::Lt, _)))
+            .any(|n| matches!(n, Symbolic::Binary(BinOp::LtI | BinOp::LtR, _)))
             .then(|| SearchMatches {
                 eclass,
                 substs: vec![Subst::default()],
@@ -657,13 +674,10 @@ impl LtPlan {
             return LtPlan::Leaf(class);
         }
         seen.push(class);
-        let plan = match egraph[class]
-            .nodes
-            .iter()
-            .find_map(|n| match n {
-                Symbolic::Ite([c, t, e]) => Some((*c, *t, *e)),
-                _ => None,
-            }) {
+        let plan = match egraph[class].nodes.iter().find_map(|n| match n {
+            Symbolic::Ite([c, t, e]) => Some((*c, *t, *e)),
+            _ => None,
+        }) {
             Some((c, t, e)) => LtPlan::Ite(
                 egraph.find(c),
                 Box::new(Self::descend(egraph, t, seen, depth - 1)),
@@ -679,22 +693,25 @@ impl LtPlan {
         matches!(self, LtPlan::Leaf(_))
     }
 
-    /// Build the mirrored tower, applying `lt` at each leaf. `ite_on_left`
-    /// selects which side of the `<` the tower operand sits on.
+    /// Build the mirrored tower, applying `op` at each leaf. `ite_on_left`
+    /// selects which side of the comparison the tower operand sits on. `op` is
+    /// the sort-tagged comparison taken from the node that matched, so the
+    /// rebuilt leaves keep the operand sort of the original.
     fn build(
         &self,
         egraph: &mut EGraph<Symbolic, ConstFold>,
+        op: BinOp,
         z: Id,
         ite_on_left: bool,
     ) -> Id {
         match self {
             LtPlan::Leaf(leaf) => {
                 let args = if ite_on_left { [*leaf, z] } else { [z, *leaf] };
-                egraph.add(Symbolic::Binary(BinOp::Lt, args))
+                egraph.add(Symbolic::Binary(op, args))
             }
             LtPlan::Ite(c, t, e) => {
-                let t = t.build(egraph, z, ite_on_left);
-                let e = e.build(egraph, z, ite_on_left);
+                let t = t.build(egraph, op, z, ite_on_left);
+                let e = e.build(egraph, op, z, ite_on_left);
                 egraph.add(Symbolic::Ite([*c, t, e]))
             }
         }
@@ -728,9 +745,9 @@ impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
         if egraph[eclass].data.known().is_some() {
             return vec![];
         }
-        let mut plans: Vec<(LtPlan, Id, bool)> = Vec::new();
+        let mut plans: Vec<(LtPlan, BinOp, Id, bool)> = Vec::new();
         for node in &egraph[eclass].nodes {
-            let Symbolic::Binary(BinOp::Lt, [l, r]) = node else {
+            let Symbolic::Binary(op @ (BinOp::LtI | BinOp::LtR), [l, r]) = node else {
                 continue;
             };
             for (tower, z, ite_on_left) in [(*l, *r, true), (*r, *l, false)] {
@@ -740,13 +757,13 @@ impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
                 }
                 let plan = LtPlan::descend(egraph, tower, &mut Vec::new(), LT_DESCEND_DEPTH);
                 if !plan.is_leaf() {
-                    plans.push((plan, z, ite_on_left));
+                    plans.push((plan, *op, z, ite_on_left));
                 }
             }
         }
         let mut changed = Vec::new();
-        for (plan, z, ite_on_left) in plans {
-            let distributed = plan.build(egraph, z, ite_on_left);
+        for (plan, op, z, ite_on_left) in plans {
+            let distributed = plan.build(egraph, op, z, ite_on_left);
             if egraph.union(eclass, distributed) {
                 changed.push(egraph.find(eclass));
             }
@@ -998,102 +1015,6 @@ fn known_bool(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Option<bool> {
     match egraph[class].data.known() {
         Some(Literal::Bool(b)) => Some(*b),
         _ => None,
-    }
-}
-
-/// The zero literal matching the **sort** of `class`'s value, if it can be told
-/// from the class's own cone.
-///
-/// `BinOp::Minus` is shared by integer and permission arithmetic, so a rule that
-/// rewrites to a zero must pick `Int(0)` or `Real(0)` correctly — a wrong pick
-/// unions two differently-typed literals into one class and trips ConstFold's
-/// `non-homogeneous operands` assertion. A folded literal answers directly;
-/// otherwise the arithmetic/`ite` cone is walked for a leaf literal (an opaque
-/// permission like `ite(c, 0/1, 1/1)` is settled by its arms). Returns `None`
-/// when nothing in reach names a sort — the caller then declines to fire.
-fn zero_like(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Option<Literal> {
-    fn int_zero() -> Literal {
-        Literal::Int(num::BigInt::from(0))
-    }
-    fn real_zero() -> Literal {
-        Literal::Real(num::BigRational::from(num::BigInt::from(0)))
-    }
-    fn of_lit(lit: &Literal) -> Option<Literal> {
-        match lit {
-            Literal::Int(_) => Some(int_zero()),
-            Literal::Real(_) => Some(real_zero()),
-            _ => None,
-        }
-    }
-    fn go(
-        egraph: &EGraph<Symbolic, ConstFold>,
-        class: Id,
-        seen: &mut HashSet<Id>,
-        depth: usize,
-    ) -> Option<Literal> {
-        let class = egraph.find(class);
-        if depth == 0 || !seen.insert(class) {
-            return None;
-        }
-        if let Some(lit) = egraph[class].data.known()
-            && let Some(z) = of_lit(lit)
-        {
-            return Some(z);
-        }
-        for node in &egraph[class].nodes {
-            match node {
-                Symbolic::Lit(lit) => {
-                    if let Some(z) = of_lit(lit) {
-                        return Some(z);
-                    }
-                }
-                // Both arms have the expression's sort; either settles it.
-                Symbolic::Ite([_, t, e]) => {
-                    for arm in [t, e] {
-                        if let Some(z) = go(egraph, *arm, seen, depth - 1) {
-                            return Some(z);
-                        }
-                    }
-                }
-                // Arithmetic is homogeneous, so either operand settles it.
-                Symbolic::Binary(BinOp::Plus | BinOp::Minus | BinOp::Mult, [a, b]) => {
-                    for op in [a, b] {
-                        if let Some(z) = go(egraph, *op, seen, depth - 1) {
-                            return Some(z);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-    go(egraph, class, &mut HashSet::new(), 16)
-}
-
-/// `x - x => 0`, with the zero's sort inferred from `x` (see [`zero_like`]).
-struct SubSelfApplier {
-    x: Var,
-}
-
-impl Applier<Symbolic, ConstFold> for SubSelfApplier {
-    fn apply_one(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        subst: &Subst,
-        _searcher_ast: Option<&PatternAst<Symbolic>>,
-        _rule_name: Symbol,
-    ) -> Vec<Id> {
-        let Some(zero) = zero_like(egraph, subst[self.x]) else {
-            return Vec::new();
-        };
-        let zero = egraph.add(Symbolic::Lit(zero));
-        if egraph.union(eclass, zero) {
-            vec![eclass]
-        } else {
-            Vec::new()
-        }
     }
 }
 
@@ -1479,10 +1400,8 @@ impl ProjApplier {
             let Symbolic::Ite([c, t, e]) = node else {
                 continue;
             };
-            if let (Some(tp), Some(ep)) = (
-                self.plan(egraph, *t, seen),
-                self.plan(egraph, *e, seen),
-            ) {
+            if let (Some(tp), Some(ep)) = (self.plan(egraph, *t, seen), self.plan(egraph, *e, seen))
+            {
                 seen.pop();
                 return Some(ProjPlan::Ite(*c, Box::new(tp), Box::new(ep)));
             }
@@ -1724,12 +1643,11 @@ fn build_instance_vals_impl(
                         Some(repl) => repl,
                         // Mint a fresh positive wildcard: `w` with `0 < w` assumed.
                         None => {
-                            let w = egraph.add(Symbolic::Wildcard(
-                                crate::verify::lang::fresh_wildcard_id(),
-                            ));
+                            let w = egraph
+                                .add(Symbolic::Wildcard(crate::verify::lang::fresh_wildcard_id()));
                             let zero = egraph
                                 .add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-                            let pos = egraph.add(Symbolic::Binary(BinOp::Lt, [zero, w]));
+                            let pos = egraph.add(Symbolic::Binary(BinOp::LtR, [zero, w]));
                             let t = true_of(egraph);
                             if egraph.union(pos, t) {
                                 changed.push(egraph.find(pos));

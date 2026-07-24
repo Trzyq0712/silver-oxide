@@ -570,7 +570,7 @@ fn merge_chunks(
     v1: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Chunk {
-    let perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p0, p1]));
+    let perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p0, p1]));
     // Eagerly collapse an indicator-partition sum (`ite(c,a,x) + ite(c,b,y)`)
     // instead of letting the tower accrete one level per merge — a borrow /
     // give-back cycle per match arm otherwise leaves the held permission as a
@@ -596,8 +596,8 @@ fn merge_chunks(
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
         num::BigInt::from(0),
     ))));
-    let p0_pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, p0]));
-    let p1_pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, p1]));
+    let p0_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, p0]));
+    let p1_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, p1]));
 
     let value = ctx.add(Symbolic::Ite([p0_pos, v0, v1]));
 
@@ -694,7 +694,7 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             continue;
         };
         let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
-        let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [b, c.perm]));
+        let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, c.perm]));
         let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
         ctx.union(le, true_);
     }
@@ -710,10 +710,10 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             };
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
             let sum = ctx.add(Symbolic::Binary(
-                BinOp::Plus,
+                BinOp::AddR,
                 [chunks[i].perm, chunks[j].perm],
             ));
-            let gt = ctx.add(Symbolic::Binary(BinOp::Lt, [b, sum]));
+            let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, sum]));
             // Both arg orders (the `!=` goal's `Eq` order is source-dependent).
             for (xs, ys) in [
                 (&chunks[i].args, &chunks[j].args),
@@ -900,7 +900,7 @@ fn prove_perm_ineq(
     }
     let false_ = ctx.false_();
     let true_ = ctx.true_();
-    let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [a2, b2]));
+    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [a2, b2]));
     let goal2 = ctx.add(Symbolic::Ite([lt, false_, true_]));
     if ctx.prove_under_pc_esc(goal2, pc_lits, Escalate::NoSplit) {
         ctx.alloc.stats.prove_merge_fallback += 1;
@@ -943,7 +943,7 @@ fn prove_obligation(
         return ctx.prove_under_pc(goal, pc_lits);
     };
     let operands = ctx.egraph[lt].nodes.iter().find_map(|n| match n {
-        Symbolic::Binary(BinOp::Lt, [a, b]) => Some((*a, *b)),
+        Symbolic::Binary(BinOp::LtR, [a, b]) => Some((*a, *b)),
         _ => None,
     });
     let Some((a, b)) = operands else {
@@ -958,7 +958,11 @@ fn prove_obligation(
 /// (prove `held ≥ needed`). Bounded by a visited set; a non-wildcard perm term
 /// (a literal / small gating `ite`) is walked in O(size).
 fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
-    fn go(ctx: &VerifyContext<'_>, id: egg::Id, seen: &mut std::collections::HashSet<egg::Id>) -> bool {
+    fn go(
+        ctx: &VerifyContext<'_>,
+        id: egg::Id,
+        seen: &mut std::collections::HashSet<egg::Id>,
+    ) -> bool {
         let id = ctx.egraph.find(id);
         if !seen.insert(id) {
             return false;
@@ -971,7 +975,7 @@ fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
                         return true;
                     }
                 }
-                Symbolic::Binary(BinOp::Mult | BinOp::Plus | BinOp::Minus, ch) => {
+                Symbolic::Binary(BinOp::MulR | BinOp::AddR | BinOp::SubR, ch) => {
                     if ch.iter().any(|c| go(ctx, *c, seen)) {
                         return true;
                     }
@@ -1000,7 +1004,7 @@ fn heap_subtract(
         // wildcard is provably positive, so this (correctly) fails — a wildcard
         // cannot be exhaled from an empty location.
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-        let pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, chunk2.perm]));
+        let pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, chunk2.perm]));
         let false_ = ctx.false_();
         let true_ = ctx.true_();
         let nonpos = ctx.add(Symbolic::Ite([pos, false_, true_]));
@@ -1017,13 +1021,13 @@ fn heap_subtract(
     // positive, so the chunk is never emptied.
     if ctx.has_wildcard && contains_wildcard(ctx, chunk2.perm) {
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-        let held_pos = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, existing.perm]));
+        let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing.perm]));
         if !ctx.prove_under_pc(held_pos, pc_lits) {
             return Err(VerifyError::InsufficientPermission);
         }
-        let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [chunk2.perm, existing.perm]));
+        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2.perm, existing.perm]));
         ctx.union(existing.value, chunk2.value);
-        let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+        let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing.perm, chunk2.perm]));
         // Assume `needed < held` and, because the e-graph has no real-order
         // arithmetic to derive `held − needed > 0` from it, the remainder's
         // positivity explicitly — otherwise a later `perm > 0` framing check on
@@ -1042,7 +1046,7 @@ fn heap_subtract(
 
     let false_ = ctx.false_();
     let true_ = ctx.true_();
-    let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [existing.perm, chunk2.perm]));
+    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [existing.perm, chunk2.perm]));
     let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
     let proven = prove_perm_ineq(ctx, goal, existing.perm, chunk2.perm, pc_lits, false);
     if !proven {
@@ -1060,7 +1064,7 @@ fn heap_subtract(
 
     ctx.union(existing.value, chunk2.value);
 
-    let remainder = ctx.add(Symbolic::Binary(BinOp::Minus, [existing.perm, chunk2.perm]));
+    let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing.perm, chunk2.perm]));
     // Whether to drop the emptied chunk is a statement about the *heap*, so it has
     // to hold at the heap's scope — **unconditionally**, not under this
     // instruction's `pc`.
@@ -1188,7 +1192,7 @@ fn eval_heap_inst(
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
             let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-            let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, write]));
+            let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [perm, write]));
             let false_ = ctx.false_();
             let true_ = ctx.true_();
             let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
@@ -1658,7 +1662,7 @@ fn walk_footprint(
             // (subtract/union), presence is `0 < perm`.
             SlotPerm::Amount(bperm) => {
                 let p = match scale {
-                    Some(pm) => ctx.add(Symbolic::Binary(BinOp::Mult, [pm, bperm])),
+                    Some(pm) => ctx.add(Symbolic::Binary(BinOp::MulR, [pm, bperm])),
                     None => bperm,
                 };
                 let chunk = Chunk::new(addr, p, value).with_recipe(recipe.clone());
@@ -1680,8 +1684,8 @@ fn walk_footprint(
                 let suff = match existing {
                     Some(c) => {
                         let hpos = ctx.perm_positive(c.perm);
-                        let imp = ctx
-                            .implication(hpos, std::iter::once((guard, Polarity::Positive)));
+                        let imp =
+                            ctx.implication(hpos, std::iter::once((guard, Polarity::Positive)));
                         ctx.prove_under_pc(imp, pc_lits)
                     }
                     // No chunk held here: sound only if the slot is not required
@@ -2872,7 +2876,7 @@ fn inst_obligations(
                 })
                 .unwrap_or_else(|| zero_real(ctx));
             let zero = zero_real(ctx);
-            let goal = ctx.add(Symbolic::Binary(BinOp::Lt, [zero, perm]));
+            let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, perm]));
             vec![(goal, VerifyError::InsufficientPermission)]
         }
         // `not(perm < 0)` desugared to an `Ite`. Applies to a location combine,
@@ -2902,7 +2906,7 @@ fn inst_obligations(
             let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let perm = eval_perm(ctx, state, perm);
             let zero = zero_real(ctx);
-            let lt = ctx.add(Symbolic::Binary(BinOp::Lt, [perm, zero]));
+            let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [perm, zero]));
             let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
             vec![(
                 goal,
@@ -2911,7 +2915,7 @@ fn inst_obligations(
         }
         // `not(divisor == 0)` desugared to an `Ite`. The divisor is homogeneous
         // with the result (casts), so the VMIR result type gives the zero's type.
-        InstKind::Pure(ty, PureInst::Binary(BinOp::Div | BinOp::Mod, _, r)) => {
+        InstKind::Pure(ty, PureInst::Binary(op, _, r)) if op.is_div_or_mod() => {
             let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
             let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let rv = state.get_val(ctx, r);
@@ -3044,7 +3048,7 @@ mod tests {
             .chunk(&test_kind(), canon)
             .expect("merged chunk missing");
 
-        let expected_perm = ctx.add(Symbolic::Binary(BinOp::Plus, [p1, p2]));
+        let expected_perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p1, p2]));
         ctx.saturate();
         assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
         // Both fractions positive (1, 2) → agreement axiom fuses the values.
@@ -3097,7 +3101,7 @@ mod tests {
         let one = real(&mut ctx, 1, 1);
         let zero = real(&mut ctx, 0, 1);
         let p = ctx.add(Symbolic::Ite([c, one, zero]));
-        let rest = ctx.add(Symbolic::Binary(BinOp::Minus, [one, p]));
+        let rest = ctx.add(Symbolic::Binary(BinOp::SubR, [one, p]));
         let (v0, v1) = (ctx.add(Symbolic::Fresh(2)), ctx.add(Symbolic::Fresh(3)));
 
         let h = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, rest, v0));
@@ -3403,7 +3407,7 @@ mod tests {
         let mut ctx = fresh_ctx(&interner);
 
         let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-        let diff = ctx.add(Symbolic::Binary(BinOp::Minus, [one, one]));
+        let diff = ctx.add(Symbolic::Binary(BinOp::SubR, [one, one]));
         ctx.egraph.rebuild();
 
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
@@ -3448,7 +3452,7 @@ mod tests {
 
         let x = ctx.add(Symbolic::Fresh(0));
         let zero = ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0))));
-        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, [x, zero]));
+        let sum = ctx.add(Symbolic::Binary(BinOp::AddI, [x, zero]));
         ctx.saturate();
 
         assert_eq!(ctx.egraph.find(sum), ctx.egraph.find(x));
@@ -3462,7 +3466,7 @@ mod tests {
         let x = ctx.add(Symbolic::Fresh(0));
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         // `0 + x` (commuted) must also fold to `x`.
-        let sum = ctx.add(Symbolic::Binary(BinOp::Plus, [zero, x]));
+        let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [zero, x]));
         ctx.saturate();
 
         assert_eq!(ctx.egraph.find(sum), ctx.egraph.find(x));

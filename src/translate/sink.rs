@@ -187,7 +187,7 @@ impl Sink {
             }
             _ => {
                 // p > 0  ==  0 < p
-                let gt = self.emit_pure(Type::Bool, PureInst::Binary(BinOp::Lt, none(), p));
+                let gt = self.emit_pure(Type::Bool, PureInst::Binary(BinOp::LtR, none(), p));
                 Perm::Ite(gt, Box::new(Perm::Wildcard), Box::new(Perm::none()))
             }
         }
@@ -258,7 +258,7 @@ impl Sink {
     pub fn emit_pure_guarded(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
         let v = self.next_val_temp();
         let pc = self.guard();
-        let heapless_obligation = matches!(inst, PureInst::Binary(BinOp::Div | BinOp::Mod, _, _));
+        let heapless_obligation = matches!(inst, PureInst::Binary(op, _, _) if op.is_div_or_mod());
         let kind = InstKind::Pure(ty, inst);
         let node = if heapless_obligation {
             self.checked_inst(pc, kind)

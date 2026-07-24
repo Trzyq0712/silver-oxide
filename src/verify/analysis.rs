@@ -205,47 +205,83 @@ impl Analysis<Symbolic> for ConstFold {
     }
 }
 
-/// Fold a binary op over two literals. Operands are **homogeneous** (the
-/// frontend inserts `real(..)` casts), so each arithmetic op dispatches on the
-/// shared literal variant and the division mode follows the operand type.
+/// Fold a binary op over two literals. The operator names its own operand sort,
+/// so each arm matches exactly one literal pair; a mismatch means the operand
+/// does not have the sort the operator claims, which is a lowering bug rather
+/// than something to fold.
+///
 /// `None` for a literal division by zero: the term is unspecified (an
 /// uninterpreted value, matching SMT semantics), not a fold-time panic —
 /// well-definedness is a separate obligation, and never checked at all inside
 /// an axiom body.
 pub fn eval_binary(op: BinOp, l: &Literal, r: &Literal) -> Option<Literal> {
     use Literal::{Int, Real};
+    /// Destructure the operands at the sort the operator declares, or panic.
+    macro_rules! operands {
+        ($variant:ident) => {
+            match (l, r) {
+                ($variant(a), $variant(b)) => (a, b),
+                _ => unreachable!(
+                    "operands are not {} for {op:?}: {l:?}, {r:?}",
+                    stringify!($variant)
+                ),
+            }
+        };
+    }
     Some(match op {
-        BinOp::Plus => match (l, r) {
-            (Int(a), Int(b)) => Int(a + b),
-            (Real(a), Real(b)) => Real(a + b),
-            _ => unreachable!("non-homogeneous operands for Plus: {l:?}, {r:?}"),
-        },
-        BinOp::Minus => match (l, r) {
-            (Int(a), Int(b)) => Int(a - b),
-            (Real(a), Real(b)) => Real(a - b),
-            _ => unreachable!("non-homogeneous operands for Minus: {l:?}, {r:?}"),
-        },
-        BinOp::Mult => match (l, r) {
-            (Int(a), Int(b)) => Int(a * b),
-            (Real(a), Real(b)) => Real(a * b),
-            _ => unreachable!("non-homogeneous operands for Mult: {l:?}, {r:?}"),
-        },
-        BinOp::Mod => match (l, r) {
-            (Int(a), Int(b)) if *b != num::BigInt::ZERO => Int(a % b),
-            (Int(_), Int(_)) => return None,
-            _ => unreachable!("non-homogeneous operands for Mod: {l:?}, {r:?}"),
-        },
-        BinOp::Div => match (l, r) {
-            (Int(a), Int(b)) if *b != num::BigInt::ZERO => Int(a / b),
-            (Real(a), Real(b)) if *b != num::BigRational::from(num::BigInt::ZERO) => Real(a / b),
-            (Int(_) | Real(_), Int(_) | Real(_)) => return None,
-            _ => unreachable!("non-homogeneous operands for Div: {l:?}, {r:?}"),
-        },
+        BinOp::AddI => {
+            let (a, b) = operands!(Int);
+            Int(a + b)
+        }
+        BinOp::AddR => {
+            let (a, b) = operands!(Real);
+            Real(a + b)
+        }
+        BinOp::SubI => {
+            let (a, b) = operands!(Int);
+            Int(a - b)
+        }
+        BinOp::SubR => {
+            let (a, b) = operands!(Real);
+            Real(a - b)
+        }
+        BinOp::MulI => {
+            let (a, b) = operands!(Int);
+            Int(a * b)
+        }
+        BinOp::MulR => {
+            let (a, b) = operands!(Real);
+            Real(a * b)
+        }
+        BinOp::Mod => {
+            let (a, b) = operands!(Int);
+            if *b == num::BigInt::ZERO {
+                return None;
+            }
+            Int(a % b)
+        }
+        BinOp::DivI => {
+            let (a, b) = operands!(Int);
+            if *b == num::BigInt::ZERO {
+                return None;
+            }
+            Int(a / b)
+        }
+        BinOp::DivR => {
+            let (a, b) = operands!(Real);
+            if *b == num::BigRational::from(num::BigInt::ZERO) {
+                return None;
+            }
+            Real(a / b)
+        }
+        BinOp::LtI => {
+            let (a, b) = operands!(Int);
+            Literal::Bool(a < b)
+        }
+        BinOp::LtR => {
+            let (a, b) = operands!(Real);
+            Literal::Bool(a < b)
+        }
         BinOp::Eq => Literal::Bool(l == r),
-        BinOp::Lt => match (l, r) {
-            (Int(a), Int(b)) => Literal::Bool(a < b),
-            (Real(a), Real(b)) => Literal::Bool(a < b),
-            _ => unreachable!("non-homogeneous operands for Lt: {l:?}, {r:?}"),
-        },
     })
 }

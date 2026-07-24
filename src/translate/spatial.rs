@@ -10,7 +10,9 @@ use crate::translate::resource::lower_resource_addr;
 use crate::translate::sink::{PcKind, Sink};
 use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
-use crate::vmir::{self, FALSE, HeapInst, HeapVal, Perm, Polarity, PureInst, Sign, TRUE, Type, Val};
+use crate::vmir::{
+    self, FALSE, HeapInst, HeapVal, Perm, Polarity, PureInst, Sign, TRUE, Type, Val,
+};
 
 /// Direction and heap semantics of a spatial lowering.
 ///
@@ -341,7 +343,7 @@ pub(crate) fn lower_assertion_bool<Ext: PureExt>(
             let p = pure_exp::lower(b, env, sink, hctx, perm)?;
             let addr = lower_resource_addr(b, env, sink, hctx, res)?;
             let held = sink.emit_pure(Type::Real, PureInst::Perm(heap, addr));
-            let lt = sink.emit_pure(Type::Bool, PureInst::Binary(vmir::BinOp::Lt, held, p));
+            let lt = sink.emit_pure(Type::Bool, PureInst::Binary(vmir::BinOp::LtR, held, p));
             Ok(Some(
                 sink.emit_pure(Type::Bool, PureInst::Ternary(lt, FALSE, TRUE)),
             ))

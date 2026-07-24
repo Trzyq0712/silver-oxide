@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{FunctionCall, HeapVal, MemberId};
+use crate::vmir::{FunctionCall, HeapVal, MemberId, Type};
 use std::fmt::{self, Display, Formatter};
 
 /// A value can be either a literal or a temporary variable defined earlier.
@@ -9,17 +9,92 @@ pub enum Val {
     Temp(usize),
 }
 
+/// A binary operator, **tagged with the sort of its operands** (`I` = `Int`,
+/// `R` = `Real`, i.e. Viper's `Perm`).
+///
+/// Viper writes one `+` for both integer and permission addition, and the sort
+/// is recovered during lowering, where the typed AST still has it. Carrying it
+/// on the operator rather than re-deriving it later is what lets an e-graph
+/// rewrite *produce* a literal: `x - x => 0` has no operand literal to read a
+/// sort off, and picking the wrong one puts an `Int` and a `Real` literal in one
+/// e-class — a type error the analysis panics on. See `verify::rewrite`.
+///
+/// `Eq` is deliberately **not** tagged: it also compares `Bool`, `Ref`, ADTs and
+/// snapshots, so a two-sort tag does not fit it, and none of its rules need to
+/// synthesise a typed literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinOp {
-    Plus,
-    Minus,
-    Mult,
+    AddI,
+    AddR,
+    SubI,
+    SubR,
+    MulI,
+    MulR,
     /// SIDECOND: The second operand must be non-zero.
-    Div,
+    DivI,
     /// SIDECOND: The second operand must be non-zero.
+    DivR,
+    /// SIDECOND: The second operand must be non-zero. `Int`-only by typing, so
+    /// it needs no sort tag.
     Mod,
+    LtI,
+    LtR,
+    /// Polymorphic over every type — see the type note above.
     Eq,
-    Lt,
+}
+
+impl BinOp {
+    /// The operand sort, or `None` for the polymorphic `Eq`.
+    pub fn sort(self) -> Option<Type> {
+        use BinOp::*;
+        match self {
+            AddI | SubI | MulI | DivI | Mod | LtI => Some(Type::Int),
+            AddR | SubR | MulR | DivR | LtR => Some(Type::Real),
+            Eq => None,
+        }
+    }
+
+    /// Whether this is the division-or-modulo family, whose non-zero-divisor
+    /// side condition is checked without consulting a heap.
+    pub fn is_div_or_mod(self) -> bool {
+        matches!(self, BinOp::DivI | BinOp::DivR | BinOp::Mod)
+    }
+
+    /// Whether this is one of the additive operators, in either sort.
+    pub fn is_additive(self) -> bool {
+        matches!(self, BinOp::AddI | BinOp::AddR | BinOp::SubI | BinOp::SubR)
+    }
+}
+
+/// Pick the sort-tagged operator for `ty`. Each panics on a non-numeric operand
+/// type: the typed Viper AST has already rejected `+` on a `Bool` or an ADT, so
+/// reaching one of these means the lowering handed over the wrong type, and
+/// silently guessing a sort would plant a type error deep in the e-graph.
+macro_rules! sorted_ctor {
+    ($($name:ident => $int:ident / $real:ident),* $(,)?) => {
+        impl BinOp {
+            $(
+                pub fn $name(ty: &Type) -> BinOp {
+                    match ty {
+                        Type::Int => BinOp::$int,
+                        Type::Real => BinOp::$real,
+                        other => panic!(
+                            concat!("`", stringify!($name), "` on a non-numeric operand type: {:?}"),
+                            other
+                        ),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+sorted_ctor! {
+    add => AddI / AddR,
+    sub => SubI / SubR,
+    mul => MulI / MulR,
+    div => DivI / DivR,
+    lt  => LtI  / LtR,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -120,14 +195,21 @@ impl Display for Val {
 
 impl Display for BinOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // The sort suffix is part of the token (`+i` / `+r`), so a VMIR dump and
+        // an e-graph rewrite pattern name the same operator the same way.
         let op = match self {
-            BinOp::Plus => "+",
-            BinOp::Minus => "-",
-            BinOp::Mult => "*",
-            BinOp::Div => "/",
+            BinOp::AddI => "+i",
+            BinOp::AddR => "+r",
+            BinOp::SubI => "-i",
+            BinOp::SubR => "-r",
+            BinOp::MulI => "*i",
+            BinOp::MulR => "*r",
+            BinOp::DivI => "/i",
+            BinOp::DivR => "/r",
             BinOp::Mod => "%",
+            BinOp::LtI => "<i",
+            BinOp::LtR => "<r",
             BinOp::Eq => "==",
-            BinOp::Lt => "<",
         };
         write!(f, "{op}")
     }
