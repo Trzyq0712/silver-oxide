@@ -264,15 +264,18 @@ fn resource_body_deps(body: &ResourceBody, out: &mut Vec<MemberId>) {
 }
 
 fn method_deps(m: &Method, out: &mut Vec<MemberId>) {
-    inst_deps(&m.insts, out);
+    for b in &m.blocks {
+        inst_deps(&b.join, out);
+        inst_deps(&b.body, out);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vmir::{
-        Function, FunctionBody, FunctionCall, HeapInst, HeapVal, Inst, InstKind, PathConds,
-        Precond, Resource, ResourceCall, Val, write,
+        Block, BlockId, Function, FunctionBody, FunctionCall, HeapInst, HeapVal, Inst, InstKind,
+        PathConds, Precond, Preds, Resource, ResourceCall, Val,
     };
     use lasso::{Key, Rodeo};
     use std::collections::HashSet;
@@ -333,7 +336,15 @@ mod tests {
         };
         Declaration::Method(Method {
             name: lasso::Spur::try_from_usize(0).unwrap(),
-            insts: vec![inst],
+            blocks: vec![Block {
+                cube: PathConds::default(),
+                preds: Preds::Entry,
+                join: vec![],
+                body: vec![inst],
+                h_out: HeapVal::Empty,
+            }]
+            .into(),
+            entry: BlockId(0),
         })
     }
 

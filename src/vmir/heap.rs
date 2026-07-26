@@ -121,6 +121,17 @@ pub enum HeapInst {
         args: Vec<Val>,
         snap: Val,
     },
+    /// `h := merge <cond> ? <then_h> : <els_h>` — the block-IR heap join: select
+    /// between two predecessor exit heaps under a binary join condition. The
+    /// *structural* per-chunk merge (`design/block-vmir/30`) that collapses the
+    /// exit permission tower lives in its evaluation. **Not emitted yet** — the
+    /// block lowering threads a single linear heap for now; this variant is
+    /// declared so the type is stable ahead of the structural-join stage.
+    Merge {
+        cond: Val,
+        then_h: HeapVal,
+        els_h: HeapVal,
+    },
 }
 
 impl HeapInst {
@@ -243,6 +254,11 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 }
                 write!(f, "), {snap}")
             }
+            HeapInst::Merge {
+                cond,
+                then_h,
+                els_h,
+            } => write!(f, "merge {cond} ? {then_h} : {els_h}"),
         }
     }
 }

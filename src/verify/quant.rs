@@ -106,7 +106,10 @@ pub(crate) fn build_recipe_table(
                     intern_insts(alloc, &mut table, &body.insts)?;
                 }
             }
-            vmir::Declaration::Method(m) => intern_insts(alloc, &mut table, &m.insts)?,
+            // Methods are block-structured; the trigger table is order-agnostic,
+            // so intern the flattened stream (method verification itself is
+            // disconnected on this branch — see `verify_method`).
+            vmir::Declaration::Method(m) => intern_insts(alloc, &mut table, &m.flatten())?,
             vmir::Declaration::Domain(_) | vmir::Declaration::Adt(_) => {}
         }
     }

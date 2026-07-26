@@ -1112,6 +1112,11 @@ fn eval_heap_inst(
     pc: &PathConds,
 ) -> Result<Heap, VerifyError> {
     match inst {
+        // Block-IR heap join. Never emitted by the current lowering (the block
+        // walker + structural merge are a later stage); unreachable here.
+        HeapInst::Merge { .. } => Err(VerifyError::Unimplemented(
+            "block-IR heap Merge (structural join stage)",
+        )),
         // `base ± acc loc perm`: build the single chunk, then union (Add) or
         // subtract (Sub) it.
         HeapInst::Combine {
@@ -2443,18 +2448,52 @@ pub(crate) fn verify_method(
     assume_axioms(&mut ctx, program)?;
     let mut state = EvalState::new();
     let mut snap = Snapshotter::from_env(method_name);
-
     snap.snapshot(&ctx, &[], "init", None);
-    walk_body(
-        &mut ctx,
-        program,
-        &mut state,
-        &mut snap,
-        &method.insts,
-        certs,
-        eval_method_inst,
-        None,
-    )
+
+    // Block walker (Stage 3): evaluate blocks in stored order — which is
+    // topological *and* the original emission order, so positional `EvalState`
+    // temps (`vals[n]` == `Temp(n)`) stay valid — running each block's `join`
+    // phase then its `body` phase through the same per-inst engine (`walk_body`)
+    // the flat verifier used. The heap threads linearly via each inst's explicit
+    // `base: HeapVal`; the per-predecessor structural merge is a later stage.
+    for (bid, block) in method.blocks.iter_enumerated() {
+        // Stored order is topological: a block's predecessors have smaller ids.
+        // (A future lowering bug that broke this would corrupt positional eval.)
+        debug_assert!(
+            match &block.preds {
+                vmir::Preds::Entry => true,
+                vmir::Preds::From(p) => p.0 < bid.0,
+                vmir::Preds::Join { then_, els, .. } => then_.0 < bid.0 && els.0 < bid.0,
+            },
+            "blocks must be stored in topological order (preds precede)"
+        );
+        // ── Stage-4 heap hook ──────────────────────────────────────────────
+        // Stage 4 will derive this block's `h_in` from `block.preds` here (a
+        // `HeapInst::Merge` for a `Join`). Stage 3 threads the heap linearly via
+        // the insts' explicit `base: HeapVal` refs, so there is nothing to do.
+        // ───────────────────────────────────────────────────────────────────
+        walk_body(
+            &mut ctx,
+            program,
+            &mut state,
+            &mut snap,
+            &block.join,
+            certs,
+            eval_method_inst,
+            None,
+        )?;
+        walk_body(
+            &mut ctx,
+            program,
+            &mut state,
+            &mut snap,
+            &block.body,
+            certs,
+            eval_method_inst,
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 /// Verify a resource self-contained: run its body in a fresh egraph with fresh

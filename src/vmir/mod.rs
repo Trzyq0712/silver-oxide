@@ -25,7 +25,7 @@ pub use function::{
     Args, ContractArg, ContractCall, Function, FunctionBody, FunctionCall, Params, Requires,
 };
 pub use inst::{Inst, InstKind, PathConds, Polarity};
-pub use method::Method;
+pub use method::{Block, BlockId, Method, Preds};
 pub use quant::{Forall, QuantTrigger, TrigHead, TrigTerm};
 pub use resource::{Precond, Resource, ResourceBody, ResourceCall, Snapshot};
 pub use ty::Bound;

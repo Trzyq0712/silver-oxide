@@ -211,6 +211,16 @@ impl Sink {
         v
     }
 
+    /// Drain and return the instructions emitted since `mark` (a prior
+    /// `self.insts.len()`). Since emission is append-only, this yields exactly
+    /// one lowering phase's insts as an owned `Vec`, letting the block lowerer
+    /// route each phase into a `Block`'s `join`/`body`. The SSA counters and memo
+    /// are untouched (global-positional ids survive), so a later block may still
+    /// reference a `Val` defined in an earlier drained phase.
+    pub fn take_since(&mut self, mark: usize) -> Vec<Inst> {
+        self.insts.drain(mark..).collect()
+    }
+
     pub fn next_val_temp(&mut self) -> Val {
         let id = self.val_base + self.val_count;
         self.val_count += 1;

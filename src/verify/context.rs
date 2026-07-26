@@ -107,7 +107,7 @@ fn decls_have_wildcard(decls: &TiVec<MemberId, Declaration>) -> bool {
         })
     }
     decls.iter().any(|d| match d {
-        Declaration::Method(m) => insts_wild(&m.insts),
+        Declaration::Method(m) => insts_wild(&m.flatten()),
         Declaration::Function(f) => f.body.as_ref().is_some_and(|b| insts_wild(&b.insts)),
         Declaration::Resource(r) => r.body.as_ref().is_some_and(|b| insts_wild(&b.insts)),
         _ => false,

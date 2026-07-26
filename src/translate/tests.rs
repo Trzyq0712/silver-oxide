@@ -149,7 +149,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
     let vmir::Declaration::Method(add) = &p.decls[add_id] else {
         panic!("add must be a Method");
     };
-    let kinds: Vec<_> = add.insts.iter().map(|i| &i.kind).collect();
+    let kinds: Vec<_> = add.iter_insts().map(|i| &i.kind).collect();
     assert!(
         kinds
             .iter()
@@ -285,9 +285,7 @@ method m(c: Bool, x: Int)
     };
     // params: c = Temp(0), x = Temp(1); the branch cond is the bare param c.
     let c = vmir::Val::Temp(0);
-    let asserts: Vec<&vmir::PathConds> = m
-        .insts
-        .iter()
+    let asserts: Vec<&vmir::PathConds> = m.iter_insts()
         .filter_map(|i| matches!(i.kind, vmir::InstKind::Assert(_)).then_some(&i.pc))
         .collect();
     assert_eq!(asserts.len(), 2, "one assert per arm");
@@ -331,9 +329,7 @@ method m(a: Bool, b: Bool, x: Ref)
         panic!("m must be a Method");
     };
     // params: a = Temp(0), b = Temp(1).
-    let assert = m
-        .insts
-        .iter()
+    let assert = m.iter_insts()
         .find(|i| matches!(i.kind, vmir::InstKind::Assert(_)))
         .expect("inner assert");
     assert_eq!(
@@ -344,9 +340,7 @@ method m(a: Bool, b: Bool, x: Ref)
         ],
         "nested guard must be the two real branch literals <a, b>, not a materialized OR"
     );
-    let exhale = m
-        .insts
-        .iter()
+    let exhale = m.iter_insts()
         .find(|i| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
         .expect("ensures exhale");
     assert!(
@@ -379,9 +373,7 @@ method m(a: Bool, b: Bool, x: Ref)
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
-    let exhale = m
-        .insts
-        .iter()
+    let exhale = m.iter_insts()
         .find(|i| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
         .expect("ensures lowers to an exhale");
     assert!(
@@ -408,9 +400,7 @@ method m(c: Bool, a: Int, b: Int) returns (r: Int)
         panic!("m must be a Method");
     };
     // params: c=Temp(0), a=Temp(1), b=Temp(2); ret r=Temp(3).
-    let phi = m
-        .insts
-        .iter()
+    let phi = m.iter_insts()
         .find(|i| {
             matches!(
                 &i.kind,
@@ -514,7 +504,7 @@ method m(x: Ref, y: Int)
     let mut saw_assert = false;
     let mut saw_assume = false;
     let mut saw_deref = false;
-    for inst in &method.insts {
+    for inst in method.iter_insts() {
         match &inst.kind {
             InstKind::Pure(_, PureInst::Binary(BinOp::DivI | BinOp::DivR, _, _)) => {
                 saw_div = true;
@@ -819,7 +809,8 @@ method m(y: Ref)
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
-    let snap_at = m.insts.iter().position(|i| {
+    let insts = m.flatten();
+    let snap_at = insts.iter().position(|i| {
         matches!(
             &i.kind,
             vmir::InstKind::Pure(vmir::Type::Snap(r), vmir::PureInst::Snap { resource, .. })
@@ -828,7 +819,7 @@ method m(y: Ref)
     });
     let snap_at = snap_at.expect("call site must emit a Snap of get#requires");
     // The following FunctionCall must carry the snapshot as its last argument.
-    let call = m.insts[snap_at..].iter().find_map(|i| match &i.kind {
+    let call = insts[snap_at..].iter().find_map(|i| match &i.kind {
         vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == get_id => {
             Some(fc)
         }
@@ -840,7 +831,7 @@ method m(y: Ref)
     // No boolean requires-assert for a heap-dep callee (Snap checks implicitly);
     // `m` has no other assert-producing constructs before the call.
     assert!(
-        !m.insts[..snap_at]
+        !insts[..snap_at]
             .iter()
             .any(|i| matches!(i.kind, vmir::InstKind::Assert(_))),
         "no boolean requires-assert before a heap-dep call"
@@ -880,8 +871,9 @@ method m() {
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
+    let insts = m.flatten();
     let calls = |f: vmir::MemberId| {
-        m.insts.iter().position(|i| {
+        insts.iter().position(|i| {
             matches!(
                 &i.kind,
                 vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == f
@@ -892,7 +884,7 @@ method m() {
     // `inc#requires(..)` call is followed by an assert.
     let req_pos = calls(inc_req).expect("inc#requires call");
     assert!(matches!(
-        &m.insts[req_pos + 1].kind,
+        &insts[req_pos + 1].kind,
         vmir::InstKind::Assert(_)
     ));
     // `inc#ensures` is declared but never called from `m`'s body — postcondition
@@ -905,7 +897,7 @@ method m() {
     // Exactly one assert (the requires check), no assume (raw contributes
     // neither, and postconditions aren't assumed).
     let count =
-        |pred: fn(&vmir::InstKind) -> bool| m.insts.iter().filter(|i| pred(&i.kind)).count();
+        |pred: fn(&vmir::InstKind) -> bool| insts.iter().filter(|i| pred(&i.kind)).count();
     assert_eq!(count(|k| matches!(k, vmir::InstKind::Assert(_))), 1);
     assert_eq!(count(|k| matches!(k, vmir::InstKind::Assume(_))), 0);
 }
@@ -1106,7 +1098,8 @@ method m(x: Int) {
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
-    let [q] = foralls(&m.insts)[..] else {
+    let insts = m.flatten();
+    let [q] = foralls(&insts)[..] else {
         panic!("expected one forall in the method body");
     };
     assert_eq!(q.captures.len(), 1, "captures the method param x");
@@ -1324,5 +1317,119 @@ fn sink_value_numbers_total_pure_insts() {
     assert!(
         matches!(t1, Val::Temp(2)),
         "temp numbering stays sequential"
+    );
+}
+
+/// Fetch a lowered method by name, panicking if it is missing or not a method.
+fn method<'a>(p: &'a vmir::Program, name: &str) -> &'a vmir::Method {
+    let id = p.id(name).unwrap_or_else(|| panic!("missing method {name}"));
+    let vmir::Declaration::Method(m) = &p.decls[id] else {
+        panic!("{name} must be a Method");
+    };
+    m
+}
+
+/// Every block's predecessors precede it in storage order (a valid topo order),
+/// and `Join`s are binary by construction. Shared structural check.
+fn assert_block_invariants(m: &vmir::Method) {
+    assert!(
+        matches!(m.blocks[m.entry].preds, vmir::Preds::Entry),
+        "entry block must be Preds::Entry"
+    );
+    assert!(
+        m.blocks[m.entry].cube.conds.is_empty(),
+        "entry block cube is <>"
+    );
+    let mut entries = 0;
+    for (bid, blk) in m.blocks.iter_enumerated() {
+        match &blk.preds {
+            vmir::Preds::Entry => entries += 1,
+            vmir::Preds::From(p) => assert!(p.0 < bid.0, "From pred must precede its block"),
+            vmir::Preds::Join { then_, els, .. } => assert!(
+                then_.0 < bid.0 && els.0 < bid.0,
+                "Join preds must precede their block (topo order)"
+            ),
+        }
+    }
+    assert_eq!(entries, 1, "exactly one entry block");
+    let phases: usize = m.blocks.iter().map(|b| b.join.len() + b.body.len()).sum();
+    assert_eq!(
+        m.flatten().len(),
+        phases,
+        "flatten is exactly join++body over all blocks"
+    );
+}
+
+#[test]
+fn diamond_lowers_to_a_single_binary_join() {
+    // `if (c) { r := a } else { r := b }` is a diamond: entry branch, two arms,
+    // one binary `Join` selecting `r` on the branch condition; no synthetic blocks.
+    let input = r#"
+method m(c: Bool, a: Int, b: Int) returns (r: Int) {
+    if (c) { r := a } else { r := b }
+    assert r == r
+}
+"#;
+    let p = run(input);
+    let m = method(&p, "m");
+    assert_block_invariants(m);
+    let joins = m
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.preds, vmir::Preds::Join { .. }))
+        .count();
+    assert_eq!(joins, 1, "a diamond has exactly one binary join");
+    // The join selects on the branch condition `c` = Temp(0) (reach is <>, so the
+    // edge reach val is the bare param).
+    let join = m
+        .blocks
+        .iter()
+        .find(|b| matches!(b.preds, vmir::Preds::Join { .. }))
+        .unwrap();
+    let vmir::Preds::Join { cond, .. } = &join.preds else {
+        unreachable!()
+    };
+    assert_eq!(*cond, vmir::Val::Temp(0), "join selects on the branch cond c");
+}
+
+#[test]
+fn nary_merge_normalizes_to_a_binary_join_chain() {
+    // Three `goto`s to one label give the merge four predecessors (three arms +
+    // fall-through). It must normalise into a chain of binary `Join`s over
+    // synthetic blocks — never a single n-ary join — reconstructing the nested
+    // phi `ite(a, 1, ite(b, 2, ite(c, 3, 4)))` for `r`.
+    let input = r#"
+method m(a: Bool, b: Bool, c: Bool) returns (r: Int) {
+    r := 0
+    if (a) { r := 1 goto done }
+    if (b) { r := 2 goto done }
+    if (c) { r := 3 goto done }
+    r := 4
+    label done
+    assert r == r
+}
+"#;
+    let p = run(input);
+    let m = method(&p, "m");
+    assert_block_invariants(m);
+    // The 4-predecessor merge folds into three binary joins (two synthetic + the
+    // real `done` block), so `Preds::Join` stays binary throughout.
+    let joins = m
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.preds, vmir::Preds::Join { .. }))
+        .count();
+    assert!(
+        joins >= 3,
+        "a 4-predecessor merge normalises into ≥3 binary joins, got {joins}"
+    );
+    // Synthetic blocks carry only a join phase (no body).
+    assert!(
+        m.blocks
+            .iter()
+            .any(|b| matches!(b.preds, vmir::Preds::Join { .. })
+                && b.body.is_empty()
+                && !b.join.is_empty()),
+        "the synthetic join blocks have a join phase and an empty body"
     );
 }

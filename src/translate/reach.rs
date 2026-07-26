@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use lasso::Spur;
 
 use crate::translate::sink::Sink;
-use crate::viper::cfg::BlockId;
 use crate::vmir::{FALSE, PathConds, Polarity, PureInst, TRUE, Type, Val};
 
 /// `!v`, constant-folded over `true`/`false`.
@@ -185,45 +184,38 @@ fn merge_adjacent(a: &PathConds, b: &PathConds) -> Option<PathConds> {
     Some(PathConds { conds })
 }
 
-/// Build a block's entry environment by phi-merging its predecessors' exit
-/// environments. A single predecessor inherits directly; multiple predecessors
-/// reconcile each variable with a nested `ite` over the edge conditions (the
-/// last arm unguarded, since the edges are exhaustive). Variables that agree
-/// across all predecessors pass through unchanged.
-pub(crate) fn build_entry_env(
+/// Phi-merge two predecessor environments under a binary join guard: `then_env`
+/// is selected when `cond` holds, `els_env` otherwise (the **unguarded**
+/// fall-through, so the select reads `cond ? then : els`). A variable that
+/// agrees on both sides passes through unchanged; one defined on a single side
+/// inherits from that side. Binary because the block IR normalises every join to
+/// a chain of these (a diamond is one; an n-way merge nests them).
+///
+/// Equivalent to a two-edge `ite(cond, then_v, els_v)` phi — the block lowerer
+/// folds it right-to-left over an n-ary merge's arms, which reproduces the
+/// former k-way `ite(ev0, v0, ite(ev1, v1, … v_last))` shape.
+pub(crate) fn merge_two_envs(
     sink: &mut Sink,
-    edges: &[(BlockId, Val)],
-    exit_env: &HashMap<BlockId, HashMap<Spur, Val>>,
+    cond: Val,
+    then_env: &HashMap<Spur, Val>,
+    els_env: &HashMap<Spur, Val>,
     var_types: &HashMap<Spur, Type>,
 ) -> HashMap<Spur, Val> {
-    if let [(p, _)] = edges {
-        return exit_env.get(p).cloned().unwrap_or_default();
-    }
     let mut names: HashSet<Spur> = HashSet::new();
-    for (p, _) in edges {
-        if let Some(e) = exit_env.get(p) {
-            names.extend(e.keys().copied());
-        }
-    }
+    names.extend(then_env.keys().copied());
+    names.extend(els_env.keys().copied());
     let mut out: HashMap<Spur, Val> = HashMap::new();
     for name in names {
-        let entries: Vec<(Val, Val)> = edges
-            .iter()
-            .filter_map(|(p, ev)| exit_env.get(p)?.get(&name).map(|v| (ev.clone(), v.clone())))
-            .collect();
-        let Some((_, first)) = entries.first() else {
-            continue;
+        let merged = match (then_env.get(&name), els_env.get(&name)) {
+            (Some(t), Some(e)) if t == e => t.clone(),
+            (Some(t), Some(e)) => {
+                let ty = var_types.get(&name).cloned().unwrap_or(Type::Int);
+                sink.emit_pure(ty, PureInst::Ternary(cond.clone(), t.clone(), e.clone()))
+            }
+            (Some(v), None) | (None, Some(v)) => v.clone(),
+            (None, None) => continue,
         };
-        if entries.iter().all(|(_, v)| v == first) {
-            out.insert(name, first.clone());
-            continue;
-        }
-        let ty = var_types.get(&name).cloned().unwrap_or(Type::Int);
-        let mut acc = entries.last().unwrap().1.clone();
-        for (ev, v) in entries[..entries.len() - 1].iter().rev() {
-            acc = sink.emit_pure(ty.clone(), PureInst::Ternary(ev.clone(), v.clone(), acc));
-        }
-        out.insert(name, acc);
+        out.insert(name, merged);
     }
     out
 }

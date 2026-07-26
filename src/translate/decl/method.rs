@@ -1,7 +1,9 @@
-//! Lower a `typed::Method` body into a `vmir::Method` (a flat `Vec<Inst>`).
-//! Control flow is linearized through the basic-block CFG (`viper::cfg`):
-//! blocks are walked in topological order, each lowered under its reaching path
-//! condition, with phi (`ite`) nodes at joins and a single linear heap.
+//! Lower a `typed::Method` body into a **block-structured** `vmir::Method`.
+//! The basic-block CFG (`viper::cfg`) is preserved (not linearized): blocks are
+//! emitted in topological order, each with a join phase (phi `ite` nodes
+//! reconciling predecessors) and a body phase (its lowered statements), threaded
+//! by a single linear heap for now. Joins are binary; an n-ary (multi-goto)
+//! merge is normalised into a chain of synthetic binary-join blocks.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -9,7 +11,7 @@ use std::marker::PhantomData;
 use lasso::Spur;
 use typed_index_collections::TiVec;
 
-use crate::translate::reach::{and_val, block_reach, build_entry_env, not_val};
+use crate::translate::reach::{and_val, block_reach, merge_two_envs, not_val};
 use crate::translate::sink::Sink;
 use crate::translate::spatial::{self, SpatialMode};
 use crate::translate::{DeclSlot, Declarator, Definer};
@@ -20,7 +22,7 @@ use crate::translate::{
 use crate::viper::cfg::{self, BlockId, EdgeSide, Terminator};
 use crate::viper::typed;
 use crate::vmir::{
-    self, HeapInst, HeapVal, PathConds, Polarity, PureInst, ResourceCall, TRUE, Type, Val,
+    self, HeapInst, HeapVal, Inst, PathConds, Polarity, PureInst, ResourceCall, TRUE, Type, Val,
 };
 
 /// One translator per Silver `method`: owns its `#requires` / `#ensures`
@@ -224,10 +226,11 @@ pub(crate) fn lower_method(
     name: Spur,
     body: &typed::StmtBlock,
 ) -> Result<vmir::Method, TranslationError> {
-    // Control flow is linearized through the basic-block CFG: blocks are walked
-    // in topological order, each lowered under its reaching path condition, with
-    // phi (`ite`) nodes reconciling variables at joins. The heap is *not* phi'd —
-    // it threads linearly through the walk, off-path contributions gated to 0
+    // The basic-block CFG is preserved as a `vmir::Block` graph: blocks are
+    // emitted in topological order, each lowered under its reaching path
+    // condition, with phi (`ite`) nodes reconciling variables at joins. The heap
+    // is *not* phi'd — it threads linearly through the walk (a structural
+    // per-predecessor merge is a later stage), off-path contributions gated to 0
     // permission (see `Sink::gate_perm`).
     let cfg = cfg::build_cfg(body).map_err(|_| {
         TranslationError::Unsupported("method control flow (loop or undefined label)")
@@ -285,7 +288,7 @@ pub(crate) fn lower_method(
     let mut labeled: HashMap<Spur, HeapVal> = HashMap::new();
 
     let order = cfg.topo_order();
-    let preds = cfg.predecessors();
+    let cfg_preds = cfg.predecessors();
     let reachable = cfg.reachable();
 
     // Per-block reaching condition (`pc`), its materialized boolean `Val` (for
@@ -301,25 +304,41 @@ pub(crate) fn lower_method(
     let mut cond_val: TiVec<BlockId, Option<Val>> = (0..n).map(|_| None).collect();
     let mut exit_env: HashMap<BlockId, HashMap<Spur, Val>> = HashMap::new();
 
+    // Block-structured output: VMIR blocks in topological order plus the synthetic
+    // binary-join blocks that normalise n-ary (multi-goto) merges, and the
+    // cfg→vmir id map so a `Preds` can name its predecessors. `blocks` order is a
+    // valid topo order (a block's preds — real or synthetic — are pushed first).
+    let mut blocks: Vec<vmir::Block> = Vec::new();
+    let mut vmir_id: HashMap<BlockId, vmir::BlockId> = HashMap::new();
+    // The method prologue (param/ret fresh temps + the `#requires` inhale) is the
+    // entry block's join prefix.
+    let prologue = sink.take_since(0);
+    let mut prologue = Some(prologue);
+
     for bid in order {
         if !reachable.contains(&bid) {
             continue;
         }
 
-        let (pc, dnf, rval, env) = if bid == cfg.entry {
+        let h_in = current_heap;
+        let is_entry = bid == cfg.entry;
+
+        // --- join phase: reach/edge emissions ---
+        let join_mark = sink.insts.len();
+        let (pc, dnf, rval, edges) = if is_entry {
             (
                 PathConds::default(),
                 vec![PathConds::default()],
                 TRUE,
-                init_env.clone(),
+                Vec::new(),
             )
         } else {
             // Pool every reachable predecessor's reach cubes (each extended by the
             // taken branch literal) for `block_reach`, and in the same pass build
             // the per-pred materialized `Val` that phis reconcile over.
             let mut pool: Vec<PathConds> = Vec::new();
-            let mut edge_vals: Vec<(BlockId, Val)> = Vec::new();
-            for (p, side) in preds[bid].iter().filter(|(p, _)| reachable.contains(p)) {
+            let mut edges: Vec<(BlockId, Val)> = Vec::new();
+            for (p, side) in cfg_preds[bid].iter().filter(|(p, _)| reachable.contains(p)) {
                 let rv = reach_val[*p].clone();
                 let (lit, ev) = match side {
                     EdgeSide::Goto => (None, rv),
@@ -342,25 +361,112 @@ pub(crate) fn lower_method(
                         pool.push(cube);
                     }
                 }
-                edge_vals.push((*p, ev));
+                edges.push((*p, ev));
             }
-
             let (dnf, pc, rval) = block_reach(&mut sink, &pool);
-            let env = build_entry_env(&mut sink, &edge_vals, &exit_env, &var_types);
-            (pc, dnf, rval, env)
+            (pc, dnf, rval, edges)
         };
         reach_pc[bid] = pc.clone();
         reach_dnf[bid] = dnf;
         reach_val[bid] = rval;
+        // Reach insts precede every phi; carried into the real block's join
+        // (k ≤ 2) or the innermost synthetic block (n-ary), so all `ev` defs come
+        // first in the flattened stream.
+        let reach_insts = sink.take_since(join_mark);
+
+        // --- entry env + Preds (+ synthetic binary-join blocks for n-ary) ---
+        // `then_` is guarded by `cond`, `els` is the unguarded fall-through arm.
+        let (env, preds_kind, real_join): (HashMap<Spur, Val>, vmir::Preds, Vec<Inst>) =
+            if is_entry {
+                (init_env.clone(), vmir::Preds::Entry, prologue.take().unwrap())
+            } else {
+                match edges.as_slice() {
+                    [] => unreachable!("a reachable non-entry block has a predecessor"),
+                    // Single predecessor: inherit its env, no phi.
+                    [(p, _)] => (
+                        exit_env.get(p).cloned().unwrap_or_default(),
+                        vmir::Preds::From(vmir_id[p]),
+                        reach_insts,
+                    ),
+                    // Diamond: one binary phi.
+                    [(p0, ev0), (p1, _)] => {
+                        let phi_mark = sink.insts.len();
+                        let env = merge_two_envs(
+                            &mut sink,
+                            ev0.clone(),
+                            &exit_env.get(p0).cloned().unwrap_or_default(),
+                            &exit_env.get(p1).cloned().unwrap_or_default(),
+                            &var_types,
+                        );
+                        let mut join = reach_insts;
+                        join.extend(sink.take_since(phi_mark));
+                        (
+                            env,
+                            vmir::Preds::Join {
+                                cond: ev0.clone(),
+                                then_: vmir_id[p0],
+                                els: vmir_id[p1],
+                            },
+                            join,
+                        )
+                    }
+                    // n-ary (multi-goto label): right-fold the arms into a chain of
+                    // synthetic binary joins, mirroring `ite(ev0, v0, ite(ev1, v1,
+                    // … v_last))`. Innermost synthetic is created first (carries the
+                    // reach insts); the outermost fold level is the real block.
+                    _ => {
+                        let k = edges.len();
+                        let (last_p, _) = &edges[k - 1];
+                        let mut acc_env = exit_env.get(last_p).cloned().unwrap_or_default();
+                        let mut acc_ref = vmir_id[last_p];
+                        let mut reach_insts = Some(reach_insts);
+                        let mut real: Option<(HashMap<Spur, Val>, vmir::Preds, Vec<Inst>)> = None;
+                        for i in (0..k - 1).rev() {
+                            let (p, ev) = &edges[i];
+                            let phi_mark = sink.insts.len();
+                            let new_env = merge_two_envs(
+                                &mut sink,
+                                ev.clone(),
+                                &exit_env.get(p).cloned().unwrap_or_default(),
+                                &acc_env,
+                                &var_types,
+                            );
+                            let mut join = reach_insts.take().unwrap_or_default();
+                            join.extend(sink.take_since(phi_mark));
+                            let kind = vmir::Preds::Join {
+                                cond: ev.clone(),
+                                then_: vmir_id[p],
+                                els: acc_ref,
+                            };
+                            if i == 0 {
+                                real = Some((new_env, kind, join));
+                            } else {
+                                let sid = vmir::BlockId(blocks.len());
+                                blocks.push(vmir::Block {
+                                    cube: pc.clone(),
+                                    preds: kind,
+                                    join,
+                                    body: Vec::new(),
+                                    h_out: h_in,
+                                });
+                                acc_ref = sid;
+                                acc_env = new_env;
+                            }
+                        }
+                        real.expect("n-ary fold produces the outermost (real) join")
+                    }
+                }
+            };
 
         // `label L` captures the heap at block entry for later `old[L]`.
         if let Some(l) = cfg.blocks[bid].label {
             labeled.insert(l, current_heap);
         }
 
-        // Lower the block's statements and terminator under its path condition.
+        // --- body phase: lower the block's statements and terminator under pc ---
         let mut env = env;
         let blk = &cfg.blocks[bid];
+        let body_mark = sink.insts.len();
         let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_conds(&pc, |sink| {
             let mut heap = current_heap;
             for stmt in &blk.stmts {
@@ -420,11 +526,25 @@ pub(crate) fn lower_method(
         current_heap = new_heap;
         cond_val[bid] = cond;
         exit_env.insert(bid, env);
+        let body = sink.take_since(body_mark);
+
+        // Push the real block after its synthetic join blocks (if any), so preds
+        // always precede successors in `blocks`.
+        let rid = vmir::BlockId(blocks.len());
+        blocks.push(vmir::Block {
+            cube: pc,
+            preds: preds_kind,
+            join: real_join,
+            body,
+            h_out: current_heap,
+        });
+        vmir_id.insert(bid, rid);
     }
 
     Ok(vmir::Method {
         name,
-        insts: sink.insts,
+        entry: vmir_id[&cfg.entry],
+        blocks: blocks.into(),
     })
 }
 
