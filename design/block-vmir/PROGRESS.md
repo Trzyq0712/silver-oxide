@@ -11,6 +11,42 @@ local/ghost fork/remap.
 
 ---
 
+## 2026-07-27 (end of session) — full tier-4-hunt clean; no perf regressions; Stage-5 scoped
+
+**Feature-matrix tier-4 hunt (analysis/feature_matrix_2026-07-24/vpr, 27 cases): ALL verify
+`NO_TIER4` with `prove_splits: 0` under fork** — including all 16 that were tier-4-load-bearing
+(composite/enum_clike/enum_struct_variant mut-through-match, enum_tuple flat/return-owned,
+generic_option/option_like/result_like matches, nested_struct__nested_if, nscale_04..20,
+rec_list_len, rec_list_sum). Old backend still forces tier-4 on these (confirmed: they fail
+OFF+NO_TIER4). Fork eliminates tier-4 across the ENTIRE corpus, not just the enum perm-cycle.
+
+**Perf vs `backend` branch (233b205, real binary): fork strictly dominates, ZERO degradations.**
+3-way (backend-t4 / this-branch-OFF-t4 / fork-ON): fork is ~2× on tier-4 cases (nscale_20
+6.76→3.14s, composite 0.48→0.27, rec_list_sum 0.19→0.08), 0.95× on structs_enums, 1.0× on
+trivial. Never slower. Block-VMIR refactor's OFF (tier-4) path ≈ backend ±10% jitter (neutral).
+
+**Stage 5 (rule diet) — measured, LOW VALUE:** under fork `lt-ite` is removable (0 fails, its
+flag-OFF job = scaled-perm `c?p:0` obligations, gone in fork's per-leaf proving) and tier-4 is
+removable (splits=0) — BUT both give ~0 speedup (not the bottleneck). `NO_EQITE` gates
+`eq-false-then/else` = **disequality unit-prop on `==` towers, NOT ite-distribution** (user
+corrected me) — NEEDED both paths. **Real bottleneck = `ite-reduce` apply (5.7s of m_add's
+9.3s @N=30)** collapsing the O(N) VALUE/snapshot ite towers (perm towers already killed). Rule
+diet is a code-cleanup only (delete lt-ite/tier-4 after 4.4 flip), not perf. Real perf levers:
+(1) incremental/dirty-set saturation (kills O(N)blocks×O(N)graph = the N² re-saturation),
+(2) snapshot-fn opacity (we expand p_Case_snap, Silicon keeps opaque = O(N) graph growth),
+(3) structural value-select like perms (harder — values read constantly).
+
+**Silicon measured** (viperserver, see [[reference_silicon_scaling]] / [[reference_viperserver_measurement]]):
+single-threaded ALSO superlinear (~N^1.7→N^3.75), NOT linear; fork faster to ~N=25-30 crossover.
+
+**OPEN for next session:** (a) Stage 4.4 default flip — strong case now (full tier-4-hunt clean,
+no regressions); needs: flip `both_arms_..._case_split_we_lack` e2e assertion, full corpus
+flag-ON, refresh baselines. (b) heap_union/merge_chunks still `to_id`s a Select existing
+(~decl:856) — additive aliasing, rarely bites. (c) Decide Stage-5 cleanup vs real-perf
+(incremental saturation) direction. Repo `enum16.vpr` left for user's viperserver runs.
+
+---
+
 ## 2026-07-27 (later still) — ite-idempotence flatten: structs_enums ON now BEATS OFF
 
 After the structural-ChunkPerm fix, `structs_enums.vpr` ON was 4.3s (OFF 2.3s), dominated by
