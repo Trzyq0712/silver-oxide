@@ -11,6 +11,29 @@ local/ghost fork/remap.
 
 ---
 
+## 2026-07-27 (later still) — ite-idempotence flatten: structs_enums ON now BEATS OFF
+
+After the structural-ChunkPerm fix, `structs_enums.vpr` ON was 4.3s (OFF 2.3s), dominated by
+`m_shape_grow` (3.2s). Profiled: one location's perm was a **196,610-leaf Select tree**;
+`same()` collapsed only 2262 of 225749 selects (1%); 222k per-leaf proofs. Root: the perm
+accreted a `Select` layer at **every** join it survived (`m_shape_grow` = 361 blocks / 86
+joins from Prusti overflow-checks + discriminant decode, NOT source nesting — only ~4 source
+branches). Within one match arm, ~8 joins share the arm's reach cond, so the tree was nested
+`Select(c, Select(c, …), …)` on the SAME `c`.
+
+Fix (user's insight): `ChunkPerm::select` now flattens `ite(c, ite(c,a,b), e) = ite(c,a,e)`
+(and the els dual) via `collapse_same_cond` — descend an arm while it re-branches on the same
+condition class, keep only the decided branch. Keeps the tree linear in *distinct* conditions.
+
+**structs_enums ON: 4.28s → 2.09s (faster than the 2.24s flag-OFF path!)**, prove_calls
+225913 → 3308, nodes_peak 7295 → 4178, 0 fails, prove_splits 0 (OFF still needs 8 tier-4
+splits). Flag OFF unaffected (Selects only built under BLOCK_MERGE). Commit `acd7074`.
+
+**Net Stage-4 story: the fork model now matches/beats the tier-4 solution on the full struct
+corpus AND is tier-4-free.** Remaining perf headroom minor.
+
+---
+
 ## 2026-07-27 (later) — structural ChunkPerm: kill Select materialization (256s→4.6s)
 
 `structs_enums.vpr` under the flag was **256s** (vs 2.5s OFF), egraph 9× bigger, 1.19M rule
