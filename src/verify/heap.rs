@@ -51,21 +51,40 @@ impl ChunkPerm {
         }
     }
 
+    /// Descend into an arm while it re-branches on the SAME condition class,
+    /// taking the then-side (`take_then`) or els-side. This is the `ite`
+    /// idempotence identity `ite(c, ite(c, a, b), e) = ite(c, a, e)` (and the
+    /// dual for the els arm): under `c` an inner `ite(c, …)` is decided, so only
+    /// its matching branch survives. CFG lowering makes many joins in one match
+    /// arm share the arm's reach `cond`, so without this the perm accretes a
+    /// redundant `Select` layer per such join.
+    fn collapse_same_cond(ctx: &VerifyContext<'_>, cond_c: egg::Id, arm: ChunkPerm, take_then: bool) -> ChunkPerm {
+        match arm {
+            ChunkPerm::Select { cond: c2, then, els } if ctx.egraph.find(c2) == cond_c => {
+                let inner = if take_then { *then } else { *els };
+                Self::collapse_same_cond(ctx, cond_c, inner, take_then)
+            }
+            other => other,
+        }
+    }
+
     /// The join-select smart constructor. `cond` is the then-edge reach value.
-    /// Applies, in order: (i) same-amount collapse (`then ≡ els ⇒ then`, the
-    /// give-back / untouched kill); (ii) dead-arm drop when `cond` const-folds
-    /// to a boolean literal in the ground graph (no `assume`); (iii) otherwise a
-    /// `Select`. Deterministic, bounded, no budget.
+    /// Applies, in order: (0) `ite`-idempotence flattening of arms that branch on
+    /// the same `cond`; (i) same-amount collapse (`then ≡ els ⇒ then`, the
+    /// give-back / untouched kill); (ii) dead-arm drop when `cond` const-folds to
+    /// a boolean literal; (iii) otherwise a `Select`. Deterministic, bounded.
     pub fn select(
         ctx: &mut VerifyContext<'_>,
         cond: egg::Id,
         then: ChunkPerm,
         els: ChunkPerm,
     ) -> Self {
+        let cond_c = ctx.egraph.find(cond);
+        let then = Self::collapse_same_cond(ctx, cond_c, then, true);
+        let els = Self::collapse_same_cond(ctx, cond_c, els, false);
         if Self::same(ctx, &then, &els) {
             return then;
         }
-        let cond_c = ctx.egraph.find(cond);
         match ctx.egraph[cond_c].data.known() {
             Some(Literal::Bool(true)) => return then,
             Some(Literal::Bool(false)) => return els,
