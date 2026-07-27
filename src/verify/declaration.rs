@@ -408,8 +408,9 @@ fn eval_pure_inst(
                 .loc_kind(loc)
                 .and_then(|k| {
                     ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
-                        .map(|c| c.perm)
+                        .map(|c| c.perm.clone())
                 })
+                .map(|p| p.to_id(ctx))
                 .unwrap_or_else(|| zero_real(ctx));
             (id, None)
         }
@@ -637,7 +638,7 @@ fn pred_addr_type(program: &vmir::Program, pred_id: MemberId) -> Type {
 /// an `Addr{group,bound,..}` type (recovered by `infer_type`, so **computed**
 /// addresses count too), record its perm, group, bound, and — for a direct
 /// `@addr` application — its value-arg e-classes (used by the non-aliasing axiom).
-fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
+fn location_chunks(ctx: &mut VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     let mut out = Vec::new();
     for (kind, chunk) in h.entries() {
         // group/bound come straight from the chunk's location kind (VMIR-sourced) —
@@ -656,8 +657,9 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
                 _ => None,
             })
             .unwrap_or_default();
+        let perm = chunk.perm.to_id(ctx);
         out.push(LocationChunk {
-            perm: chunk.perm,
+            perm,
             group: kind.group,
             bound: kind.bound.clone(),
             args,
@@ -805,8 +807,10 @@ fn find_chunk_consolidated(
     let mut acc = first;
     for next in &found[1..] {
         out = out.without_chunk(kind, next.addr);
+        let acc_perm = acc.perm.to_id(ctx);
+        let next_perm = next.perm.to_id(ctx);
         acc = merge_chunks(
-            ctx, acc.addr, acc.perm, acc.value, next.perm, next.value, pc_lits,
+            ctx, acc.addr, acc_perm, acc.value, next_perm, next.value, pc_lits,
         );
     }
     out = out.with_chunk(kind, acc.clone());
@@ -824,12 +828,14 @@ fn heap_union(
     let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, false);
     if let Some(existing) = existing {
         // Replace the existing chunk in place (keep its stored address key).
+        let existing_perm = existing.perm.to_id(ctx);
+        let chunk2_perm = chunk2.perm.to_id(ctx);
         let merged = merge_chunks(
             ctx,
             existing.addr,
-            existing.perm,
+            existing_perm,
             existing.value,
-            chunk2.perm,
+            chunk2_perm,
             chunk2.value,
             pc_lits,
         );
@@ -957,7 +963,7 @@ fn prove_obligation(
 /// rule (require `held > 0`, assume `needed < held`) over the concrete one
 /// (prove `held ≥ needed`). Bounded by a visited set; a non-wildcard perm term
 /// (a literal / small gating `ite`) is walked in O(size).
-fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
+pub(crate) fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
     fn go(
         ctx: &VerifyContext<'_>,
         id: egg::Id,
@@ -997,6 +1003,7 @@ fn heap_subtract(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
     let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
+    let chunk2_perm = chunk2.perm.to_id(ctx);
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
         // conditional footprint slot whose guard is false — a nested predicate
@@ -1004,7 +1011,7 @@ fn heap_subtract(
         // wildcard is provably positive, so this (correctly) fails — a wildcard
         // cannot be exhaled from an empty location.
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-        let pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, chunk2.perm]));
+        let pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, chunk2_perm]));
         let false_ = ctx.false_();
         let true_ = ctx.true_();
         let nonpos = ctx.add(Symbolic::Ite([pos, false_, true_]));
@@ -1019,15 +1026,16 @@ fn heap_subtract(
     // **assume** the taken share is strictly smaller (`needed < held`) under the
     // pc — Silicon's constrainable-ARP rule. The `held − needed` remainder stays
     // positive, so the chunk is never emptied.
-    if ctx.has_wildcard && contains_wildcard(ctx, chunk2.perm) {
+    let existing_perm = existing.perm.to_id(ctx);
+    if ctx.has_wildcard && contains_wildcard(ctx, chunk2_perm) {
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-        let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing.perm]));
+        let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing_perm]));
         if !ctx.prove_under_pc(held_pos, pc_lits) {
             return Err(VerifyError::InsufficientPermission);
         }
-        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2.perm, existing.perm]));
+        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2_perm, existing_perm]));
         ctx.union(existing.value, chunk2.value);
-        let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing.perm, chunk2.perm]));
+        let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
         // Assume `needed < held` and, because the e-graph has no real-order
         // arithmetic to derive `held − needed > 0` from it, the remainder's
         // positivity explicitly — otherwise a later `perm > 0` framing check on
@@ -1046,17 +1054,17 @@ fn heap_subtract(
 
     let false_ = ctx.false_();
     let true_ = ctx.true_();
-    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [existing.perm, chunk2.perm]));
+    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [existing_perm, chunk2_perm]));
     let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-    let proven = prove_perm_ineq(ctx, goal, existing.perm, chunk2.perm, pc_lits, false);
+    let proven = prove_perm_ineq(ctx, goal, existing_perm, chunk2_perm, pc_lits, false);
     if !proven {
         if crate::verify::viz::dump_perm_enabled() {
             eprintln!(
                 "[perm-dump] insufficient at subtract in group {:?}\n\
                  held.perm:\n{}needed.perm:\n{}",
                 kind.group,
-                crate::verify::viz::dump_term(ctx, existing.perm, 64),
-                crate::verify::viz::dump_term(ctx, chunk2.perm, 64),
+                crate::verify::viz::dump_term(ctx, existing_perm, 64),
+                crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
             );
         }
         return Err(VerifyError::InsufficientPermission);
@@ -1064,7 +1072,7 @@ fn heap_subtract(
 
     ctx.union(existing.value, chunk2.value);
 
-    let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing.perm, chunk2.perm]));
+    let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
     // Whether to drop the emptied chunk is a statement about the *heap*, so it has
     // to hold at the heap's scope — **unconditionally**, not under this
     // instruction's `pc`.
@@ -1189,7 +1197,7 @@ fn eval_heap_inst(
             let kind = state
                 .loc_kind(loc)
                 .expect("assign location must be Addr-typed");
-            let perm = h.perm_at(&kind, addr).unwrap_or_else(|| zero_real(ctx));
+            let perm = h.perm_at(ctx, &kind, addr).unwrap_or_else(|| zero_real(ctx));
             // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc.
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
@@ -1688,7 +1696,8 @@ fn walk_footprint(
                     find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
                 let suff = match existing {
                     Some(c) => {
-                        let hpos = ctx.perm_positive(c.perm);
+                        let c_perm = c.perm.to_id(ctx);
+                        let hpos = ctx.perm_positive(c_perm);
                         let imp =
                             ctx.implication(hpos, std::iter::once((guard, Polarity::Positive)));
                         ctx.prove_under_pc(imp, pc_lits)
@@ -2911,8 +2920,9 @@ fn inst_obligations(
                 .loc_kind(loc)
                 .and_then(|k| {
                     ctx.chunk_under_pc(held.chunks_of(&k), addr, pc_lits)
-                        .map(|c| c.perm)
+                        .map(|c| c.perm.clone())
                 })
+                .map(|p| p.to_id(ctx))
                 .unwrap_or_else(|| zero_real(ctx));
             let zero = zero_real(ctx);
             let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, perm]));
@@ -3089,7 +3099,7 @@ mod tests {
 
         let expected_perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p1, p2]));
         ctx.saturate();
-        assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
+        assert_eq!(ctx.egraph.find(chunk.perm.repr_id()), ctx.egraph.find(expected_perm));
         // Both fractions positive (1, 2) → agreement axiom fuses the values.
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
         assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v1));
@@ -3150,7 +3160,7 @@ mod tests {
             .expect("merged chunk missing");
         ctx.saturate();
         assert_eq!(
-            ctx.egraph.find(chunk.perm),
+            ctx.egraph.find(chunk.perm.repr_id()),
             ctx.egraph.find(one),
             "(1 - p) + p must collapse back to the full permission"
         );
@@ -3374,7 +3384,7 @@ mod tests {
             .expect("result chunk missing");
         let expected_perm = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         ctx.egraph.rebuild();
-        assert_eq!(ctx.egraph.find(chunk.perm), ctx.egraph.find(expected_perm));
+        assert_eq!(ctx.egraph.find(chunk.perm.repr_id()), ctx.egraph.find(expected_perm));
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
     }
 
