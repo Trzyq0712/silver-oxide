@@ -23,6 +23,12 @@ use crate::vmir::{
 pub(crate) enum PcKind {
     Branch,
     Fact,
+    /// A CFG **block cube** under the Stage-4 fork model. It rides in every
+    /// inst's `pc` (so the verifier proves under it and the join merge folds
+    /// dead edges), but — unlike a `Branch` — it does NOT gate permissions:
+    /// fork arms run unguarded and the join's structural SELECT carries the
+    /// branch. Excluded from [`Sink::branch_conds`].
+    Cube,
 }
 
 /// A mutable sink for emitted instructions plus the running counters. The
@@ -108,8 +114,20 @@ impl Sink {
     /// the method-body linearizer to lower a basic block under its path
     /// condition. The pops run even when `f` returns `Err`.
     pub(crate) fn with_conds<R>(&mut self, conds: &PathConds, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.with_conds_kind(conds, PcKind::Branch, f)
+    }
+
+    /// Like [`Sink::with_conds`] but pushes each literal under `kind`. The
+    /// Stage-4 body lowering uses [`PcKind::Cube`] so the block cube guards
+    /// obligations (it is in `pc`) without gating permissions.
+    pub(crate) fn with_conds_kind<R>(
+        &mut self,
+        conds: &PathConds,
+        kind: PcKind,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         for (cond, pol) in &conds.conds {
-            self.pc.push((cond.clone(), *pol, PcKind::Branch));
+            self.pc.push((cond.clone(), *pol, kind));
         }
         let r = f(self);
         for _ in &conds.conds {
@@ -140,12 +158,6 @@ impl Sink {
     /// wildcard-bearing permission gates *structurally* as [`Perm::Ite`] so the
     /// wildcard survives to the verifier.
     pub(crate) fn gate_perm(&mut self, perm: Perm) -> Perm {
-        // Stage-4 fork model: arms run unguarded (the verifier assumes the block
-        // cube and SELECTs at the join), so no permission is gated. Equivalent to
-        // the empty-pc branch below.
-        if crate::util::block_merge_enabled() {
-            return perm;
-        }
         if let Perm::Amount(v) = perm {
             return Perm::Amount(self.gate_perm_val(v));
         }
@@ -206,12 +218,6 @@ impl Sink {
     /// heap ternary) so the *value* must carry the branch instead of the chunk. The
     /// empty top-level pc returns `val` unchanged.
     pub(crate) fn gate_value(&mut self, val: Val, old: Val, ty: Type) -> Val {
-        // Stage-4 fork model: a field write in an arm is unconditional in that
-        // arm's heap; the join's chunk-value select (`merge_heaps`) carries the
-        // branch, so the write must NOT also be gated.
-        if crate::util::block_merge_enabled() {
-            return val;
-        }
         let mut v = val;
         for (lit, pol) in self.branch_conds().into_iter().rev() {
             let (then_, else_) = match pol {
@@ -341,6 +347,14 @@ impl Sink {
         yields_snap: bool,
     ) -> (HeapVal, Option<Val>) {
         let h = match sign {
+            // Fork model (Stage 4): the branch no longer rides in the perm scale,
+            // so the inhale must carry the block cube as its pc — the verifier
+            // guards the inhaled bool by it (else a conditional inhale leaks its
+            // fact past the branch). Stage 3 keeps the inhale total (branch in the
+            // scale). An empty pc (unconditional inhale) guards by nothing either way.
+            Sign::Add if crate::util::block_merge_enabled() => {
+                self.emit_heap_guarded(HeapInst::Inhale { base, call, perm })
+            }
             Sign::Add => self.emit_heap(HeapInst::Inhale { base, call, perm }),
             Sign::Sub => self.emit_heap_guarded(HeapInst::Exhale { base, call, perm }),
         };

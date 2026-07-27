@@ -521,7 +521,14 @@ pub(crate) fn lower_method(
         let mut env = env;
         let blk = &cfg.blocks[bid];
         let body_mark = sink.insts.len();
-        let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_conds(&pc, |sink| {
+        // Fork model: push the cube as `Cube` (guards obligations, does NOT gate
+        // permissions — the join merge SELECTs). Stage 3 gates via `Branch`.
+        let cube_kind = if block_merge {
+            crate::translate::sink::PcKind::Cube
+        } else {
+            crate::translate::sink::PcKind::Branch
+        };
+        let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_conds_kind(&pc, cube_kind, |sink| {
             let mut heap = h_in;
             for stmt in &blk.stmts {
                 heap = lower_stmt(b, &mut env, sink, heap, baseline, &mut labeled, stmt)?;

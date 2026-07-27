@@ -1428,11 +1428,16 @@ fn eval_method_inst(
             // Exhale: consume the held chunks, assert the bool under `pc`.
             let (source, direction, bool_guard) = if is_inhale {
                 let pos = ctx.perm_positive(scale);
-                (
-                    ValueSource::Fresh,
-                    Direction::Produce,
-                    vec![(pos, Polarity::Positive)],
-                )
+                let mut guard = vec![(pos, Polarity::Positive)];
+                // Fork model (Stage 4): the branch no longer rides in the perm
+                // scale (arms run unguarded), so the block cube must guard the
+                // inhaled bool — otherwise a conditional `inhale` on one arm
+                // leaks its fact past the branch. Stage 3 keeps the scale guard
+                // alone (the branch is in `0 < scale`).
+                if crate::util::block_merge_enabled() {
+                    guard.extend_from_slice(&pc_lits);
+                }
+                (ValueSource::Fresh, Direction::Produce, guard)
             } else {
                 (
                     ValueSource::ReadHeap(base_h.clone()),
