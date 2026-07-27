@@ -11,6 +11,33 @@ local/ghost fork/remap.
 
 ---
 
+## 2026-07-27 (later) — structural ChunkPerm: kill Select materialization (256s→4.6s)
+
+`structs_enums.vpr` under the flag was **256s** (vs 2.5s OFF), egraph 9× bigger, 1.19M rule
+applications. Two causes, both fixed:
+1. `ChunkPerm::to_id` lowered join `Select` perm-trees into the ground graph → the `ite`
+   dragged snapshot-fn unfolds + forall + ite-reduce + `lt-ite` through every saturation.
+2. `fold_under_pc` cloned the whole graph **per join** to fold a dead edge — dominant cost on
+   struct CFGs (hundreds of joins). Found via the fast repro
+   `feature_matrix.../enum_struct_variant__mut_through_match.vpr` (hung ON; graph was only ~2k
+   nodes, so it was clone/saturate cost, not bloat).
+
+Fix = **Select never materializes**. Perm predicates prove **per leaf** over the ChunkPerm
+tree (`prove_perm_leaves`: recurse Select, push cond → pc, discharge each Leaf under the
+accumulated pc). Dead inner edge auto-discharges: its arm's pc = `block_cube ∧ ¬edge`,
+contradictory when cube⇒edge → leaf vacuous, no clone. New `prove_sufficient` /
+`prove_perm_positive` / `prove_perm_write` / `perm_sub` (structural remainder) /
+`perm_all_zero`. Converted heap_subtract, assume_location_axioms (bound per-leaf, non-alias
+Leaf-only), Assign, Presence, Deref-framing off `to_id`. `fold_under_pc` reduced to a live
+`known()` check (no clone). Dropped per-join `ctx.reduce()`.
+
+**Result:** structs_enums ON **256s→4.57s**, nodes 38320→7296, rule_applications 1.19M→9.9k,
+`prove_tier4` 6→0, `prove_splits` 0, 0 fails. Small struct cases now faster ON than OFF. Flag
+OFF byte-identical (303 lib + suite). Watch: `prove_calls` 227k vs 4.9k OFF — per-leaf proving
+does many cheap tier-1 proves (headroom, not critical). Commits `e0e59ba` + cleanup.
+
+---
+
 ## 2026-07-27 — Stage 4.0–4.3 landed: structural heap merge kills enum tier-4
 
 All behind `SILVER_OXIDE_BLOCK_MERGE` (default OFF). Flag OFF stays byte-identical to
