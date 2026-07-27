@@ -24,10 +24,6 @@ pub enum ChunkPerm {
 }
 
 impl ChunkPerm {
-    pub fn leaf(id: egg::Id) -> Self {
-        ChunkPerm::Leaf(id)
-    }
-
     /// Structural equality with LEAVES compared by e-class `find` (so a `1/1`
     /// from either arm counts as equal). O(size), no saturation.
     fn same(ctx: &VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> bool {
@@ -106,16 +102,6 @@ impl ChunkPerm {
         }
     }
 
-    /// Whether any leaf carries a wildcard. Wildcard perms stay `Leaf` and never
-    /// enter a `Select`, so in practice this walks a single leaf.
-    pub fn has_wildcard(&self, ctx: &VerifyContext<'_>) -> bool {
-        match self {
-            ChunkPerm::Leaf(id) => super::declaration::contains_wildcard(ctx, *id),
-            ChunkPerm::Select { then, els, .. } => {
-                then.has_wildcard(ctx) || els.has_wildcard(ctx)
-            }
-        }
-    }
 }
 
 /// The **kind** of a heap location: a field/predicate group, the held value
@@ -178,10 +164,6 @@ impl Chunk {
         }
     }
 
-    /// The chunk's permission lowered to an e-class id.
-    pub fn perm_id(&self, ctx: &mut VerifyContext<'_>) -> egg::Id {
-        self.perm.to_id(ctx)
-    }
 
     pub fn with_recipe(mut self, recipe: Option<crate::vmir::Val>) -> Self {
         self.recipe = recipe;
@@ -265,5 +247,26 @@ impl Heap {
         self.groups
             .iter()
             .flat_map(|(k, cs)| cs.iter().map(move |c| (k, c)))
+    }
+
+    /// The location kinds (group keys) present in the heap.
+    pub fn kinds(&self) -> impl Iterator<Item = &LocationKind> {
+        self.groups.keys()
+    }
+
+    /// The chunk at `addr` within `kind`'s group, matched by **canonical**
+    /// e-class (`ctx.egraph.find`) so an address that only aliases the stored
+    /// key under the currently-assumed context still resolves. Used by the
+    /// Stage-4 join merge (a chunk held on both arms must line up by identity).
+    pub fn chunk_canon(
+        &self,
+        ctx: &VerifyContext<'_>,
+        kind: &LocationKind,
+        addr: egg::Id,
+    ) -> Option<&Chunk> {
+        let canon = ctx.egraph.find(addr);
+        self.chunks_of(kind)
+            .iter()
+            .find(|c| ctx.egraph.find(c.addr) == canon)
     }
 }

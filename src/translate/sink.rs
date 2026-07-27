@@ -140,6 +140,12 @@ impl Sink {
     /// wildcard-bearing permission gates *structurally* as [`Perm::Ite`] so the
     /// wildcard survives to the verifier.
     pub(crate) fn gate_perm(&mut self, perm: Perm) -> Perm {
+        // Stage-4 fork model: arms run unguarded (the verifier assumes the block
+        // cube and SELECTs at the join), so no permission is gated. Equivalent to
+        // the empty-pc branch below.
+        if crate::util::block_merge_enabled() {
+            return perm;
+        }
         if let Perm::Amount(v) = perm {
             return Perm::Amount(self.gate_perm_val(v));
         }
@@ -200,6 +206,12 @@ impl Sink {
     /// heap ternary) so the *value* must carry the branch instead of the chunk. The
     /// empty top-level pc returns `val` unchanged.
     pub(crate) fn gate_value(&mut self, val: Val, old: Val, ty: Type) -> Val {
+        // Stage-4 fork model: a field write in an arm is unconditional in that
+        // arm's heap; the join's chunk-value select (`merge_heaps`) carries the
+        // branch, so the write must NOT also be gated.
+        if crate::util::block_merge_enabled() {
+            return val;
+        }
         let mut v = val;
         for (lit, pol) in self.branch_conds().into_iter().rev() {
             let (then_, else_) = match pol {

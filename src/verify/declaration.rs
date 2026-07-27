@@ -6,7 +6,7 @@ use crate::{
         cert::{FunctionDefinition, ResourceDefinition},
         context::{Escalate, VerifyContext},
         error::VerifyError,
-        heap::{Chunk, Heap, LocationKind},
+        heap::{Chunk, ChunkPerm, Heap, LocationKind},
         lang::Symbolic,
         viz::Snapshotter,
     },
@@ -29,6 +29,12 @@ struct EvalState {
     /// desync from the eval column.
     recipes: Vec<Option<Val>>,
     heaps: Vec<Heap>,
+    /// Heap temps produced on a **provably unreachable** path (a block whose
+    /// cube is refuted in the ground graph — e.g. after `bb_unreach`'s `inhale
+    /// false`). The Stage-4 join merge drops such an arm outright instead of
+    /// selecting a `0`-leaf against it (which would need a tier-4 exhaustiveness
+    /// split). Keyed by `HeapVal::Temp` index.
+    dead_heaps: std::collections::HashSet<usize>,
 }
 
 impl EvalState {
@@ -38,6 +44,7 @@ impl EvalState {
             val_types: Vec::new(),
             recipes: Vec::new(),
             heaps: Vec::new(),
+            dead_heaps: std::collections::HashSet::new(),
         }
     }
 
@@ -50,6 +57,7 @@ impl EvalState {
             val_types: arg_types,
             recipes,
             heaps: Vec::new(),
+            dead_heaps: std::collections::HashSet::new(),
         }
     }
 
@@ -134,6 +142,12 @@ fn get_heap(state: &EvalState, hv: &HeapVal) -> Heap {
         HeapVal::Empty => Heap::empty(),
         HeapVal::Temp(n) => state.heaps[*n].clone(),
     }
+}
+
+/// Whether a heap operand was produced on a provably-unreachable path (see
+/// [`EvalState::dead_heaps`]).
+fn heapval_dead(state: &EvalState, hv: &HeapVal) -> bool {
+    matches!(hv, HeapVal::Temp(n) if state.dead_heaps.contains(n))
 }
 
 /// Heaps to visualize for an instruction, labeled as in VMIR (`h0`, `h1`, …).
@@ -1112,6 +1126,99 @@ fn heap_subtract(
     Ok(out)
 }
 
+/// Structural control-flow SELECT merge of two predecessor exit heaps at a
+/// binary join (`HeapInst::Merge`). Runs with the join block's cube ALREADY
+/// assumed in `ctx` (the walker assumed the block pc before this inst), so a
+/// chunk's full-cube reach guard has const-folded to the bare edge — the select
+/// keys on `cond` (the then-edge reach value) alone.
+///
+/// Per location kind, per canonical address:
+/// - held on **both** arms ⇒ SELECT the perm (`cond ? p_then : p_els`); when the
+///   two amounts are structurally equal (give-back / untouched) `select`
+///   collapses it to the bare constant and `cond` dies — this is the tier-4 kill.
+///   The value is the phi `ite(cond, v_then, v_els)`.
+/// - held on **one** arm only ⇒ genuinely conditional footprint (`cond ? p : 0`
+///   or `cond ? 0 : p`); if the absent side is a dead arm, `select`'s dead-arm
+///   drop already removed the `0` leaf.
+///
+/// SELECT, never `+`: summing edge-guarded arm chunks double-counts and rebuilds
+/// the tower (design 30).
+fn merge_heaps(
+    ctx: &mut VerifyContext<'_>,
+    cond: egg::Id,
+    h_then: &Heap,
+    h_els: &Heap,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Heap {
+    // Normalize first so an arm's give-back permission `(1/1 − p) + p` folds to
+    // its canonical class (`1/1`) before the select compares arms — otherwise
+    // structurally-equal give-backs sit in distinct classes and `same()` fails
+    // to collapse the tower.
+    ctx.reduce();
+    // Does the edge condition fold under THIS join's block cube? Tested in a
+    // scratch clone (`fold_under_pc`) so the live graph is never poisoned. When
+    // the block cube makes one edge infeasible, `cond` folds and every select in
+    // this merge drops the dead arm — killing the `0`-leaf tower that otherwise
+    // forces a tier-4 case split. `None` at an empty-cube (exit) join → rely on
+    // structural `same()` (arms both gave back `1/1`).
+    let cond_fold = ctx.fold_under_pc(cond, pc_lits);
+    let mut out = Heap::empty();
+    // Union of the kinds present in either arm.
+    let mut kinds: Vec<LocationKind> = h_then.kinds().cloned().collect();
+    for k in h_els.kinds() {
+        if !kinds.contains(k) {
+            kinds.push(k.clone());
+        }
+    }
+    for kind in &kinds {
+        // Union of canonical addresses across both arms.
+        let mut addrs: Vec<egg::Id> = Vec::new();
+        for c in h_then.chunks_of(kind).iter().chain(h_els.chunks_of(kind)) {
+            let canon = ctx.egraph.find(c.addr);
+            if !addrs.iter().any(|a| ctx.egraph.find(*a) == canon) {
+                addrs.push(canon);
+            }
+        }
+        for addr in addrs {
+            let ct = h_then.chunk_canon(ctx, kind, addr).cloned();
+            let ce = h_els.chunk_canon(ctx, kind, addr).cloned();
+            // A folded edge picks its live arm outright — both a held/held select
+            // and a divergent held/absent become that arm alone (no `0` leaf).
+            let chunk = match (cond_fold, ct, ce) {
+                // Then-edge live: keep the then arm's chunk (drop els entirely).
+                (Some(true), Some(a), _) => Some(a),
+                (Some(true), None, _) => None,
+                // Els-edge live: keep the els arm's chunk.
+                (Some(false), _, Some(b)) => Some(b),
+                (Some(false), _, None) => None,
+                // Undecided edge: structural select (may still be a genuine
+                // conditional footprint at an empty-cube join).
+                (None, Some(a), Some(b)) => {
+                    let perm = ChunkPerm::select(ctx, cond, a.perm.clone(), b.perm.clone());
+                    let value = ctx.add(Symbolic::Ite([cond, a.value, b.value]));
+                    Some(Chunk::new_perm(a.addr, perm, value))
+                }
+                (None, Some(a), None) => {
+                    let zero = ChunkPerm::Leaf(zero_real(ctx));
+                    let perm = ChunkPerm::select(ctx, cond, a.perm.clone(), zero);
+                    Some(Chunk::new_perm(a.addr, perm, a.value))
+                }
+                (None, None, Some(b)) => {
+                    let zero = ChunkPerm::Leaf(zero_real(ctx));
+                    let perm = ChunkPerm::select(ctx, cond, zero, b.perm.clone());
+                    Some(Chunk::new_perm(b.addr, perm, b.value))
+                }
+                (_, None, None) => None,
+            };
+            if let Some(chunk) = chunk {
+                out = out.with_chunk(kind, chunk);
+            }
+        }
+    }
+    assume_location_axioms(ctx, &out);
+    out
+}
+
 /// Evaluate a heap inst. `Sub` may fail with `InsufficientPermission`.
 fn eval_heap_inst(
     ctx: &mut VerifyContext<'_>,
@@ -1120,11 +1227,31 @@ fn eval_heap_inst(
     pc: &PathConds,
 ) -> Result<Heap, VerifyError> {
     match inst {
-        // Block-IR heap join. Never emitted by the current lowering (the block
-        // walker + structural merge are a later stage); unreachable here.
-        HeapInst::Merge { .. } => Err(VerifyError::Unimplemented(
-            "block-IR heap Merge (structural join stage)",
-        )),
+        // Block-IR heap join: structural per-chunk SELECT of the two predecessor
+        // exit heaps (Stage 4). Only reached under SILVER_OXIDE_BLOCK_MERGE — the
+        // linear lowering never emits `Merge`.
+        HeapInst::Merge {
+            cond,
+            then_h,
+            els_h,
+        } => {
+            // An unreachable predecessor arm (its cube refuted, e.g. the enum
+            // `bb_unreach` after `inhale false`) is dropped outright — selecting
+            // a `0`-leaf against it would need a tier-4 exhaustiveness split.
+            match (heapval_dead(state, then_h), heapval_dead(state, els_h)) {
+                (false, true) => return Ok(get_heap(state, then_h)),
+                (true, false) => return Ok(get_heap(state, els_h)),
+                _ => {}
+            }
+            let cond_id = state.get_val(ctx, cond);
+            let h_then = get_heap(state, then_h);
+            let h_els = get_heap(state, els_h);
+            // `inst.pc` carries the join block's cube (the lowering emits the
+            // Merge under it) — the context `fold_under_pc` assumes to drop dead
+            // arms.
+            let pc_lits = collect_pc_lits(ctx, state, pc);
+            Ok(merge_heaps(ctx, cond_id, &h_then, &h_els, &pc_lits))
+        }
         // `base ± acc loc perm`: build the single chunk, then union (Add) or
         // subtract (Sub) it.
         HeapInst::Combine {
@@ -2501,6 +2628,25 @@ pub(crate) fn verify_method(
             eval_method_inst,
             None,
         )?;
+        // Stage-4 dead-arm tagging: if the block's cube is now refuted in the
+        // ground graph (an unreachable arm — e.g. after `inhale false` unioned a
+        // reach flag with `false`), tag its exit heap so a downstream join merge
+        // drops it instead of forming a `0`-leaf that needs a tier-4 split. Cheap:
+        // just consults folded literals, no clone.
+        if crate::util::block_merge_enabled() {
+            if let vmir::HeapVal::Temp(n) = block.h_out {
+                let lits = collect_pc_lits(&mut ctx, &state, &block.cube);
+                let refuted = lits.iter().any(|(id, pol)| {
+                    matches!(
+                        ctx.egraph[ctx.egraph.find(*id)].data.known(),
+                        Some(Literal::Bool(b)) if *b != matches!(pol, Polarity::Positive)
+                    )
+                });
+                if refuted {
+                    state.dead_heaps.insert(n);
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -287,6 +287,14 @@ pub(crate) fn lower_method(
     let baseline = current_heap;
     let mut labeled: HashMap<Spur, HeapVal> = HashMap::new();
 
+    // Stage-4 structural heap merge (SILVER_OXIDE_BLOCK_MERGE): each block's
+    // `h_in` is derived from its `Preds` (a `HeapInst::Merge` at a `Join`) and
+    // arms lower unguarded; with the flag off the heap threads linearly through
+    // `current_heap` as before. `h_out_of` records every pushed block's exit
+    // heap so a later join's `Merge` can name its predecessors' heaps.
+    let block_merge = crate::util::block_merge_enabled();
+    let mut h_out_of: HashMap<vmir::BlockId, HeapVal> = HashMap::new();
+
     let order = cfg.topo_order();
     let cfg_preds = cfg.predecessors();
     let reachable = cfg.reachable();
@@ -376,7 +384,7 @@ pub(crate) fn lower_method(
 
         // --- entry env + Preds (+ synthetic binary-join blocks for n-ary) ---
         // `then_` is guarded by `cond`, `els` is the unguarded fall-through arm.
-        let (env, preds_kind, real_join): (HashMap<Spur, Val>, vmir::Preds, Vec<Inst>) =
+        let (env, preds_kind, mut real_join): (HashMap<Spur, Val>, vmir::Preds, Vec<Inst>) =
             if is_entry {
                 (init_env.clone(), vmir::Preds::Entry, prologue.take().unwrap())
             } else {
@@ -433,22 +441,42 @@ pub(crate) fn lower_method(
                             );
                             let mut join = reach_insts.take().unwrap_or_default();
                             join.extend(sink.take_since(phi_mark));
+                            let then_ = vmir_id[p];
+                            let els = acc_ref;
                             let kind = vmir::Preds::Join {
                                 cond: ev.clone(),
-                                then_: vmir_id[p],
-                                els: acc_ref,
+                                then_,
+                                els,
                             };
                             if i == 0 {
                                 real = Some((new_env, kind, join));
                             } else {
                                 let sid = vmir::BlockId(blocks.len());
+                                // A synthetic join has an empty body, so its exit
+                                // heap is exactly its `Merge` (flag on) or the
+                                // linear cursor (flag off).
+                                let syn_h_out = if block_merge {
+                                    let mark = sink.insts.len();
+                                    let m = sink.with_conds(&pc, |sink| {
+                                        sink.emit_heap_guarded(HeapInst::Merge {
+                                            cond: ev.clone(),
+                                            then_h: h_out_of[&then_],
+                                            els_h: h_out_of[&els],
+                                        })
+                                    });
+                                    join.extend(sink.take_since(mark));
+                                    m
+                                } else {
+                                    h_in
+                                };
                                 blocks.push(vmir::Block {
                                     cube: pc.clone(),
                                     preds: kind,
                                     join,
                                     body: Vec::new(),
-                                    h_out: h_in,
+                                    h_out: syn_h_out,
                                 });
+                                h_out_of.insert(sid, syn_h_out);
                                 acc_ref = sid;
                                 acc_env = new_env;
                             }
@@ -458,9 +486,35 @@ pub(crate) fn lower_method(
                 }
             };
 
+        // Derive this block's entry heap from its `Preds` (fork model) or the
+        // linear cursor (flag off). A `Join` emits a `HeapInst::Merge` into the
+        // join phase, before the body reads it.
+        let h_in = if block_merge {
+            match &preds_kind {
+                vmir::Preds::Entry => baseline,
+                vmir::Preds::From(p) => h_out_of[p],
+                vmir::Preds::Join { cond, then_, els } => {
+                    let mark = sink.insts.len();
+                    // Emit under the block cube so the Merge inst carries it as
+                    // its pc (the verifier's `fold_under_pc` assumes it).
+                    let m = sink.with_conds(&pc, |sink| {
+                        sink.emit_heap_guarded(HeapInst::Merge {
+                            cond: cond.clone(),
+                            then_h: h_out_of[then_],
+                            els_h: h_out_of[els],
+                        })
+                    });
+                    real_join.extend(sink.take_since(mark));
+                    m
+                }
+            }
+        } else {
+            current_heap
+        };
+
         // `label L` captures the heap at block entry for later `old[L]`.
         if let Some(l) = cfg.blocks[bid].label {
-            labeled.insert(l, current_heap);
+            labeled.insert(l, h_in);
         }
 
         // --- body phase: lower the block's statements and terminator under pc ---
@@ -468,7 +522,7 @@ pub(crate) fn lower_method(
         let blk = &cfg.blocks[bid];
         let body_mark = sink.insts.len();
         let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_conds(&pc, |sink| {
-            let mut heap = current_heap;
+            let mut heap = h_in;
             for stmt in &blk.stmts {
                 heap = lower_stmt(b, &mut env, sink, heap, baseline, &mut labeled, stmt)?;
             }
@@ -539,6 +593,7 @@ pub(crate) fn lower_method(
             h_out: current_heap,
         });
         vmir_id.insert(bid, rid);
+        h_out_of.insert(rid, current_heap);
     }
 
     Ok(vmir::Method {

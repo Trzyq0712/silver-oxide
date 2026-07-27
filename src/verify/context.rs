@@ -594,6 +594,44 @@ impl<'a> VerifyContext<'a> {
         proven
     }
 
+    /// Whether `cond` folds to a boolean literal once `pc_lits` are assumed,
+    /// tested in a scratch clone so the live graph is never poisoned (assuming a
+    /// block cube globally would make sibling branches inconsistent — unsound).
+    /// Used by the Stage-4 join merge to drop a dead arm's `0` leaf: at a join
+    /// whose block cube `X` makes one edge infeasible, `cond` folds and the
+    /// select collapses to the live arm. `None` = undecided (a genuine
+    /// conditional footprint, or an infeasible cube).
+    pub(crate) fn fold_under_pc(
+        &mut self,
+        cond: egg::Id,
+        pc_lits: &[(egg::Id, Polarity)],
+    ) -> Option<bool> {
+        if let Some(Literal::Bool(b)) = self.egraph[self.egraph.find(cond)].data.known() {
+            return Some(*b);
+        }
+        if pc_lits.is_empty() {
+            return None;
+        }
+        let mut probe = self.egraph.clone();
+        let true_p = probe.add(Symbolic::Lit(Literal::Bool(true)));
+        let false_p = probe.add(Symbolic::Lit(Literal::Bool(false)));
+        for (id, pol) in pc_lits {
+            let want_true = matches!(pol, Polarity::Positive);
+            match probe[*id].data.known() {
+                // Cube already infeasible → leave `cond` undecided.
+                Some(Literal::Bool(b)) if *b != want_true => return None,
+                _ => {
+                    probe.union(*id, if want_true { true_p } else { false_p });
+                }
+            }
+        }
+        let probe = self.run_probe(probe);
+        match probe[probe.find(cond)].data.known() {
+            Some(Literal::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
     /// Persist a proven obligation so future identical ones hit tier 1.
     ///
     /// Default (and always for an **empty-pc** goal, where `imp == goal`): union
