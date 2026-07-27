@@ -221,15 +221,6 @@ impl Heap {
         self.chunks_of(kind).iter().find(|c| c.addr == addr)
     }
 
-    pub fn perm_at(
-        &self,
-        ctx: &mut VerifyContext<'_>,
-        kind: &LocationKind,
-        addr: egg::Id,
-    ) -> Option<egg::Id> {
-        self.chunk(kind, addr).map(|c| c.perm.to_id(ctx))
-    }
-
     /// Insert `chunk` into `kind`'s group, replacing any chunk already at the
     /// same `addr` (preserving today's one-chunk-per-address semantics).
     pub fn with_chunk(&self, kind: &LocationKind, chunk: Chunk) -> Self {
