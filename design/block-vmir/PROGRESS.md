@@ -11,6 +11,92 @@ local/ghost fork/remap.
 
 ---
 
+## 2026-07-27 — Stage 4.0–4.3 landed: structural heap merge kills enum tier-4
+
+All behind `SILVER_OXIDE_BLOCK_MERGE` (default OFF). Flag OFF stays byte-identical to
+Stage 3 (303 lib + full suite green). Commits: `7c6f1b6` (4.0/4.1), `c54add9` (4.2/4.3),
+`1422570` (fork-correctness fixes).
+
+**Landed:**
+- **4.0/4.1** `ChunkPerm` (`Leaf(Id) | Select{cond,then,els}`) held outside the union-find;
+  smart ctors `select`/`same`/`to_id`; `Chunk.perm: ChunkPerm`. Migrated
+  merge_chunks/heap_union/heap_subtract/find_chunk_consolidated/location_chunks/Deref/Assign
+  to read perms via `to_id`. Aliasing perms stay `Leaf`. `Leaf`+`to_id`-identity ⇒ flag-OFF
+  byte-identical.
+- **4.2** lowering: per-block `h_in` from `Preds` (`HeapInst::Merge` at a `Join`, carrying
+  the block cube as its pc), `h_out_of` map, synthetic n-ary joins emit `Merge` too. Verify
+  `merge_heaps`: per-kind/per-canonical-addr structural SELECT; give-back arms both fold to
+  `1/1` ⇒ `same()` collapse. `Heap::kinds`/`chunk_canon`.
+- **4.3** dead-arm dropping: (a) `fold_under_pc` scratch-clone probe assumes the join cube to
+  fold a dead edge; (b) `EvalState.dead_heaps` tags an unreachable block's exit heap (cube
+  refuted in the ground graph, e.g. `bb_unreach` after `inhale false`) so the merge drops
+  that arm instead of a `0`-leaf.
+
+**Architecture confirmed (the key realization):** GROUND e-graph = **storage** — never
+assumes a block cube (a global cube-assume makes sibling branches inconsistent → unsound;
+verified by a throwaway `ASSUME_CUBE` diagnostic that both collapsed the tower *and*
+demonstrated the poisoning). SCRATCH clone = **decision** — `fold_under_pc` assumes the join
+cube transiently to fold dead edges, then discards (same clone-and-throw as tier-3/4). This
+is the minimal slice of the "ghost + local egraphs" direction.
+
+**Fork-correctness fixes (`1422570`):** the assume-in-resources design had put the branch in
+the *perm scale* (`gate_perm`), not `inst.pc`. Removing scale-gating under the fork model
+leaked. Fixes: new `PcKind::Cube` (rides in `pc`, excluded from `branch_conds` so
+gate_perm/gate_value keep gating genuine spatial `b ? A : A'` conds but not the cube); the
+`inhale` is emitted **guarded** under the flag and its produced bool is guarded by the block
+cube. Reverted the blanket gate no-ops.
+
+**Result:** `gen_enum_match {2,3,8,20}` verify with `NO_TIER4=1` — `prove_splits: 0`,
+`prove_tier4: 0`. Whole `tests/cases/passing/permissions` corpus verifies flag-ON + NO_TIER4.
+Passing corpus no regressions; every failing corpus case still fails flag-ON (soundness).
+
+**Deviation from `81`:** the plan put the enum gate at 4.2 and unreachable-block handling at
+4.3, but the failing split is the exhaustiveness `0`-leaf (the `bb_unreach` arm), so 4.2's
+gate actually needs 4.3's dead-arm mechanism — landed together. The plan's "walker assumes the
+block pc" premise was false; replaced by the ground-storage / scratch-decision split above.
+
+**Next (4.4, a deliberate decision — NOT done):** flip `SILVER_OXIDE_BLOCK_MERGE` default ON.
+Blocked on: (1) flip the `both_arms_..._case_split_we_lack` e2e assertion — the fork join now
+*proves* it (its comment anticipates this); (2) run the full 305-case `structs_enums` corpus
+flag-ON (not in-repo); (3) refresh `benchmarks/baseline/*` + review the cost diff (should
+drop — tier-4 gone). Then prune the now-dead `gate_perm`/`gate_value`/linear-thread paths.
+
+---
+
+## 2026-07-27 — Stage 4 plan written (pre-implementation)
+
+**Status:** design only, no code. Wrote the code-level Stage 4 guide
+`81-stage4-implementation.md` (indexed in README) for the implementing agent: concrete
+types, signatures, pseudocode, line anchors into the current tree.
+
+**The three deliverables (user-requested):**
+1. **Heap storage** — `Chunk.perm: egg::Id → ChunkPerm { Leaf(id) | Select{cond,then,els} }`.
+   `Leaf` = anything the frontend built, INCLUDING a program-written `c ==> acc` gated ite
+   (opaque, never decomposed — "nothing we can do, throw into the e-graph"). `Select` is
+   built ONLY by the join merge (control flow) = the explicit structure. Smart ctors:
+   same-amount collapse (`then≡els⇒then`, give-back), dead-arm drop under block-cube fold,
+   const-fold; `to_id` lowers to an e-graph `Ite` only where the prover needs an e-class.
+   Merge consults **block PCs only**.
+2. **Smart joins** — `merge_heaps(cond, h_then, h_els)` per chunk: both-hold ⇒
+   `select(cond, pt, pe)` (equal ⇒ bare constant = the tier-4 kill); one-side ⇒
+   `select(cond, p, 0)` = divergent U4. SELECT across arms, ADD only within an arm. Nested
+   joins collapse bottom-up via topo order. `HeapInst::Merge` arm calls it; lowering derives
+   `h_in` from `Preds` and **drops `gate_perm`/`gate_value`** (arms run unguarded).
+3. **Unreachable blocks** — detection == join-elimination == one const-fold, **no dead-block
+   flag in v1**: a dead arm's edge `cond` folds false ⇒ `select` drops it ⇒ its `h_out` never
+   selected. v1 detection = const-fold only (no assume — the single ground graph would be
+   poisoned; no clone); body-skip is an optional perf layer; scratch-clone is escalation
+   (not needed for the enum family). Route-1: divergent-but-dead side ⇒ no `0` leaf.
+
+**Staging:** 4.0 flag `SILVER_OXIDE_BLOCK_MERGE` (default OFF, A/B) → 4.1 `ChunkPerm`
+(gate: flag-OFF byte-identical) → 4.2 fork + `Merge` + drop gating (gate: `gen_enum_match 8`
+`NO_TIER4` green) → 4.3 dead-arm → 4.4 scale N=100 + flip default. Plan mirror in
+`~/.claude/plans/block-vmir-stage4.md`.
+
+**Next:** implement 4.0/4.1 (await go).
+
+---
+
 ## 2026-07-27 — Stage 3: block walker (verifier reconnected)
 
 **Status:** landed, uncommitted on `backend-blocks`. Milestone: **M1 complete** (block IR +
