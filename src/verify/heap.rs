@@ -93,6 +93,25 @@ impl ChunkPerm {
         }
     }
 
+    /// The leaf amount id if this is a bare `Leaf` (no branch structure).
+    pub fn as_leaf(&self) -> Option<egg::Id> {
+        match self {
+            ChunkPerm::Leaf(id) => Some(*id),
+            ChunkPerm::Select { .. } => None,
+        }
+    }
+
+    /// Visit every leaf amount id (the branch conditions are skipped).
+    pub fn for_each_leaf(&self, f: &mut impl FnMut(egg::Id)) {
+        match self {
+            ChunkPerm::Leaf(id) => f(*id),
+            ChunkPerm::Select { then, els, .. } => {
+                then.for_each_leaf(f);
+                els.for_each_leaf(f);
+            }
+        }
+    }
+
     /// A representative e-class id for debug display, WITHOUT mutating the graph
     /// (a `Leaf`'s id, or a `Select`'s condition). Viz only — not a real perm id.
     pub fn repr_id(&self) -> egg::Id {

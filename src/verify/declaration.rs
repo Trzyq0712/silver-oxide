@@ -632,7 +632,10 @@ fn merge_chunks(
 /// A location chunk extracted from a heap for the location axioms: its
 /// permission, the location group tag, its argument e-classes, and its bound.
 struct LocationChunk {
-    perm: egg::Id,
+    /// Kept **structural** — a bounded location's axiom is assumed per leaf, and
+    /// non-aliasing only fires for bare (`Leaf`) perms, so a join `Select` never
+    /// materializes as an `ite` in the graph.
+    perm: ChunkPerm,
     group: lasso::Spur,
     args: Vec<egg::Id>,
     bound: Bound,
@@ -652,7 +655,7 @@ fn pred_addr_type(program: &vmir::Program, pred_id: MemberId) -> Type {
 /// an `Addr{group,bound,..}` type (recovered by `infer_type`, so **computed**
 /// addresses count too), record its perm, group, bound, and — for a direct
 /// `@addr` application — its value-arg e-classes (used by the non-aliasing axiom).
-fn location_chunks(ctx: &mut VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
+fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     let mut out = Vec::new();
     for (kind, chunk) in h.entries() {
         // group/bound come straight from the chunk's location kind (VMIR-sourced) —
@@ -671,9 +674,8 @@ fn location_chunks(ctx: &mut VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> 
                 _ => None,
             })
             .unwrap_or_default();
-        let perm = chunk.perm.to_id(ctx);
         out.push(LocationChunk {
-            perm,
+            perm: chunk.perm.clone(),
             group: kind.group,
             bound: kind.bound.clone(),
             args,
@@ -704,18 +706,27 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     let false_ = ctx.false_();
     let true_ = ctx.true_();
 
-    // Bound: perm ≤ b at each bounded location.
+    // Bound: perm ≤ b at each bounded location — assumed **per leaf** of the
+    // (possibly branch-structured) perm, so a join `Select` never materializes.
+    // A literal leaf (`1/1`, `0`) folds the axiom to a tautology (no node kept).
     for c in &chunks {
         let Bound::Bounded(b) = &c.bound else {
             continue;
         };
         let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
-        let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, c.perm]));
-        let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
-        ctx.union(le, true_);
+        let mut leaves = Vec::new();
+        c.perm.for_each_leaf(&mut |l| leaves.push(l));
+        for leaf in leaves {
+            let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, leaf]));
+            let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
+            ctx.union(le, true_);
+        }
     }
 
-    // Non-aliasing: same bounded location, perms sum > bound ⇒ args differ.
+    // Non-aliasing: same bounded location, perms sum > bound ⇒ args differ. Only
+    // fires for bare (`Leaf`) perms — a branch-structured perm would need the
+    // sum materialized; skipping is sound (it can only lose a disequality, never
+    // add one) and the merged heap holds one leaf-perm chunk per location anyway.
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
             if chunks[i].group != chunks[j].group {
@@ -724,11 +735,11 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             let Bound::Bounded(b) = &chunks[i].bound else {
                 continue;
             };
+            let (Some(pi), Some(pj)) = (chunks[i].perm.as_leaf(), chunks[j].perm.as_leaf()) else {
+                continue;
+            };
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
-            let sum = ctx.add(Symbolic::Binary(
-                BinOp::AddR,
-                [chunks[i].perm, chunks[j].perm],
-            ));
+            let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [pi, pj]));
             let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, sum]));
             // Both arg orders (the `!=` goal's `Eq` order is source-dependent).
             for (xs, ys) in [
@@ -930,6 +941,108 @@ fn prove_perm_ineq(
     ctx.prove_under_pc(goal, pc_lits) || ctx.prove_under_pc(goal2, pc_lits)
 }
 
+/// Prove a per-leaf permission predicate over a (possibly branch-structured)
+/// [`ChunkPerm`] **WITHOUT materializing the `Select` into the ground graph**.
+/// A `Select` pushes its condition into the pc and requires the predicate on
+/// both arms; a `Leaf` discharges it under the accumulated pc. This is the CFG
+/// case split done through the pc — no `ite` node, no `lt-ite`, no tier-4, and
+/// (crucially) no perm-tower bloat in the live graph. The predicate is built
+/// from a leaf amount id by `mk`.
+fn prove_perm_leaves(
+    ctx: &mut VerifyContext<'_>,
+    perm: &ChunkPerm,
+    pc_lits: &[(egg::Id, Polarity)],
+    mk: &dyn Fn(&mut VerifyContext<'_>, egg::Id, &[(egg::Id, Polarity)]) -> bool,
+) -> bool {
+    match perm {
+        ChunkPerm::Leaf(h) => mk(ctx, *h, pc_lits),
+        ChunkPerm::Select { cond, then, els } => {
+            let mut pc_t = pc_lits.to_vec();
+            pc_t.push((*cond, Polarity::Positive));
+            if !prove_perm_leaves(ctx, then, &pc_t, mk) {
+                return false;
+            }
+            let mut pc_e = pc_lits.to_vec();
+            pc_e.push((*cond, Polarity::Negative));
+            prove_perm_leaves(ctx, els, &pc_e, mk)
+        }
+    }
+}
+
+/// `held ≥ needed` over a structured `held`, per leaf (no `Select` in the graph).
+fn prove_sufficient(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    needed: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> bool {
+    prove_perm_leaves(ctx, held, pc_lits, &move |ctx, h, pc| {
+        let false_ = ctx.false_();
+        let true_ = ctx.true_();
+        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, needed]));
+        let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+        prove_perm_ineq(ctx, goal, h, needed, pc, false)
+    })
+}
+
+/// `0 < held` over a structured `held`, per leaf.
+fn prove_perm_positive(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> bool {
+    prove_perm_leaves(ctx, held, pc_lits, &|ctx, h, pc| {
+        let zero = zero_real(ctx);
+        let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, h]));
+        ctx.prove_under_pc(goal, pc)
+    })
+}
+
+/// `¬(held < 1)` (full/write permission) over a structured `held`, per leaf.
+fn prove_perm_write(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> bool {
+    prove_perm_leaves(ctx, held, pc_lits, &|ctx, h, pc| {
+        let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, write]));
+        let false_ = ctx.false_();
+        let true_ = ctx.true_();
+        let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+        ctx.prove_under_pc(goal, pc)
+    })
+}
+
+/// `held − needed`, kept structural (leaves get `SubR`, the tree stays a
+/// `Select` via the smart constructor so it never materializes as an `ite`).
+fn perm_sub(ctx: &mut VerifyContext<'_>, held: &ChunkPerm, needed: egg::Id) -> ChunkPerm {
+    match held {
+        ChunkPerm::Leaf(h) => {
+            ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::SubR, [*h, needed])))
+        }
+        ChunkPerm::Select { cond, then, els } => {
+            let t = perm_sub(ctx, then, needed);
+            let e = perm_sub(ctx, els, needed);
+            ChunkPerm::select(ctx, *cond, t, e)
+        }
+    }
+}
+
+/// Whether every leaf of `perm` const-folds to `0` (the chunk is emptied on
+/// every branch, so it can be dropped). Const-fold only, no `Select` in the graph.
+fn perm_all_zero(ctx: &VerifyContext<'_>, perm: &ChunkPerm) -> bool {
+    match perm {
+        ChunkPerm::Leaf(h) => matches!(
+            ctx.egraph[ctx.egraph.find(*h)].data.known(),
+            Some(Literal::Real(r)) if *r == num::BigRational::from(num::BigInt::from(0))
+        ),
+        ChunkPerm::Select { then, els, .. } => {
+            perm_all_zero(ctx, then) && perm_all_zero(ctx, els)
+        }
+    }
+}
+
 /// Prove an obligation `goal` under `pc_lits`. If the goal is a permission
 /// comparison `Ite(Lt(a, b), false, true)` (the shape of every `perm ≥ 0` and
 /// sufficiency side condition) and the cheap tiers fail, retry with the
@@ -1040,8 +1153,10 @@ fn heap_subtract(
     // **assume** the taken share is strictly smaller (`needed < held`) under the
     // pc — Silicon's constrainable-ARP rule. The `held − needed` remainder stays
     // positive, so the chunk is never emptied.
-    let existing_perm = existing.perm.to_id(ctx);
     if ctx.has_wildcard && contains_wildcard(ctx, chunk2_perm) {
+        // Wildcard held/needed perms are always leaves (never a join `Select`),
+        // so materializing here is a no-op id.
+        let existing_perm = existing.perm.to_id(ctx);
         let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
         let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing_perm]));
         if !ctx.prove_under_pc(held_pos, pc_lits) {
@@ -1066,13 +1181,12 @@ fn heap_subtract(
         return Ok(out);
     }
 
-    let false_ = ctx.false_();
-    let true_ = ctx.true_();
-    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [existing_perm, chunk2_perm]));
-    let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-    let proven = prove_perm_ineq(ctx, goal, existing_perm, chunk2_perm, pc_lits, false);
+    // Sufficiency `held ≥ needed`, proven per-leaf over the (possibly
+    // branch-structured) held perm — the `Select` never enters the graph.
+    let proven = prove_sufficient(ctx, &existing.perm, chunk2_perm, pc_lits);
     if !proven {
         if crate::verify::viz::dump_perm_enabled() {
+            let existing_perm = existing.perm.to_id(ctx);
             eprintln!(
                 "[perm-dump] insufficient at subtract in group {:?}\n\
                  held.perm:\n{}needed.perm:\n{}",
@@ -1086,7 +1200,8 @@ fn heap_subtract(
 
     ctx.union(existing.value, chunk2.value);
 
-    let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
+    // Remainder stays structural (leaves get `SubR`); never an `ite` in the graph.
+    let remainder = perm_sub(ctx, &existing.perm, chunk2_perm);
     // Whether to drop the emptied chunk is a statement about the *heap*, so it has
     // to hold at the heap's scope — **unconditionally**, not under this
     // instruction's `pc`.
@@ -1109,17 +1224,14 @@ fn heap_subtract(
     // evaluates to 0 on-path and to the retained permission off-path, and a
     // zero-permission chunk is inert (`perm > 0` gates every use). An ordinary
     // unguarded consume still folds to `1/1 - 1/1 = 0` and drops, as before.
-    let empty = matches!(
-        ctx.egraph[remainder].data.known(),
-        Some(Literal::Real(r)) if *r == num::BigRational::from(num::BigInt::from(0))
-    );
+    let empty = perm_all_zero(ctx, &remainder);
     if empty {
         out = out.without_chunk(kind, existing.addr);
     } else {
         // The value (and so its recipe provenance) is unchanged by a subtract.
         out = out.with_chunk(
             kind,
-            Chunk::new(existing.addr, remainder, existing.value)
+            Chunk::new_perm(existing.addr, remainder, existing.value)
                 .with_recipe(existing.recipe.clone()),
         );
     }
@@ -1143,25 +1255,18 @@ fn heap_subtract(
 ///
 /// SELECT, never `+`: summing edge-guarded arm chunks double-counts and rebuilds
 /// the tower (design 30).
-fn merge_heaps(
-    ctx: &mut VerifyContext<'_>,
-    cond: egg::Id,
-    h_then: &Heap,
-    h_els: &Heap,
-    pc_lits: &[(egg::Id, Polarity)],
-) -> Heap {
-    // Normalize first so an arm's give-back permission `(1/1 − p) + p` folds to
-    // its canonical class (`1/1`) before the select compares arms — otherwise
-    // structurally-equal give-backs sit in distinct classes and `same()` fails
-    // to collapse the tower.
-    ctx.reduce();
-    // Does the edge condition fold under THIS join's block cube? Tested in a
-    // scratch clone (`fold_under_pc`) so the live graph is never poisoned. When
-    // the block cube makes one edge infeasible, `cond` folds and every select in
-    // this merge drops the dead arm — killing the `0`-leaf tower that otherwise
-    // forces a tier-4 case split. `None` at an empty-cube (exit) join → rely on
-    // structural `same()` (arms both gave back `1/1`).
-    let cond_fold = ctx.fold_under_pc(cond, pc_lits);
+fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els: &Heap) -> Heap {
+    // NOTE: no eager `ctx.reduce()` here — re-saturating the graph at every join
+    // was O(joins) full saturations. Give-back collapse now relies on the arms'
+    // leaves folding during the per-leaf perm proofs instead.
+    //
+    // `cond_fold`: a cheap LIVE-graph `known()` check (no clone) — if the edge
+    // already folded, drop the dead arm early. When it is `None` the arm stays a
+    // structural `Select`; a truly-infeasible edge is discharged later by the
+    // per-leaf perm proof, whose pc becomes `block_cube ∧ ¬edge` (contradictory
+    // when the cube implies the edge, so the leaf holds vacuously) — no per-join
+    // graph clone, which was the dominant cost on struct-heavy CFGs.
+    let cond_fold = ctx.fold_under_pc(cond);
     let mut out = Heap::empty();
     // Union of the kinds present in either arm.
     let mut kinds: Vec<LocationKind> = h_then.kinds().cloned().collect();
@@ -1246,11 +1351,7 @@ fn eval_heap_inst(
             let cond_id = state.get_val(ctx, cond);
             let h_then = get_heap(state, then_h);
             let h_els = get_heap(state, els_h);
-            // `inst.pc` carries the join block's cube (the lowering emits the
-            // Merge under it) — the context `fold_under_pc` assumes to drop dead
-            // arms.
-            let pc_lits = collect_pc_lits(ctx, state, pc);
-            Ok(merge_heaps(ctx, cond_id, &h_then, &h_els, &pc_lits))
+            Ok(merge_heaps(ctx, cond_id, &h_then, &h_els))
         }
         // `base ± acc loc perm`: build the single chunk, then union (Add) or
         // subtract (Sub) it.
@@ -1324,22 +1425,22 @@ fn eval_heap_inst(
             let kind = state
                 .loc_kind(loc)
                 .expect("assign location must be Addr-typed");
-            let perm = h.perm_at(ctx, &kind, addr).unwrap_or_else(|| zero_real(ctx));
-            // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc.
+            let perm = h
+                .chunk(&kind, addr)
+                .map(|c| c.perm.clone())
+                .unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx)));
+            // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc —
+            // per leaf, so a branch-structured held perm never materializes.
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
-            let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-            let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [perm, write]));
-            let false_ = ctx.false_();
-            let true_ = ctx.true_();
-            let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-            if !ctx.prove_under_pc(goal, &pc_lits) {
+            if !prove_perm_write(ctx, &perm, &pc_lits) {
                 return Err(VerifyError::InsufficientPermission);
             }
-            Ok(h.with_chunk(&kind, Chunk::new(addr, perm, new_val)))
+            // Permission unchanged by the write; keep it structural.
+            Ok(h.with_chunk(&kind, Chunk::new_perm(addr, perm, new_val)))
         }
     }
 }
@@ -1828,11 +1929,12 @@ fn walk_footprint(
                     find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
                 let suff = match existing {
                     Some(c) => {
-                        let c_perm = c.perm.to_id(ctx);
-                        let hpos = ctx.perm_positive(c_perm);
-                        let imp =
-                            ctx.implication(hpos, std::iter::once((guard, Polarity::Positive)));
-                        ctx.prove_under_pc(imp, pc_lits)
+                        // `guard ⇒ 0 < held`, proven per leaf (never materialize
+                        // the held `Select`): assume `guard` in the pc, prove
+                        // `0 < leaf` on each branch.
+                        let mut pc = pc_lits.to_vec();
+                        pc.push((guard, Polarity::Positive));
+                        prove_perm_positive(ctx, &c.perm, &pc)
                     }
                     // No chunk held here: sound only if the slot is not required
                     // on this path (`guard` is false).
@@ -3067,17 +3169,36 @@ fn inst_obligations(
         InstKind::Pure(_, PureInst::Deref(heap, loc)) => {
             let addr = state.get_val(ctx, loc);
             let held = get_heap(state, heap);
-            let perm = state
-                .loc_kind(loc)
-                .and_then(|k| {
-                    ctx.chunk_under_pc(held.chunks_of(&k), addr, pc_lits)
-                        .map(|c| c.perm.clone())
-                })
-                .map(|p| p.to_id(ctx))
-                .unwrap_or_else(|| zero_real(ctx));
-            let zero = zero_real(ctx);
-            let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, perm]));
-            vec![(goal, VerifyError::InsufficientPermission)]
+            let perm = state.loc_kind(loc).and_then(|k| {
+                ctx.chunk_under_pc(held.chunks_of(&k), addr, pc_lits)
+                    .map(|c| c.perm.clone())
+            });
+            match perm {
+                // A bare (or absent) perm: the goal `0 < leaf` is discharged by
+                // the caller exactly as before (flag-OFF byte-identical).
+                None => {
+                    let zero = zero_real(ctx);
+                    let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, zero]));
+                    vec![(goal, VerifyError::InsufficientPermission)]
+                }
+                Some(p @ ChunkPerm::Leaf(_)) => {
+                    let leaf = p.as_leaf().unwrap();
+                    let zero = zero_real(ctx);
+                    let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, leaf]));
+                    vec![(goal, VerifyError::InsufficientPermission)]
+                }
+                // A branch-structured held perm: prove `0 < perm` per leaf (never
+                // materialize the `Select`). On success emit no goal; on failure a
+                // trivially-false goal carries the error to the caller.
+                Some(p) => {
+                    if prove_perm_positive(ctx, &p, pc_lits) {
+                        vec![]
+                    } else {
+                        let false_ = ctx.false_();
+                        vec![(false_, VerifyError::InsufficientPermission)]
+                    }
+                }
+            }
         }
         // `not(perm < 0)` desugared to an `Ite`. Applies to a location combine,
         // a resource inhale/exhale, and fold/unfold (their permission scale must
