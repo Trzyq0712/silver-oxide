@@ -969,6 +969,15 @@ fn prove_perm_leaves(
     }
 }
 
+/// The folded rational value of an e-class, if known — used by the per-leaf
+/// fast paths to decide a comparison against a literal WITHOUT a prove_under_pc.
+fn known_real(ctx: &VerifyContext<'_>, id: egg::Id) -> Option<num::BigRational> {
+    match ctx.egraph[ctx.egraph.find(id)].data.known() {
+        Some(Literal::Real(r)) => Some(r.clone()),
+        _ => None,
+    }
+}
+
 /// `held ≥ needed` over a structured `held`, per leaf (no `Select` in the graph).
 fn prove_sufficient(
     ctx: &mut VerifyContext<'_>,
@@ -977,6 +986,15 @@ fn prove_sufficient(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
     prove_perm_leaves(ctx, held, pc_lits, &move |ctx, h, pc| {
+        // Fast path: two known literals that already satisfy `h ≥ needed` need
+        // no prove (the give-back `1/1 ≥ 1/1` case — the vast majority of leaves).
+        // A literal that FAILS may still be a dead branch (`0 ≥ 1` on an
+        // infeasible arm), so it falls through to the pc-aware prove.
+        if let (Some(hr), Some(nr)) = (known_real(ctx, h), known_real(ctx, needed)) {
+            if hr >= nr {
+                return true;
+            }
+        }
         let false_ = ctx.false_();
         let true_ = ctx.true_();
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, needed]));
@@ -992,6 +1010,11 @@ fn prove_perm_positive(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
     prove_perm_leaves(ctx, held, pc_lits, &|ctx, h, pc| {
+        if let Some(hr) = known_real(ctx, h) {
+            if hr > num::BigRational::from(num::BigInt::from(0)) {
+                return true;
+            }
+        }
         let zero = zero_real(ctx);
         let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, h]));
         ctx.prove_under_pc(goal, pc)
@@ -1005,6 +1028,11 @@ fn prove_perm_write(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
     prove_perm_leaves(ctx, held, pc_lits, &|ctx, h, pc| {
+        if let Some(hr) = known_real(ctx, h) {
+            if hr >= num::BigRational::from(num::BigInt::from(1)) {
+                return true;
+            }
+        }
         let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, write]));
         let false_ = ctx.false_();
@@ -1257,8 +1285,8 @@ fn heap_subtract(
 /// the tower (design 30).
 fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els: &Heap) -> Heap {
     // NOTE: no eager `ctx.reduce()` here — re-saturating the graph at every join
-    // was O(joins) full saturations. Give-back collapse now relies on the arms'
-    // leaves folding during the per-leaf perm proofs instead.
+    // was O(joins) full saturations, and it does not collapse the ChunkPerm tree
+    // anyway (that structure is Rust-side, not the e-graph).
     //
     // `cond_fold`: a cheap LIVE-graph `known()` check (no clone) — if the edge
     // already folded, drop the dead arm early. When it is `None` the arm stays a
