@@ -107,47 +107,46 @@ pub(crate) struct VerifyContext<'a> {
 /// full rule set (independently of ground), so it can discharge every obligation
 /// in the block without re-cloning ground per obligation.
 ///
-/// Id-space soundness: VMIR only ever composes ids it explicitly minted through
-/// `add`; rule-derived enodes are never cross-referenced as operands. So the two
-/// graphs may diverge freely on rule nodes — we only track a `map` from each
-/// post-build ground mint to its scratch twin. Ids present at build time are
-/// identical in both (clone preserves them), so an id absent from `map`
-/// translates to itself.
+/// Id-space handling: ids present at build time are identical in both graphs
+/// (clone preserves them), so a ground id below `watermark` translates to itself.
+/// Ids minted after the build are mirrored through the `add`/`union` hooks into
+/// `map`. A ground id at-or-above `watermark` that is *not* in the map is a
+/// rule-derived operand the scratch never received (e.g. a `find`-canonical
+/// leader produced by a ground `reduce`/`saturate`): [`VerifyContext::tr`]
+/// imports it on demand (extract a ground representative, re-add into the
+/// scratch), so the scratch is a valid clone base under any ground state.
 struct BlockScratch {
     egraph: egg::EGraph<Symbolic, ConstFold>,
-    /// ground id → scratch id, for mints recorded since the clone. Absent ⇒
-    /// pre-build id ⇒ identity (see [`Self::translate`]).
+    /// ground id → scratch id, for mints recorded since the clone.
     map: HashMap<egg::Id, egg::Id>,
+    /// Ground e-node count (`total_size`) at build time — the id-space boundary:
+    /// a ground id `< watermark` existed in the clone (identity-valid in the
+    /// scratch). `total_size` only ever under-counts after a rebuild, which is
+    /// safe here (a pre-build id then just gets re-imported, a no-op via
+    /// hash-consing).
+    watermark: usize,
     /// The `true` literal's ground id at build time — identity-valid in the
     /// scratch. Canonicalize with `find` before comparing (saturation merges it
     /// into a larger class).
     true_id: egg::Id,
-    /// Set on every mirrored `add`/`union`; cleared by a saturation. Avoids
-    /// re-saturating an unchanged scratch across consecutive obligations.
+    /// Set on every mirrored `add`/`union` and every import; cleared by a
+    /// saturation. Avoids re-saturating an unchanged scratch across consecutive
+    /// obligations.
     dirty: bool,
 }
 
 impl BlockScratch {
-    /// Translate a ground id into the scratch id space (identity for pre-build
-    /// ids, which the clone preserved).
-    fn translate(&self, g: egg::Id) -> egg::Id {
-        self.map.get(&g).copied().unwrap_or(g)
-    }
-
-    /// Mirror a ground `add` of `node` (which produced ground id `ground_id`)
-    /// into the scratch, translating its children. Idempotent per ground id.
-    fn mirror_add(&mut self, ground_id: egg::Id, node: Symbolic) {
-        self.dirty = true;
-        if self.map.contains_key(&ground_id) {
-            return;
+    /// Fast translate: `Some(scratch id)` for a mapped or pre-build id; `None`
+    /// when a post-build ground id is unmapped and so must be imported by
+    /// [`VerifyContext::tr`].
+    fn fast_translate(&self, g: egg::Id) -> Option<egg::Id> {
+        if let Some(&s) = self.map.get(&g) {
+            Some(s)
+        } else if usize::from(g) < self.watermark {
+            Some(g)
+        } else {
+            None
         }
-        use egg::Language as _;
-        let mut snode = node;
-        for c in snode.children_mut() {
-            *c = self.translate(*c);
-        }
-        let s = self.egraph.add(snode);
-        self.map.insert(ground_id, s);
     }
 }
 
@@ -242,15 +241,69 @@ impl<'a> VerifyContext<'a> {
         if merged {
             self.clean = None;
         }
-        if let Some(sc) = self.scratch.as_mut() {
+        if self.scratch.is_some() {
             // Mirror into the block scratch. A same-typed conflict there (the
             // cube made this union contradictory) folds to `Inconsistent`, not a
             // panic — that just makes the block's goals vacuously provable.
-            let (ta, tb) = (sc.translate(a), sc.translate(b));
+            let (ta, tb) = (self.tr(a), self.tr(b));
+            let sc = self.scratch.as_mut().unwrap();
             sc.egraph.union(ta, tb);
             sc.dirty = true;
         }
         merged
+    }
+
+    /// Translate a **ground** id into the current block scratch's id space.
+    /// Identity outside a scratch. Fast path (a mapped or pre-build id) is O(1);
+    /// otherwise the ground term at `g` is imported into the scratch (extract a
+    /// representative e-node, translate its children, re-add), so the scratch is
+    /// a valid clone base even when a lazy/structural ground has surfaced
+    /// rule-derived ids as operands.
+    fn tr(&mut self, g: egg::Id) -> egg::Id {
+        let g = self.egraph.find(g);
+        match self.scratch.as_ref() {
+            None => return g,
+            Some(sc) => {
+                if let Some(s) = sc.fast_translate(g) {
+                    return s;
+                }
+            }
+        }
+        use egg::Language as _;
+        let node = self.egraph[g].nodes[0].clone();
+        let kids: Vec<egg::Id> = node.children().to_vec();
+        let tkids: Vec<egg::Id> = kids.iter().map(|c| self.tr(*c)).collect();
+        let mut snode = node;
+        for (slot, tk) in snode.children_mut().iter_mut().zip(tkids) {
+            *slot = tk;
+        }
+        let sc = self.scratch.as_mut().unwrap();
+        let s = sc.egraph.add(snode);
+        sc.map.insert(g, s);
+        sc.dirty = true;
+        s
+    }
+
+    /// Mirror a ground `add` of `node` (which produced ground id `ground_id`)
+    /// into the block scratch, translating its children through [`Self::tr`].
+    /// Idempotent per ground class.
+    fn mirror_add(&mut self, ground_id: egg::Id, node: Symbolic) {
+        let key = self.egraph.find(ground_id);
+        if self.scratch.as_ref().unwrap().map.contains_key(&key) {
+            self.scratch.as_mut().unwrap().dirty = true;
+            return;
+        }
+        use egg::Language as _;
+        let kids: Vec<egg::Id> = node.children().to_vec();
+        let tkids: Vec<egg::Id> = kids.iter().map(|c| self.tr(*c)).collect();
+        let mut snode = node;
+        for (slot, tk) in snode.children_mut().iter_mut().zip(tkids) {
+            *slot = tk;
+        }
+        let sc = self.scratch.as_mut().unwrap();
+        let s = sc.egraph.add(snode);
+        sc.map.insert(key, s);
+        sc.dirty = true;
     }
 
     /// Whether the e-graph has reached a contradiction (some e-class merged
@@ -371,9 +424,9 @@ impl<'a> VerifyContext<'a> {
         self.clean = Some(self.clean_tag(CleanLevel::Full));
     }
 
-    /// One full-rule-set run, shared by [`Self::saturate`] and
-    /// [`Self::run_probe`]. Memo scoping is ambient (see `rewrite::Memo`):
-    /// live runs write the persistent base, scratch scopes an overlay.
+    /// One full-rule-set run, shared by [`Self::saturate`], [`Self::run_probe`],
+    /// and the block scratch. Memo scoping is ambient (see `rewrite::Memo`): live
+    /// runs write the persistent base, scratch scopes an overlay.
     fn saturate_flat(
         &mut self,
         egraph: egg::EGraph<Symbolic, ConstFold>,
@@ -419,7 +472,7 @@ impl<'a> VerifyContext<'a> {
             if self.egraph.total_size() != before {
                 self.clean = None;
             }
-            self.scratch.as_mut().unwrap().mirror_add(id, node);
+            self.mirror_add(id, node);
             id
         } else {
             let id = self.egraph.add(node);
@@ -594,10 +647,15 @@ impl<'a> VerifyContext<'a> {
 
         // Inside a method block, discharge tier-3 against the per-block scratch
         // graph (reused across the block's obligations) instead of cloning ground
-        // per obligation. Functions/resources have no CFG (a whole-body scratch
-        // would just equal ground), so they keep the per-obligation clone path
-        // below — it stays load-bearing there for function-precondition, division
-        // side-condition, and `acc`-non-negativity obligations.
+        // per obligation. The scratch is the strictly better clone base: warm,
+        // cube-assumed, and kept in sync with ground. Its `tr` translation imports
+        // any ground operand it is missing (`find` can surface rule-derived leader
+        // ids the mirror never received), so it is always a valid clone base.
+        //
+        // Functions/resources have no CFG — a whole-body scratch would just equal
+        // ground — so they keep the per-obligation clone path below, load-bearing
+        // there for function-precondition, division side-condition, and
+        // `acc`-non-negativity obligations.
         if self.in_block {
             let proven = self.prove_via_scratch(goal, pc_lits);
             if proven {
@@ -612,6 +670,10 @@ impl<'a> VerifyContext<'a> {
         // the tier-2 verdict again. Skip straight to tier 3.5 / the function
         // case split (an empty-pc goal — a branching function's exit post —
         // is exactly the shape that reaches here).
+        //
+        // Only functions/resources reach here (method obligations returned via the
+        // scratch above), and their tier-2 always ran the full rule set, so the
+        // shortcut's premise (the live graph is fully saturated) holds.
         if pc_lits.iter().all(|(id, pol)| {
             matches!(
                 self.egraph[*id].data.known(),
@@ -698,6 +760,10 @@ impl<'a> VerifyContext<'a> {
         let false_id = self.false_();
         let cube = std::mem::take(&mut self.current_cube);
         let mut egraph = self.egraph.clone();
+        // Id-space boundary = the clone's e-node count *before* the cube unions
+        // (which only merge, never add ids) and any later rebuild (which can only
+        // shrink `total_size`). Ground ids below it are identity-valid here.
+        let watermark = egraph.total_size();
         for (id, pol) in &cube {
             let lit = if matches!(pol, Polarity::Positive) {
                 true_id
@@ -713,6 +779,7 @@ impl<'a> VerifyContext<'a> {
         self.scratch = Some(BlockScratch {
             egraph,
             map: HashMap::new(),
+            watermark,
             true_id,
             dirty: true,
         });
@@ -742,6 +809,12 @@ impl<'a> VerifyContext<'a> {
     /// clone the *warm* scratch and assume only those, then saturate.
     fn prove_via_scratch(&mut self, goal: egg::Id, pc_lits: &[(egg::Id, Polarity)]) -> bool {
         self.ensure_scratch();
+        // Translate goal + pc into scratch space first: `tr` may *import* ground
+        // operands (a lazy/structural ground surfaces rule-canonical leaders),
+        // which dirties the scratch — so import before the saturation below.
+        let tg = self.tr(goal);
+        let tpc: Vec<(egg::Id, Polarity)> =
+            pc_lits.iter().map(|(id, p)| (self.tr(*id), *p)).collect();
         self.saturate_scratch();
 
         let sc = self.scratch.as_ref().expect("scratch live");
@@ -750,21 +823,17 @@ impl<'a> VerifyContext<'a> {
         if sc.egraph.classes().any(|c| c.data.is_inconsistent()) {
             return true;
         }
-        let tg = sc.translate(goal);
         if sc.egraph.find(tg) == sc.egraph.find(sc.true_id) {
             self.alloc.stats.block_scratch_freehits += 1;
             return true;
         }
-        let all_sat = pc_lits.iter().all(|(id, pol)| {
-            let tid = sc.egraph.find(sc.translate(*id));
+        let all_sat = tpc.iter().all(|(tid, pol)| {
             matches!(
-                sc.egraph[tid].data.known(),
+                sc.egraph[sc.egraph.find(*tid)].data.known(),
                 Some(Literal::Bool(b)) if *b == matches!(pol, Polarity::Positive)
             )
         });
         let probe_base = sc.egraph.clone();
-        let tpc: Vec<(egg::Id, Polarity)> =
-            pc_lits.iter().map(|(id, p)| (sc.translate(*id), *p)).collect();
 
         // Free hit: the cube already implies the pc — no extra assumption needed,
         // go straight to the goal-structural decompositions on the warm scratch.
