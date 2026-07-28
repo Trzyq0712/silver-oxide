@@ -335,11 +335,7 @@ fn static_rules() -> Vec<Rule> {
         rw!("mul-one-int-r"; "(*i ?x 1)" => "?x"),
         rw!("mul-one-int-l"; "(*i 1 ?x)" => "?x"),
         // x * 0 => 0  (a resource delta scaled by `none`). Kept for completeness
-        // of the identity set, at a small measured cost: the `0/1` it introduces
-        // gives `lt-ite` more tower to distribute over (26 → 41 applications on
-        // `enum_clike__match_flat`) without shrinking the graph — peak nodes are
-        // unchanged — which costs ~2% on `nscale_20` and ~3.6% on the small
-        // cases. Well inside the net win of this rule set.
+        // of the identity set, at negligible cost.
         rw!("mul-zero-real-r"; "(*r ?x 0/1)" => "0/1"),
         rw!("mul-zero-real-l"; "(*r 0/1 ?x)" => "0/1"),
         rw!("mul-zero-int-r"; "(*i ?x 0)" => "0"),
@@ -357,8 +353,7 @@ fn static_rules() -> Vec<Rule> {
         // sufficiency check can only crack by case-splitting. Sound over
         // reals (total ops), strictly shrinking. Both operand orders are spelled
         // out: there is deliberately no commutativity rule (it blows the graph
-        // up; `flatten_plus`/`merge_summands` normalize sums procedurally
-        // instead), so a give-back landing on the other side of the `+` would
+        // up), so a give-back landing on the other side of the `+` would
         // otherwise never cancel.
         rw!("add-sub-cancel-int-r"; "(+i (-i ?x ?p) ?p)" => "?x"),
         rw!("add-sub-cancel-int-l"; "(+i ?p (-i ?x ?p))" => "?x"),
@@ -392,113 +387,59 @@ fn static_rules() -> Vec<Rule> {
         // fused `ite-reduce` pass — they are `Ite`-bucket shapes conditioned on
         // the class's proven boolean, exactly what its applier already inspects.
     ]);
-    // General same-condition context pruning. Unconditional identities (the inner
-    // `?c` is the outer condition's e-class): inside the then-branch the condition
-    // is true, inside the else-branch it is false. Strictly reduce ite nesting
-    // depth → terminating. They generalize the ad-hoc nested shapes in `ite-reduce`
-    // and collapse a *select*-shaped permission (heap-join model) to `1/1` with no
-    // case split — turning a tier-4 split into ~5 local rewrites on the select
-    // tower. But they search every ite-bucket class each iteration and roughly
-    // *double* wall time on the additive-thread benchmarks we run today (~2s → ~4s
-    // on `structs_enums.vpr`), which never produce the select shape, so they are
-    // **opt-in** (`SILVER_OXIDE_PRUNE_ITE`) until the heap-join lowering that emits
-    // selects lands. See `presentation/why_switch_architecture.typ`.
-    if std::env::var_os("SILVER_OXIDE_PRUNE_ITE").is_some() {
-        rules.extend(vec![
-            rw!("ite-then-context"; "(ite ?c (ite ?c ?a ?b) ?e)" => "(ite ?c ?a ?e)"),
-            rw!("ite-else-context"; "(ite ?c ?t (ite ?c ?a ?b))" => "(ite ?c ?t ?b)"),
-        ]);
-    }
-    // Disequality reasoning over disproven `==` classes — pulled out of the old
-    // fused `eq-false-then/else` applier into standalone rules (all share the `Eq` bucket +
-    // the `Known(false)` gate). Env gates for A/B measurement.
-    if std::env::var_os("SILVER_OXIDE_NO_MIRROR").is_none() {
-        rules.push(
-            Rewrite::new("eq-false-mirror", EqBucketSearcher, EqFalseMirrorApplier)
-                .expect("eq-false-mirror rule"),
-        );
-    }
-    if std::env::var_os("SILVER_OXIDE_NO_CONTRA").is_none() {
-        rules.push(
-            Rewrite::new(
-                "contra-congruence",
-                EqBucketSearcher,
-                ContraCongruenceApplier { memo: Memo::new() },
-            )
-            .expect("contra-congruence rule"),
-        );
-    }
-    rules.extend(distributive_ite_rules());
+    // Disequality reasoning over disproven `==` classes — standalone rules that
+    // share the `Eq` bucket + the `Known(false)` gate. (A same-condition
+    // `ite-then/else-context` pruning pair used to sit here, gated opt-in for a
+    // heap-join model that *materialized* select towers into the graph; the
+    // block-merge fork proves selects per leaf and never lowers them, so that
+    // pruning had nothing to fire on and was removed.)
+    rules.push(
+        Rewrite::new("eq-false-mirror", EqBucketSearcher, EqFalseMirrorApplier)
+            .expect("eq-false-mirror rule"),
+    );
+    rules.push(
+        Rewrite::new(
+            "contra-congruence",
+            EqBucketSearcher,
+            ContraCongruenceApplier { memo: Memo::new() },
+        )
+        .expect("contra-congruence rule"),
+    );
+    rules.extend(disequality_unit_prop_rules());
     rules
 }
 
-/// Rules that push down the builtin operators into the ite branches.
-fn distributive_ite_rules() -> Vec<Rule> {
-    // EXPERIMENT: distributive ite rules disabled to measure their effect.
-    // NO_DISTRIB kills both; NO_EQITE / NO_LTITE kill one each.
-    let no_distrib = std::env::var_os("SILVER_OXIDE_NO_DISTRIB").is_some();
-    let mut rules = vec![];
-    if !no_distrib && std::env::var_os("SILVER_OXIDE_NO_EQITE").is_none() {
-        // Unit propagation from disproven `==` through ite towers — NOT
-        // eq-over-ite distribution (unguarded pattern forms blow the graph up
-        // ~75x on real programs: every pair of ite-towers under an `==`
-        // cross-multiplies — see the applier doc). Split by which arm the other
-        // operand matches; nested towers unwind one level per saturation
-        // iteration (the derived disequality re-enters the `Eq` bucket).
-        rules.push(
-            Rewrite::new(
-                "eq-false-then",
-                EqBucketSearcher,
-                EqFalseUnitApplier {
-                    then_side: true,
-                    memo: Memo::new(),
-                },
-            )
-            .expect("eq-false-then rule"),
-        );
-        rules.push(
-            Rewrite::new(
-                "eq-false-else",
-                EqBucketSearcher,
-                EqFalseUnitApplier {
-                    then_side: false,
-                    memo: Memo::new(),
-                },
-            )
-            .expect("eq-false-else rule"),
-        );
-    }
-    if !no_distrib && std::env::var_os("SILVER_OXIDE_NO_LTITE").is_none() {
-        // LT distribution. Load-bearing: CFG linearization encodes a
-        // conditional inhale/exhale as a *scaled permission* `c ? p : 0`, so
-        // the permission ≥ 0 obligation of such an instruction is a `<`
-        // applied to an `ite` tower. The fused rule pushes the `<` all the way
-        // to the tower's leaves in ONE application (each leaf comparison
-        // const-folds, then `ite-reduce` collapses the rebuilt tower), instead
-        // of one level per saturation iteration.
-        rules.push(
-            Rewrite::new(
-                "lt-ite",
-                LtBucketSearcher,
-                LtIteDistributeApplier { memo: Memo::new() },
-            )
-            .expect("lt-ite rule"),
-        );
-    }
-    rules.extend(vec![
-        // // MULT rules
-        // rw!("mult-ite-l"; "(* (ite ?c ?x ?y) ?z)" => "(ite ?c (* ?x ?z) (* ?y ?z))"),
-        // rw!("mult-ite-r"; "(* ?z (ite ?c ?x ?y))" => "(ite ?c (* ?z ?x) (* ?z ?y))"),
-        // // PLUS rules
-        // rw!("plus-ite-l"; "(+ (ite ?c ?x ?y) ?z)" => "(ite ?c (+ ?x ?z) (+ ?y ?z))"),
-        // rw!("plus-ite-r"; "(+ ?z (ite ?c ?x ?y))" => "(ite ?c (+ ?z ?x) (+ ?z ?y))"),
-        // // MINUS rules
-        // rw!("minus-ite-l"; "(- (ite ?c ?x ?y) ?z)" => "(ite ?c (- ?x ?z) (- ?y ?z))"),
-        // rw!("minus-ite-r"; "(- ?z (ite ?c ?x ?y))" => "(ite ?c (- ?z ?x) (- ?z ?y))"),
-        // // REAL rules
-        // rw!("real-ite"; "(real (ite ?c ?x ?y))" => "(ite ?c (real ?x) (real ?y))"),
-    ]);
-    rules
+/// Unit propagation from a **disproven** `==` through `ite` towers — NOT
+/// eq-over-ite distribution (unguarded pattern forms blow the graph up ~75x on
+/// real programs: every pair of ite-towers under an `==` cross-multiplies —
+/// see the applier doc). Split by which arm the other operand matches; nested
+/// towers unwind one level per saturation iteration (the derived disequality
+/// re-enters the `Eq` bucket).
+///
+/// (There used to be a companion `lt-ite` that distributed `<` over an ite
+/// tower; the block-merge fork proves scaled permissions per leaf, so no
+/// `<`-over-`ite` tower ever forms and the rule was removed.)
+fn disequality_unit_prop_rules() -> Vec<Rule> {
+    vec![
+        Rewrite::new(
+            "eq-false-then",
+            EqBucketSearcher,
+            EqFalseUnitApplier {
+                then_side: true,
+                memo: Memo::new(),
+            },
+        )
+        .expect("eq-false-then rule"),
+        Rewrite::new(
+            "eq-false-else",
+            EqBucketSearcher,
+            EqFalseUnitApplier {
+                then_side: false,
+                memo: Memo::new(),
+            },
+        )
+        .expect("eq-false-else rule"),
+    ]
 }
 
 /// Terminating `ite` simplifications. Shared by the saturation rule set and the
@@ -506,10 +447,7 @@ fn distributive_ite_rules() -> Vec<Rule> {
 /// instruction's path condition) `ite-true`/`ite-false` reduce a gated
 /// permission `b ? p : 0` to `p` (resp. `0`), which is what discharges a
 /// conditional `acc`'s permission ≥ 0 obligation and peels the optional snapshot
-/// member's discriminant. When no such literal is available (a CFG-linearized
-/// conditional inhale carries its guard in the permission, not the path
-/// condition), the saturation-only `lt-ite` rule distributes the comparison
-/// instead.
+/// member's discriminant.
 /// The terminating `ite` simplifications, fused into **one** rule that scans
 /// the `Ite` op bucket once per iteration and node-checks every shape. The
 /// twelve equivalent `rw!` patterns cost ~70% of all search time on real
@@ -616,191 +554,6 @@ impl Searcher<Symbolic, ConstFold> for EqBucketSearcher {
                 substs: vec![Subst::default()],
                 ast: None,
             })
-    }
-
-    fn vars(&self) -> Vec<Var> {
-        vec![]
-    }
-}
-
-/// Searcher for the fused `<`-over-ite distribution: every e-class holding an
-/// `Lt` node, via the `classes_by_op` bucket.
-struct LtBucketSearcher;
-
-impl Searcher<Symbolic, ConstFold> for LtBucketSearcher {
-    fn search_with_limit(
-        &self,
-        egraph: &EGraph<Symbolic, ConstFold>,
-        limit: usize,
-    ) -> Vec<SearchMatches<'_, Symbolic>> {
-        // One bucket per sort now, and `<` distributes over an ite tower the
-        // same way in both — scan them together.
-        let mut out: Vec<SearchMatches<'_, Symbolic>> = Vec::new();
-        for op in [BinOp::LtI, BinOp::LtR] {
-            let Some(classes) = egraph.classes_for_op(&Discriminant::Binary(op)) else {
-                continue;
-            };
-            out.extend(
-                classes
-                    .take(limit.saturating_sub(out.len()))
-                    .map(|eclass| SearchMatches {
-                        eclass,
-                        substs: vec![Subst::default()],
-                        ast: None,
-                    }),
-            );
-        }
-        out
-    }
-
-    fn search_eclass_with_limit(
-        &self,
-        egraph: &EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        _limit: usize,
-    ) -> Option<SearchMatches<'_, Symbolic>> {
-        egraph[eclass]
-            .nodes
-            .iter()
-            .any(|n| matches!(n, Symbolic::Binary(BinOp::LtI | BinOp::LtR, _)))
-            .then(|| SearchMatches {
-                eclass,
-                substs: vec![Subst::default()],
-                ast: None,
-            })
-    }
-
-    fn vars(&self) -> Vec<Var> {
-        vec![]
-    }
-}
-
-/// The plan of one full `<`-over-ite descent: mirrors the ite tower under a
-/// comparison operand, with the comparison applied at every leaf. `Leaf` holds
-/// the operand's e-class; the caller builds `lt(leaf, z)` (or `lt(z, leaf)`)
-/// there.
-enum LtPlan {
-    Leaf(Id),
-    Ite(Id, Box<LtPlan>, Box<LtPlan>),
-}
-
-impl LtPlan {
-    /// Descend the ite tower rooted at `class` (read-only). `seen` guards
-    /// against e-class cycles; `depth` bounds pathological towers. A class
-    /// with no ite node is a leaf.
-    fn descend(
-        egraph: &EGraph<Symbolic, ConstFold>,
-        class: Id,
-        seen: &mut Vec<Id>,
-        depth: usize,
-    ) -> LtPlan {
-        let class = egraph.find(class);
-        // NB: do *not* stop at a class that const-folds to a literal. Such a
-        // class can hold a literal and a deep `Ite` tower at once — `true` and
-        // `1/1` both do — and inside a tier-4 pinned probe the tower is exactly
-        // what relates the arm permissions. Treating it as a leaf here cost
-        // 15s on an 18-arm enum match (12s → 27s) while saving ~4ms on
-        // structs_enums.vpr; the cheap half of that idea is the `known()` early
-        // return in `apply_one` below, which is kept.
-        if depth == 0 || seen.contains(&class) {
-            return LtPlan::Leaf(class);
-        }
-        seen.push(class);
-        let plan = match egraph[class].nodes.iter().find_map(|n| match n {
-            Symbolic::Ite([c, t, e]) => Some((*c, *t, *e)),
-            _ => None,
-        }) {
-            Some((c, t, e)) => LtPlan::Ite(
-                egraph.find(c),
-                Box::new(Self::descend(egraph, t, seen, depth - 1)),
-                Box::new(Self::descend(egraph, e, seen, depth - 1)),
-            ),
-            None => LtPlan::Leaf(class),
-        };
-        seen.pop();
-        plan
-    }
-
-    fn is_leaf(&self) -> bool {
-        matches!(self, LtPlan::Leaf(_))
-    }
-
-    /// Build the mirrored tower, applying `op` at each leaf. `ite_on_left`
-    /// selects which side of the comparison the tower operand sits on. `op` is
-    /// the sort-tagged comparison taken from the node that matched, so the
-    /// rebuilt leaves keep the operand sort of the original.
-    fn build(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        op: BinOp,
-        z: Id,
-        ite_on_left: bool,
-    ) -> Id {
-        match self {
-            LtPlan::Leaf(leaf) => {
-                let args = if ite_on_left { [*leaf, z] } else { [z, *leaf] };
-                egraph.add(Symbolic::Binary(op, args))
-            }
-            LtPlan::Ite(c, t, e) => {
-                let t = t.build(egraph, op, z, ite_on_left);
-                let e = e.build(egraph, op, z, ite_on_left);
-                egraph.add(Symbolic::Ite([*c, t, e]))
-            }
-        }
-    }
-}
-
-/// Applier for the fused `lt-ite`: for each `Lt` node whose operand class
-/// holds an ite tower, rebuild the whole tower once with the comparison at
-/// the leaves and union it with the `Lt` class. One application replaces a
-/// per-level rewrite cascade (one saturation iteration per tower level).
-struct LtIteDistributeApplier {
-    /// One descent per canonical (tower root, other operand, side).
-    memo: Memo<(Id, Id, bool)>,
-}
-
-/// Tower descent bound: deeper towers keep their tail as an opaque leaf (the
-/// next application, memo-keyed on the new class, picks it up if it matters).
-const LT_DESCEND_DEPTH: usize = 24;
-
-impl Applier<Symbolic, ConstFold> for LtIteDistributeApplier {
-    fn apply_one(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        eclass: Id,
-        _subst: &Subst,
-        _searcher_ast: Option<&PatternAst<Symbolic>>,
-        _rule_name: Symbol,
-    ) -> Vec<Id> {
-        // Already folded to a literal: distributing over the tower cannot add
-        // information.
-        if egraph[eclass].data.known().is_some() {
-            return vec![];
-        }
-        let mut plans: Vec<(LtPlan, BinOp, Id, bool)> = Vec::new();
-        for node in &egraph[eclass].nodes {
-            let Symbolic::Binary(op @ (BinOp::LtI | BinOp::LtR), [l, r]) = node else {
-                continue;
-            };
-            for (tower, z, ite_on_left) in [(*l, *r, true), (*r, *l, false)] {
-                let (tower, z) = (egraph.find(tower), egraph.find(z));
-                if !self.memo.insert((tower, z, ite_on_left)) {
-                    continue;
-                }
-                let plan = LtPlan::descend(egraph, tower, &mut Vec::new(), LT_DESCEND_DEPTH);
-                if !plan.is_leaf() {
-                    plans.push((plan, *op, z, ite_on_left));
-                }
-            }
-        }
-        let mut changed = Vec::new();
-        for (plan, op, z, ite_on_left) in plans {
-            let distributed = plan.build(egraph, op, z, ite_on_left);
-            if egraph.union(eclass, distributed) {
-                changed.push(egraph.find(eclass));
-            }
-        }
-        changed
     }
 
     fn vars(&self) -> Vec<Var> {
@@ -1130,11 +883,22 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
             // redundant: stop scanning `t`'s nodes on the first collapse, and skip
             // the else-branch scan entirely if the then-branch already produced
             // one. (There is no per-class index of "nodes conditioned on `c`", so
-            // the scan of a branch class's nodes itself cannot be avoided — but it
-            // is one class's nodes, and it ends early.)
+            // the scan of a branch class's nodes cannot be targeted — but it is one
+            // class's nodes, ends early, and is bounded below.)
             let mut collapsed = false;
+            // The nested-collapse shapes need an inner `Ite` conditioned on the
+            // *same* `c` sitting in a branch class. Branch classes that hoard many
+            // nodes (the `true` class alone reaches ~1600 on enum-match) almost
+            // never hold such an inner ite, so scanning them per outer-ite per
+            // iteration is the cubic cost (55% of runtime). Skip the scan on large
+            // branch classes: the load-bearing structural-join shape keeps its
+            // branch classes tiny. Sound either way (skipping a rewrite is
+            // incomplete, not unsound).
+            const NESTED_SCAN_BOUND: usize = 64;
+            let scan_t = egraph[t].nodes.len() <= NESTED_SCAN_BOUND;
+            let scan_e = egraph[e].nodes.len() <= NESTED_SCAN_BOUND;
             //   c ? (c ? x : y) : e
-            for inner in &egraph[t].nodes {
+            for inner in scan_t.then(|| &egraph[t].nodes).into_iter().flatten() {
                 let Symbolic::Ite([c2, x, y]) = inner else {
                     continue;
                 };
@@ -1156,7 +920,7 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
             }
             // Nested same-condition ite in the false branch:
             //   c ? t : (c ? x : y)
-            if !collapsed {
+            if !collapsed && scan_e {
                 for inner in &egraph[e].nodes {
                     let Symbolic::Ite([c2, x, y]) = inner else {
                         continue;
