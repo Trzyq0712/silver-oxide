@@ -1406,67 +1406,82 @@ struct ProjApplier {
     index: usize,
 }
 
-/// A projection's extraction plan over an argument e-class: either the ctor is
-/// directly present (project the field), or the class holds an `ite` whose both
-/// arms extract recursively — the projection then commutes into the `ite`
-/// (`projᵢ(ite(c, cons(a..), cons(b..))) ⇒ ite(c, aᵢ, bᵢ)`). The latter is what
-/// connects an enum discriminator's boxed `ite` body to a switch that compares
-/// the *unboxed* value: without it the `proj∘cons` reduction never fires (the
-/// arg class holds an `Ite`, not the ctor) and exhaustiveness `assert false`
-/// can't see the case split.
-enum ProjPlan {
-    Field(Id),
-    Ite(Id, Box<ProjPlan>, Box<ProjPlan>),
-}
-
 impl ProjApplier {
-    /// Plan the extraction for `class` (read-only pass; building needs `&mut`).
-    /// `seen` guards against e-class cycles.
-    fn plan(
+    /// Extract the projected field out of `class`, returning the e-class of the
+    /// result (adding `ite` nodes as needed). Either the ctor is directly present
+    /// (return the field arg), or the class holds an `ite` whose both arms extract
+    /// recursively — the projection commutes into the `ite`
+    /// (`projᵢ(ite(c, cons(a..), cons(b..))) ⇒ ite(c, aᵢ, bᵢ)`). That commuting arm
+    /// is what connects an enum discriminator's boxed `ite` body to a switch that
+    /// compares the *unboxed* value: without it the `proj∘cons` reduction never
+    /// fires (the arg class holds an `Ite`, not the ctor) and exhaustiveness
+    /// `assert false` can't see the case split.
+    ///
+    /// The argument class is frequently a **shared** `ite`-DAG (e.g. the join
+    /// snapshot of a `match` that mutates a `&mut` enum — an arm's heap reuses
+    /// substructure from the entry heap, so the same sub-class is reachable by
+    /// many root→leaf paths). `memo` caches the per-class result so each class is
+    /// visited once; without it a DAG with `d` shared classes is walked over its
+    /// (up to `2^d`) distinct paths, which was ~half of `structs_enums`'s
+    /// `m_shape_grow` time. `seen` is the in-progress cycle guard: a class whose
+    /// extraction depends on an active cycle is *not* memoized (its `acyclic`
+    /// return is `false`), so cycle semantics match the former path-stack walk on
+    /// pathological graphs while the common acyclic case memoizes cleanly.
+    ///
+    /// Returns `(result, acyclic)`: `result` is the extracted class (or `None` if
+    /// not projectable); `acyclic` is `false` iff the computation short-circuited
+    /// on an in-progress class, marking the result as not cacheable by callers.
+    fn project(
         &self,
-        egraph: &EGraph<Symbolic, ConstFold>,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
         class: Id,
+        memo: &mut HashMap<Id, Option<Id>>,
         seen: &mut Vec<Id>,
-    ) -> Option<ProjPlan> {
+    ) -> (Option<Id>, bool) {
         let class = egraph.find(class);
+        if let Some(&r) = memo.get(&class) {
+            return (r, true);
+        }
         if seen.contains(&class) {
-            return None;
+            return (None, false);
         }
         seen.push(class);
-        // Direct ctor hit wins.
+        // Read-only scan: a direct ctor hit wins; otherwise collect the `ite`
+        // triples in node order. Copy the ids out so the `&egraph` borrow ends
+        // before the recursive `&mut egraph` calls below.
+        let mut field = None;
+        let mut ites: Vec<[Id; 3]> = Vec::new();
         for node in &egraph[class].nodes {
-            if let Symbolic::FuncApp(c, _, args) = node
-                && *c == self.ctor
-                && self.index < args.len()
-            {
-                seen.pop();
-                return Some(ProjPlan::Field(args[self.index]));
+            match node {
+                Symbolic::FuncApp(c, _, args) if *c == self.ctor && self.index < args.len() => {
+                    field = Some(args[self.index]);
+                    break;
+                }
+                Symbolic::Ite([c, t, e]) => ites.push([*c, *t, *e]),
+                _ => {}
             }
         }
-        // Otherwise: an ite whose both arms extract.
-        for node in &egraph[class].nodes {
-            let Symbolic::Ite([c, t, e]) = node else {
-                continue;
-            };
-            if let (Some(tp), Some(ep)) = (self.plan(egraph, *t, seen), self.plan(egraph, *e, seen))
-            {
-                seen.pop();
-                return Some(ProjPlan::Ite(*c, Box::new(tp), Box::new(ep)));
+        let mut result = None;
+        let mut acyclic = true;
+        if let Some(f) = field {
+            result = Some(f);
+        } else {
+            for [c, t, e] in ites {
+                let (tr, ta) = self.project(egraph, t, memo, seen);
+                acyclic &= ta;
+                let Some(tid) = tr else { continue };
+                let (er, ea) = self.project(egraph, e, memo, seen);
+                acyclic &= ea;
+                let Some(eid) = er else { continue };
+                result = Some(egraph.add(Symbolic::Ite([c, tid, eid])));
+                break;
             }
         }
         seen.pop();
-        None
-    }
-
-    fn build(egraph: &mut EGraph<Symbolic, ConstFold>, plan: &ProjPlan) -> Id {
-        match plan {
-            ProjPlan::Field(id) => *id,
-            ProjPlan::Ite(c, t, e) => {
-                let t = Self::build(egraph, t);
-                let e = Self::build(egraph, e);
-                egraph.add(Symbolic::Ite([*c, t, e]))
-            }
+        if acyclic {
+            memo.insert(class, result);
         }
+        (result, acyclic)
     }
 }
 
@@ -1480,10 +1495,9 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
         _rule_name: Symbol,
     ) -> Vec<Id> {
         let xc = egraph.find(subst[tag_x()]);
-        let Some(plan) = self.plan(egraph, xc, &mut Vec::new()) else {
+        let (Some(field), _) = self.project(egraph, xc, &mut HashMap::new(), &mut Vec::new()) else {
             return vec![];
         };
-        let field = Self::build(egraph, &plan);
         if egraph.union(eclass, field) {
             vec![egraph.find(eclass)]
         } else {
