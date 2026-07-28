@@ -87,6 +87,68 @@ pub(crate) struct VerifyContext<'a> {
     /// sound; a stale leader after an unrelated merge only causes a safe
     /// re-prove.
     proven_imps: std::collections::HashSet<egg::Id>,
+    /// The current method block's control cube (the shared pc of all its insts),
+    /// as live-graph literal ids. Set by [`Self::begin_block`]; the scratch
+    /// assumes it. Empty outside a method block (functions/resources don't use
+    /// the scratch).
+    current_cube: Vec<(egg::Id, Polarity)>,
+    /// Whether we are inside a method block walk — gates the scratch on
+    /// (functions/resources keep the per-obligation clone path).
+    in_block: bool,
+    /// The live per-block scratch, built lazily on the block's first tier-3
+    /// obligation and discarded at block exit. `None` when no obligation has
+    /// needed it yet (or outside a method block).
+    scratch: Option<BlockScratch>,
+}
+
+/// A parallel "scratch" e-graph for one method block: a clone of ground taken at
+/// build time with the block cube assumed, kept in sync with ground through the
+/// [`VerifyContext::add`]/[`VerifyContext::union`] hooks. It saturates under the
+/// full rule set (independently of ground), so it can discharge every obligation
+/// in the block without re-cloning ground per obligation.
+///
+/// Id-space soundness: VMIR only ever composes ids it explicitly minted through
+/// `add`; rule-derived enodes are never cross-referenced as operands. So the two
+/// graphs may diverge freely on rule nodes — we only track a `map` from each
+/// post-build ground mint to its scratch twin. Ids present at build time are
+/// identical in both (clone preserves them), so an id absent from `map`
+/// translates to itself.
+struct BlockScratch {
+    egraph: egg::EGraph<Symbolic, ConstFold>,
+    /// ground id → scratch id, for mints recorded since the clone. Absent ⇒
+    /// pre-build id ⇒ identity (see [`Self::translate`]).
+    map: HashMap<egg::Id, egg::Id>,
+    /// The `true` literal's ground id at build time — identity-valid in the
+    /// scratch. Canonicalize with `find` before comparing (saturation merges it
+    /// into a larger class).
+    true_id: egg::Id,
+    /// Set on every mirrored `add`/`union`; cleared by a saturation. Avoids
+    /// re-saturating an unchanged scratch across consecutive obligations.
+    dirty: bool,
+}
+
+impl BlockScratch {
+    /// Translate a ground id into the scratch id space (identity for pre-build
+    /// ids, which the clone preserved).
+    fn translate(&self, g: egg::Id) -> egg::Id {
+        self.map.get(&g).copied().unwrap_or(g)
+    }
+
+    /// Mirror a ground `add` of `node` (which produced ground id `ground_id`)
+    /// into the scratch, translating its children. Idempotent per ground id.
+    fn mirror_add(&mut self, ground_id: egg::Id, node: Symbolic) {
+        self.dirty = true;
+        if self.map.contains_key(&ground_id) {
+            return;
+        }
+        use egg::Language as _;
+        let mut snode = node;
+        for c in snode.children_mut() {
+            *c = self.translate(*c);
+        }
+        let s = self.egraph.add(snode);
+        self.map.insert(ground_id, s);
+    }
 }
 
 /// Whether any declaration uses a `wildcard` permission (a heap-op `Perm` with
@@ -153,6 +215,9 @@ impl<'a> VerifyContext<'a> {
             has_wildcard: decls_have_wildcard(decls),
             oob_memo: std::env::var_os("SILVER_OXIDE_OOB_MEMO").is_some(),
             proven_imps: std::collections::HashSet::new(),
+            current_cube: Vec::new(),
+            in_block: false,
+            scratch: None,
         }
     }
 
@@ -176,6 +241,14 @@ impl<'a> VerifyContext<'a> {
         let merged = self.egraph.union(a, b);
         if merged {
             self.clean = None;
+        }
+        if let Some(sc) = self.scratch.as_mut() {
+            // Mirror into the block scratch. A same-typed conflict there (the
+            // cube made this union contradictory) folds to `Inconsistent`, not a
+            // panic — that just makes the block's goals vacuously provable.
+            let (ta, tb) = (sc.translate(a), sc.translate(b));
+            sc.egraph.union(ta, tb);
+            sc.dirty = true;
         }
         merged
     }
@@ -339,11 +412,22 @@ impl<'a> VerifyContext<'a> {
 
     pub(crate) fn add(&mut self, node: Symbolic) -> egg::Id {
         let before = self.egraph.total_size();
-        let id = self.egraph.add(node);
-        if self.egraph.total_size() != before {
-            self.clean = None;
+        // Keep `node` for the scratch mirror only when a scratch is live (the
+        // clone is not free — most adds happen with no scratch and pay nothing).
+        if self.scratch.is_some() {
+            let id = self.egraph.add(node.clone());
+            if self.egraph.total_size() != before {
+                self.clean = None;
+            }
+            self.scratch.as_mut().unwrap().mirror_add(id, node);
+            id
+        } else {
+            let id = self.egraph.add(node);
+            if self.egraph.total_size() != before {
+                self.clean = None;
+            }
+            id
         }
-        id
     }
 
     /// The `true` boolean-literal e-class.
@@ -483,23 +567,6 @@ impl<'a> VerifyContext<'a> {
         goal: egg::Id,
         pc_lits: &[(egg::Id, Polarity)],
     ) -> bool {
-        self.prove_under_pc_esc(goal, pc_lits, Escalate::Full)
-    }
-
-    /// [`Self::prove_under_pc`], but with explicit control over whether the
-    /// ladder may escalate to the tier-4 case split.
-    ///
-    /// `Escalate::NoSplit` runs tiers 1/0/2/3/3.5 and stops. A caller that has
-    /// its own cheaper fallback (today: the `merge_ite_sum` collapse in
-    /// `prove_perm_ineq`) uses it to try *that* before paying for a split, so
-    /// tier-4 stays a genuine last resort rather than winning a race against a
-    /// linear-cost alternative.
-    pub(crate) fn prove_under_pc_esc(
-        &mut self,
-        goal: egg::Id,
-        pc_lits: &[(egg::Id, Polarity)],
-        esc: Escalate,
-    ) -> bool {
         self.alloc.stats.prove_calls += 1;
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
@@ -525,12 +592,26 @@ impl<'a> VerifyContext<'a> {
             return true;
         }
 
+        // Inside a method block, discharge tier-3 against the per-block scratch
+        // graph (reused across the block's obligations) instead of cloning ground
+        // per obligation. Functions/resources have no CFG (a whole-body scratch
+        // would just equal ground), so they keep the per-obligation clone path
+        // below — it stays load-bearing there for function-precondition, division
+        // side-condition, and `acc`-non-negativity obligations.
+        if self.in_block {
+            let proven = self.prove_via_scratch(goal, pc_lits);
+            if proven {
+                self.record_proven(imp, true_, pc_lits.is_empty());
+            }
+            return proven;
+        }
+
         // Tier 3 shortcut: if every PC literal already carries its required
         // polarity in the just-saturated live graph, assuming the PC adds
         // nothing — the probe would re-saturate an identical graph and reach
-        // the tier-2 verdict again. Skip straight to the tier-4 case split
-        // (an empty-pc goal — a method's exit exhale after a CFG join — is
-        // exactly the shape that needs one).
+        // the tier-2 verdict again. Skip straight to tier 3.5 / the function
+        // case split (an empty-pc goal — a branching function's exit post —
+        // is exactly the shape that reaches here).
         if pc_lits.iter().all(|(id, pol)| {
             matches!(
                 self.egraph[*id].data.known(),
@@ -538,8 +619,7 @@ impl<'a> VerifyContext<'a> {
             )
         }) {
             let probe = self.egraph.clone();
-            let proven = self.tier35(&probe, goal)
-                || (esc.may_split() && self.split_prove(&probe, goal, &[goal]));
+            let proven = self.tier35(&probe, goal) || self.split_prove(&probe, goal);
             if proven {
                 self.record_proven(imp, true_, pc_lits.is_empty());
             }
@@ -576,14 +656,9 @@ impl<'a> VerifyContext<'a> {
             } else if self.tier35(&probe, goal) {
                 // Tier 3.5: non-forking ite-goal decomposition.
                 true
-            } else if esc.may_split() {
-                // Tier 4: prove by case analysis on an ite condition.
-                let roots: Vec<egg::Id> = std::iter::once(goal)
-                    .chain(pc_lits.iter().map(|(id, _)| *id))
-                    .collect();
-                self.split_prove(&probe, goal, &roots)
             } else {
-                false
+                // Function case split on a goal-structural ite condition.
+                self.split_prove(&probe, goal)
             }
         };
 
@@ -592,6 +667,135 @@ impl<'a> VerifyContext<'a> {
             self.record_proven(imp, true_, pc_lits.is_empty());
         }
         proven
+    }
+
+    /// Enter a method block: record its control cube (shared pc of all its
+    /// insts) and drop any previous block's scratch (sibling cubes are mutually
+    /// exclusive, so it cannot be reused). The scratch itself is (re)built lazily
+    /// on the block's first tier-3 obligation.
+    pub(crate) fn begin_block(&mut self, cube: Vec<(egg::Id, Polarity)>) {
+        self.current_cube = cube;
+        self.in_block = true;
+        self.scratch = None;
+    }
+
+    /// Leave the block walk (after the last block, or before a non-block walk):
+    /// discard the scratch and clear block state.
+    pub(crate) fn end_block(&mut self) {
+        self.current_cube.clear();
+        self.in_block = false;
+        self.scratch = None;
+    }
+
+    /// Build the block scratch if absent: clone ground, assume the block cube.
+    /// Ids present now are identical in both graphs (clone preserves them), so
+    /// the translation map starts empty.
+    fn ensure_scratch(&mut self) {
+        if self.scratch.is_some() {
+            return;
+        }
+        let true_id = self.true_();
+        let false_id = self.false_();
+        let cube = std::mem::take(&mut self.current_cube);
+        let mut egraph = self.egraph.clone();
+        for (id, pol) in &cube {
+            let lit = if matches!(pol, Polarity::Positive) {
+                true_id
+            } else {
+                false_id
+            };
+            // Same-typed conflict ⇒ `Inconsistent` (not a panic): a contradictory
+            // cube marks the block path infeasible, so its goals hold vacuously.
+            egraph.union(*id, lit);
+        }
+        egraph.rebuild();
+        self.current_cube = cube;
+        self.scratch = Some(BlockScratch {
+            egraph,
+            map: HashMap::new(),
+            true_id,
+            dirty: true,
+        });
+        self.alloc.stats.block_scratch_clones += 1;
+    }
+
+    /// Saturate the block scratch under the full rule set if it changed since the
+    /// last saturation. Counted separately from the live/probe saturations.
+    fn saturate_scratch(&mut self) {
+        if !self.scratch.as_ref().is_some_and(|s| s.dirty) {
+            return;
+        }
+        let _scope = rewrite::ScratchScope::enter();
+        let mut sc = self.scratch.take().expect("scratch live");
+        let before = self.alloc.stats.sat_iterations;
+        sc.egraph = self.saturate_flat(sc.egraph);
+        self.alloc.stats.block_scratch_saturations += 1;
+        self.alloc.stats.block_scratch_iterations += self.alloc.stats.sat_iterations - before;
+        sc.dirty = false;
+        self.scratch = Some(sc);
+    }
+
+    /// Tier-3 against the per-block scratch. The scratch already has the block
+    /// cube assumed and saturated, so an obligation whose pc is fully implied by
+    /// the cube is discharged with no per-obligation clone (a "free hit").
+    /// Obligations carrying extra pc literals (a perm-`Select` branch condition)
+    /// clone the *warm* scratch and assume only those, then saturate.
+    fn prove_via_scratch(&mut self, goal: egg::Id, pc_lits: &[(egg::Id, Polarity)]) -> bool {
+        self.ensure_scratch();
+        self.saturate_scratch();
+
+        let sc = self.scratch.as_ref().expect("scratch live");
+        // A contradictory cube (or a mirrored union that conflicts under it)
+        // makes every goal vacuously provable.
+        if sc.egraph.classes().any(|c| c.data.is_inconsistent()) {
+            return true;
+        }
+        let tg = sc.translate(goal);
+        if sc.egraph.find(tg) == sc.egraph.find(sc.true_id) {
+            self.alloc.stats.block_scratch_freehits += 1;
+            return true;
+        }
+        let all_sat = pc_lits.iter().all(|(id, pol)| {
+            let tid = sc.egraph.find(sc.translate(*id));
+            matches!(
+                sc.egraph[tid].data.known(),
+                Some(Literal::Bool(b)) if *b == matches!(pol, Polarity::Positive)
+            )
+        });
+        let probe_base = sc.egraph.clone();
+        let tpc: Vec<(egg::Id, Polarity)> =
+            pc_lits.iter().map(|(id, p)| (sc.translate(*id), *p)).collect();
+
+        // Free hit: the cube already implies the pc — no extra assumption needed,
+        // go straight to the goal-structural decompositions on the warm scratch.
+        if all_sat {
+            self.alloc.stats.block_scratch_freehits += 1;
+            return self.tier35(&probe_base, tg) || self.split_prove(&probe_base, tg);
+        }
+
+        // Extra literals: assume them on a clone of the warm scratch.
+        let mut probe = probe_base;
+        let true_p = probe.add(Symbolic::Lit(Literal::Bool(true)));
+        let false_p = probe.add(Symbolic::Lit(Literal::Bool(false)));
+        for (id, pol) in &tpc {
+            let want_true = matches!(pol, Polarity::Positive);
+            match probe[*id].data.known() {
+                // Off-path literal ⇒ `pc ⇒ goal` holds vacuously.
+                Some(Literal::Bool(b)) if *b != want_true => return true,
+                _ => {
+                    probe.union(*id, if want_true { true_p } else { false_p });
+                }
+            }
+        }
+        probe.rebuild();
+        let probe = self.run_probe(probe);
+        if probe.find(tg) == probe.find(true_p) {
+            true
+        } else if self.tier35(&probe, tg) {
+            true
+        } else {
+            self.split_prove(&probe, tg)
+        }
     }
 
     /// Whether `cond` already folds to a boolean literal in the **live** graph —
@@ -729,96 +933,67 @@ impl<'a> VerifyContext<'a> {
         probe.find(goal) == probe.find(true_p)
     }
 
-    /// Tier 4 — **case split**. The e-graph cannot reason by cases: an `ite`
-    /// whose condition is an unconstrained boolean stays opaque, so a fact that
-    /// holds in *both* branches is never concluded. That is exactly what a CFG
-    /// join leaves behind — the held permission is a sum of branch-scaled
-    /// `ite(flag, p, 0)` terms, and the exit exhale needs it under a disjunction
-    /// of the flags. Pick an undecided `ite` condition from the cone of the goal
-    /// and the path condition, and prove the goal twice — assuming it, and
-    /// assuming its negation. If both branches close, the goal holds.
+    /// **Function-body case split.** The e-graph cannot reason by cases: an
+    /// `ite` whose condition is an unconstrained boolean stays opaque, so a
+    /// fact that holds in *both* branches is never concluded on its own.
     ///
-    /// Searched by **iterative deepening**: every candidate is tried at depth 1
-    /// before any pair at depth 2, so a goal needing one split (the common
-    /// case) costs at most `2·|candidates|` probe saturations, and a
-    /// mis-ordered candidate costs one level, not a subtree. `SPLIT_BUDGET`
-    /// caps total probe saturations per goal so an unprovable goal degrades
-    /// gracefully.
-    fn split_prove(
-        &mut self,
-        probe: &egg::EGraph<Symbolic, ConstFold>,
-        goal: egg::Id,
-        roots: &[egg::Id],
-    ) -> bool {
+    /// The block-merge fork discharges every *method* CFG join structurally
+    /// (per-leaf proving through the path condition — see the block walker), so
+    /// the obligations that still reach here come from **branching pure
+    /// functions**: a `?:` whose arms establish `result` under different
+    /// conditions (`x>=0 ? x : -x` with `ensures result>=0`), or an arm calling
+    /// a function whose precondition only holds on that branch. Silicon forks
+    /// the path per branch; we case-split the goal instead.
+    ///
+    /// Unlike the retired method-oriented split, the candidate conditions are
+    /// read off **the goal term only** — not the whole path-condition cone —
+    /// and there is no probe budget or iterative deepening: a function goal
+    /// nests only a handful of conditions. The split is depth-first, guarded for
+    /// termination by an `assumed` set (finitely many distinct conditions, none
+    /// re-split twice on one path).
+    fn split_prove(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
         self.alloc.stats.prove_tier4 += 1;
-        // Diagnostic kill switch: run with SILVER_OXIDE_NO_TIER4=1 to measure
-        // which members/goals depend on the case split (everything else in the
-        // prove path is unaffected).
-        if std::env::var_os("SILVER_OXIDE_NO_TIER4").is_some() {
-            return false;
-        }
-        let mut budget = SPLIT_BUDGET;
-        for depth in 1..=SPLIT_DEPTH {
-            if self.split_tree(probe, goal, roots, depth, &mut budget) {
-                self.alloc.stats.prove_splits += 1;
-                return true;
-            }
-            if budget == 0 {
-                break;
-            }
+        let mut assumed: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
+        if self.split_goal(probe, goal, &mut assumed) {
+            self.alloc.stats.prove_splits += 1;
+            return true;
         }
         false
     }
 
-    /// Prove `goal` by a case tree of at most `depth` nested splits: a branch
-    /// that does not close outright recurses (both arms must close).
-    fn split_tree(
+    /// Prove `goal` by case analysis on an undecided condition drawn from the
+    /// goal's own `ite` structure: assume each polarity, re-saturate, and either
+    /// close the branch outright or recurse on a further condition. Both arms
+    /// must close. `assumed` blocks re-splitting a condition already fixed on
+    /// this path, which bounds the recursion.
+    fn split_goal(
         &mut self,
         probe: &egg::EGraph<Symbolic, ConstFold>,
         goal: egg::Id,
-        roots: &[egg::Id],
-        depth: usize,
-        budget: &mut usize,
+        assumed: &mut std::collections::HashSet<egg::Id>,
     ) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        let candidates = split_candidates(probe, roots);
-        if crate::verify::viz::dump_perm_enabled() {
-            eprintln!(
-                "[split-dump] depth {depth}: {} candidates, budget {budget}",
-                candidates.len()
-            );
-        }
-        for cond in candidates {
-            if *budget < 2 {
-                return false;
+        for cond in split_candidates(probe, &[goal]) {
+            if assumed.contains(&probe.find(cond)) {
+                continue;
             }
             let mut all_closed = true;
             for want_true in [true, false] {
-                if *budget == 0 {
-                    return false;
-                }
-                *budget -= 1;
                 let mut branch = probe.clone();
                 let lit = branch.add(Symbolic::Lit(Literal::Bool(want_true)));
                 branch.union(cond, lit);
                 branch.rebuild();
                 let branch = self.run_probe(branch);
-                if !Self::probe_holds(&branch, goal)
-                    && !self.split_tree(&branch, goal, roots, depth - 1, budget)
-                {
-                    all_closed = false;
-                    break;
+                if !Self::probe_holds(&branch, goal) {
+                    assumed.insert(probe.find(cond));
+                    let closed = self.split_goal(&branch, goal, assumed);
+                    assumed.remove(&probe.find(cond));
+                    if !closed {
+                        all_closed = false;
+                        break;
+                    }
                 }
             }
             if all_closed {
-                if crate::verify::viz::dump_perm_enabled() {
-                    eprintln!(
-                        "[split-dump] goal closed by splitting on:\n{}",
-                        crate::verify::viz::dump_term(self, cond, 4),
-                    );
-                }
                 return true;
             }
         }
@@ -833,155 +1008,11 @@ impl<'a> VerifyContext<'a> {
         probe: egg::EGraph<Symbolic, ConstFold>,
     ) -> egg::EGraph<Symbolic, ConstFold> {
         let _scope = crate::verify::rewrite::ScratchScope::enter();
-        self.saturate_flat(probe)
-    }
-
-    /// Collapse a permission **sum of `ite`s that share conditions** into a
-    /// single nested `ite`, by repeatedly applying the sound identity
-    /// `ite(c, a, x) + ite(c, b, y) ≡ ite(c, a+b, x+y)` (and the const-folding
-    /// `k + ite(...)`). This is what a CFG join over an N-arm `match` needs: the
-    /// held permission is a nested **indicator partition**
-    /// `ite(c_0, 1, ite(c_1, 1, … 0))`-shaped sum with one summand per arm, and
-    /// merging the same-condition summands collapses it to `ite(∨c_k, 1, 0)` in
-    /// O(N) steps — the exact permission the exit exhale needs, discharged
-    /// **without any case split** and scaling to any arm count.
-    ///
-    /// Returns a value-equal e-class built fresh (not unioned into `id`), so it
-    /// is used only where asked (the failure path of a permission comparison),
-    /// never perturbing the live graph on passing code. `budget` caps added
-    /// nodes.
-    pub(crate) fn merge_ite_sum(&mut self, id: egg::Id, budget: &mut usize) -> egg::Id {
-        // Flatten the `+` spine into a list of summands (only `+`, not `-` —
-        // a partition is all-additive; a `-` summand is left opaque).
-        let mut summands = Vec::new();
-        self.flatten_plus(self.egraph.find(id), &mut summands, &mut Vec::new());
-        self.merge_summands(summands, budget)
-    }
-
-    fn flatten_plus(&self, id: egg::Id, out: &mut Vec<egg::Id>, seen: &mut Vec<egg::Id>) {
-        let id = self.egraph.find(id);
-        if seen.contains(&id) {
-            out.push(id);
-            return;
-        }
-        if self.egraph[id].data.known().is_some() {
-            out.push(id);
-            return;
-        }
-        seen.push(id);
-        // A class holding an `ite` node is a partition **summand leaf** — do not
-        // descend a `+` node it may also hold (that `+` is cancellation residue,
-        // e.g. `x = (x - p) + p`, often self-referential; descending it pulls a
-        // spurious zero-valued term into the sum and defeats the collapse).
-        let has_ite = self.egraph[id]
-            .nodes
-            .iter()
-            .any(|n| matches!(n, Symbolic::Ite(_)));
-        let plus = if has_ite {
-            None
-        } else {
-            self.egraph[id].nodes.iter().find_map(|n| match n {
-                Symbolic::Binary(BinOp::AddR, k) => Some(*k),
-                _ => None,
-            })
-        };
-        match plus {
-            Some([a, b]) => {
-                self.flatten_plus(a, out, seen);
-                self.flatten_plus(b, out, seen);
-            }
-            None => out.push(id),
-        }
-        seen.pop();
-    }
-
-    /// Sum a list of summands, merging any two that share an outer `ite`
-    /// condition via `ite(c,a,x)+ite(c,b,y) => ite(c, a+b, x+y)`, then recursing
-    /// into the merged arms. Const summands fold together.
-    fn merge_summands(&mut self, summands: Vec<egg::Id>, budget: &mut usize) -> egg::Id {
-        use num::BigRational;
-        // The outer `ite` condition of a class, if any (const classes = leaf).
-        let cond_of = |cx: &Self, x: egg::Id| -> Option<egg::Id> {
-            if cx.egraph[x].data.known().is_some() {
-                return None;
-            }
-            cx.egraph[x].nodes.iter().find_map(|n| match n {
-                Symbolic::Ite([c, _, _]) => Some(cx.egraph.find(*c)),
-                _ => None,
-            })
-        };
-        // Partition summands by their outer condition; const/opaque ones pool.
-        let mut const_sum = BigRational::from(num::BigInt::from(0));
-        let mut has_const = false;
-        let mut opaque: Vec<egg::Id> = Vec::new();
-        // Preserve first-seen order of conditions for a stable rebuild.
-        let mut groups: Vec<(egg::Id, Vec<egg::Id>)> = Vec::new();
-        for s in summands {
-            let s = self.egraph.find(s);
-            if let Some(Literal::Real(r)) = self.egraph[s].data.known() {
-                const_sum += r;
-                has_const = true;
-                continue;
-            }
-            match cond_of(self, s) {
-                Some(c) => match groups.iter_mut().find(|(gc, _)| *gc == c) {
-                    Some((_, v)) => v.push(s),
-                    None => groups.push((c, vec![s])),
-                },
-                None => opaque.push(s),
-            }
-        }
-        // Rebuild: sum of (per-condition merged ites) + opaque + const.
-        let mut terms: Vec<egg::Id> = Vec::new();
-        for (c, members) in groups {
-            if members.len() == 1 {
-                terms.push(members[0]);
-                continue;
-            }
-            if *budget == 0 {
-                // Out of budget: fall back to a plain (unmerged) sum of the
-                // members themselves — value-equal by construction. (Summing
-                // their *then* arms is NOT: it drops the conditions and the
-                // else sides.)
-                let mut acc = members[0];
-                for &m in &members[1..] {
-                    acc = self.add(Symbolic::Binary(BinOp::AddR, [acc, m]));
-                }
-                terms.push(acc);
-                continue;
-            }
-            // Merge all same-condition members: collect their then/else arms,
-            // recurse on each side.
-            let mut thens = Vec::new();
-            let mut elses = Vec::new();
-            for m in members {
-                if let Some((_, t, e)) = self.egraph[m].nodes.iter().find_map(|n| match n {
-                    Symbolic::Ite([mc, t, e]) if self.egraph.find(*mc) == c => Some((*mc, *t, *e)),
-                    _ => None,
-                }) {
-                    thens.push(t);
-                    elses.push(e);
-                }
-            }
-            *budget = budget.saturating_sub(1);
-            let t = self.merge_summands(thens, budget);
-            let e = self.merge_summands(elses, budget);
-            terms.push(self.add(Symbolic::Ite([c, t, e])));
-        }
-        terms.extend(opaque);
-        if has_const {
-            terms.push(self.add(Symbolic::Lit(Literal::Real(const_sum))));
-        }
-        if terms.is_empty() {
-            return self.add(Symbolic::Lit(Literal::Real(BigRational::from(
-                num::BigInt::from(0),
-            ))));
-        }
-        let mut acc = terms[0];
-        for &t in &terms[1..] {
-            acc = self.add(Symbolic::Binary(BinOp::AddR, [acc, t]));
-        }
-        acc
+        let iters_before = self.alloc.stats.sat_iterations;
+        let out = self.saturate_flat(probe);
+        self.alloc.stats.probe_saturations += 1;
+        self.alloc.stats.probe_iterations += self.alloc.stats.sat_iterations - iters_before;
+        out
     }
 
     /// Resolve which of `chunks` sits at address `addr`, consulting aliasing
@@ -1049,49 +1080,11 @@ impl<'a> VerifyContext<'a> {
     }
 }
 
-/// Whether a prove call may fall through to the tier-4 case split.
-///
-/// Tier 4 is exponential in the arm count, so it must be the *last* thing tried
-/// for a given obligation — including after any cheaper alternative the caller
-/// itself owns. Because the tier ladder lives inside `prove_under_pc` while
-/// `prove_perm_ineq`'s linear `merge_ite_sum` collapse lives one layer above it,
-/// a plain call would let tier 4 preempt the cheaper route. `NoSplit` stops the
-/// ladder at tier 3.5 so the caller can interleave its own fallback first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Escalate {
-    /// Full ladder: tiers 1/0/2/3/3.5, then the tier-4 case split.
-    Full,
-    /// Cheap tiers only (1/0/2/3/3.5). Never reaches tier 4.
-    NoSplit,
-}
-
-impl Escalate {
-    fn may_split(self) -> bool {
-        matches!(self, Escalate::Full)
-    }
-}
-
-/// How many nested `ite` conditions tier 4 may split on. A CFG join of an
-/// n-way branch needs up to n-1 nested splits (one per excluded arm); 3 covers
-/// the 4-variant enums in the Prusti output.
-const SPLIT_DEPTH: usize = 3;
-
-/// Cap on probe saturations per tier-4 goal: an unprovable goal stops costing
-/// time instead of exploring the full case tree. Sized empirically: the widest
-/// provable goal in the Prusti benchmark (`m_rect_normalize`'s mid-body
-/// exhale, a depth-2 tree over a ~20-condition cone) needs ~350 probes;
-/// raising further buys nothing (the one remaining failure is
-/// budget-insensitive up to 2048) and each failing goal burns the full cap.
-const SPLIT_BUDGET: usize = 384;
-
-/// The `ite` conditions worth splitting on: those in the **cone** of `roots`
-/// (the goal and the path-condition literals) whose truth value is undecided
-/// (a `ConstFold`-known condition would make one branch vacuous). The cone,
-/// not the whole e-graph: a saturated probe holds hundreds of `ite`s with no
-/// bearing on the goal, and trying each is what makes naive splitting
-/// exponential. Breadth-first from the roots, so the conditions structurally
-/// nearest the goal — the ones that actually gate it — are tried first; no
-/// further ranking.
+/// The `ite` conditions worth splitting on: those reachable from `roots` (the
+/// goal term) whose truth value is undecided — a `ConstFold`-known condition
+/// would make one branch vacuous. Breadth-first from the goal, so the
+/// conditions structurally nearest it — the ones that actually gate it — come
+/// first; no further ranking.
 fn split_candidates(probe: &egg::EGraph<Symbolic, ConstFold>, roots: &[egg::Id]) -> Vec<egg::Id> {
     use egg::Language as _;
     let mut visited: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
@@ -1108,9 +1101,7 @@ fn split_candidates(probe: &egg::EGraph<Symbolic, ConstFold>, roots: &[egg::Id])
         // its nodes are equalities/arithmetic *residue* (e.g. the `1/1` class
         // accretes every cancelled borrow/give-back pair `(x−p)+p`), and no
         // condition reachable only through it can change the goal — the value
-        // here is already decided. Descending it floods the candidate list
-        // (its residue grows with program size, pushing the useful candidate
-        // past the split budget — the N=20 match-arm cliff).
+        // here is already decided. Descending it only floods the candidate list.
         if probe[id].data.known().is_some() {
             continue;
         }
@@ -1141,7 +1132,7 @@ fn run_rules<'r>(
     // the caller sees an ordinary "not proven", which surfaced as a false
     // insufficient-permission at ~20 match arms (one tower level collapses per
     // iteration, so deep-but-terminating collapses need iterations ∝ depth).
-    let mut runner = egg::Runner::default()
+    let runner = egg::Runner::default()
         .with_scheduler(egg::SimpleScheduler)
         .with_node_limit(100_000)
         .with_iter_limit(iter_limit.unwrap_or(100))

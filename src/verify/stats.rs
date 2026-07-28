@@ -31,6 +31,23 @@ pub struct VerifyStats {
     pub saturations: u64,
     /// `reduce()` calls (terminating reductions only).
     pub reduces: u64,
+    /// Scratch full-rule-set (non-ground) saturations on a throwaway clone —
+    /// tier-3 goal probes and forall-WD checks (`run_probe`). Disjoint from
+    /// `saturations` (which counts only live persistent-graph runs).
+    pub probe_saturations: u64,
+    /// egg `Runner` iterations spent inside `probe_saturations` (subset of
+    /// `sat_iterations`).
+    pub probe_iterations: u64,
+    /// Per-block scratch e-graph experiment (`SILVER_OXIDE_BLOCK_SCRATCH`):
+    /// ground clones taken to build a block scratch (one per block that reaches
+    /// tier-3), full-rule-set saturations of that shared scratch, and the egg
+    /// iterations they cost. `block_scratch_freehits` counts obligations
+    /// discharged straight off the saturated scratch with no per-obligation
+    /// clone (their pc was already implied by the block cube). All non-gated.
+    pub block_scratch_clones: u64,
+    pub block_scratch_saturations: u64,
+    pub block_scratch_iterations: u64,
+    pub block_scratch_freehits: u64,
     /// total egg `Runner` iterations across all saturations/reductions/probes.
     pub sat_iterations: u64,
     /// peak e-graph size observed in any iteration.
@@ -51,14 +68,11 @@ pub struct VerifyStats {
     /// Goals discharged by tier 3.5 — non-forking `ite`-goal decomposition
     /// (a constant branch reduces the goal to its other branch, no case split).
     pub prove_tier35: u64,
-    /// Goals that escalated to the tier-4 case split, and how many were proven
-    /// by it.
+    /// Goals that reached the function case split, and how many were proven by
+    /// it. (Only branching pure functions reach it — method CFG joins are
+    /// discharged structurally.)
     pub prove_tier4: u64,
     pub prove_splits: u64,
-    /// Permission-comparison goals closed by the `merge_ite_sum` fallback
-    /// *before* any tier-4 escalation (see `prove_perm_ineq`). Each one is a
-    /// case split we no longer pay for.
-    pub prove_merge_fallback: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
     /// Per-rule search/apply wall clock (excluded from `Eq` / the snapshot).
