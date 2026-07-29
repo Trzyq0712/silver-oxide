@@ -347,15 +347,11 @@ impl Sink {
         yields_snap: bool,
     ) -> (HeapVal, Option<Val>) {
         let h = match sign {
-            // Fork model (Stage 4): the branch no longer rides in the perm scale,
-            // so the inhale must carry the block cube as its pc — the verifier
-            // guards the inhaled bool by it (else a conditional inhale leaks its
-            // fact past the branch). Stage 3 keeps the inhale total (branch in the
-            // scale). An empty pc (unconditional inhale) guards by nothing either way.
-            Sign::Add if crate::util::block_merge_enabled() => {
-                self.emit_heap_guarded(HeapInst::Inhale { base, call, perm })
-            }
-            Sign::Add => self.emit_heap(HeapInst::Inhale { base, call, perm }),
+            // Fork model: the branch no longer rides in the perm scale, so the
+            // inhale carries the block cube as its pc — the verifier guards the
+            // inhaled bool by it (else a conditional inhale leaks its fact past
+            // the branch). An empty pc (unconditional inhale) guards by nothing.
+            Sign::Add => self.emit_heap_guarded(HeapInst::Inhale { base, call, perm }),
             Sign::Sub => self.emit_heap_guarded(HeapInst::Exhale { base, call, perm }),
         };
         let snap = yields_snap.then(|| self.next_val_temp());

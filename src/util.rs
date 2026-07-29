@@ -13,15 +13,6 @@ pub fn log_dir() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Stage-4 structural heap merge (`SILVER_OXIDE_BLOCK_MERGE`, default OFF).
-/// Both the lowering (stops gating arms) and the verifier (starts merging heaps
-/// at joins) read this — they MUST agree, so it is a single process-wide flag.
-pub fn block_merge_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("SILVER_OXIDE_BLOCK_MERGE").is_some())
-}
-
 // fmt
 
 pub struct Brackets<T, I: IntoIterator<Item = T> + Copy>(char, I, char);

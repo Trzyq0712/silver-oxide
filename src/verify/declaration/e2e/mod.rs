@@ -2987,24 +2987,18 @@ method p3(c: Bool, x: Int) { if (c) { assume x > 0  assert x > 0 } }
 }
 
 #[test]
-fn both_arms_establishing_a_fact_needs_a_case_split_we_lack() {
-    // KNOWN INCOMPLETENESS (not unsoundness). Both arms inhale `x > 0`, so it
-    // genuinely holds at the merge — Silicon proves this. We record `c ⇒ x>0`
-    // and `¬c ⇒ x>0`; recombining them into `x>0` needs a `c ∨ ¬c` case split
-    // the e-graph does not perform. Before Phase 1 this verified, but only via
-    // the same unsound unconditional union that made the leak tests pass. Flip
-    // this assertion once branch joins or the Z3 fallback land.
+fn both_arms_establishing_a_fact_verifies_via_structural_join() {
+    // Both arms inhale `x > 0`, so it genuinely holds at the merge. The
+    // structural block join (fork model) recombines `c ⇒ x>0` and `¬c ⇒ x>0`
+    // into `x > 0` without a case split — the incompleteness that used to force
+    // this to fail (recorded here as a KNOWN LIMITATION until branch joins
+    // landed) is gone. Silicon proves it too.
     let input = r#"
 method give(x: Int) ensures x > 0
 method p2(c: Bool, x: Int) { if (c) { give(x) } else { give(x) }  assert x > 0 }
 "#;
     let program = lower(input);
-    let result = verify_named_method(&program, "p2");
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
-        "expected AssertionFailed (case-split incompleteness); if this now verifies, \
-         branch joins improved — flip the assertion. Got {result:?}"
-    );
+    assert!(verify_named_method(&program, "p2").is_ok());
 }
 
 // --- Phase 3: function definitions are purified recipes, not e-graph grafts ---

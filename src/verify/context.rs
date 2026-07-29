@@ -867,22 +867,6 @@ impl<'a> VerifyContext<'a> {
         }
     }
 
-    /// Whether `cond` already folds to a boolean literal in the **live** graph —
-    /// a pure `known()` lookup, no clone. Used by the Stage-4 join merge as a
-    /// cheap early drop of a dead arm; when it returns `None` the arm is kept as
-    /// a structural `Select` and the dead branch is discharged later by the
-    /// per-leaf perm proof (its pc becomes `block_cube ∧ ¬edge`, contradictory
-    /// when the cube implies the edge, so the leaf holds vacuously). Assuming the
-    /// cube in a scratch clone here would be one full graph clone *per join* —
-    /// measured as the dominant cost on struct-heavy CFGs — and buys nothing the
-    /// structural proof does not already get.
-    pub(crate) fn fold_under_pc(&mut self, cond: egg::Id) -> Option<bool> {
-        match self.egraph[self.egraph.find(cond)].data.known() {
-            Some(Literal::Bool(b)) => Some(*b),
-            _ => None,
-        }
-    }
-
     /// Persist a proven obligation so future identical ones hit tier 1.
     ///
     /// Default (and always for an **empty-pc** goal, where `imp == goal`): union

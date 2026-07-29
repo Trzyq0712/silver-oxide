@@ -1026,6 +1026,19 @@ fn heap_subtract(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
     let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
+    // Guarded-merge path: a stored chunk keeps a FLAT presence guard and a
+    // guard-free amount. Reconstruct the exact legacy `guard ? perm : 0`
+    // obligation transiently here — once, per consume — so sufficiency/remainder
+    // are proven against the gated perm (present only where the guard holds),
+    // preserving legacy semantics while merges stay flat.
+    let existing = existing.map(|c| {
+        if !c.guard().is_empty() {
+            let gated = gate_perm_by_guard(ctx, &c.perm, c.guard());
+            Chunk::new_perm(c.addr, gated, c.value).with_recipe(c.recipe.clone())
+        } else {
+            c
+        }
+    });
     let chunk2_perm = chunk2.perm.to_id(ctx);
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
@@ -1134,37 +1147,59 @@ fn heap_subtract(
     Ok(out)
 }
 
-/// Structural control-flow SELECT merge of two predecessor exit heaps at a
-/// binary join (`HeapInst::Merge`). Runs with the join block's cube ALREADY
-/// assumed in `ctx` (the walker assumed the block pc before this inst), so a
-/// chunk's full-cube reach guard has const-folded to the bare edge — the select
-/// keys on `cond` (the then-edge reach value) alone.
+/// Set-equality of two guard cubes under canonical e-classes (order-insensitive;
+/// guards are small).
+fn cube_eq(ctx: &VerifyContext<'_>, a: &[(egg::Id, Polarity)], b: &[(egg::Id, Polarity)]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|(ia, pa)| {
+            let ca = ctx.egraph.find(*ia);
+            b.iter()
+                .any(|(ib, pb)| pa == pb && ctx.egraph.find(*ib) == ca)
+        })
+}
+
+/// Append `lit` to a guard cube (idempotent under canonical e-classes).
+fn cube_push(
+    ctx: &VerifyContext<'_>,
+    base: &[(egg::Id, Polarity)],
+    lit: (egg::Id, Polarity),
+) -> crate::verify::heap::HeapPc {
+    let c = ctx.egraph.find(lit.0);
+    if base
+        .iter()
+        .any(|(i, p)| *p == lit.1 && ctx.egraph.find(*i) == c)
+    {
+        return std::rc::Rc::from(base.to_vec());
+    }
+    let mut v = base.to_vec();
+    v.push(lit);
+    std::rc::Rc::from(v)
+}
+
+/// Structural control-flow merge of two predecessor exit heaps at a binary join
+/// (`HeapInst::Merge`). The reachability edge is carried as a **flat per-chunk
+/// guard cube** relative to the join heap's `pc`, never a `?:0` `Select` tower —
+/// so the amount stays a guard-free `Leaf` and no `0` leaf is ever built (absence
+/// is `¬guard`). Per location kind, per canonical address:
+/// - **present on one arm only** ⇒ carry the chunk, flat-append the branch
+///   literal to its guard (`cond+` for then, `cond−` for els). No `Select`, no
+///   `0` leaf, depth stays 0. (`p_Case_j` ends as `guard=[¬c0,¬c1,cⱼ], 1/1`.)
+/// - **both arms, equal guard, congruent amount** ⇒ carry with that guard; the
+///   branch literal drops (give-back / shared-prefix uplift). Value phi only if
+///   the values differ.
+/// - **both arms, equal guard, divergent amount** ⇒ a single-level `Select` on
+///   `cond` in the amount (genuine perm divergence, per-leaf prove). Guard shared.
+/// - **both arms, guards differ** ⇒ genuine `(cond∧g_t)∨(¬cond∧g_e)` disjunction,
+///   not a flat cube: fall back to the gated `guard?perm:0` amount encoding
+///   (sound, rare — counted via `MergeTrace` to see if it ever fires).
 ///
-/// Per location kind, per canonical address:
-/// - held on **both** arms ⇒ SELECT the perm (`cond ? p_then : p_els`); when the
-///   two amounts are structurally equal (give-back / untouched) `select`
-///   collapses it to the bare constant and `cond` dies — this is the tier-4 kill.
-///   The value is the phi `ite(cond, v_then, v_els)`.
-/// - held on **one** arm only ⇒ genuinely conditional footprint (`cond ? p : 0`
-///   or `cond ? 0 : p`); if the absent side is a dead arm, `select`'s dead-arm
-///   drop already removed the `0` leaf.
-///
-/// SELECT, never `+`: summing edge-guarded arm chunks double-counts and rebuilds
-/// the tower (design 30).
+/// The presence guard is reconstructed into the exact `guard?perm:0` obligation
+/// **transiently at each consume site** (`gate_perm_by_guard`), so merges stay
+/// flat while sufficiency/remainder keep the pre-hoist semantics. Runs only when
+/// both arms are live (a dead arm is dropped at the `Merge` inst before this is
+/// called), so an absent side is a genuine conditional footprint.
 fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els: &Heap) -> Heap {
-    // NOTE: no eager `ctx.reduce()` here — re-saturating the graph at every join
-    // was O(joins) full saturations, and it does not collapse the ChunkPerm tree
-    // anyway (that structure is Rust-side, not the e-graph).
-    //
-    // `cond_fold`: a cheap LIVE-graph `known()` check (no clone) — if the edge
-    // already folded, drop the dead arm early. When it is `None` the arm stays a
-    // structural `Select`; a truly-infeasible edge is discharged later by the
-    // per-leaf perm proof, whose pc becomes `block_cube ∧ ¬edge` (contradictory
-    // when the cube implies the edge, so the leaf holds vacuously) — no per-join
-    // graph clone, which was the dominant cost on struct-heavy CFGs.
-    let cond_fold = ctx.fold_under_pc(cond);
     let mut out = Heap::empty();
-    // Union of the kinds present in either arm.
     let mut kinds: Vec<LocationKind> = h_then.kinds().cloned().collect();
     for k in h_els.kinds() {
         if !kinds.contains(k) {
@@ -1172,7 +1207,6 @@ fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els:
         }
     }
     for kind in &kinds {
-        // Union of canonical addresses across both arms.
         let mut addrs: Vec<egg::Id> = Vec::new();
         for c in h_then.chunks_of(kind).iter().chain(h_els.chunks_of(kind)) {
             let canon = ctx.egraph.find(c.addr);
@@ -1183,33 +1217,47 @@ fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els:
         for addr in addrs {
             let ct = h_then.chunk_canon(ctx, kind, addr).cloned();
             let ce = h_els.chunk_canon(ctx, kind, addr).cloned();
-            // A folded edge picks its live arm outright — both a held/held select
-            // and a divergent held/absent become that arm alone (no `0` leaf).
-            let chunk = match (cond_fold, ct, ce) {
-                // Then-edge live: keep the then arm's chunk (drop els entirely).
-                (Some(true), Some(a), _) => Some(a),
-                (Some(true), None, _) => None,
-                // Els-edge live: keep the els arm's chunk.
-                (Some(false), _, Some(b)) => Some(b),
-                (Some(false), _, None) => None,
-                // Undecided edge: structural select (may still be a genuine
-                // conditional footprint at an empty-cube join).
-                (None, Some(a), Some(b)) => {
-                    let perm = ChunkPerm::select(ctx, cond, a.perm.clone(), b.perm.clone());
-                    let value = ctx.add(Symbolic::Ite([cond, a.value, b.value]));
-                    Some(Chunk::new_perm(a.addr, perm, value))
+            let chunk = match (ct, ce) {
+                (Some(a), Some(b)) => {
+                    let value = if ctx.egraph.find(a.value) == ctx.egraph.find(b.value) {
+                        a.value
+                    } else {
+                        ctx.add(Symbolic::Ite([cond, a.value, b.value]))
+                    };
+                    if cube_eq(ctx, a.guard(), b.guard()) {
+                        // Same presence on both arms → carry with shared guard.
+                        // Amount: congruent ⇒ bare; divergent ⇒ single Select.
+                        let perm = if ChunkPerm::same(ctx, &a.perm, &b.perm) {
+                            a.perm.clone()
+                        } else {
+                            ChunkPerm::select(ctx, cond, a.perm.clone(), b.perm.clone())
+                        };
+                        Some(
+                            Chunk::new_perm(a.addr, perm, value)
+                                .with_guard(a.guard.clone())
+                                .with_recipe(a.recipe.clone()),
+                        )
+                    } else {
+                        // Guards differ: genuine disjunction. Fall back to the
+                        // legacy gated encoding — `guard? p : 0` on each side under
+                        // `cond` — with an empty residual guard (conditionality
+                        // lives in the amount here).
+                        crate::verify::heap::MergeTrace::bump_zero();
+                        let pa = gate_perm_by_guard(ctx, &a.perm, a.guard());
+                        let pb = gate_perm_by_guard(ctx, &b.perm, b.guard());
+                        let perm = ChunkPerm::select(ctx, cond, pa, pb);
+                        Some(Chunk::new_perm(a.addr, perm, value).with_recipe(a.recipe.clone()))
+                    }
                 }
-                (None, Some(a), None) => {
-                    let zero = ChunkPerm::Leaf(zero_real(ctx));
-                    let perm = ChunkPerm::select(ctx, cond, a.perm.clone(), zero);
-                    Some(Chunk::new_perm(a.addr, perm, a.value))
+                (Some(a), None) => {
+                    let guard = cube_push(ctx, a.guard(), (cond, Polarity::Positive));
+                    Some(a.with_guard(guard))
                 }
-                (None, None, Some(b)) => {
-                    let zero = ChunkPerm::Leaf(zero_real(ctx));
-                    let perm = ChunkPerm::select(ctx, cond, zero, b.perm.clone());
-                    Some(Chunk::new_perm(b.addr, perm, b.value))
+                (None, Some(b)) => {
+                    let guard = cube_push(ctx, b.guard(), (cond, Polarity::Negative));
+                    Some(b.with_guard(guard))
                 }
-                (_, None, None) => None,
+                (None, None) => None,
             };
             if let Some(chunk) = chunk {
                 out = out.with_chunk(kind, chunk);
@@ -1218,6 +1266,24 @@ fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els:
     }
     assume_location_axioms(ctx, &out);
     out
+}
+
+/// Materialize `guard ? perm : 0` for the rare guards-differ fallback. With an
+/// empty guard this is `perm` unchanged (no node).
+fn gate_perm_by_guard(
+    ctx: &mut VerifyContext<'_>,
+    perm: &ChunkPerm,
+    guard: &[(egg::Id, Polarity)],
+) -> ChunkPerm {
+    let mut acc = perm.clone();
+    for (id, pol) in guard {
+        let zero = ChunkPerm::Leaf(zero_real(ctx));
+        acc = match pol {
+            Polarity::Positive => ChunkPerm::select(ctx, *id, acc, zero),
+            Polarity::Negative => ChunkPerm::select(ctx, *id, zero, acc),
+        };
+    }
+    acc
 }
 
 /// Evaluate a heap inst. `Sub` may fail with `InsufficientPermission`.
@@ -1320,22 +1386,38 @@ fn eval_heap_inst(
             let kind = state
                 .loc_kind(loc)
                 .expect("assign location must be Addr-typed");
-            let perm = h
-                .chunk(&kind, addr)
+            let held = h.chunk(&kind, addr).cloned();
+            let perm = held
+                .as_ref()
                 .map(|c| c.perm.clone())
                 .unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx)));
+            let guard = held
+                .as_ref()
+                .map(|c| c.guard.clone())
+                .unwrap_or_else(|| std::rc::Rc::from(Vec::new()));
             // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc —
-            // per leaf, so a branch-structured held perm never materializes.
+            // per leaf, so a branch-structured held perm never materializes. Under
+            // the guarded-merge path the write obligation is proven against the
+            // guard-gated perm (write required only where the chunk is present).
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
                 .iter()
                 .map(|(v, p)| (state.get_val(ctx, v), *p))
                 .collect();
-            if !prove_perm_write(ctx, &perm, &pc_lits) {
+            let proof_perm = if !guard.is_empty() {
+                gate_perm_by_guard(ctx, &perm, &guard)
+            } else {
+                perm.clone()
+            };
+            if !prove_perm_write(ctx, &proof_perm, &pc_lits) {
                 return Err(VerifyError::InsufficientPermission);
             }
-            // Permission unchanged by the write; keep it structural.
-            Ok(h.with_chunk(&kind, Chunk::new_perm(addr, perm, new_val)))
+            // Permission (and its presence guard) unchanged by the write; keep it
+            // structural.
+            Ok(h.with_chunk(
+                &kind,
+                Chunk::new_perm(addr, perm, new_val).with_guard(guard),
+            ))
         }
     }
 }
@@ -1823,10 +1905,16 @@ fn walk_footprint(
                     Some(c) => {
                         // `guard ⇒ 0 < held`, proven per leaf (never materialize
                         // the held `Select`): assume `guard` in the pc, prove
-                        // `0 < leaf` on each branch.
+                        // `0 < leaf` on each branch. Guard-gate the held perm under
+                        // the guarded-merge path so presence is respected.
+                        let held = if !c.guard().is_empty() {
+                            gate_perm_by_guard(ctx, &c.perm, c.guard())
+                        } else {
+                            c.perm.clone()
+                        };
                         let mut pc = pc_lits.to_vec();
                         pc.push((guard, Polarity::Positive));
-                        prove_perm_positive(ctx, &c.perm, &pc)
+                        prove_perm_positive(ctx, &held, &pc)
                     }
                     // No chunk held here: sound only if the slot is not required
                     // on this path (`guard` is false).
@@ -2653,6 +2741,12 @@ pub(crate) fn verify_method(
         }
     }
     ctx.end_block();
+    if let Some(t) = crate::verify::heap::MergeTrace::take() {
+        eprintln!(
+            "[merge-trace] {method_name}: selects_built={} zero_leaves={} max_depth={}",
+            t.selects_built, t.zero_leaves, t.max_depth
+        );
+    }
     Ok(())
 }
 
@@ -3068,8 +3162,17 @@ fn inst_obligations(
             let addr = state.get_val(ctx, loc);
             let held = get_heap(state, heap);
             let perm = state.loc_kind(loc).and_then(|k| {
-                ctx.chunk_under_pc(held.chunks_of(&k), addr, pc_lits)
-                    .map(|c| c.perm.clone())
+                let c = ctx
+                    .chunk_under_pc(held.chunks_of(&k), addr, pc_lits)?
+                    .clone();
+                // Guarded-merge path: frame against the guard-gated perm (a
+                // conditionally-held location frames only where its guard holds).
+                let p = if !c.guard().is_empty() {
+                    gate_perm_by_guard(ctx, &c.perm, c.guard())
+                } else {
+                    c.perm.clone()
+                };
+                Some(p)
             });
             match perm {
                 // A bare (or absent) perm: the goal `0 < leaf` is discharged by

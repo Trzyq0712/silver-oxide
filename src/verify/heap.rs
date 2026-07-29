@@ -1,18 +1,104 @@
+use std::cell::Cell;
 use std::rc::Rc;
 
 use lasso::Spur;
 
 use crate::verify::context::VerifyContext;
 use crate::verify::lang::Symbolic;
-use crate::vmir::{Bound, Literal, Type};
+use crate::vmir::{Bound, Literal, Polarity, Type};
+
+/// A path condition in verify space: a single conjunctive cube of e-class
+/// literals (the analog of a block's `PathConds`, already minimized by
+/// `reach.rs` at lowering). Shared `Rc` so cloning a `Heap` per-inst stays O(1).
+pub type HeapPc = Rc<[(egg::Id, Polarity)]>;
+
+/// S0 merge instrumentation (gated by `SILVER_OXIDE_TRACE_MERGE`). Counts the
+/// join-merge structures the pc-hoist plan aims to flatten: `Select` nodes
+/// actually built (reachability towers), `0`-leaf constructions (absence encoded
+/// as a `?:0` amount), and the deepest `Select` tree seen. Reset/dumped per
+/// method by [`MergeTrace::take`]. Pure diagnostics — no effect when the flag is
+/// off (the `enabled()` check short-circuits every hot-path bump).
+#[derive(Default, Clone, Copy)]
+pub struct MergeTrace {
+    pub selects_built: u64,
+    pub zero_leaves: u64,
+    pub max_depth: u32,
+}
+
+thread_local! {
+    static MERGE_TRACE: Cell<MergeTrace> = const { Cell::new(MergeTrace {
+        selects_built: 0,
+        zero_leaves: 0,
+        max_depth: 0,
+    }) };
+    static MERGE_TRACE_ON: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+impl MergeTrace {
+    fn enabled() -> bool {
+        MERGE_TRACE_ON.with(|c| match c.get() {
+            Some(b) => b,
+            None => {
+                let b = std::env::var_os("SILVER_OXIDE_TRACE_MERGE").is_some();
+                c.set(Some(b));
+                b
+            }
+        })
+    }
+
+    fn bump_select(depth: u32) {
+        if !Self::enabled() {
+            return;
+        }
+        MERGE_TRACE.with(|c| {
+            let mut t = c.get();
+            t.selects_built += 1;
+            t.max_depth = t.max_depth.max(depth);
+            c.set(t);
+        });
+    }
+
+    pub(crate) fn bump_zero() {
+        if !Self::enabled() {
+            return;
+        }
+        MERGE_TRACE.with(|c| {
+            let mut t = c.get();
+            t.zero_leaves += 1;
+            c.set(t);
+        });
+    }
+
+    /// Read and reset the per-thread counters. `None` when tracing is off.
+    pub fn take() -> Option<MergeTrace> {
+        if !Self::enabled() {
+            return None;
+        }
+        MERGE_TRACE.with(|c| {
+            let t = c.get();
+            c.set(MergeTrace::default());
+            Some(t)
+        })
+    }
+}
+
+impl ChunkPerm {
+    /// The `Select`-nesting depth of this perm tree (a `Leaf` is 0). Diagnostic.
+    fn depth(&self) -> u32 {
+        match self {
+            ChunkPerm::Leaf(_) => 0,
+            ChunkPerm::Select { then, els, .. } => 1 + then.depth().max(els.depth()),
+        }
+    }
+}
 
 /// A chunk's permission as an explicit term, held OUTSIDE the union-find so a
 /// control-flow join can build a structural `Select` that collapses without
 /// saturation. `Leaf` is an e-class id (a literal `1/1`, a symbolic real, a
 /// wildcard-bearing term, or a program-written `c ==> acc` gate) and is treated
 /// as OPAQUE — never structurally decomposed. `Select` is built ONLY by the
-/// Stage-4 join merge ([`ChunkPerm::select`]). With `SILVER_OXIDE_BLOCK_MERGE`
-/// off every perm is a `Leaf` and [`ChunkPerm::to_id`] is the identity.
+/// control-flow join merge ([`ChunkPerm::select`]); a perm the frontend built
+/// is always a `Leaf`, for which [`ChunkPerm::to_id`] is the identity.
 #[derive(Debug, Clone)]
 pub enum ChunkPerm {
     Leaf(egg::Id),
@@ -26,7 +112,7 @@ pub enum ChunkPerm {
 impl ChunkPerm {
     /// Structural equality with LEAVES compared by e-class `find` (so a `1/1`
     /// from either arm counts as equal). O(size), no saturation.
-    fn same(ctx: &VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> bool {
+    pub(crate) fn same(ctx: &VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> bool {
         match (a, b) {
             (ChunkPerm::Leaf(x), ChunkPerm::Leaf(y)) => {
                 ctx.egraph.find(*x) == ctx.egraph.find(*y)
@@ -90,11 +176,13 @@ impl ChunkPerm {
             Some(Literal::Bool(false)) => return els,
             _ => {}
         }
-        ChunkPerm::Select {
+        let out = ChunkPerm::Select {
             cond,
             then: Box::new(then),
             els: Box::new(els),
-        }
+        };
+        MergeTrace::bump_select(out.depth());
+        out
     }
 
     /// Lower to an e-graph id — ONLY where the prover needs an e-class
@@ -177,6 +265,15 @@ pub struct Chunk {
     pub(crate) addr: egg::Id,
     pub(crate) perm: ChunkPerm,
     pub(crate) value: egg::Id,
+    /// Reachability guard: the flat cube of branch literals under which this
+    /// chunk is present (empty = unconditional). A held-on-one-arm conditional
+    /// footprint carries its arm's reach cube here (appended per join by
+    /// `merge_heaps`), instead of nesting a `?:0` `Select` into `perm` — so
+    /// `perm` stays a guard-free amount and no `0` leaf is ever built. Presence is
+    /// `guard ∧` the consuming instruction's pc; the amount holds unconditionally
+    /// under it, and the consume sites reconstruct the `guard?perm:0` obligation
+    /// transiently (`gate_perm_by_guard`).
+    pub(crate) guard: HeapPc,
     /// Recipe provenance of `value` — the recipe-space temp a certificate walk
     /// (function/resource verification) associates with the held value, so a
     /// later `Deref` purifies to the pure term this chunk was produced from.
@@ -198,6 +295,7 @@ impl Chunk {
             addr,
             perm,
             value,
+            guard: Rc::from(Vec::new()),
             recipe: None,
         }
     }
@@ -205,6 +303,17 @@ impl Chunk {
 
     pub fn with_recipe(mut self, recipe: Option<crate::vmir::Val>) -> Self {
         self.recipe = recipe;
+        self
+    }
+
+    /// This chunk's residual presence guard (relative to the heap `pc`).
+    pub(crate) fn guard(&self) -> &[(egg::Id, Polarity)] {
+        &self.guard
+    }
+
+    /// Return this chunk with residual presence guard `guard` (structural share).
+    pub(crate) fn with_guard(mut self, guard: HeapPc) -> Self {
+        self.guard = guard;
         self
     }
 }
@@ -218,6 +327,10 @@ impl Chunk {
 /// chunk per address (the same-address merge happens in `declaration.rs`). The
 /// vec shape is the prerequisite for the lazy Σ-ite permission model (chunks
 /// accumulating per `acc`), which lands later.
+///
+/// A chunk's reachability is carried by its own [`Chunk::guard`] (a flat cube),
+/// not by a heap-level path condition — the join merge appends the branch literal
+/// per chunk, and the consume sites gate against `guard ∧` the instruction pc.
 #[derive(Debug, Clone)]
 pub struct Heap {
     groups: im::HashMap<LocationKind, Rc<[Chunk]>>,
