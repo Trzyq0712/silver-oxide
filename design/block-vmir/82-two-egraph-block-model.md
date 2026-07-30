@@ -5,6 +5,25 @@
 > between-sessions reference for the two-egraph redesign. Approved 2026-07-29.
 > Related: `README.md` (invariants), components `20`/`30`/`50`, `81-stage4-*`,
 > memory `project_two_egraph_block_model`.
+>
+> ## ⚠ Superseded in part — read this first (2026-07-30)
+>
+> Implemented, measured, and **partly overturned by the measurements**. The plan
+> below is kept as written, because its reasoning is still the best statement of
+> the model; the deltas are:
+>
+> | Plan says | What actually happened |
+> |---|---|
+> | Invariant 1 kills the OOB crash "by construction" (`tr` = total lookup) | The crash was **four id-hygiene bugs**, fixed **unconditionally** — chiefly importing `nodes[0]` of a *canonical* class (`Lit(true)` for anything merged with `true`) instead of `id_to_node`'s node-minted-at-that-id, and a `watermark` from `memo.len()` which *shrinks* on a reduce. `tr` still imports (recipe `build`s bypass the mirror hooks); the import is now faithful, so drift is safe rather than fatal. |
+> | Invariants 2 + 3: never prove on / saturate / reduce ground in-block | **Dropped.** Scratch-as-sole-prover cost ~6× (81% of runtime in scratch saturation). Replaced by a **ground-first hybrid**: tiers 0/1/2 on ground, scratch as a *reusable* tier 3. Perf parity restored (`structs_enums` 1.56s vs 1.59s baseline). |
+> | Invariant 4: scratch assumes unguarded | Kept, and now **unconditional** (the `SILVER_OXIDE_TWO_EGRAPH` flag is gone — it measured behaviour- and perf-identical once the scratch stopped being the sole prover). |
+> | Invariant 5: extra PC only for expression-embedded side conditions | **Empirically false.** 115 of 123 extra-PC obligations come from `prove_perm_leaves` — the suffix is the *held permission's own branch structure*. Restate as "side conditions **or** per-leaf permission structure"; not worth asserting. |
+> | Invariant 6: statement insts carry block-PC only | Holds everywhere measured (lib 303, corpus 47, matrix 27) under `SILVER_OXIDE_ASSERT_BLOCK_PC`. The predicted `unfolding` violation is real but **benign** — the lowering re-folds (effect is scoped) and fabricates no permission, so the S1 mitigation "reject `unfolding`" was **not** implemented: the invariant is too strong, not the code. |
+> | Invariant 7 needs two `Heap` instances | **One ground heap suffices**: a guarded debit *distributed* across the pc-alias set. Matches Silicon's default `consumeGreedy` (`PermMin` + carried remainder). The parked-negative form needs the guarded-Σ-ite read side, which is Silicon's `moreCompleteExhale` mode. |
+> | Staging S1→S4 | S1 landed (reshaped), S2's invariant 7 landed for fields + predicates + symbolic amounts, S3 measured (5 and 6 restated), S4 cleanup done. Remaining: the guarded-Σ-ite read side, and the ghost archive for the per-block re-derivation cost. |
+>
+> Full narrative, numbers and failed experiments: `PROGRESS.md`, entries dated
+> 2026-07-30.
 
 ## Context
 

@@ -11,6 +11,52 @@ local/ghost fork/remap.
 
 ---
 
+## 2026-07-28 — Stage 4.4 + Stage 5 landed: fork is the ONLY model; tier-4 slimmed to function-only
+
+**Committed to the fork.** `SILVER_OXIDE_BLOCK_MERGE` flipped default ON, validated
+(303 lib + 3 suite + perf baseline + feature-matrix all green, methods `prove_splits: 0`),
+then the flag and the entire OFF (linear-thread) path were **deleted**. `block_merge_enabled`
+gone; `method.rs` lowering emits `HeapInst::Merge`/`PcKind::Cube` unconditionally; the linear
+`h_in` cursor + the `block_merge` conditionals in `sink.rs`/`declaration.rs` removed. Note:
+`gate_perm`/`gate_value`/`PcKind::Branch` are **kept** — they are NOT OFF-path-only, they gate
+function-body ternaries (`pure_exp.rs`) and predicate/footprint conditions (`spatial.rs`).
+
+**KEY FINDING — tier-4 is NOT fully replaced.** The fork restructures **method CFGs** into
+blocks; **pure functions** stay expression trees. A branching function whose `?:` arms
+establish `result` differently still needs a case split — even `absv(x){x>=0?x:-x} ensures
+result>=0` fails without one (confirmed identical on committed HEAD, so this is pre-existing,
+not a regression; `absv` itself also needs sign arithmetic the e-graph lacks — `clamp` and the
+two `*_post_under_a_branch_via_case_split` e2e tests are the real guards). So tier-4 was
+**slimmed, not deleted** (user decision): the heavy method-oriented machinery
+(`split_tree` iterative-deepening, `SPLIT_BUDGET`, whole-pc-cone `split_candidates`) is gone,
+replaced by a **goal-directed, function-only** `split_prove`/`split_goal` — reads candidate
+conditions off the **goal term only**, depth-first, terminated by an `assumed` set, no budget.
+Behaviorally identical to old tier-4 on function cases; methods never reach it (splits=0).
+
+**Rule diet (Stage 5).** Removed: `lt-ite` (+ `LtBucketSearcher`/`LtIteDistributeApplier`/
+`LtPlan`) — its job was the scaled-perm `c?p:0 ≥ 0` obligation, gone under per-leaf proving
+(A/B: lib+suite+perf green without it, fires 0× on baselines); the `PRUNE_ITE` opt-in
+`ite-then/else-context` pair — targeted a select tower the fork never materializes; the
+commented mult/plus/minus/real-ite blocks; and the now-decided experiment env-knobs
+(`NO_LTITE`/`NO_DISTRIB`/`NO_EQITE`/`NO_MIRROR`/`NO_CONTRA`, `NO_TIER4`). **Kept** (argued):
+all algebraic give-back cancellation (`add-sub-cancel`/`sub-self`/… — cancel borrow cycles,
+a mechanism SEPARATE from CFG-join towers), disequality unit-prop (`eq-false-*`,
+`contra-congruence`, `eq-false-mirror`), `ite-reduce`, quantifier/function rules.
+
+**`merge_ite_sum` DROPPED entirely** (user: "all perm reasoning should happen directly").
+Both uses gone — the `prove_perm_ineq` lazy collapse AND the `merge_chunks` eager
+additive-aliasing collapse — plus `flatten_plus`/`merge_summands`/`prove_merge_fallback`.
+`prove_perm_ineq` and `prove_obligation` collapsed into plain `prove_under_pc`; with the
+NoSplit gating gone the whole `Escalate` enum + `prove_under_pc_esc` were inlined away (every
+prove now runs the full ladder). Structural per-leaf proving (`prove_perm_leaves`) covers what
+the collapse did: 303 lib + 3 suite + perf all green (baselines unchanged — the collapse never
+fired on them), method corpus fails=0/splits=0, aliasing corpus (pred_merge/deref) still green.
+Net src delta for the whole session ≈ **−660 lines**.
+
+**Gate:** external `structs_enums` corpus (user-run) is the final soundness check before merge.
+
+---
+
 ## 2026-07-27 (end of session) — full tier-4-hunt clean; no perf regressions; Stage-5 scoped
 
 **Feature-matrix tier-4 hunt (analysis/feature_matrix_2026-07-24/vpr, 27 cases): ALL verify
@@ -275,3 +321,261 @@ register, migration gates) reconciled to neighbour-consistent, plus the staged v
 `exhale …#ensures 1/1`, a **representation** gap — value phi already collapses, perm does not
 (`Σ ite(flag,1/1,0)` with a `0` leaf). Block joins route perm through the same exhaustive
 edge → structural collapse. VMIR no longer quadratic (`1b53e98`).
+
+---
+
+## 2026-07-30 — S1: two-egraph id separation + `tr` crash fix (flag-gated)
+
+**Status:** implemented, uncommitted on `backend-blocks`, behind
+`SILVER_OXIDE_TWO_EGRAPH` (default **off**). Plans: `82-two-egraph-block-model.md`
+(model/invariants) + `~/.claude/plans/plan-it-wise-taco.md` (S1 exec plan).
+
+**Milestone met.** `analysis/feature_matrix_2026-07-24/vpr/generic_option__match_flat.vpr`
+panics on HEAD (`egg unionfind index out of bounds`) and verifies 59/59 declarations
+with the flag on. Gates: `cargo test --lib` 303/303 **both** polarities, `tests/suite.rs`
+3/3 both, feature matrix 27/27 with 0 panics on.
+
+**Shipped (on-path):** eager per-block scratch (`begin_block`); scratch assumes
+**unguarded** (invariant 4, `scratch_assume_unguarded`); in-block `prove_under_pc`
+routed to the scratch before the ground tier-2 `saturate`; ground `reduce()` disabled
+in-block and run **between** blocks instead; framing matches in the scratch via
+`heap_canons` (batched, one saturation per match) in `chunk_under_pc` +
+`find_chunk_consolidated`; `reduce_scratch` cheap tier with `dirty`/`dirty_reduce`;
+`prove_via_scratch` tiers reduce-then-saturate; `rewrite::Memo` overlays became a
+**stack** keyed by scope id, and the block scratch `resume`s one scope for its whole
+lifetime.
+
+**Four id-mistranslation bugs (all silent; each broke a cluster of tests):**
+1. `with_scratch_graph` swapped ground for a throwaway clone with the scratch still
+   attached — the mirror recorded `map` keys that ceased to exist on restore.
+2. `tr` began with `egraph.find(g)`. Ground canonicalization is not
+   meaning-preserving for the scratch: once anything merges into the `true` class,
+   ground `find` hands back the `true` leader, so every assumed fact translated to
+   scratch-`true` and each mirrored union degenerated to `true == true`. Raw ids only.
+3. Import used `egraph[g].nodes[0]` — an arbitrary member of the *canonical* class
+   (`Lit(true)` for anything merged with `true`). Now `id_to_node(g)`, the node minted
+   at that uncanonical id.
+4. `watermark` used `total_size()` (`memo.len()`, which *shrinks* on a reduce), so
+   pre-clone ids fell onto the import path and import rebuilt an **unmerged** copy of a
+   class the clone already had merged. Now `egraph.nodes().len()`.
+
+**Known deviation from invariant 1:** `tr` still imports (faithfully) instead of
+asserting, because recipe `.build()` writes straight to `ctx.egraph`, bypassing the
+`add`/`union` mirror hooks. Routing `build` through the mirror is the prerequisite for
+the assert. Invariant 6's `unfolding`-rejection was not needed (no corpus case hits it).
+
+**Perf: on is ~6× slower** — `structs_enums.vpr` 1.59s → 9.4s, corpus suite 0.43 →
+2.67s. Measured causes:
+- Ground *is* thinner (clone bases 39–1434 nodes; legacy ground peaked at 3861), and
+  the prover graph is rebuilt per block from a cold applier memo.
+- Sharing the memo across blocks (unsound experiment: scratch runs writing `base`)
+  gives 9.47 → 4.88s, so ≈2× is **cross-block** re-derivation. The correct per-scratch
+  overlay scope gave **zero** gain, which pins the loss as cross-block rather than
+  cross-obligation — and memo bookkeeping cannot fix it, since block B's clone
+  genuinely lacks block A's instances (suppressing the rebuild without the instance
+  present would be a completeness bug).
+- Remaining ≈3× unattributed: the scratch peaks at 32k nodes / 14.8k classes vs
+  legacy's 3861 / 2867.
+
+**Two things to keep straight when reasoning about that growth:** instantiation is
+**presence**-triggered, not truth-triggered (`ForallApplier` adds the guarded
+`Ite(forall, inst, true)` whatever the forall's truth; `f%pre` is a presence token) —
+so guards were never keeping appliers dormant; the live hypothesis is trigger
+*surfacing* (the assumed cube collapses `ite`s and merges classes, so more trigger
+terms exist), still unverified. And unioning with `true` does not shrink the graph:
+unions merge classes but never delete nodes.
+
+**Failed experiments (recorded so they are not retried blind):** ground `saturate()`
+at every block boundary (>2min); one ground `saturate()` per method (10.5s — ground is
+near-empty at method entry); out-of-band export of conditional obligations
+(23.3s — `record_proven`'s union into ground is load-bearing); scratch reuse across
+same-cube chains (never fires, consecutive cubes always differ).
+
+**Next:** the real lever is the ghost archive — let the *definitional* tier
+(axiom/forall/function-unfold instances, unconditionally valid) land in ground so all
+blocks share it, while PC-dependent derivations stay scratch-only. Then S2 (dual heap
++ guarded ground debit), S3 (tier-3/statement-PC hardening), S4 (cleanup + flip
+default; perf-regression baselines need re-recording — the deltas are fingerprint-only).
+
+### 2026-07-30 (same session) — pivot to a ground-first hybrid; crash fix is unconditional
+
+Strict S1 (scratch = sole prover) cost ~6×, and a wall-clock breakdown by e-graph
+(new `VerifyStats::graph_timing`) put **81% of the runtime in scratch
+saturate/reduce** (7.64s of 9.4s), ground at 0.61s — *less* than the 1.08s ground
+spends with the flag off — clone at 0.48s, probes at 0.02s. So neither the clone nor
+the dual-graph bookkeeping was the problem; the cost was saturating a per-block graph.
+
+**Ground-first (user's proposal, implemented).** Tiers 0/1/2 run on ground again and
+the scratch becomes a *reusable* tier 3 — legacy behaviour plus reuse across
+obligations that share a PC. If a block never needs the scratch it never pays for one.
+Results: `structs_enums.vpr` **1.55s vs 1.59s off**, corpus suite 0.42 vs 0.43,
+perm-cycle cases identical (0.16 / 0.11), scratch time 0.02s, lib 303/303 and suite
+3/3 both polarities, feature matrix 27/27 with 0 panics, and the `perf_regression`
+baseline passes again. Scratch counters on now match off exactly (14 clones / 14
+saturations).
+
+**The crash fix turned out to be unconditional.** `generic_option__match_flat.vpr`
+verifies 59/59 with the flag **off** as well. The OOB was the four id-hygiene bugs —
+above all the unfaithful `nodes[0]` import and the `memo.len()` watermark — not the
+two-egraph discipline. Invariant 1 is therefore now "imports are faithful, so drift is
+safe" rather than "drift is impossible by construction".
+
+**Invariants 2 and 3 are no longer enforced**: ground is proven on and saturated
+in-block. Soundness is unaffected (ground never has the PC assumed unguarded, so its
+facts stay guarded and nothing leaks to a sibling or a join), but **S2 loses an
+inherited argument**: the scratch heap's PC-aware chunk identity was justified by
+ground never seeing PC-derived facts, and that justification has to be re-established
+against the hybrid rather than assumed.
+
+**Open question recorded separately:** assuming a PC *unguarded* inflates the graph
+~8× (32k nodes / 14.8k classes vs 3861 / 2867) for the same obligation count, with 9×
+the rule applications. Not applier-unblocking — instantiation is presence-triggered.
+Leading hypothesis is trigger *surfacing* (the assumed cube collapses `ite`s and merges
+classes, so more terms sit in matchable positions), unverified. This matters well
+beyond the block work: it is the same shape as the heap-free-precondition pollution
+multiplier, and it argues for keeping guarded representations and proving structurally
+rather than by assumption.
+
+### 2026-07-30 (same session) — adjusted S2 first increment: invariant 7 (pc-alias consume)
+
+The S2 gate was an adversarial aliasing case, and it **failed on both polarities**
+before this change: `requires acc(x.f,1/2) && acc(y.f,1/2)` then `exhale acc(x.f,1/1)`
+under `if (x == y)`. Distinct chunks on ground; one location holding `1/1` wherever the
+pc holds.
+
+**Shipped** (`ctx.pc_alias_partners`, `ctx.gate_amount_by_pc`,
+`heap_subtract_pc_aliased`): when the plain sufficiency proof fails, probe for chunks
+that alias the demanded address *only* under the pc, prove `Σ holds ≥ needed` under the
+pc, assume value agreement **guarded** (unioning outright would claim `x.f == y.f` on
+the `x != y` path), and debit guarded — `pc ? take : 0`. No chunk is merged: ground
+never consolidates conditionally-equal addresses.
+
+**Which half of the plan got implemented (a real divergence, not a plan defect).** The
+consume model specifies *two* halves: park the whole debit on the demanded chunk as a
+guarded negative, **and** read permissions as a guarded Σ-ite,
+`avail(x.f) = perm(f(x)) + ite(x==y, perm(f(y)), 0) + …`, so "how much came from each
+chunk" is a non-question. That is sound. What we have today is only the first half:
+reads consult a *single* chunk, with no alias sum. Parking the debit against that read
+path is unsound, and two canaries proved it: after the `1/1` consume, `assert y.f == y.f` wrongly verified
+(partner still reading `1/2`), and so did `exhale acc(y.f,1/2)` — the latter never even
+reaching the alias fallback, since the partner's own half satisfies the plain proof. So
+the debit is instead **distributed greedily across the alias set**, each chunk giving up
+`min(holds, still needed)` gated by the pc. That drives every member to its true
+remainder, keeps the per-chunk `≥ 0` obligation intact by construction, and needs no
+alias probe on subsequent operations.
+
+**These are Silicon's two exhale modes, checked against its source** — not a "real
+design" and a "workaround":
+
+- **Greedy (Silicon's default), `ChunkSupporter.consumeGreedy:152`**: `findChunk` resolves
+  the address syntactically *or via the prover* (`findChunkWithProver`, which knows
+  `x == y` from the path condition), then takes `toTake = PermMin(ch.perm, perms)` from
+  that chunk and carries `PermMinus(perms, toTake)` on as the remaining demand. That is
+  exactly the distributed `min(holds, still needed)` debit implemented here.
+- **`moreCompleteExhale` (opt-in / fallback), `MoreCompleteExhaleSupporter.permSummariseOnly:56`**:
+  `permissionSum = PermPlus(permissionSum, Ite(argumentEqualities, ch.perm, NoPerm))`,
+  with the value side guarded identically
+  (`Implies(And(argumentEqualities, IsPositive(ch.perm)), ?s === ch.snap)`). This is the
+  guarded Σ-ite the consume model's step 4 describes.
+
+**Neither mode merges chunks at consume time** — merging lives only in
+`StateConsolidator`. For us a merge would be outright wrong: the ground heap is PC-unaware,
+so a merged chunk would leak onto the `x != y` path.
+
+So we now match Silicon's default mode. The Σ-ite read side remains worth building (it
+never attributes fractions to particular chunks, and it is what Silicon falls back to when
+greedy is incomplete), but it is an *alternative* mode rather than a correction of this
+one. The four canaries pin the observable behaviour under either.
+
+**Gates:** lib 303/303 both polarities, corpus **29 passing / 12 failing all correct**
+(4 new cases: `passing/permissions/pc_alias_consume_sums_halves.vpr` +
+`failing/pc_alias_{double_spend,partner_read,partner_double_spend}.vpr`), feature matrix
+27/27 with 0 panics, `perf_regression` baseline passes, `structs_enums.vpr` 1.57s vs
+1.59s baseline. The probe is only paid when the plain proof fails, so unaliased consumes
+cost nothing.
+
+**Still open for S2:** predicate-kind locations (only field chunks are exercised by the
+canaries); a symbolic-fraction case (the `min` `ite` folds away for concrete fractions,
+so the symbolic path is untested); and the second `Heap` instance from the original plan
+is now unnecessary — a single ground heap with guarded distributed debits covers
+invariant 7, which is a simplification the pivot bought.
+
+### 2026-07-30 (same session) — S3 measured: invariants 5 and 6 both need restating
+
+**Invariant 6 (statement insts carry block-PC only) — holds, with one exception, and the
+exception is fine.** Added `assert_statement_pc_is_block_cube`, gated on
+`SILVER_OXIDE_ASSERT_BLOCK_PC` (an env gate rather than `debug_assert`, so it can run in
+release over the corpus and matrix — a `debug_assert` compiles out of exactly the runs
+that exercise interesting programs). Clean on lib 303, corpus 47 cases, matrix 27/27.
+
+The one violating shape is the one plan 82 predicted, `unfolding p in e` under a ternary:
+`pc = [b]` against an empty block cube. But the plan's conclusion — reject the construct
+in S1 — does **not** follow from what it actually does. Measured:
+`assert (unfolding acc(P(x),1/1) in x.f == x.f)` verifies, a *trailing* `assert x.f == x.f`
+correctly fails (so the lowering re-folds: the effect is scoped, not leaked), and a guarded
+`unfolding` demanding `1/1` while only `1/2` is held is correctly rejected (no permission
+fabrication). So `unfolding` is sound today and merely violates the invariant's letter.
+**Rejection not implemented** — it would delete working functionality to satisfy an
+invariant that is itself too strong. Behaviour pinned instead by
+`passing/predicates/unfolding_expr_scoped_read.vpr` +
+`failing/unfolding_expr_{does_not_leak,needs_permission}.vpr`.
+
+**Invariant 5 (extra PC only for expression-embedded side conditions) — empirically
+false as written.** New non-gated counters `prove_in_block_{cube_only,extra_pc}` plus a
+`#[track_caller]` + `SILVER_OXIDE_TRACE_EXTRA_PC` attribution. On `structs_enums.vpr`:
+2652 cube-only vs 205 extra-pc (7%). Across corpus + matrix, every extra-pc obligation
+comes from one of three places:
+
+- **115 from `prove_perm_leaves`** (`prove_sufficient` 95, `prove_perm_positive` 20) —
+  the suffix is the *held permission's own branch structure*, not an expression guard.
+  This is the dominant source and the plan does not mention it. Benign by construction:
+  each leaf is proven under exactly the branch that reaches it.
+- **8 from the per-inst obligation loop** (`declaration.rs:2774`) — these are the
+  expression-embedded ones invariant 5 describes: a `perm(...)` expression under a
+  ternary (`conditional_perm_matches_exhale.vpr`) and the guarded `unfolding` above.
+- **0 function-precondition or division checks** in this corpus, in-block.
+
+So invariant 5 should be restated as "extra PC comes from expression-embedded side
+conditions *or* from the branch structure of a permission being proven per-leaf", and it
+is not worth asserting. No perf cost from the instrumentation (1.54–1.57s vs 1.57s;
+`perf_regression` passes).
+
+### 2026-07-30 (same session) — S4: flag deleted, dead code removed, plan 82 marked superseded-in-part
+
+**`SILVER_OXIDE_TWO_EGRAPH` is gone.** After the pivot it selected exactly one thing —
+invariant 4, unguarded scratch assumes — and measured identical either way (1.55–1.57s
+both, same saturation/free-hit/tier-3 counts, 2 rule applications apart). Invariant 4 is
+right in principle and free, and it matters more once the scratch is used harder, so it is
+now **unconditional** and the knob is deleted rather than left as a flag whose meaning
+nobody could state. `scratch_assume_unguarded` carries the reasoning in its doc comment.
+
+**Dead code removed:** `in_two_egraph_block` (unused), `heap_canons` (after framing
+returned to ground it was a batched `egraph.find` behind a misleading name — inlined).
+`reduce_scratch` + `dirty_reduce` are **kept**: still load-bearing for the tiered scratch
+prove. Stale comments corrected — `chunk_under_pc` no longer claims to match in the
+scratch, and the `BlockScratch` doc now says imports come from `id_to_node` (the node
+minted at that exact uncanonical id) rather than "a ground representative", which is the
+distinction the crash turned on.
+
+**Plan 82 now opens with a superseded-in-part table** (crash fixed by id-hygiene not by
+construction; invariants 2/3 dropped; 4 unconditional; 5 restated; 6 too strong; 7 needs
+one heap; staging status), and the README row points at it. The plan body is kept as
+written — its reasoning is still the clearest statement of the model.
+
+**Final state of this branch (all uncommitted):**
+
+- lib **303/303**, also 303/303 with `SILVER_OXIDE_ASSERT_BLOCK_PC=1`
+- corpus **33 passing / 17 failing correctly rejected / 1 known-limitation**
+  (+1 passing, +3 failing, +1 known-limitation this session beyond the alias four)
+- feature matrix **27/27**, and a **78-file panic sweep across corpus + matrix: 0 panics**
+- `perf_regression` baseline **passes unchanged**
+- `structs_enums.vpr` **1.56s** (baseline 1.59s), `structs_enums_base.vpr` 1.06s
+- the original crash repro verifies **59/59 declarations**
+
+**Open, in rough priority order:** (1) the ghost archive — share definitional instances so
+per-block re-derivation stops costing ~2×, the one lever left on the two-egraph perf story;
+(2) the guarded-Σ-ite perm read side, which would let invariant 7 use the more faithful
+parked-negative debit (Silicon's `moreCompleteExhale`); (3) why assuming a PC inflates the
+graph ~8× — still unattributed, and it bears on far more than this work; (4)
+`known_limitations/perm_sign_from_earlier_conjunct.vpr` — a precondition's earlier conjunct
+does not inform a later `acc`'s perm-sign side condition, which Silicon accepts.

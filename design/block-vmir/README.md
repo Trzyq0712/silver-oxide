@@ -74,6 +74,8 @@ understanding / Open decisions / Sketch / Risks / Depends-feeds / Status).
 | 60 | [components/60-risks-soundness.md](components/60-risks-soundness.md) | consolidated risk register + adversarial tests; loops; certs/recipes; quantifiers | all | **no high-severity design-sink risk remains** (see register) |
 | 70 | [components/70-migration-gates.md](components/70-migration-gates.md) | incremental migration, kill switches, benchmarks, go/no-go gates | all | seeded |
 | 80 | [80-implementation-plan.md](80-implementation-plan.md) | **staged v1 build plan** (single ground e-graph; M1→M3, skips M2) | all | **assembled 2026-07-26** |
+| 81 | [81-stage4-implementation.md](81-stage4-implementation.md) | **Stage 4 code-level guide** (ChunkPerm storage, merge_heaps, dead-arm) — for the implementing agent | 10,30,50,80 | **written 2026-07-27** (pre-impl) |
+| 82 | [82-two-egraph-block-model.md](82-two-egraph-block-model.md) | two-egraph exec (ground+scratch); 7 invariants; stages S1–S4. **Read its superseded-in-part header first**: crash fixed by id-hygiene (not by construction), invariants 2/3 dropped for a ground-first hybrid, 5 restated, 7 needs only one heap | 20,30,50 | **implemented + partly overturned 2026-07-30** — see PROGRESS.md |
 
 ---
 
