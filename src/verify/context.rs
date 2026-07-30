@@ -489,9 +489,10 @@ impl<'a> VerifyContext<'a> {
         self.egraph = self.saturate_flat(egraph);
         if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
             eprintln!(
-                "[ground-sat] {n0}n/{c0}c -> {}n/{}c ({} iters)",
+                "[ground-sat] {n0}n/{c0}c -> {}n/{}c true={} ({} iters)",
                 self.egraph.total_number_of_nodes(),
                 self.egraph.number_of_classes(),
+                { let t = self.egraph.find(self.true_id_cached()); self.egraph[t].nodes.len() },
                 self.alloc.stats.sat_iterations - it0,
             );
         }
@@ -539,6 +540,12 @@ impl<'a> VerifyContext<'a> {
         self.alloc.stats.reduces += 1;
         self.alloc.stats.record_run(&iterations);
         self.clean = Some(self.clean_tag(CleanLevel::Reduce));
+    }
+
+    fn true_id_cached(&self) -> egg::Id {
+        self.egraph
+            .lookup(Symbolic::Lit(Literal::Bool(true)))
+            .expect("true present")
     }
 
     pub(crate) fn add(&mut self, node: Symbolic) -> egg::Id {
@@ -921,11 +928,13 @@ impl<'a> VerifyContext<'a> {
         sc.egraph = self.saturate_flat(sc.egraph);
         if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
             eprintln!(
-                "[scratch-sat] {n0}n/{c0}c -> {}n/{}c  (ground {}n/{}c, {} iters)",
+                "[scratch-sat] {n0}n/{c0}c -> {}n/{}c true={} (ground {}n/{}c true={}, {} iters)",
                 sc.egraph.total_number_of_nodes(),
                 sc.egraph.number_of_classes(),
+                { let t = sc.egraph.find(sc.true_id); sc.egraph[t].nodes.len() },
                 self.egraph.total_number_of_nodes(),
                 self.egraph.number_of_classes(),
+                { let t = self.egraph.find(self.true_id_cached()); self.egraph[t].nodes.len() },
                 self.alloc.stats.sat_iterations - before,
             );
         }
