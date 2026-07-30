@@ -1,0 +1,14 @@
+// Predicate counterpart of failing/pc_alias_partner_double_spend.vpr: after the
+// pc-aliased `1/1` consume, the partner's own remaining half must be gone too.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref, y: Ref)
+    requires acc(P(x), 1/2) && acc(P(y), 1/2)
+{
+    if (x == y) {
+        exhale acc(P(x), 1/1)
+        exhale acc(P(y), 1/2)
+    }
+}

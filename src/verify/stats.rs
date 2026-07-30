@@ -65,6 +65,13 @@ pub struct VerifyStats {
     /// clone+saturate path (the clearest deterioration signal).
     pub prove_calls: u64,
     pub prove_tier3: u64,
+    /// In-block obligations split by how their pc relates to the block cube
+    /// (invariant 5 of the two-egraph block model): `cube_only` needs no extra
+    /// assumption beyond what the block already establishes, `extra_pc` carries a
+    /// suffix and should only ever be an expression-embedded side condition — a
+    /// function precondition or a division/mod check. Non-gated (a measurement).
+    pub prove_in_block_cube_only: u64,
+    pub prove_in_block_extra_pc: u64,
     /// Goals discharged by tier 3.5 — non-forking `ite`-goal decomposition
     /// (a constant branch reduces the goal to its other branch, no case split).
     pub prove_tier35: u64,
@@ -75,6 +82,8 @@ pub struct VerifyStats {
     pub prove_splits: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
+    /// Per-e-graph wall clock (ground vs block scratch vs probes vs clones).
+    pub graph_timing: GraphTimingTrend,
     /// Per-rule search/apply wall clock (excluded from `Eq` / the snapshot).
     pub rule_timing: RuleTimingTrend,
 }
@@ -90,6 +99,32 @@ impl PartialEq for TimingTrend {
     }
 }
 impl Eq for TimingTrend {}
+
+/// Wall-clock seconds attributed to each e-graph a run maintains, so a
+/// two-egraph run can be read as "how much went to ground vs the block scratch".
+/// Non-deterministic — a trend, never gated.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GraphTiming {
+    /// `saturate()` + `reduce()` on the persistent ground graph.
+    pub ground: f64,
+    /// `saturate_scratch()` + `reduce_scratch()` on the per-block scratch.
+    pub scratch: f64,
+    /// `run_probe()` — throwaway clones (tier-3 goal probes, WD checks).
+    pub probe: f64,
+    /// Building a block scratch: the ground clone plus the cube unions/rebuild.
+    pub scratch_clone: f64,
+}
+
+/// [`GraphTiming`] wrapper, `Eq`-transparent like [`TimingTrend`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GraphTimingTrend(pub GraphTiming);
+
+impl PartialEq for GraphTimingTrend {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for GraphTimingTrend {}
 
 /// Wall-clock seconds one rule spent in its searcher/applier over the whole
 /// run. Non-deterministic — a trend, never gated.

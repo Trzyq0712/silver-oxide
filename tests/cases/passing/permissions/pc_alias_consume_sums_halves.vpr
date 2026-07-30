@@ -1,0 +1,18 @@
+// Invariant 7 of the two-egraph block model: a consume whose sufficiency holds
+// only because the path condition makes two chunks alias.
+//
+// `acc(x.f,1/2)` and `acc(y.f,1/2)` are distinct chunks on ground, but under the
+// in-branch `x == y` they are one location holding `1/1`, so exhaling `1/1`
+// succeeds. The debit is recorded guarded and distributed across the alias set, so
+// ground never merges chunks that are only conditionally equal.
+// Negative counterparts: failing/pc_alias_{double_spend,partner_*}.vpr
+
+field f: Int
+
+method m(x: Ref, y: Ref)
+    requires acc(x.f, 1/2) && acc(y.f, 1/2)
+{
+    if (x == y) {
+        exhale acc(x.f, 1/1)
+    }
+}

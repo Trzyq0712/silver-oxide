@@ -776,26 +776,31 @@ fn find_chunk_consolidated(
     pc_lits: &[(egg::Id, Polarity)],
     retry_on_miss: bool,
 ) -> (Heap, Option<Chunk>) {
-    let mut canon = ctx.egraph.find(addr);
-    let matches = |ctx: &VerifyContext<'_>, h: &Heap, canon: egg::Id| -> Vec<Chunk> {
-        h.chunks_of(kind)
+    // Address matching is ground e-class equality. Chunk canons are snapshotted up
+    // front because the retry below mutates the graph, and canons from before and
+    // after a `reduce` are not comparable.
+    let chunks_vec: Vec<Chunk> = h.chunks_of(kind).to_vec();
+    let canon = ctx.egraph.find(addr);
+    let chunk_canons: Vec<egg::Id> =
+        chunks_vec.iter().map(|c| ctx.egraph.find(c.addr)).collect();
+    let collect_found = |canon: egg::Id, chunk_canons: &[egg::Id]| -> Vec<Chunk> {
+        chunks_vec
             .iter()
-            .filter(|c| ctx.egraph.find(c.addr) == canon)
-            .cloned()
+            .zip(chunk_canons)
+            .filter(|(_, cc)| **cc == canon)
+            .map(|(c, _)| c.clone())
             .collect()
     };
-    let mut found = matches(ctx, h, canon);
+    let mut found = collect_found(canon, &chunk_canons);
+    // Retry-on-miss: the subtracted address may be a recipe-rebuilt snapshot spine
+    // (`@addr(cons.0(f(.., Some(unwrap(proj_0(s))))))`) that only meets the held
+    // chunk's address after the terminating reductions collapse the snapshot towers.
     if found.is_empty() && retry_on_miss {
-        // Miss: the subtracted address may be a recipe-rebuilt snapshot spine
-        // (`@addr(cons.0(f(.., Some(unwrap(proj_0(s))))))`) that only meets
-        // the held chunk's address after the terminating reductions collapse
-        // the snapshot towers. The rebuild-time reduce is conditional on new
-        // e-nodes, which misses when an earlier (e.g. dead-branch) occurrence
-        // already created them — so normalize once here and retry before
-        // reporting a miss.
         ctx.reduce();
-        canon = ctx.egraph.find(addr);
-        found = matches(ctx, h, canon);
+        let canon = ctx.egraph.find(addr);
+        let chunk_canons: Vec<egg::Id> =
+            chunks_vec.iter().map(|c| ctx.egraph.find(c.addr)).collect();
+        found = collect_found(canon, &chunk_canons);
     }
     let Some(first) = found.first().cloned() else {
         return (h.clone(), None);
@@ -1094,6 +1099,19 @@ fn heap_subtract(
     // branch-structured) held perm — the `Select` never enters the graph.
     let proven = prove_sufficient(ctx, &existing.perm, chunk2_perm, pc_lits);
     if !proven {
+        // Invariant 7 — consume under **pc-implied aliasing**. `acc(x.f,1/2)` and
+        // `acc(y.f,1/2)` are distinct chunks on ground, but under an in-branch
+        // `x == y` they are one location holding `1/1`. Sum the demanded chunk with
+        // its pc-alias partners and re-prove; the debit stays guarded (below), so
+        // ground never consolidates two chunks that are only conditionally equal.
+        //
+        // Tried only after the plain proof fails: no unaliased consume pays the probe.
+        let partners = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
+        if !partners.is_empty() {
+            return heap_subtract_pc_aliased(
+                ctx, h1, out, kind, &existing, chunk2, chunk2_perm, &partners, pc_lits,
+            );
+        }
         if crate::verify::viz::dump_perm_enabled() {
             let existing_perm = existing.perm.to_id(ctx);
             eprintln!(
@@ -1145,6 +1163,146 @@ fn heap_subtract(
         );
     }
     Ok(out)
+}
+
+/// Consume `chunk2` when sufficiency only holds because the pc makes other chunks
+/// alias `chunk2.addr` (invariant 7 of the two-egraph block model).
+///
+/// - **Sufficiency** is proven against the *sum* over the demanded chunk and its
+///   pc-alias `partners`: at any state where the pc holds they are one location, so
+///   their fractions add (`1/2 + 1/2 ≥ 1/1`).
+/// - **The debit is guarded and _distributed_** across the alias set, greedily:
+///   each chunk gives up `min(it holds, still needed)`, gated by `pc ? take : 0`. No
+///   chunk is merged — off-path the locations are genuinely distinct and nothing there
+///   was given up.
+///
+///   Distribution (rather than parking the whole debit on the demanded chunk as a
+///   guarded negative) is what makes every *later* operation correct without another
+///   alias probe. Parking it leaves the partner reading `1/2` when the location
+///   actually holds nothing, so `assert y.f == y.f` and even `exhale acc(y.f,1/2)`
+///   would both wrongly succeed — the latter never reaching this function at all,
+///   since the partner's own half satisfies the plain proof. Distributing drives every
+///   member of the set to its true remainder, so the unsummed per-address view stays
+///   sound and the per-chunk `≥ 0` obligation is preserved by construction.
+/// - **Value agreement** is likewise assumed only under the pc: unioning the two
+///   values outright would claim `x.f == y.f` on the path where `x != y`.
+#[allow(clippy::too_many_arguments)]
+fn heap_subtract_pc_aliased(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    out: Heap,
+    kind: &LocationKind,
+    existing: &Chunk,
+    chunk2: Chunk,
+    chunk2_perm: egg::Id,
+    partners: &[egg::Id],
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Result<Heap, VerifyError> {
+    let mut total = existing.perm.to_id(ctx);
+    for addr in partners {
+        let Some(p) = h1
+            .chunks_of(kind)
+            .iter()
+            .find(|c| ctx.egraph.find(c.addr) == ctx.egraph.find(*addr))
+            .map(|c| c.perm.clone())
+        else {
+            continue;
+        };
+        let p = p.to_id(ctx);
+        total = ctx.add(Symbolic::Binary(BinOp::AddR, [total, p]));
+    }
+    // `needed ≤ total`, i.e. `!(total < needed)`, under the pc.
+    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [total, chunk2_perm]));
+    let false_ = ctx.false_();
+    let true_ = ctx.true_();
+    let sufficient = ctx.add(Symbolic::Ite([lt, false_, true_]));
+    if !ctx.prove_under_pc(sufficient, pc_lits) {
+        return Err(VerifyError::InsufficientPermission);
+    }
+    // Golden rule, but only where the locations coincide.
+    let agree = ctx.add(Symbolic::Binary(BinOp::Eq, [existing.value, chunk2.value]));
+    ctx.assume_guarded(agree, pc_lits.iter().rev().copied());
+
+    // Greedy distribution over the alias set, demanded chunk first.
+    let mut out = out;
+    let mut remaining = chunk2_perm;
+    let set: Vec<Chunk> = std::iter::once(existing.clone())
+        .chain(partners.iter().filter_map(|a| {
+            h1.chunks_of(kind)
+                .iter()
+                .find(|c| ctx.egraph.find(c.addr) == ctx.egraph.find(*a))
+                .cloned()
+        }))
+        .collect();
+    for chunk in set {
+        let hold = chunk.perm.to_id(ctx);
+        // `min(hold, remaining)` — a symbolic hold needs the `ite`; concrete
+        // fractions fold it away.
+        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [hold, remaining]));
+        let take = ctx.add(Symbolic::Ite([lt, hold, remaining]));
+        let gated = ctx.gate_amount_by_pc(take, pc_lits);
+        let rest = perm_sub(ctx, &chunk.perm, gated);
+        remaining = ctx.add(Symbolic::Binary(BinOp::SubR, [remaining, take]));
+        // Same hygiene as the plain path: drop a chunk only when the remainder is
+        // *unconditionally* zero (off-path the permission was never given up).
+        if perm_all_zero(ctx, &rest) {
+            out = out.without_chunk(kind, chunk.addr);
+        } else {
+            out = out.with_chunk(
+                kind,
+                Chunk::new_perm(chunk.addr, rest, chunk.value)
+                    .with_recipe(chunk.recipe.clone()),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Invariant 6 of the two-egraph block model (`design/block-vmir/82-*.md`):
+/// statement-level heap instructions operate at the **block-PC level only** — their
+/// `inst.pc` is exactly the block cube, never a cube plus a suffix — because they
+/// cannot appear as sub-expressions. Expression-embedded obligations (a function
+/// precondition, a division check) are the only things allowed an extra suffix.
+///
+/// Checked rather than assumed, because the lowering is where it could silently
+/// break, and a violation would mean a heap effect landing under a condition the
+/// block model does not know about. Gated on `SILVER_OXIDE_ASSERT_BLOCK_PC` so it can
+/// be run over the corpus and feature matrix in release builds (a `debug_assert`
+/// would compile out of exactly the runs that exercise interesting programs).
+///
+/// Known violating shape: `unfolding p in e` is a Viper *expression* but is lowered to
+/// a statement-level `HeapInst::Unfold`, so it can sit under an extra ternary guard.
+/// Plan 82 proposes rejecting it until it becomes a scoped node.
+fn assert_statement_pc_is_block_cube(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    inst: &Inst,
+) {
+    if !ctx.in_block() || std::env::var_os("SILVER_OXIDE_ASSERT_BLOCK_PC").is_none() {
+        return;
+    }
+    let statement_level = matches!(
+        inst.kind,
+        InstKind::Heap(
+            HeapInst::Inhale { .. }
+                | HeapInst::Exhale { .. }
+                | HeapInst::Fold { .. }
+                | HeapInst::Unfold { .. }
+                | HeapInst::Assign(..)
+        )
+    );
+    if !statement_level {
+        return;
+    }
+    let pc = collect_pc_lits(ctx, state, &inst.pc);
+    assert!(
+        cube_eq(ctx, &pc, ctx.current_cube()),
+        "invariant 6: statement-level inst carries a pc other than the block cube \
+         ({} literals vs {} in the cube) — kind {:?}",
+        pc.len(),
+        ctx.current_cube().len(),
+        std::mem::discriminant(&inst.kind),
+    );
 }
 
 /// Set-equality of two guard cubes under canonical e-classes (order-insensitive;
@@ -2586,6 +2744,7 @@ fn walk_body(
     mut footprint_ops: Option<&mut Vec<(Val, vmir::Perm)>>,
 ) -> Result<(), VerifyError> {
     for (inst_idx, inst) in insts.iter().enumerate() {
+        assert_statement_pc_is_block_cube(ctx, state, inst);
         if let (Some(ops), InstKind::Heap(HeapInst::Combine { loc, perm, .. })) =
             (&mut footprint_ops, &inst.kind)
         {

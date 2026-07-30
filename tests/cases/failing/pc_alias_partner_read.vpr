@@ -1,0 +1,15 @@
+// The guarded debit must be *distributed* across the pc-alias set, not parked as a
+// negative on the demanded chunk: after exhaling the full `1/1`, the partner `y.f`
+// holds nothing either, so reading it must fail. Parking the debit on `x.f` alone
+// leaves `y.f` reading `1/2` and this case wrongly verifies.
+
+field f: Int
+
+method m(x: Ref, y: Ref)
+    requires acc(x.f, 1/2) && acc(y.f, 1/2)
+{
+    if (x == y) {
+        exhale acc(x.f, 1/1)
+        assert y.f == y.f
+    }
+}

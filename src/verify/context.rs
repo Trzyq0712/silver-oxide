@@ -110,11 +110,12 @@ pub(crate) struct VerifyContext<'a> {
 /// Id-space handling: ids present at build time are identical in both graphs
 /// (clone preserves them), so a ground id below `watermark` translates to itself.
 /// Ids minted after the build are mirrored through the `add`/`union` hooks into
-/// `map`. A ground id at-or-above `watermark` that is *not* in the map is a
-/// rule-derived operand the scratch never received (e.g. a `find`-canonical
-/// leader produced by a ground `reduce`/`saturate`): [`VerifyContext::tr`]
-/// imports it on demand (extract a ground representative, re-add into the
-/// scratch), so the scratch is a valid clone base under any ground state.
+/// `map`. A ground id at-or-above `watermark` that is *not* in the map is either a
+/// rule-derived operand the scratch never received (ground *is* saturated in-block
+/// under the ground-first model) or an unmirrored recipe `build`:
+/// [`VerifyContext::tr`] imports it on demand from `id_to_node` — the node minted at
+/// that exact uncanonical id, never a canonical-class representative — so the scratch
+/// is a valid clone base under any ground state.
 struct BlockScratch {
     egraph: egg::EGraph<Symbolic, ConstFold>,
     /// ground id → scratch id, for mints recorded since the clone.
@@ -133,6 +134,16 @@ struct BlockScratch {
     /// saturation. Avoids re-saturating an unchanged scratch across consecutive
     /// obligations.
     dirty: bool,
+    /// Applier-memo scope for **this scratch graph**, resumed by each of its runs.
+    /// The graph outlives a single run, so its memo must too — see the scoping
+    /// notes in `rewrite`. A fresh scope per run would forget instances that are
+    /// still in the graph and rebuild them on every obligation.
+    scope: u64,
+    /// As `dirty`, but for the cheap reduce-only run used by **framing**
+    /// ([`VerifyContext::reduce_scratch`]). A full saturation subsumes a reduce, so
+    /// it clears both; a reduce clears only this one — otherwise every framing
+    /// lookup would force the next obligation to re-saturate from scratch.
+    dirty_reduce: bool,
 }
 
 impl BlockScratch {
@@ -249,6 +260,7 @@ impl<'a> VerifyContext<'a> {
             let sc = self.scratch.as_mut().unwrap();
             sc.egraph.union(ta, tb);
             sc.dirty = true;
+            sc.dirty_reduce = true;
         }
         merged
     }
@@ -260,7 +272,13 @@ impl<'a> VerifyContext<'a> {
     /// a valid clone base even when a lazy/structural ground has surfaced
     /// rule-derived ids as operands.
     fn tr(&mut self, g: egg::Id) -> egg::Id {
-        let g = self.egraph.find(g);
+        // NB: **no** ground `find` here. Ground canonicalization is not
+        // meaning-preserving for the scratch: the first union that merges a term
+        // into the `true` class makes ground `find` return the `true` leader for it,
+        // so canonicalizing first would translate *every* such term to the scratch's
+        // `true` — silently turning each mirrored union/assume into `true == true`.
+        // Under invariant 3 (ground never saturates/reduces in-block) ground grows
+        // only through mirrored ops, so the raw id a caller holds is a stable name.
         match self.scratch.as_ref() {
             None => return g,
             Some(sc) => {
@@ -269,8 +287,16 @@ impl<'a> VerifyContext<'a> {
                 }
             }
         }
+        // Miss: an unmirrored ground mint — recipe `build`s add straight to
+        // `ctx.egraph`, bypassing the `add`/`union` hooks (invariant 1's remaining
+        // gap; closing it means routing `build` through the mirror). Import it
+        // **faithfully**: `id_to_node(g)` is the node *minted at that id*, whereas
+        // `self.egraph[g].nodes[0]` picks an arbitrary member of `g`'s canonical
+        // class — once any union merged `g` into the `true` class that representative
+        // is `Lit(true)`, so the import would silently turn the imported term into
+        // `true` (and any mirrored union over it into `true == true`).
         use egg::Language as _;
-        let node = self.egraph[g].nodes[0].clone();
+        let node = self.egraph.id_to_node(g).clone();
         let kids: Vec<egg::Id> = node.children().to_vec();
         let tkids: Vec<egg::Id> = kids.iter().map(|c| self.tr(*c)).collect();
         let mut snode = node;
@@ -281,16 +307,53 @@ impl<'a> VerifyContext<'a> {
         let s = sc.egraph.add(snode);
         sc.map.insert(g, s);
         sc.dirty = true;
+        sc.dirty_reduce = true;
         s
+    }
+
+    /// Whether we are inside a method block's **body** walk (the join phase runs
+    /// outside one — its cube's reach boolean is materialized *by* the join).
+    pub(crate) fn in_block(&self) -> bool {
+        self.in_block
+    }
+
+    /// The current block's control cube, as live ids. Empty outside a block body.
+    pub(crate) fn current_cube(&self) -> &[(egg::Id, Polarity)] {
+        &self.current_cube
+    }
+
+    /// Assume `fact` **unguarded** in the block scratch (invariant 4 of
+    /// `design/block-vmir/82-two-egraph-block-model.md`): the scratch already bakes in
+    /// the block PC and only ever discharges that block's goals, so a Viper
+    /// `assume`/`inhale` fact holds there outright — no need to make `ite-reduce`
+    /// release it from under a guard first. Ground keeps the PC-guarded implication, so
+    /// the fact cannot leak to a sibling path — see [`Self::assume_guarded`].
+    ///
+    /// Unconditional since 2026-07-30 (was `SILVER_OXIDE_TWO_EGRAPH`): measured
+    /// behaviour- and perf-identical either way once the scratch became a tier-3
+    /// fallback rather than the sole prover, so the knob only obscured the model.
+    fn scratch_assume_unguarded(&mut self, fact: egg::Id) {
+        if self.scratch.is_none() {
+            return;
+        }
+        let tf = self.tr(fact);
+        let sc = self.scratch.as_mut().unwrap();
+        let true_s = sc.true_id;
+        sc.egraph.union(tf, true_s);
+        sc.dirty = true;
+        sc.dirty_reduce = true;
     }
 
     /// Mirror a ground `add` of `node` (which produced ground id `ground_id`)
     /// into the block scratch, translating its children through [`Self::tr`].
     /// Idempotent per ground class.
     fn mirror_add(&mut self, ground_id: egg::Id, node: Symbolic) {
-        let key = self.egraph.find(ground_id);
+        // Key on the id `add` returned, raw — see the `find` note in [`Self::tr`].
+        let key = ground_id;
         if self.scratch.as_ref().unwrap().map.contains_key(&key) {
-            self.scratch.as_mut().unwrap().dirty = true;
+            let sc = self.scratch.as_mut().unwrap();
+            sc.dirty = true;
+            sc.dirty_reduce = true;
             return;
         }
         use egg::Language as _;
@@ -304,6 +367,7 @@ impl<'a> VerifyContext<'a> {
         let s = sc.egraph.add(snode);
         sc.map.insert(key, s);
         sc.dirty = true;
+        sc.dirty_reduce = true;
     }
 
     /// Whether the e-graph has reached a contradiction (some e-class merged
@@ -418,8 +482,10 @@ impl<'a> VerifyContext<'a> {
         if self.is_clean(CleanLevel::Full) {
             return;
         }
+        let t = std::time::Instant::now();
         let egraph = std::mem::take(&mut self.egraph);
         self.egraph = self.saturate_flat(egraph);
+        self.alloc.stats.graph_timing.0.ground += t.elapsed().as_secs_f64();
         self.alloc.stats.saturations += 1;
         self.clean = Some(self.clean_tag(CleanLevel::Full));
     }
@@ -451,6 +517,7 @@ impl<'a> VerifyContext<'a> {
         if self.is_clean(CleanLevel::Reduce) {
             return;
         }
+        let t = std::time::Instant::now();
         let egraph = std::mem::take(&mut self.egraph);
         let (egraph, iterations) = run_rules(
             egraph,
@@ -458,6 +525,7 @@ impl<'a> VerifyContext<'a> {
             None,
         );
         self.egraph = egraph;
+        self.alloc.stats.graph_timing.0.ground += t.elapsed().as_secs_f64();
         self.alloc.stats.reduces += 1;
         self.alloc.stats.record_run(&iterations);
         self.clean = Some(self.clean_tag(CleanLevel::Reduce));
@@ -573,6 +641,8 @@ impl<'a> VerifyContext<'a> {
         let imp = self.implication(fact, guards);
         let true_ = self.true_();
         self.union(imp, true_);
+        // Invariant 4: ground guarded, scratch unguarded.
+        self.scratch_assume_unguarded(fact);
         self.egraph.rebuild();
     }
 
@@ -589,6 +659,8 @@ impl<'a> VerifyContext<'a> {
         for fact in facts {
             let imp = self.implication(fact, guards.iter().copied());
             self.union(imp, true_);
+            // Invariant 4: ground guarded, scratch unguarded.
+            self.scratch_assume_unguarded(fact);
         }
         self.egraph.rebuild();
     }
@@ -615,12 +687,30 @@ impl<'a> VerifyContext<'a> {
     ///
     /// On success the implication is merged with `true` in the live graph so the
     /// next identical obligation hits tier 1. (Tiers 1/2 already have it merged.)
+    #[track_caller]
     pub(crate) fn prove_under_pc(
         &mut self,
         goal: egg::Id,
         pc_lits: &[(egg::Id, Polarity)],
     ) -> bool {
         self.alloc.stats.prove_calls += 1;
+        // Invariant-5 measurement: does this in-block obligation need anything beyond
+        // the block cube? Every cube literal appears in `pc_lits` (the lowering wraps
+        // the body in the cube), so "extra" is simply a longer pc.
+        if self.in_block {
+            if pc_lits.len() > self.current_cube.len() {
+                self.alloc.stats.prove_in_block_extra_pc += 1;
+                if std::env::var_os("SILVER_OXIDE_TRACE_EXTRA_PC").is_some() {
+                    eprintln!(
+                        "[extra-pc] +{} lits over cube, from {}",
+                        pc_lits.len() - self.current_cube.len(),
+                        std::panic::Location::caller(),
+                    );
+                }
+            } else {
+                self.alloc.stats.prove_in_block_cube_only += 1;
+            }
+        }
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
 
@@ -633,6 +723,7 @@ impl<'a> VerifyContext<'a> {
         {
             return true;
         }
+
         // Tier 0: the held facts are contradictory (e.g. a field location holds
         // > 1/1 permission) — every goal is vacuously provable.
         if self.is_inconsistent() {
@@ -733,12 +824,14 @@ impl<'a> VerifyContext<'a> {
 
     /// Enter a method block: record its control cube (shared pc of all its
     /// insts) and drop any previous block's scratch (sibling cubes are mutually
-    /// exclusive, so it cannot be reused). The scratch itself is (re)built lazily
-    /// on the block's first tier-3 obligation.
+    /// exclusive, so it cannot be reused). Under the two-egraph discipline the
+    /// scratch is built **eagerly** here so it is the coherent reasoning graph for
+    /// the whole body (proving *and* framing), keeping ground raw; otherwise it is
+    /// (re)built lazily on the block's first tier-3 obligation.
     pub(crate) fn begin_block(&mut self, cube: Vec<(egg::Id, Polarity)>) {
+        self.scratch = None;
         self.current_cube = cube;
         self.in_block = true;
-        self.scratch = None;
     }
 
     /// Leave the block walk (after the last block, or before a non-block walk):
@@ -759,11 +852,14 @@ impl<'a> VerifyContext<'a> {
         let true_id = self.true_();
         let false_id = self.false_();
         let cube = std::mem::take(&mut self.current_cube);
+        let t_clone = std::time::Instant::now();
         let mut egraph = self.egraph.clone();
-        // Id-space boundary = the clone's e-node count *before* the cube unions
-        // (which only merge, never add ids) and any later rebuild (which can only
-        // shrink `total_size`). Ground ids below it are identity-valid here.
-        let watermark = egraph.total_size();
+        // Id-space boundary = the size of the *id-indexed* node vector, i.e. the
+        // number of ids ever minted. Not `total_size()` (= `memo.len()`, which
+        // dedups and *shrinks* on a reduce): an under-count there pushes genuine
+        // pre-clone ids onto `tr`'s import path, and importing rebuilds an
+        // **unmerged** copy of a class whose ground merges the clone already had.
+        let watermark = egraph.nodes().len();
         for (id, pol) in &cube {
             let lit = if matches!(pol, Polarity::Positive) {
                 true_id
@@ -782,7 +878,10 @@ impl<'a> VerifyContext<'a> {
             watermark,
             true_id,
             dirty: true,
+            dirty_reduce: true,
+            scope: rewrite::new_scope_id(),
         });
+        self.alloc.stats.graph_timing.0.scratch_clone += t_clone.elapsed().as_secs_f64();
         self.alloc.stats.block_scratch_clones += 1;
     }
 
@@ -792,13 +891,43 @@ impl<'a> VerifyContext<'a> {
         if !self.scratch.as_ref().is_some_and(|s| s.dirty) {
             return;
         }
-        let _scope = rewrite::ScratchScope::enter();
         let mut sc = self.scratch.take().expect("scratch live");
+        let _scope = rewrite::ScratchScope::resume(sc.scope);
+        let _t = std::time::Instant::now();
         let before = self.alloc.stats.sat_iterations;
         sc.egraph = self.saturate_flat(sc.egraph);
         self.alloc.stats.block_scratch_saturations += 1;
         self.alloc.stats.block_scratch_iterations += self.alloc.stats.sat_iterations - before;
         sc.dirty = false;
+        sc.dirty_reduce = false;
+        self.alloc.stats.graph_timing.0.scratch += _t.elapsed().as_secs_f64();
+        self.scratch = Some(sc);
+    }
+
+    /// Run only the terminating structural reductions on the block scratch — the
+    /// scratch counterpart of [`Self::reduce`], and what **framing** needs: address
+    /// matching wants snapshot towers collapsed, not the full rule set. Keeping this
+    /// separate from [`Self::saturate_scratch`] is what stops every heap lookup from
+    /// paying a full saturation (the in-block equivalent of ground's cheap `reduce`).
+    fn reduce_scratch(&mut self) {
+        if !self.scratch.as_ref().is_some_and(|s| s.dirty_reduce) {
+            return;
+        }
+        let mut sc = self.scratch.take().expect("scratch live");
+        let _scope = rewrite::ScratchScope::resume(sc.scope);
+        let _t = std::time::Instant::now();
+        let egraph = std::mem::take(&mut sc.egraph);
+        let (egraph, iterations) = run_rules(
+            egraph,
+            self.static_reduce.iter().chain(self.alloc.rules()),
+            None,
+        );
+        sc.egraph = egraph;
+        self.alloc.stats.record_run(&iterations);
+        // A reduce is not a saturation: leave `dirty` set so the next obligation
+        // still runs the full rule set.
+        sc.dirty_reduce = false;
+        self.alloc.stats.graph_timing.0.scratch += _t.elapsed().as_secs_f64();
         self.scratch = Some(sc);
     }
 
@@ -815,6 +944,20 @@ impl<'a> VerifyContext<'a> {
         let tg = self.tr(goal);
         let tpc: Vec<(egg::Id, Polarity)> =
             pc_lits.iter().map(|(id, p)| (self.tr(*id), *p)).collect();
+        // Tier the scratch the way the ground path is tiered: try the cheap
+        // reductions first and saturate only if the goal is still open. Saturating
+        // unconditionally is what made the scratch expensive — with the block PC
+        // assumed *unguarded* (invariant 4) the `ite` guards no longer throttle
+        // function-unfold / axiom-trigger / forall cascades, so a full run can grow
+        // the graph 20-30× for a goal the reductions already close.
+        self.reduce_scratch();
+        {
+            let sc = self.scratch.as_ref().expect("scratch live");
+            if sc.egraph.find(tg) == sc.egraph.find(sc.true_id) {
+                self.alloc.stats.block_scratch_freehits += 1;
+                return true;
+            }
+        }
         self.saturate_scratch();
 
         let sc = self.scratch.as_ref().expect("scratch live");
@@ -1061,8 +1204,10 @@ impl<'a> VerifyContext<'a> {
         probe: egg::EGraph<Symbolic, ConstFold>,
     ) -> egg::EGraph<Symbolic, ConstFold> {
         let _scope = crate::verify::rewrite::ScratchScope::enter();
+        let t = std::time::Instant::now();
         let iters_before = self.alloc.stats.sat_iterations;
         let out = self.saturate_flat(probe);
+        self.alloc.stats.graph_timing.0.probe += t.elapsed().as_secs_f64();
         self.alloc.stats.probe_saturations += 1;
         self.alloc.stats.probe_iterations += self.alloc.stats.sat_iterations - iters_before;
         out
@@ -1118,15 +1263,85 @@ impl<'a> VerifyContext<'a> {
         chunks.iter().find(move |c| probe.find(c.addr) == canon)
     }
 
+    /// The chunks that alias `addr` **only under `pc_lits`** — pc-equal but not
+    /// ground-equal. These are the partners a consume may draw on (invariant 7): at
+    /// a state where the pc holds they are the *same* location as `addr`, so their
+    /// fractions add, while on ground they stay distinct and must not be merged.
+    /// Returns their addresses (stable keys into the heap group).
+    ///
+    /// Same probe shape as [`Self::chunk_under_pc`], but collects every match rather
+    /// than the first: sufficiency needs the whole sum, not one partner.
+    pub(crate) fn pc_alias_partners(
+        &mut self,
+        chunks: &[crate::verify::heap::Chunk],
+        addr: egg::Id,
+        pc_lits: &[(egg::Id, Polarity)],
+    ) -> Vec<egg::Id> {
+        if pc_lits.is_empty() {
+            return Vec::new();
+        }
+        let ground = self.egraph.find(addr);
+        let mut probe = self.egraph.clone();
+        for (id, pol) in pc_lits {
+            let want_true = matches!(pol, Polarity::Positive);
+            // Unsatisfiable pc: the consume is vacuous, so inventing partners would
+            // only mask that — leave it to the (vacuous-pc) obligation check.
+            if matches!(probe[*id].data.known(), Some(Literal::Bool(b)) if *b != want_true) {
+                return Vec::new();
+            }
+            let lit = probe.add(Symbolic::Lit(Literal::Bool(want_true)));
+            probe.union(*id, lit);
+        }
+        probe.rebuild();
+        let probe = self.run_probe(probe);
+        let canon = probe.find(addr);
+        chunks
+            .iter()
+            .filter(|c| probe.find(c.addr) == canon && self.egraph.find(c.addr) != ground)
+            .map(|c| c.addr)
+            .collect()
+    }
+
+    /// Gate a permission amount by a path condition: `pc ? amount : 0`. The ground
+    /// heap records a pc-alias consume as a **guarded** debit (invariant 7) — the
+    /// full amount comes off the demanded chunk where the pc holds, and nothing comes
+    /// off where it does not (there the chunks are distinct and nothing was given up).
+    pub(crate) fn gate_amount_by_pc(
+        &mut self,
+        amount: egg::Id,
+        pc_lits: &[(egg::Id, Polarity)],
+    ) -> egg::Id {
+        let zero = self.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+        pc_lits.iter().fold(amount, |acc, (lit, pol)| {
+            let arms = if matches!(pol, Polarity::Positive) {
+                [*lit, acc, zero]
+            } else {
+                [*lit, zero, acc]
+            };
+            self.add(Symbolic::Ite(arms))
+        })
+    }
+
     /// Run `f` with `self.egraph` swapped for a scratch clone of the live
     /// graph, restoring the live graph — and its fixpoint cache, which `f`'s
     /// scratch runs would otherwise clobber — afterwards. The whole extent is
     /// a scratch memo scope.
+    /// The block scratch is **detached** for the extent: inside `f` the "ground"
+    /// graph is a throwaway whose ids are restored away afterwards, so mirroring
+    /// into the scratch would record `map` entries keyed by ids that cease to mean
+    /// anything — a stale entry then makes `tr` hand back an unrelated class
+    /// (invariant 1). With the scratch detached, `f`'s obligations take the
+    /// non-block path (saturate + clone the throwaway), which is what the swapped
+    /// universe wants anyway.
     pub(crate) fn with_scratch_graph<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let _scope = crate::verify::rewrite::ScratchScope::enter();
         let live = self.egraph.clone();
         let clean = self.clean;
+        let scratch = self.scratch.take();
+        let in_block = std::mem::replace(&mut self.in_block, false);
         let out = f(self);
+        self.in_block = in_block;
+        self.scratch = scratch;
         self.egraph = live;
         self.clean = clean;
         out

@@ -1,0 +1,15 @@
+// Invariant 7 for a *predicate* location, not just a field: under `x == y` the two
+// half-permissions to `P(x)` / `P(y)` are one resource holding `1/1`. The pc-alias
+// consume path is LocationKind-generic, so this needed no separate support.
+// Negative counterpart: failing/pc_alias_predicate_double_spend.vpr
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref, y: Ref)
+    requires acc(P(x), 1/2) && acc(P(y), 1/2)
+{
+    if (x == y) {
+        exhale acc(P(x), 1/1)
+    }
+}

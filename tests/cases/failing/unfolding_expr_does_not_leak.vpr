@@ -1,0 +1,13 @@
+// The `unfolding` must not leave the predicate unfolded after its expression: the
+// trailing read of `x.f` has no permission and must be rejected. Guards the "scoped"
+// half of unfolding_expr_scoped_read.vpr.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref)
+    requires acc(P(x), 1/1)
+{
+    assert (unfolding acc(P(x), 1/1) in x.f == x.f)
+    assert x.f == x.f
+}

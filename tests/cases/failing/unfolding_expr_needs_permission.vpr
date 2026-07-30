@@ -1,0 +1,12 @@
+// A guarded `unfolding` still has to pay for what it unfolds: only 1/2 of `P(x)` is
+// held while the unfolding demands 1/1, so this must be rejected. Guards against the
+// expression-level unfold fabricating permission on its guarded path.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref, b: Bool)
+    requires acc(P(x), 1/2)
+{
+    assert b ? (unfolding acc(P(x), 1/1) in true) : true
+}

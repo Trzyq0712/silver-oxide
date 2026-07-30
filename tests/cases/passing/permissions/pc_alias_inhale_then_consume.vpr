@@ -1,0 +1,15 @@
+// The inhale side needs no alias handling of its own: an `inhale` under `x == y`
+// stores an ordinary (pc-guarded) chunk at `x.f`, and the *consume*-side alias sum
+// (invariant 7) is what adds it to the half already held at `y.f` to reach `1/1`.
+// Leak counterpart: failing/pc_alias_inhale_does_not_leak.vpr
+
+field f: Int
+
+method m(x: Ref, y: Ref)
+    requires acc(y.f, 1/2)
+{
+    if (x == y) {
+        inhale acc(x.f, 1/2)
+        exhale acc(x.f, 1/1)
+    }
+}

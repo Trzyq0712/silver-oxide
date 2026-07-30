@@ -1,0 +1,14 @@
+// Symbolic-amount counterpart of failing/pc_alias_double_spend.vpr: after the
+// pc-aliased `p + p` (= 1/1) consume, the alias set is empty, so a further `p` fails.
+
+field f: Int
+
+method m(x: Ref, y: Ref, p: Perm)
+    requires acc(x.f, 1/2) && acc(y.f, 1/2)
+{
+    assume p == 1/2
+    if (x == y) {
+        exhale acc(x.f, p + p)
+        exhale acc(x.f, p)
+    }
+}

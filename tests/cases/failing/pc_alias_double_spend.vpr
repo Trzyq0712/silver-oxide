@@ -1,0 +1,14 @@
+// Counterpart to passing/permissions/pc_alias_consume_sums_halves.vpr: once the
+// pc-aliased `1/1` is consumed, the alias set holds nothing, so a further `1/2`
+// must be rejected. Guards against the alias sum being credited twice.
+
+field f: Int
+
+method m(x: Ref, y: Ref)
+    requires acc(x.f, 1/2) && acc(y.f, 1/2)
+{
+    if (x == y) {
+        exhale acc(x.f, 1/1)
+        exhale acc(x.f, 1/2)
+    }
+}

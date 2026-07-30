@@ -1,0 +1,22 @@
+// KNOWN LIMITATION — should verify, currently rejected.
+//
+// The perm-sign side condition of `acc(x.f, p)` is discharged without the facts
+// established by *earlier* parts of the same specification: `0/1 < p` is already
+// stated, so `p` is provably positive by the time the `acc` is evaluated. Both the
+// separate-clause and the `&&` form fail identically, so it is not about clause
+// splitting — the side condition simply does not see the preceding conjunct.
+//
+// Silicon accepts both: `&&` is short-circuiting and `requires` clauses are
+// evaluated in order, so `0 < p` is in the path condition before the `acc`.
+//
+// Found 2026-07-30 while trying to build a symbolic-fraction canary for the
+// pc-alias consume path (invariant 7) — the inability to hold a symbolic
+// non-negative fraction is why that path is only covered with concrete fractions.
+// Tracked in design/block-vmir/PROGRESS.md.
+
+field f: Int
+
+method n(x: Ref, p: Perm)
+    requires 0/1 < p
+    requires acc(x.f, p)
+{}

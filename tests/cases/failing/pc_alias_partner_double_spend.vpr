@@ -1,0 +1,15 @@
+// The sharpest form: after the pc-aliased `1/1` consume, exhaling the partner's own
+// remaining half must fail. This one never reaches the alias-sum fallback (the
+// partner's `1/2` satisfies the plain sufficiency proof on its own), so only a
+// distributed debit rejects it.
+
+field f: Int
+
+method m(x: Ref, y: Ref)
+    requires acc(x.f, 1/2) && acc(y.f, 1/2)
+{
+    if (x == y) {
+        exhale acc(x.f, 1/1)
+        exhale acc(y.f, 1/2)
+    }
+}

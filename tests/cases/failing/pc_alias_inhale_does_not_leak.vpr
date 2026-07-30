@@ -1,0 +1,14 @@
+// The conditionally inhaled half must not be credited outside its branch: after the
+// `if`, only the original `1/2` at `y.f` is held, so exhaling `1/1` must fail. Guards
+// against a pc-alias inhale being merged into the partner chunk unconditionally.
+
+field f: Int
+
+method m(x: Ref, y: Ref)
+    requires acc(y.f, 1/2)
+{
+    if (x == y) {
+        inhale acc(x.f, 1/2)
+    }
+    exhale acc(y.f, 1/1)
+}

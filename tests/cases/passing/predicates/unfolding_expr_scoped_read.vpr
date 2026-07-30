@@ -1,0 +1,20 @@
+// `unfolding p in e` exposes the predicate body for the duration of `e` only. Both
+// the plain and the ternary-guarded form verify.
+//
+// Plan 82's invariant 6 (statement insts carry block-PC only) proposed *rejecting*
+// this construct, on the assumption that lowering it to a statement-level
+// `HeapInst::Unfold` broke the block model. Measured 2026-07-30: the lowering
+// re-folds, so the effect is scoped, and the guarded form fabricates no permission —
+// see the failing/unfolding_* counterparts. It does carry a pc suffix beyond the
+// block cube, so `SILVER_OXIDE_ASSERT_BLOCK_PC` fires on the guarded form; the
+// invariant is the thing that is too strong, not this code.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref, b: Bool)
+    requires acc(P(x), 1/1)
+{
+    assert (unfolding acc(P(x), 1/1) in x.f == x.f)
+    assert b ? (unfolding acc(P(x), 1/1) in x.f == x.f) : true
+}

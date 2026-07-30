@@ -1,0 +1,20 @@
+// pc-alias consume (invariant 7) with a *symbolic* demanded amount: `p + p` is built
+// from an opaque perm value, so the greedy debit's `min(holds, needed)` —
+// `ite(holds < needed, holds, needed)` — is constructed symbolically rather than
+// const-folded away as it is for literal fractions.
+//
+// `p`'s value arrives by `assume` rather than a precondition because a symbolic
+// non-negative fraction cannot currently be *held*: see
+// known_limitations/perm_sign_from_earlier_conjunct.vpr.
+// Negative counterpart: failing/pc_alias_symbolic_double_spend.vpr
+
+field f: Int
+
+method m(x: Ref, y: Ref, p: Perm)
+    requires acc(x.f, 1/2) && acc(y.f, 1/2)
+{
+    assume p == 1/2
+    if (x == y) {
+        exhale acc(x.f, p + p)
+    }
+}
