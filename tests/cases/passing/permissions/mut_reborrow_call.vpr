@@ -1,0 +1,1278 @@
+// Minimized reproducer: passing a `&mut` reborrow into a call.
+//
+// Prusti encoding of:
+//     pub struct C { pub n: i32 }
+//     pub fn bump(c: &mut C) { c.n = c.n + 1; }
+//     pub fn read(c: &C) -> i32 { c.n }
+//     pub fn once_param(c: &mut C) { bump(c); }
+//     pub fn twice_param(c: &mut C) { bump(c); bump(c); }
+//     pub fn mut_then_read(c: &mut C) -> i32 { bump(c); read(c) }
+//     pub fn twice_local() -> i32 { let mut c = C { n: 0 }; bump(&mut c); bump(&mut c); c.n }
+//     pub fn write_then_call(c: &mut C) { c.n = 5; bump(c); }
+//
+// All five callers failed with "insufficient permission" before the framing-miss retry
+// under full saturation: the reborrow's address term (`p_Ref_mutable_arbitrary_value`
+// spine) only meets the held chunk's address after the full rule set runs, and the miss
+// retry ran the terminating reductions only. Every Rust program that calls a helper
+// taking `&mut` hits this, so it guards the whole benchmarks/rust corpus.
+domain s_Param  {
+  
+  
+}
+
+domain s_Int_i32  {
+  
+  function s_Int_i32_cons(arg0: Int): s_Int_i32 
+  
+  function s_Int_i32_value(arg0: s_Int_i32): Int 
+  
+  axiom s_Int_i32_ax_cons {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      s_Int_i32_cons(s_Int_i32_value(s)) == s)
+  }
+  
+  axiom s_Int_i32_ax_bounds {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      -2147483648 <= s_Int_i32_value(s) && s_Int_i32_value(s) <= 2147483647)
+  }
+  
+  axiom s_Int_i32_ax_value {
+    (forall value: Int ::
+      { s_Int_i32_cons(value) }
+      -2147483648 <= value && value <= 2147483647 ==>
+      s_Int_i32_value(s_Int_i32_cons(value)) == value)
+  }
+}
+
+domain s_Bool  {
+  
+  function s_Bool_cons(arg0: Bool): s_Bool 
+  
+  function s_Bool_value(arg0: s_Bool): Bool 
+  
+  axiom s_Bool_ax_cons {
+    (forall s: s_Bool ::
+      { s_Bool_value(s) }
+      s_Bool_cons(s_Bool_value(s)) == s)
+  }
+  
+  axiom s_Bool_ax_value {
+    (forall value: Bool ::
+      { s_Bool_cons(value) }
+      s_Bool_value(s_Bool_cons(value)) == value)
+  }
+}
+
+domain TypeOf  {
+  
+  function s_C_typeof(arg0: s_C): Type 
+  
+  function s_Param_typeof(arg0: s_Param): Type 
+  
+  function s_0_Tuple_typeof(arg0: s_0_Tuple): Type 
+  
+  function s_Int_i32_typeof(arg0: s_Int_i32): Type 
+  
+  function s_Bool_typeof(arg0: s_Bool): Type 
+}
+
+domain trait_Pointee  {
+  
+  function Pointee_assoc_type_Metadata(arg0: Type): Type 
+  
+  function impl_Pointee(arg0: Type): Bool 
+}
+
+field p_Ref_mutable_val: s_Ref_mutable
+
+field p_Int_i32_val: s_Int_i32
+
+field p_Bool_val: s_Bool
+
+field p_Ref_immutable_val: s_Ref_immutable
+
+function mir_binop_AddWithOverflow_Int_i32_Int_i32(arg1: s_Int_i32, arg2: s_Int_i32): s_2_Tuple
+{
+  (let val ==
+    (s_Int_i32_value(arg1) + s_Int_i32_value(arg2)) in
+    (let wrapped_val ==
+      ((val + 2147483648) % 4294967296 - 2147483648) in
+      s_2_Tuple_cons(make_generic_s_Int_i32(s_Int_i32_cons(wrapped_val)), make_generic_s_Bool(s_Bool_cons(wrapped_val !=
+      val)))))
+}
+
+function make_generic_s_C(self: s_C): s_Param
+  ensures s_Param_typeof(result) == s_C_type()
+  ensures make_concrete_s_C(result) == self
+
+
+function make_concrete_s_C(snap: s_Param): s_C
+  ensures make_generic_s_C(result) == snap
+
+
+function make_generic_s_0_Tuple(self: s_0_Tuple): s_Param
+  ensures s_Param_typeof(result) == s_0_Tuple_type()
+  ensures make_concrete_s_0_Tuple(result) == self
+
+
+function make_concrete_s_0_Tuple(snap: s_Param): s_0_Tuple
+  ensures make_generic_s_0_Tuple(result) == snap
+
+
+function make_generic_s_Int_i32(self: s_Int_i32): s_Param
+  ensures s_Param_typeof(result) == s_Int_i32_type()
+  ensures make_concrete_s_Int_i32(result) == self
+
+
+function make_concrete_s_Int_i32(snap: s_Param): s_Int_i32
+  ensures make_generic_s_Int_i32(result) == snap
+
+
+function make_generic_s_Bool(self: s_Bool): s_Param
+  ensures s_Param_typeof(result) == s_Bool_type()
+  ensures make_concrete_s_Bool(result) == self
+
+
+function make_concrete_s_Bool(snap: s_Param): s_Bool
+  ensures make_generic_s_Bool(result) == snap
+
+
+function s_0_Tuple_unreachable(): s_0_Tuple
+  ensures false
+
+
+function s_Param_unreachable(T$0: Type): s_Param
+  ensures false
+
+
+function s_Ref_mutable_unreachable(U$1: Type): s_Ref_mutable
+  ensures false
+
+
+function s_Int_i32_unreachable(): s_Int_i32
+  ensures false
+
+
+function s_C_unreachable(): s_C
+  ensures false
+
+
+function s_C_field_0(self: Ref): Ref
+  ensures (self == null) == (result == null)
+
+
+function s_Bool_unreachable(): s_Bool
+  ensures false
+
+
+function s_2_Tuple_unreachable(T$0: Type, U$1: Type): s_2_Tuple
+  ensures false
+
+
+function s_2_Tuple_field_0(self: Ref, T$0: Type, U$1: Type): Ref
+  ensures (self == null) == (result == null)
+
+
+function s_2_Tuple_field_1(self: Ref, T$0: Type, U$1: Type): Ref
+  ensures (self == null) == (result == null)
+
+
+function s_Ref_immutable_unreachable(U$1: Type): s_Ref_immutable
+  ensures false
+
+
+function p_0_Tuple_snap(self: Ref): s_0_Tuple
+  requires acc(p_0_Tuple(self), write)
+{
+  (unfolding acc(p_0_Tuple(self), write) in s_0_Tuple_cons())
+}
+
+function p_Param_snap(self: Ref, T$0: Type): s_Param
+  requires acc(p_Param(self, T$0), write)
+
+
+function p_Ref_mutable_arbitrary_value(r: Ref, metadata: s_Param): s_Ref_mutable
+  ensures result.s_Ref_mutable_0 == r
+  ensures result.s_Ref_mutable_1 == metadata
+
+
+function p_Ref_mutable_snap(self: Ref, U$1: Type): s_Ref_mutable
+  requires acc(p_Ref_mutable(self, U$1), write)
+{
+  (unfolding acc(p_Ref_mutable(self, U$1), write) in
+    self.p_Ref_mutable_val)
+}
+
+function p_Int_i32_snap(self: Ref): s_Int_i32
+  requires acc(p_Int_i32(self), write)
+{
+  (unfolding acc(p_Int_i32(self), write) in self.p_Int_i32_val)
+}
+
+function p_C_snap(self: Ref): s_C
+  requires acc(p_C(self), write)
+{
+  (unfolding acc(p_C(self), write) in
+    s_C_cons(p_Int_i32_snap(s_C_field_0(self))))
+}
+
+function p_2_Tuple_snap(self: Ref, T$0: Type, U$1: Type): s_2_Tuple
+  requires acc(p_2_Tuple(self, T$0, U$1), write)
+{
+  (unfolding acc(p_2_Tuple(self, T$0, U$1), write) in
+    s_2_Tuple_cons(p_Param_snap(s_2_Tuple_field_0(self, T$0, U$1), T$0), p_Param_snap(s_2_Tuple_field_1(self,
+    T$0, U$1), U$1)))
+}
+
+function p_Bool_snap(self: Ref): s_Bool
+  requires acc(p_Bool(self), write)
+{
+  (unfolding acc(p_Bool(self), write) in self.p_Bool_val)
+}
+
+function p_Ref_immutable_snap(self: Ref, U$1: Type): s_Ref_immutable
+  requires acc(p_Ref_immutable(self, U$1), write)
+{
+  (unfolding acc(p_Ref_immutable(self, U$1), write) in
+    self.p_Ref_immutable_val)
+}
+
+predicate p_0_Tuple(self: Ref) {
+  true
+}
+
+predicate p_Param(self: Ref, T$0: Type) 
+
+predicate p_Ref_mutable(self: Ref, U$1: Type) {
+  acc(self.p_Ref_mutable_val, write)
+}
+
+predicate p_Int_i32(self: Ref) {
+  acc(self.p_Int_i32_val, write)
+}
+
+predicate p_C(self: Ref) {
+  acc(p_Int_i32(s_C_field_0(self)), write)
+}
+
+predicate p_2_Tuple(self: Ref, T$0: Type, U$1: Type) {
+  acc(p_Param(s_2_Tuple_field_0(self, T$0, U$1), T$0), write) &&
+  acc(p_Param(s_2_Tuple_field_1(self, T$0, U$1), U$1), write)
+}
+
+predicate p_Bool(self: Ref) {
+  acc(self.p_Bool_val, write)
+}
+
+predicate p_Ref_immutable(self: Ref, U$1: Type) {
+  acc(self.p_Ref_immutable_val, write)
+}
+
+method m_bump(_0p: Ref, _1p: Ref)
+  requires acc(p_Ref_mutable(_1p, s_C_type()), write)
+  requires acc(p_Param(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0,
+    s_C_type()), write)
+  ensures acc(p_0_Tuple(_0p), write)
+  ensures acc(p_Param(old(p_Ref_mutable_snap(_1p, s_C_type())).s_Ref_mutable_0,
+    s_C_type()), write)
+{
+  var _2p: Ref
+  var _3p: Ref
+  var _from_bb0_to_bb1: Bool
+  var _tmp0: s_Bool
+  var _tmp1: s_Int_i32
+  label start
+  // var _2p
+  // var _3p
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: StorageLive(_2)
+  label _before_0_1
+  // [MIR] bb0[1]: _2 = copy ((*_1).0: i32)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[1], eval_stmt_phase: PreOperands }))) })
+  unfold acc(p_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0), write)
+  // (PCG) handled edge Add: {*c} -> {(*c).n}
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb0[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Int_i32_assign(_2p, p_Int_i32_snap(s_C_field_0(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)))
+  label _before_0_2
+  // [MIR] bb0[2]: _3 = AddWithOverflow(copy _2, const 1_i32)
+  fold acc(p_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0), write)
+  // (PCG) handled edge Remove: {*c} -> {(*c).n}
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[1], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_2_Tuple_assign(_3p, s_Int_i32_type(), s_Bool_type(), mir_binop_AddWithOverflow_Int_i32_Int_i32(p_Int_i32_snap(_2p),
+    s_Int_i32_cons(1)))
+  label _before_0_3
+  // [MIR] bb0[3]: assert(!move (_3.1: bool), "attempt to compute `{} + {}`, which would overflow", move _2, const 1_i32) -> [success: bb1, unwind: bb2]
+  // PCG (T) pre_operands
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // [PCG] Expand(RepackExpand { from: _3, guide: None, capability: E, _marker: PhantomData<&()> })
+  unfold acc(p_2_Tuple(_3p, s_Int_i32_type(), s_Bool_type()), write)
+  make_concrete_Int_i32(s_2_Tuple_field_0(_3p, s_Int_i32_type(), s_Bool_type()))
+  make_concrete_Bool(s_2_Tuple_field_1(_3p, s_Int_i32_type(), s_Bool_type()))
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3.1, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  // var _tmp0
+  _tmp0 := p_Bool_snap(s_2_Tuple_field_1(_3p, s_Int_i32_type(), s_Bool_type()))
+  exhale acc(p_Bool(s_2_Tuple_field_1(_3p, s_Int_i32_type(), s_Bool_type())), write)
+  inhale s_Bool_value(_tmp0) == false
+  _from_bb0_to_bb1 := true
+  goto bb_1
+  label bb_1
+  label _before_1_0
+  // [MIR] bb1[0]: ((*_1).0: i32) = move (_3.0: i32)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3.0, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1).0, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals((*_1).0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }))) })
+  unfold acc(p_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0), write)
+  // (PCG) handled edge Add: {*c} -> {(*c).n}
+  // exhale due to Weaken(E, W)
+  exhale acc(p_Int_i32(s_C_field_0(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)), write)
+  // var _tmp1
+  _tmp1 := p_Int_i32_snap(s_2_Tuple_field_0(_3p, s_Int_i32_type(), s_Bool_type()))
+  exhale acc(p_Int_i32(s_2_Tuple_field_0(_3p, s_Int_i32_type(), s_Bool_type())), write)
+  p_Int_i32_assign(s_C_field_0(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0),
+    _tmp1)
+  label _before_1_1
+  // [MIR] bb1[1]: StorageDead(_2)
+  fold acc(p_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0), write)
+  // (PCG) handled edge Remove: {*c} -> {(*c).n}
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) Remove BorrowFlow(BorrowFlowEdge { source: LifetimeProjection { base: Place(Remote(RemotePlace { local: _1 })), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, target: LifetimeProjection { base: Current(_1), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, kind: InitialBorrows })
+  // (PCG) handled edge Remove: Remote(_1)↓'?3 -> c↓'?3
+  // [PCG] Collapse(RepackCollapse { to: _3, capability: W, guide: None, _marker: PhantomData<&()> })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _2, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _2 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_2
+  // [MIR] bb1[2]: _0 = const ()
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb1[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_0_Tuple_assign(_0p, s_0_Tuple_cons())
+  label _before_1_3
+  // [MIR] bb1[3]: return
+  // PCG (T) pre_operands
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post0
+  goto end
+  label bb_2
+  // cleanup block
+  assert false
+  goto end
+  label end
+  // return
+}
+
+method m_read(_0p: Ref, _1p: Ref)
+  requires acc(p_Ref_immutable(_1p, s_C_type()), write)
+  ensures acc(p_Int_i32(_0p), write)
+{
+  label start
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: _0 = copy ((*_1).0: i32)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (PCG) handled edge Add: {*c} -> {(*c).n}
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb0[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Int_i32_assign(_0p, make_concrete_s_C(p_Ref_immutable_snap(_1p, s_C_type()).s_Ref_immutable_2).s_C_0)
+  label _before_0_1
+  // [MIR] bb0[1]: return
+  // PCG (T) pre_operands
+  // (PCG) handled edge Remove: {*c} -> {(*c).n}
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb0[1], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) Remove BorrowFlow(BorrowFlowEdge { source: LifetimeProjection { base: Place(Remote(RemotePlace { local: _1 })), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, target: LifetimeProjection { base: Current(_1), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, kind: InitialBorrows })
+  // (PCG) handled edge Remove: Remote(_1)↓'?3 -> c↓'?3
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post0
+  goto end
+  label end
+  // return
+}
+
+method m_once_param(_0p: Ref, _1p: Ref)
+  requires acc(p_Ref_mutable(_1p, s_C_type()), write)
+  requires acc(p_Param(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0,
+    s_C_type()), write)
+  ensures acc(p_0_Tuple(_0p), write)
+  ensures acc(p_Param(old(p_Ref_mutable_snap(_1p, s_C_type())).s_Ref_mutable_0,
+    s_C_type()), write)
+{
+  var _2p: Ref
+  var _3p: Ref
+  var _from_bb0_to_bb1: Bool
+  label start
+  // var _2p
+  // var _3p
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: StorageLive(_2)
+  label _before_0_1
+  // [MIR] bb0[1]: StorageLive(_3)
+  label _before_0_2
+  // [MIR] bb0[2]: _3 = &mut (*_1)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_3p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_3p, s_C_type()).s_Ref_mutable_0)
+  label _before_0_3
+  // [MIR] bb0[3]: _2 = bump(move _3) -> [return: bb1, unwind: bb2]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_1), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _1, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _3, at: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostMain }))) })
+  goto bb_term_0
+  label bb_term_0
+  label pre0
+  m_bump(_2p, _3p)
+  label post1
+  _from_bb0_to_bb1 := true
+  goto bb_1
+  label bb_1
+  label _before_1_0
+  // [MIR] bb1[0]: StorageDead(_3)
+  make_concrete_C(old[_before_0_3](p_Ref_mutable_snap(old[_before_0_3](_3p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _3 before bb0[3] <before bb0[3]> = &mut  *c
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) Remove BorrowFlow(BorrowFlowEdge { source: LifetimeProjection { base: Place(Remote(RemotePlace { local: _1 })), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, target: LifetimeProjection { base: Current(_1), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, kind: InitialBorrows })
+  // (PCG) handled edge Remove: Remote(_1)↓'?4 -> c↓'?4
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_1
+  // [MIR] bb1[1]: StorageDead(_2)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _2, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _2 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_2
+  // [MIR] bb1[2]: _0 = const ()
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb1[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_0_Tuple_assign(_0p, s_0_Tuple_cons())
+  label _before_1_3
+  // [MIR] bb1[3]: return
+  // PCG (T) pre_operands
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post2
+  goto end
+  label bb_2
+  // cleanup block
+  assert false
+  goto end
+  label end
+  // return
+}
+
+method m_twice_param(_0p: Ref, _1p: Ref)
+  requires acc(p_Ref_mutable(_1p, s_C_type()), write)
+  requires acc(p_Param(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0,
+    s_C_type()), write)
+  ensures acc(p_0_Tuple(_0p), write)
+  ensures acc(p_Param(old(p_Ref_mutable_snap(_1p, s_C_type())).s_Ref_mutable_0,
+    s_C_type()), write)
+{
+  var _2p: Ref
+  var _3p: Ref
+  var _4p: Ref
+  var _5p: Ref
+  var _from_bb1_to_bb2: Bool
+  var _from_bb0_to_bb1: Bool
+  label start
+  // var _2p
+  // var _3p
+  // var _4p
+  // var _5p
+  _from_bb1_to_bb2 := false
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: StorageLive(_2)
+  label _before_0_1
+  // [MIR] bb0[1]: StorageLive(_3)
+  label _before_0_2
+  // [MIR] bb0[2]: _3 = &mut (*_1)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_3p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_3p, s_C_type()).s_Ref_mutable_0)
+  label _before_0_3
+  // [MIR] bb0[3]: _2 = bump(move _3) -> [return: bb1, unwind: bb3]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_1), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _1, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _3, at: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostMain }))) })
+  goto bb_term_0
+  label bb_term_0
+  label pre0
+  m_bump(_2p, _3p)
+  label post1
+  _from_bb0_to_bb1 := true
+  goto bb_1
+  label bb_1
+  label _before_1_0
+  // [MIR] bb1[0]: StorageDead(_3)
+  make_concrete_C(old[_before_0_3](p_Ref_mutable_snap(old[_before_0_3](_3p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _3 before bb0[3] <before bb0[3]> = &mut  *c
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_1
+  // [MIR] bb1[1]: StorageDead(_2)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _2, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _2 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_2
+  // [MIR] bb1[2]: StorageLive(_4)
+  label _before_1_3
+  // [MIR] bb1[3]: StorageLive(_5)
+  label _before_1_4
+  // [MIR] bb1[4]: _5 = &mut (*_1)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_5), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_5p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_5p, s_C_type()).s_Ref_mutable_0)
+  label _before_1_5
+  // [MIR] bb1[5]: _4 = bump(move _5) -> [return: bb2, unwind: bb3]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_1), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _1, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb1[5], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb1[5], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_4), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _5, at: Before(AnalysisLocation { location: bb1[5], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[5], eval_stmt_phase: PostMain }))) })
+  goto bb_term_1
+  label bb_term_1
+  label pre2
+  m_bump(_4p, _5p)
+  label post3
+  _from_bb1_to_bb2 := true
+  goto bb_2
+  label bb_3
+  // cleanup block
+  assert false
+  goto end
+  label bb_2
+  label _before_2_0
+  // [MIR] bb2[0]: StorageDead(_5)
+  make_concrete_C(old[_before_1_5](p_Ref_mutable_snap(old[_before_1_5](_5p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _5 before bb1[5] <before bb1[5]> = &mut  *c
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) Remove BorrowFlow(BorrowFlowEdge { source: LifetimeProjection { base: Place(Remote(RemotePlace { local: _1 })), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, target: LifetimeProjection { base: Current(_1), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, kind: InitialBorrows })
+  // (PCG) handled edge Remove: Remote(_1)↓'?5 -> c↓'?5
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_5), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_1
+  // [MIR] bb2[1]: StorageDead(_4)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb2[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_4), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _4, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _4 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb2[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_2
+  // [MIR] bb2[2]: _0 = const ()
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb2[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_0_Tuple_assign(_0p, s_0_Tuple_cons())
+  label _before_2_3
+  // [MIR] bb2[3]: return
+  // PCG (T) pre_operands
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post4
+  goto end
+  label end
+  // return
+}
+
+method m_mut_then_read(_0p: Ref, _1p: Ref)
+  requires acc(p_Ref_mutable(_1p, s_C_type()), write)
+  requires acc(p_Param(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0,
+    s_C_type()), write)
+  ensures acc(p_Int_i32(_0p), write)
+  ensures acc(p_Param(old(p_Ref_mutable_snap(_1p, s_C_type())).s_Ref_mutable_0,
+    s_C_type()), write)
+{
+  var _2p: Ref
+  var _3p: Ref
+  var _4p: Ref
+  var _from_bb1_to_bb2: Bool
+  var _from_bb0_to_bb1: Bool
+  label start
+  // var _2p
+  // var _3p
+  // var _4p
+  _from_bb1_to_bb2 := false
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: StorageLive(_2)
+  label _before_0_1
+  // [MIR] bb0[1]: StorageLive(_3)
+  label _before_0_2
+  // [MIR] bb0[2]: _3 = &mut (*_1)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_3p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_3p, s_C_type()).s_Ref_mutable_0)
+  label _before_0_3
+  // [MIR] bb0[3]: _2 = bump(move _3) -> [return: bb1, unwind: bb3]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_1), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _1, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _3, at: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PostMain }))) })
+  goto bb_term_0
+  label bb_term_0
+  label pre0
+  m_bump(_2p, _3p)
+  label post1
+  _from_bb0_to_bb1 := true
+  goto bb_1
+  label bb_1
+  label _before_1_0
+  // [MIR] bb1[0]: StorageDead(_3)
+  make_concrete_C(old[_before_0_3](p_Ref_mutable_snap(old[_before_0_3](_3p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _3 before bb0[3] <before bb0[3]> = &mut  *c
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[2], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_1
+  // [MIR] bb1[1]: StorageDead(_2)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _2, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _2 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_2
+  // [MIR] bb1[2]: StorageLive(_4)
+  label _before_1_3
+  // [MIR] bb1[3]: _4 = &(*_1)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[3], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb1[3], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_4), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_immutable_assign(_4p, s_C_type(), s_Ref_immutable_cons(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_1)), make_generic_s_C(p_C_snap(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0))))
+  label _before_1_4
+  // [MIR] bb1[4]: _0 = read(move _4) -> [return: bb2, unwind: bb3]
+  // PCG (T) pre_operands
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _4, at: Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PostMain }))) })
+  goto bb_term_1
+  label bb_term_1
+  label pre2
+  m_read(_0p, _4p)
+  label post3
+  _from_bb1_to_bb2 := true
+  goto bb_2
+  label bb_3
+  // cleanup block
+  assert false
+  goto end
+  label bb_2
+  label _before_2_0
+  // [MIR] bb2[0]: StorageDead(_4)
+  // (ignoring) Remove Borrow(BorrowEdge { blocked_place: Current((*_1)), assigned_ref: Labelled(LabelledPlace { place: _4, at: Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }), kind: Shared, reserve_location: bb1[3], region: '?4, borrow_index: Some(bw1), assigned_lifetime_projection_label: Some(Location(Before(AnalysisLocation { location: bb1[4], eval_stmt_phase: PostMain }))) })
+  // (PCG) handled edge Remove: borrow: _4 before bb1[4] <before bb1[4]> = & *c
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb1[3], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) Remove BorrowFlow(BorrowFlowEdge { source: LifetimeProjection { base: Place(Remote(RemotePlace { local: _1 })), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, target: LifetimeProjection { base: Current(_1), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, kind: InitialBorrows })
+  // (PCG) handled edge Remove: Remote(_1)↓'?5 -> c↓'?5
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_4), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_1
+  // [MIR] bb2[1]: return
+  // PCG (T) pre_operands
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post4
+  goto end
+  label end
+  // return
+}
+
+method m_twice_local(_0p: Ref)
+  ensures acc(p_Int_i32(_0p), write)
+{
+  var _1p: Ref
+  var _2p: Ref
+  var _3p: Ref
+  var _4p: Ref
+  var _5p: Ref
+  var _6p: Ref
+  var _7p: Ref
+  var _from_bb1_to_bb2: Bool
+  var _from_bb0_to_bb1: Bool
+  label start
+  // var _1p
+  // var _2p
+  // var _3p
+  // var _4p
+  // var _5p
+  // var _6p
+  // var _7p
+  _from_bb1_to_bb2 := false
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: StorageLive(_1)
+  label _before_0_1
+  // [MIR] bb0[1]: _1 = C { n: const 0_i32 }
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _1, location: Before(AnalysisLocation { location: bb0[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_1), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_C_assign(_1p, s_C_cons(s_Int_i32_cons(0)))
+  label _before_0_2
+  // [MIR] bb0[2]: FakeRead(ForLet(None), _1)
+  label _before_0_3
+  // [MIR] bb0[3]: StorageLive(_2)
+  label _before_0_4
+  // [MIR] bb0[4]: StorageLive(_3)
+  label _before_0_5
+  // [MIR] bb0[5]: StorageLive(_4)
+  label _before_0_6
+  // [MIR] bb0[6]: _4 = &mut _1
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb0[6], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_4), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_4p, s_C_type(), p_Ref_mutable_arbitrary_value(_1p, make_generic_s_0_Tuple(s_0_Tuple_cons())))
+  make_generic_C(p_Ref_mutable_snap(_4p, s_C_type()).s_Ref_mutable_0)
+  label _before_0_7
+  // [MIR] bb0[7]: _3 = &mut (*_4)
+  make_concrete_C(p_Ref_mutable_snap(_4p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {_4} -> {(*_4)}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_4))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[7], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[7], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_3p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_4p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_4p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_3p, s_C_type()).s_Ref_mutable_0)
+  label _before_0_8
+  // [MIR] bb0[8]: _2 = bump(move _3) -> [return: bb1, unwind: bb3]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_4), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _4, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[8], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb0[8], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _3, at: Before(AnalysisLocation { location: bb0[8], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[8], eval_stmt_phase: PostMain }))) })
+  goto bb_term_0
+  label bb_term_0
+  label pre0
+  m_bump(_2p, _3p)
+  label post1
+  _from_bb0_to_bb1 := true
+  goto bb_1
+  label bb_1
+  label _before_1_0
+  // [MIR] bb1[0]: StorageDead(_3)
+  make_concrete_C(old[_before_0_8](p_Ref_mutable_snap(old[_before_0_8](_3p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _3 before bb0[8] <before bb0[8]> = &mut  (*_4)
+  // (ignoring) Restore(RestoreCapability { place: (*_4), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_4p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {_4} -> {(*_4)}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_4))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[7], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_4), location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _4, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _4, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_4))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  make_concrete_C(p_Ref_mutable_snap(_4p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: borrow: _4 = &mut  c
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // exhale due to Weaken(E, W)
+  exhale acc(p_Ref_mutable(_4p, s_C_type()), write)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_1
+  // [MIR] bb1[1]: StorageDead(_4)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_4), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _4, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_2
+  // [MIR] bb1[2]: StorageDead(_2)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _2, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _2 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[2], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_3
+  // [MIR] bb1[3]: StorageLive(_5)
+  label _before_1_4
+  // [MIR] bb1[4]: StorageLive(_6)
+  label _before_1_5
+  // [MIR] bb1[5]: StorageLive(_7)
+  label _before_1_6
+  // [MIR] bb1[6]: _7 = &mut _1
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _7, location: Before(AnalysisLocation { location: bb1[6], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_7), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_7p, s_C_type(), p_Ref_mutable_arbitrary_value(_1p, make_generic_s_0_Tuple(s_0_Tuple_cons())))
+  make_generic_C(p_Ref_mutable_snap(_7p, s_C_type()).s_Ref_mutable_0)
+  label _before_1_7
+  // [MIR] bb1[7]: _6 = &mut (*_7)
+  make_concrete_C(p_Ref_mutable_snap(_7p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {_7} -> {(*_7)}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_7))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[7], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _6, location: Before(AnalysisLocation { location: bb1[7], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_6), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_6p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_7p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_7p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_6p, s_C_type()).s_Ref_mutable_0)
+  label _before_1_8
+  // [MIR] bb1[8]: _5 = bump(move _6) -> [return: bb2, unwind: bb3]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_7), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _7, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _6, location: Before(AnalysisLocation { location: bb1[8], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb1[8], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_5), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _6, at: Before(AnalysisLocation { location: bb1[8], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb1[8], eval_stmt_phase: PostMain }))) })
+  goto bb_term_1
+  label bb_term_1
+  label pre2
+  m_bump(_5p, _6p)
+  label post3
+  _from_bb1_to_bb2 := true
+  goto bb_2
+  label bb_3
+  // cleanup block
+  assert false
+  goto end
+  label bb_2
+  label _before_2_0
+  // [MIR] bb2[0]: StorageDead(_6)
+  make_concrete_C(old[_before_1_8](p_Ref_mutable_snap(old[_before_1_8](_6p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _6 before bb1[8] <before bb1[8]> = &mut  (*_7)
+  // (ignoring) Restore(RestoreCapability { place: (*_7), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_7p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {_7} -> {(*_7)}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_7))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb1[7], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_7), location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _7, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _7, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_7))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  make_concrete_C(p_Ref_mutable_snap(_7p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: borrow: _7 = &mut  c
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // exhale due to Weaken(E, W)
+  exhale acc(p_Ref_mutable(_7p, s_C_type()), write)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _6, location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_6), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _6, location: Before(AnalysisLocation { location: bb2[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_1
+  // [MIR] bb2[1]: StorageDead(_7)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _7, location: Before(AnalysisLocation { location: bb2[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_7), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _7, location: Before(AnalysisLocation { location: bb2[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_2
+  // [MIR] bb2[2]: StorageDead(_5)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb2[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_5), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _5, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _5 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _5, location: Before(AnalysisLocation { location: bb2[2], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_3
+  // [MIR] bb2[3]: _0 = copy (_1.0: i32)
+  // [PCG] Expand(RepackExpand { from: _1, guide: None, capability: R, _marker: PhantomData<&()> })
+  unfold acc(p_C(_1p), write)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb2[3], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Int_i32_assign(_0p, p_Int_i32_snap(s_C_field_0(_1p)))
+  label _before_2_4
+  // [MIR] bb2[4]: StorageDead(_1)
+  // [PCG] Collapse(RepackCollapse { to: _1, capability: R, guide: None, _marker: PhantomData<&()> })
+  fold acc(p_C(_1p), write)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _1, location: Before(AnalysisLocation { location: bb2[4], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_1), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _1, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _1 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _1, location: Before(AnalysisLocation { location: bb2[4], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_2_5
+  // [MIR] bb2[5]: return
+  // PCG (T) pre_operands
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post4
+  goto end
+  label end
+  // return
+}
+
+method m_write_then_call(_0p: Ref, _1p: Ref)
+  requires acc(p_Ref_mutable(_1p, s_C_type()), write)
+  requires acc(p_Param(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0,
+    s_C_type()), write)
+  ensures acc(p_0_Tuple(_0p), write)
+  ensures acc(p_Param(old(p_Ref_mutable_snap(_1p, s_C_type())).s_Ref_mutable_0,
+    s_C_type()), write)
+{
+  var _2p: Ref
+  var _3p: Ref
+  var _from_bb0_to_bb1: Bool
+  label start
+  // var _2p
+  // var _3p
+  _from_bb0_to_bb1 := false
+  goto bb_0
+  label bb_0
+  label _before_0_0
+  // [MIR] bb0[0]: ((*_1).0: i32) = const 5_i32
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1).0, location: Before(AnalysisLocation { location: bb0[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals((*_1).0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[0], eval_stmt_phase: PreMain }))) })
+  unfold acc(p_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0), write)
+  // (PCG) handled edge Add: {*c} -> {(*c).n}
+  // exhale due to Weaken(E, W)
+  exhale acc(p_Int_i32(s_C_field_0(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)), write)
+  p_Int_i32_assign(s_C_field_0(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0),
+    s_Int_i32_cons(5))
+  label _before_0_1
+  // [MIR] bb0[1]: StorageLive(_2)
+  fold acc(p_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0), write)
+  // (PCG) handled edge Remove: {*c} -> {(*c).n}
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[0], eval_stmt_phase: PreMain }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb0[1], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  label _before_0_2
+  // [MIR] bb0[2]: StorageLive(_3)
+  label _before_0_3
+  // [MIR] bb0[3]: _3 = &mut (*_1)
+  make_concrete_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Add: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PreOperands }))) })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_Ref_mutable_assign(_3p, s_C_type(), p_Ref_mutable_arbitrary_value(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_0, make_generic_s_0_Tuple(make_concrete_s_0_Tuple(p_Ref_mutable_snap(_1p,
+    s_C_type()).s_Ref_mutable_1))))
+  make_generic_C(p_Ref_mutable_snap(_3p, s_C_type()).s_Ref_mutable_0)
+  label _before_0_4
+  // [MIR] bb0[4]: _2 = bump(move _3) -> [return: bb1, unwind: bb2]
+  // PCG (T) pre_operands
+  // (ignoring) Weaken(Weaken { place: (*_1), from: R, to: None, for_storage_dead: false, _marker: PhantomData<&()> })
+  // (ignoring) Weaken(Weaken { place: _1, from: R, to: Some(W), for_storage_dead: false, _marker: PhantomData<&()> })
+  // PCG (T) post_operands
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb0[4], eval_stmt_phase: PostOperands }), reason: MoveOut, _marker: PhantomData<&()> })
+  // PCG (T) pre_main
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb0[4], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // PCG (T) post_main
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Labelled(LabelledPlace { place: _3, at: Before(AnalysisLocation { location: bb0[4], eval_stmt_phase: PostOperands }), _marker: PhantomData<&()> }))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> })), label: Some(Location(Before(AnalysisLocation { location: bb0[4], eval_stmt_phase: PostMain }))) })
+  goto bb_term_0
+  label bb_term_0
+  label pre0
+  m_bump(_2p, _3p)
+  label post1
+  _from_bb0_to_bb1 := true
+  goto bb_1
+  label bb_1
+  label _before_1_0
+  // [MIR] bb1[0]: StorageDead(_3)
+  make_concrete_C(old[_before_0_4](p_Ref_mutable_snap(old[_before_0_4](_3p),
+    s_C_type()).s_Ref_mutable_0))
+  // (PCG) handled edge Remove: borrow: _3 before bb0[4] <before bb0[4]> = &mut  *c
+  // (ignoring) Restore(RestoreCapability { place: (*_1), capability: E, _marker: PhantomData<&()> })
+  make_generic_C(p_Ref_mutable_snap(_1p, s_C_type()).s_Ref_mutable_0)
+  // (PCG) handled edge Remove: {c} -> {*c}
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Location(Before(AnalysisLocation { location: bb0[3], eval_stmt_phase: PreOperands }))), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: (*_1), location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreOperands }), reason: Collapse, _marker: PhantomData<&()> })
+  // [PCG] RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // ignored repack op: RegainLoanedCapability(RegainedCapability { place: _1, capability: E })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: Equals(LifetimeProjection(LifetimeProjection { base: Place(Local(Current(_1))), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: Some(Future), phantom: PhantomData<&()> })), label: None })
+  // (ignoring) Remove BorrowFlow(BorrowFlowEdge { source: LifetimeProjection { base: Place(Remote(RemotePlace { local: _1 })), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, target: LifetimeProjection { base: Current(_1), region_idx: LifetimeProjectionIdx(0, PhantomData<pcg::borrow_pcg::region_projection::Region>), label: None, phantom: PhantomData<&()> }, kind: InitialBorrows })
+  // (PCG) handled edge Remove: Remote(_1)↓'?4 -> c↓'?4
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_3), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _3, location: Before(AnalysisLocation { location: bb1[0], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_1
+  // [MIR] bb1[1]: StorageDead(_2)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_2), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  // [PCG] Weaken(Weaken { place: _2, from: E, to: W, for_storage_dead: true, _marker: PhantomData<&()> })
+  // Weaken(E, W) for _2 (skipped exhale: StorageDead)
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _2, location: Before(AnalysisLocation { location: bb1[1], eval_stmt_phase: PreMain }), reason: StorageDead, _marker: PhantomData<&()> })
+  label _before_1_2
+  // [MIR] bb1[2]: _0 = const ()
+  // (ignoring) LabelPlace(LabelPlaceAction { place: _0, location: Before(AnalysisLocation { location: bb1[2], eval_stmt_phase: PreMain }), reason: Write, _marker: PhantomData<&()> })
+  // (ignoring) LabelLifetimeProjection(LabelLifetimeProjectionAction { predicate: And([PlaceEquals(_0), InSourceNodes, EdgeType(BorrowFlow { future_edge_kind: Some(FromExpansion) })]), label: None })
+  p_0_Tuple_assign(_0p, s_0_Tuple_cons())
+  label _before_1_3
+  // [MIR] bb1[3]: return
+  // PCG (T) pre_operands
+  // PCG (T) post_operands
+  // PCG (T) pre_main
+  // PCG (T) post_main
+  label package_post2
+  goto end
+  label bb_2
+  // cleanup block
+  assert false
+  goto end
+  label end
+  // return
+}
+
+method make_generic_C(self: Ref)
+  requires acc(p_C(self), write)
+  ensures acc(p_Param(self, s_C_type()), write)
+  ensures old(make_generic_s_C(p_C_snap(self))) ==
+    p_Param_snap(self, s_C_type())
+
+
+method make_concrete_C(self: Ref)
+  requires acc(p_Param(self, s_C_type()), write)
+  ensures acc(p_C(self), write)
+  ensures old(p_Param_snap(self, s_C_type())) ==
+    make_generic_s_C(p_C_snap(self))
+
+
+method make_generic_Int_i32(self: Ref)
+  requires acc(p_Int_i32(self), write)
+  ensures acc(p_Param(self, s_Int_i32_type()), write)
+  ensures old(make_generic_s_Int_i32(p_Int_i32_snap(self))) ==
+    p_Param_snap(self, s_Int_i32_type())
+
+
+method make_concrete_Int_i32(self: Ref)
+  requires acc(p_Param(self, s_Int_i32_type()), write)
+  ensures acc(p_Int_i32(self), write)
+  ensures old(p_Param_snap(self, s_Int_i32_type())) ==
+    make_generic_s_Int_i32(p_Int_i32_snap(self))
+
+
+method make_generic_Bool(self: Ref)
+  requires acc(p_Bool(self), write)
+  ensures acc(p_Param(self, s_Bool_type()), write)
+  ensures old(make_generic_s_Bool(p_Bool_snap(self))) ==
+    p_Param_snap(self, s_Bool_type())
+
+
+method make_concrete_Bool(self: Ref)
+  requires acc(p_Param(self, s_Bool_type()), write)
+  ensures acc(p_Bool(self), write)
+  ensures old(p_Param_snap(self, s_Bool_type())) ==
+    make_generic_s_Bool(p_Bool_snap(self))
+
+
+method p_0_Tuple_assign(self: Ref, value: s_0_Tuple)
+  ensures acc(p_0_Tuple(self), write)
+  ensures p_0_Tuple_snap(self) == value
+
+
+method p_Param_assign(self: Ref, T$0: Type, value: s_Param)
+  ensures acc(p_Param(self, T$0), write)
+  ensures p_Param_snap(self, T$0) == value
+
+
+method p_Ref_mutable_assign(self: Ref, U$1: Type, value: s_Ref_mutable)
+  ensures acc(p_Ref_mutable(self, U$1), write)
+  ensures p_Ref_mutable_snap(self, U$1) == value
+
+
+method p_Int_i32_assign(self: Ref, value: s_Int_i32)
+  ensures acc(p_Int_i32(self), write)
+  ensures p_Int_i32_snap(self) == value
+
+
+method p_C_assign(self: Ref, value: s_C)
+  ensures acc(p_C(self), write)
+  ensures p_C_snap(self) == value
+
+
+method p_2_Tuple_assign(self: Ref, T$0: Type, U$1: Type, value: s_2_Tuple)
+  ensures acc(p_2_Tuple(self, T$0, U$1), write)
+  ensures p_2_Tuple_snap(self, T$0, U$1) == value
+
+
+method p_Bool_assign(self: Ref, value: s_Bool)
+  ensures acc(p_Bool(self), write)
+  ensures p_Bool_snap(self) == value
+
+
+method p_Ref_immutable_assign(self: Ref, U$1: Type, value: s_Ref_immutable)
+  ensures acc(p_Ref_immutable(self, U$1), write)
+  ensures p_Ref_immutable_snap(self, U$1) == value
+
+
+adt s_0_Tuple {
+  s_0_Tuple_cons()
+}
+
+adt s_Ref_mutable {
+  s_Ref_mutable_cons(s_Ref_mutable_0: Ref, s_Ref_mutable_1: s_Param, s_Ref_mutable_2: s_Param)
+}
+
+adt s_C {
+  s_C_cons(s_C_0: s_Int_i32)
+}
+
+adt s_2_Tuple {
+  s_2_Tuple_cons(s_2_Tuple_0: s_Param, s_2_Tuple_1: s_Param)
+}
+
+adt s_Ref_immutable {
+  s_Ref_immutable_cons(s_Ref_immutable_0: Ref, s_Ref_immutable_1: s_Param, s_Ref_immutable_2: s_Param)
+}
+
+adt Type {
+  s_C_type()
+  s_0_Tuple_type()
+  s_Int_i32_type()
+  s_Bool_type()
+  Unknown_type(non_unit: Int)
+}
