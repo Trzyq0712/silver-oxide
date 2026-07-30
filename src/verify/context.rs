@@ -99,6 +99,31 @@ pub(crate) struct VerifyContext<'a> {
     /// obligation and discarded at block exit. `None` when no obligation has
     /// needed it yet (or outside a method block).
     scratch: Option<BlockScratch>,
+    /// Whether the current block has already reached tier 3 — i.e. whether a scratch
+    /// exists *and* the block has proven it needs one. Everything after that point is
+    /// what a "sticky" scratch mode would take over (gate G1); measurement only, no
+    /// behaviour depends on it.
+    block_saw_tier3: bool,
+    /// Cube of every block walked so far, keyed by its index in walk order, plus
+    /// whether that block built a scratch. Used to answer "did a dominator with a
+    /// strictly smaller cube have a scratch to inherit?" (gate G2). Cleared per
+    /// verification unit; cubes are stored canonicalized at `begin_block` time.
+    block_cubes: Vec<BlockRecord>,
+    /// Walk-order index of the current block, i.e. its slot in `block_cubes`.
+    current_block: Option<usize>,
+}
+
+/// One walked block, for the dominator-reuse availability measurement.
+struct BlockRecord {
+    /// Walk-order index of the immediate dominator, as reported by the lowering.
+    idom: Option<usize>,
+    /// The block's cube, canonical ids at `begin_block` time.
+    cube: Vec<(egg::Id, Polarity)>,
+    /// Whether this block ever built a scratch (so a descendant could inherit it).
+    built_scratch: bool,
+    /// Tier-3 obligations raised in this block, and total obligations.
+    tier3: u64,
+    obligations: u64,
 }
 
 /// A parallel "scratch" e-graph for one method block: a clone of ground taken at
@@ -228,6 +253,9 @@ impl<'a> VerifyContext<'a> {
             current_cube: Vec::new(),
             in_block: false,
             scratch: None,
+            block_saw_tier3: false,
+            block_cubes: Vec::new(),
+            current_block: None,
         }
     }
 
@@ -496,7 +524,12 @@ impl<'a> VerifyContext<'a> {
                 self.alloc.stats.sat_iterations - it0,
             );
         }
-        self.alloc.stats.graph_timing.0.ground += t.elapsed().as_secs_f64();
+        let secs = t.elapsed().as_secs_f64();
+        self.alloc.stats.graph_timing.0.ground += secs;
+        if self.block_saw_tier3 {
+            self.alloc.stats.graph_timing.0.ground_after_first_tier3 += secs;
+            self.alloc.stats.ground_saturations_after_first_tier3 += 1;
+        }
         self.alloc.stats.saturations += 1;
         self.clean = Some(self.clean_tag(CleanLevel::Full));
     }
@@ -747,6 +780,12 @@ impl<'a> VerifyContext<'a> {
             } else {
                 self.alloc.stats.prove_in_block_cube_only += 1;
             }
+            if self.block_saw_tier3 {
+                self.alloc.stats.prove_in_block_after_first_tier3 += 1;
+            }
+            if let Some(me) = self.current_block {
+                self.block_cubes[me].obligations += 1;
+            }
         }
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
@@ -758,6 +797,7 @@ impl<'a> VerifyContext<'a> {
         if self.egraph.find(imp) == self.egraph.find(true_)
             || (self.oob_memo && self.proven_imps.contains(&self.egraph.find(imp)))
         {
+            self.alloc.stats.prove_tier1 += 1;
             return true;
         }
 
@@ -770,6 +810,7 @@ impl<'a> VerifyContext<'a> {
         // also expose a contradiction, so re-check inconsistency too.
         self.saturate();
         if self.is_inconsistent() || self.egraph.find(imp) == self.egraph.find(true_) {
+            self.alloc.stats.prove_tier2 += 1;
             return true;
         }
 
@@ -865,8 +906,22 @@ impl<'a> VerifyContext<'a> {
     /// the block's first tier-3 obligation: building it at entry measured 1.8x
     /// slower on `structs_enums` (2284 clones instead of 14 — most blocks never
     /// reach tier 3).
-    pub(crate) fn begin_block(&mut self, cube: Vec<(egg::Id, Polarity)>) {
+    ///
+    /// `idom` is the walk-order index of the block's immediate dominator (`None` for
+    /// the entry block), used only by the dominator-reuse measurement below.
+    pub(crate) fn begin_block(&mut self, cube: Vec<(egg::Id, Polarity)>, idom: Option<usize>) {
         self.scratch = None;
+        self.block_saw_tier3 = false;
+        let canon: Vec<(egg::Id, Polarity)> =
+            cube.iter().map(|(id, p)| (self.egraph.find(*id), *p)).collect();
+        self.block_cubes.push(BlockRecord {
+            idom,
+            cube: canon,
+            built_scratch: false,
+            tier3: 0,
+            obligations: 0,
+        });
+        self.current_block = Some(self.block_cubes.len() - 1);
         self.current_cube = cube;
         self.in_block = true;
     }
@@ -874,9 +929,76 @@ impl<'a> VerifyContext<'a> {
     /// Leave the block walk (after the last block, or before a non-block walk):
     /// discard the scratch and clear block state.
     pub(crate) fn end_block(&mut self) {
+        if std::env::var_os("SILVER_OXIDE_TRACE_BLOCKS").is_some() {
+            self.trace_block();
+        }
         self.current_cube.clear();
         self.in_block = false;
         self.scratch = None;
+        self.block_saw_tier3 = false;
+        self.current_block = None;
+    }
+
+    /// Walk-order index of the nearest dominator whose cube is a **strict subset** of
+    /// this block's and which built a scratch — i.e. a graph this block could have
+    /// inherited instead of cloning ground (gate G2 of the lazy-scratch plan).
+    ///
+    /// Strict-subset is the soundness condition: a superset cube means strictly more
+    /// assumptions, so every fact the ancestor derived still holds here. Sibling arms
+    /// never qualify (their cubes are incomparable), which is why a join has to fall
+    /// back to ground — the arms' derived facts hold only under their own cube.
+    fn dom_reuse_source(&self) -> Option<usize> {
+        self.dom_ancestor(true)
+    }
+
+    /// As [`Self::dom_reuse_source`] but ignoring whether the ancestor built a scratch:
+    /// "is there a dominator whose cube is a strict subset at all?". Measured
+    /// separately because laziness makes the two diverge — a chain can exist while no
+    /// ancestor ever materialized a graph, and then inheritance has to carry *facts*,
+    /// not an e-graph.
+    fn dom_chain_source(&self) -> Option<usize> {
+        self.dom_ancestor(false)
+    }
+
+    fn dom_ancestor(&self, require_scratch: bool) -> Option<usize> {
+        let me = self.current_block?;
+        let mine = &self.block_cubes[me].cube;
+        let mut at = self.block_cubes[me].idom;
+        while let Some(i) = at {
+            let anc = self.block_cubes.get(i)?;
+            let strict_subset = anc.cube.len() < mine.len()
+                && anc.cube.iter().all(|lit| mine.contains(lit));
+            if strict_subset && (!require_scratch || anc.built_scratch) {
+                return Some(i);
+            }
+            at = anc.idom;
+        }
+        None
+    }
+
+    /// One `[block]` line per walked block (`SILVER_OXIDE_TRACE_BLOCKS`): cube size,
+    /// dominator relation, and how many of its obligations reached tier 3.
+    fn trace_block(&self) {
+        let Some(me) = self.current_block else { return };
+        let rec = &self.block_cubes[me];
+        let (idom_cube, subset) = match rec.idom.and_then(|i| self.block_cubes.get(i)) {
+            Some(anc) => (
+                anc.cube.len() as i64,
+                anc.cube.len() < rec.cube.len() && anc.cube.iter().all(|l| rec.cube.contains(l)),
+            ),
+            None => (-1, false),
+        };
+        eprintln!(
+            "[block] idx={me} idom={:?} cube={} idom_cube={idom_cube} subset={} \
+             built_scratch={} reuse_src={:?} tier3={} obligations={}",
+            rec.idom,
+            rec.cube.len(),
+            if subset { "yes" } else { "no" },
+            rec.built_scratch,
+            self.dom_reuse_source(),
+            rec.tier3,
+            rec.obligations,
+        );
     }
 
     /// Build the block scratch if absent: clone ground, assume the block cube.
@@ -932,6 +1054,9 @@ impl<'a> VerifyContext<'a> {
         });
         self.alloc.stats.graph_timing.0.scratch_clone += t_clone.elapsed().as_secs_f64();
         self.alloc.stats.block_scratch_clones += 1;
+        if let Some(me) = self.current_block {
+            self.block_cubes[me].built_scratch = true;
+        }
     }
 
     /// Saturate the block scratch under the full rule set if it changed since the
@@ -1024,6 +1149,21 @@ impl<'a> VerifyContext<'a> {
             (0, 0, 0)
         };
         let fresh = self.scratch.is_none();
+        // Gate measurements: this is a tier-3 site. Classify whether a dominator's
+        // scratch was available to inherit *before* building ours (building marks the
+        // current block, which must not count as its own source).
+        if self.dom_reuse_source().is_some() {
+            self.alloc.stats.dom_reuse_available += 1;
+        } else {
+            self.alloc.stats.dom_reuse_none += 1;
+        }
+        if self.dom_chain_source().is_some() {
+            self.alloc.stats.dom_chain_available += 1;
+        }
+        if let Some(me) = self.current_block {
+            self.block_cubes[me].tier3 += 1;
+        }
+        self.block_saw_tier3 = true;
         self.ensure_scratch();
         // Translate goal + pc into scratch space first: `tr` may *import* ground
         // operands (a lazy/structural ground surfaces rule-canonical leaders),

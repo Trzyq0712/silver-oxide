@@ -63,6 +63,12 @@ pub struct VerifyStats {
     /// `prove_under_pc` calls, and how many reached the expensive Tier-3
     /// clone+saturate path (the clearest deterioration signal).
     pub prove_calls: u64,
+    /// Obligations closed by the two cheap ground tiers: `prove_tier1` = the memo /
+    /// `true`-class hit, `prove_tier2` = the post-`saturate()` re-check. Together with
+    /// `prove_tier3` they say how thin the tier-3 population really is — the premise
+    /// of the lazy-scratch design (see `design/block-vmir/82-*.md`). Non-gated.
+    pub prove_tier1: u64,
+    pub prove_tier2: u64,
     pub prove_tier3: u64,
     /// In-block obligations split by how their pc relates to the block cube
     /// (invariant 5 of the two-egraph block model): `cube_only` needs no extra
@@ -71,6 +77,22 @@ pub struct VerifyStats {
     /// function precondition or a division/mod check. Non-gated (a measurement).
     pub prove_in_block_cube_only: u64,
     pub prove_in_block_extra_pc: u64,
+    /// Gate G1 of `plans/…scratch-mode`: in-block obligations raised **after** their
+    /// block's first tier-3, i.e. the population a "sticky" scratch (keep proving in
+    /// the scratch once it exists, stop saturating ground) would move off ground —
+    /// and the ground saturations it would eliminate. Non-gated.
+    pub prove_in_block_after_first_tier3: u64,
+    pub ground_saturations_after_first_tier3: u64,
+    /// Gate G2: tier-3 sites classified by whether a *dominator* block with a strictly
+    /// smaller cube had itself built a scratch — i.e. whether there was anything to
+    /// inherit. `dom_reuse_available` counts the sites where there was. Non-gated.
+    pub dom_reuse_available: u64,
+    pub dom_reuse_none: u64,
+    /// Tier-3 sites that have a strict-subset dominator **regardless** of whether it
+    /// built a scratch. The gap against `dom_reuse_available` is the cost of laziness:
+    /// the chain exists, but no ancestor materialized a graph to inherit — so
+    /// inheritance would have to carry derived *facts* instead. Non-gated.
+    pub dom_chain_available: u64,
     /// Goals discharged by tier 3.5 — non-forking `ite`-goal decomposition
     /// (a constant branch reduces the goal to its other branch, no case split).
     pub prove_tier35: u64,
@@ -112,6 +134,9 @@ pub struct GraphTiming {
     pub probe: f64,
     /// Building a block scratch: the ground clone plus the cube unions/rebuild.
     pub scratch_clone: f64,
+    /// The `ground` share spent after the current block's first tier-3 obligation —
+    /// gate G1's denominator-side number (what sticky mode claims to remove).
+    pub ground_after_first_tier3: f64,
 }
 
 /// [`GraphTiming`] wrapper, `Eq`-transparent like [`TimingTrend`].
