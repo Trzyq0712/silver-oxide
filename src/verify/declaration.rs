@@ -1030,6 +1030,29 @@ fn heap_subtract(
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
+    heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, true)
+}
+
+/// `sat_retry`: whether a framing miss may re-try under a **full saturation**
+/// ([`VerifyContext::saturate`]) before reporting insufficient permission. The address
+/// of a `&mut` reborrow passed to a call meets the held chunk's address only after the
+/// full rule set runs — `find_chunk_consolidated`'s own retry runs the terminating
+/// reductions only, which is not enough for it.
+///
+/// Placed *after* the provably-zero fallback, not inside the lookup: retrying at every
+/// miss cost 36x on `structs_enums` (1.48s → 53.5s), because a legitimately absent
+/// chunk (a conditional footprint slot with a false guard) is a common, cheap
+/// no-op — and it is exactly the case the zero check closes without any saturation.
+/// Here only an obligation that would otherwise *fail* pays, so the cost lands on
+/// runs that were about to error anyway.
+fn heap_subtract_inner(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    kind: &LocationKind,
+    chunk2: Chunk,
+    pc_lits: &[(egg::Id, Polarity)],
+    sat_retry: bool,
+) -> Result<Heap, VerifyError> {
     let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
     // Guarded-merge path: a stored chunk keeps a FLAT presence guard and a
     // guard-free amount. Reconstruct the exact legacy `guard ? perm : 0`
@@ -1058,6 +1081,21 @@ fn heap_subtract(
         let nonpos = ctx.add(Symbolic::Ite([pos, false_, true_]));
         if ctx.prove_under_pc(nonpos, pc_lits) {
             return Ok(out);
+        }
+        if sat_retry {
+            ctx.saturate();
+            return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, false);
+        }
+        if std::env::var_os("SILVER_OXIDE_TRACE_MISS").is_some() {
+            eprintln!(
+                "[miss] group {:?} demanded addr:\n{}held addrs ({}):",
+                kind.group,
+                crate::verify::viz::dump_term(ctx, chunk2.addr, 40),
+                h1.chunks_of(kind).len(),
+            );
+            for c in h1.chunks_of(kind).to_vec() {
+                eprintln!("{}", crate::verify::viz::dump_term(ctx, c.addr, 40));
+            }
         }
         return Err(VerifyError::InsufficientPermission);
     };
@@ -1303,6 +1341,27 @@ fn assert_statement_pc_is_block_cube(
         ctx.current_cube().len(),
         std::mem::discriminant(&inst.kind),
     );
+}
+
+/// Nearest common dominator of two blocks, walking the (already-filled) idom chains.
+/// `idoms[i]` is block `i`'s immediate dominator in walk order; both arguments index
+/// blocks that precede the caller topologically, so their entries exist.
+fn nearest_common_dominator(
+    idoms: &[Option<usize>],
+    a: usize,
+    b: usize,
+) -> Option<usize> {
+    let chain = |mut at: Option<usize>| {
+        let mut out = vec![];
+        while let Some(i) = at {
+            out.push(i);
+            at = idoms.get(i).copied().flatten();
+        }
+        out
+    };
+    let a_chain = chain(Some(a));
+    let b_chain = chain(Some(b));
+    a_chain.into_iter().find(|i| b_chain.contains(i))
 }
 
 /// Set-equality of two guard cubes under canonical e-classes (order-insensitive;
@@ -2838,6 +2897,8 @@ pub(crate) fn verify_method(
     // phase then its `body` phase through the same per-inst engine (`walk_body`)
     // the flat verifier used. The heap threads linearly via each inst's explicit
     // `base: HeapVal`; the per-predecessor structural merge is a later stage.
+    // Immediate dominator per block, in walk order; filled as blocks are walked.
+    let mut idoms: Vec<Option<usize>> = Vec::with_capacity(method.blocks.len());
     for (bid, block) in method.blocks.iter_enumerated() {
         // Stored order is topological: a block's predecessors have smaller ids.
         // (A future lowering bug that broke this would corrupt positional eval.)
@@ -2867,10 +2928,22 @@ pub(crate) fn verify_method(
             eval_method_inst,
             None,
         )?;
+        // Immediate dominator in walk order (blocks are stored topologically, so both
+        // preds are already resolved). A `Join`'s idom is the nearest common ancestor
+        // of its arms — the pre-split block. Only the dominator-reuse *measurement*
+        // consumes this (see `VerifyContext::dom_reuse_source`).
+        let idom = match &block.preds {
+            vmir::Preds::Entry => None,
+            vmir::Preds::From(p) => Some(p.0 as usize),
+            vmir::Preds::Join { then_, els, .. } => {
+                nearest_common_dominator(&idoms, then_.0 as usize, els.0 as usize)
+            }
+        };
+        idoms.push(idom);
         // Record this block's cube for the (experimental) per-block scratch. All
         // body insts share it (vmir::Block::cube), so the scratch assumes it once.
         let cube = collect_pc_lits(&mut ctx, &state, &block.cube);
-        ctx.begin_block(cube);
+        ctx.begin_block(cube, idom);
         walk_body(
             &mut ctx,
             program,
