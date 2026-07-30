@@ -44,15 +44,25 @@ Needs the local Prusti checkout (`../../tools/prusti_encode.sh`, override with
 `PRUSTI_RUSTC`). Roughly 1-3 minutes and ~0.5-1 MB of Viper per source, which is why
 `vpr/` is committed.
 
-## Note on the `&mut`-into-a-call gap
+## Two `&mut`-into-a-call gaps this corpus uncovered
 
-Every program here that calls a helper taking `&mut` — that is, most of them — failed to
-verify with "insufficient permission" when the corpus was first built. The diagnosis
-(`SILVER_OXIDE_TRACE_MISS`) was that the reborrow's address term meets the held chunk's
-address only after a **full** saturation, while the framing-miss retry ran the
-terminating reductions only. Fixed in `heap_subtract_inner` (commit "retry a framing
-miss under full saturation before failing"), which is why every member verifies now.
+Every program here that calls a helper taking `&mut` — most of them — failed with
+"insufficient permission" when the corpus was first built. `SILVER_OXIDE_TRACE_MISS`
+(demanded vs held addresses at a framing miss) showed two distinct causes:
 
-The minimized reproducer lives in `tests/cases/passing/permissions/mut_reborrow_call.vpr`.
-If a future change reintroduces the gap, that case fails first and the whole corpus
-follows.
+1. **Unconditional call.** The reborrow's address term meets the held chunk's address
+   only after a **full** saturation, while the miss retry ran the terminating reductions
+   only. Fixed in `heap_subtract_inner`; the retry sits after the provably-zero check so
+   only a would-fail obligation pays (retrying at every miss cost 36x).
+   Pinned by `tests/cases/passing/permissions/mut_reborrow_call.vpr`.
+
+2. **Call inside a branch arm.** The arm's reborrow mints its own ref, and
+   `p_Ref_mutable_assign` states `snap(arm_ref) == arbitrary_value(param_addr, ..)` only
+   *under the arm's pc* — invisible to ground-canonical address matching. Fixed by
+   routing a consume miss through `chunk_under_pc` (already used on the read side) and
+   taking the invariant-7 path with an empty partner set: sufficiency under the pc, debit
+   gated by the pc. Pinned by
+   `tests/cases/passing/permissions/mut_reborrow_call_in_branch.vpr`.
+
+Both are why the sources here are written as ordinary Rust rather than around the
+verifier. If either gap returns, those two cases fail before the corpus does.

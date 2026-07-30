@@ -173,8 +173,8 @@ pub fn mat3_cube_trace(m: &Mat3) -> i32 {
     t1 * t1 * t1 - 3 * t1 * t2 + 2 * t3 + d1 - d2
 }
 
-/// A call on a reborrowed `&mut` parameter after a join whose arm also called on it —
-/// the shape that needed the full-saturation miss retry (see README).
+/// A `&mut` call inside a branch arm, then another on the same parameter after the join
+/// — the shape pinned by passing/permissions/mut_reborrow_call_in_branch.vpr.
 pub fn mat3_normalize_signs(m: &mut Mat3) {
     let d = mat3_det(m);
     if d < 0 {
