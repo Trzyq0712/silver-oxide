@@ -1860,6 +1860,13 @@ fn eval_method_inst(
             // formula and releases the token (mirrors `eval_snap`); otherwise a
             // plain `prove_under_pc`.
             if !ctx.prove_under_pc(id, &pc_lits) {
+                if std::env::var_os("SILVER_OXIDE_TRACE_ASSERT").is_some() {
+                    eprintln!(
+                        "[assert-fail] Assert inst, pc={} lits:\n{}",
+                        pc_lits.len(),
+                        crate::verify::viz::dump_term(ctx, id, 40),
+                    );
+                }
                 return Err(VerifyError::AssertionFailed);
             }
             // A certificate walk re-exports the assert as a guarded fact —
@@ -2181,6 +2188,13 @@ fn walk_footprint(
         // The precondition/predicate body must hold over the consumed values.
         Direction::Consume => {
             if !ctx.prove_under_pc(bool_id, bool_guard) {
+                if std::env::var_os("SILVER_OXIDE_TRACE_ASSERT").is_some() {
+                    eprintln!(
+                        "[assert-fail] resource-bool consume, pc={} lits:\n{}",
+                        bool_guard.len(),
+                        crate::verify::viz::dump_term(ctx, bool_id, 40),
+                    );
+                }
                 return Err(VerifyError::AssertionFailed);
             }
         }
