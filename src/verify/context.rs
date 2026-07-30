@@ -484,7 +484,17 @@ impl<'a> VerifyContext<'a> {
         }
         let t = std::time::Instant::now();
         let egraph = std::mem::take(&mut self.egraph);
+        let (n0, c0) = (egraph.total_number_of_nodes(), egraph.number_of_classes());
+        let it0 = self.alloc.stats.sat_iterations;
         self.egraph = self.saturate_flat(egraph);
+        if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
+            eprintln!(
+                "[ground-sat] {n0}n/{c0}c -> {}n/{}c ({} iters)",
+                self.egraph.total_number_of_nodes(),
+                self.egraph.number_of_classes(),
+                self.alloc.stats.sat_iterations - it0,
+            );
+        }
         self.alloc.stats.graph_timing.0.ground += t.elapsed().as_secs_f64();
         self.alloc.stats.saturations += 1;
         self.clean = Some(self.clean_tag(CleanLevel::Full));
@@ -824,10 +834,10 @@ impl<'a> VerifyContext<'a> {
 
     /// Enter a method block: record its control cube (shared pc of all its
     /// insts) and drop any previous block's scratch (sibling cubes are mutually
-    /// exclusive, so it cannot be reused). Under the two-egraph discipline the
-    /// scratch is built **eagerly** here so it is the coherent reasoning graph for
-    /// the whole body (proving *and* framing), keeping ground raw; otherwise it is
-    /// (re)built lazily on the block's first tier-3 obligation.
+    /// exclusive, so it cannot be reused). The scratch itself is built lazily, on
+    /// the block's first tier-3 obligation: building it at entry measured 1.8x
+    /// slower on `structs_enums` (2284 clones instead of 14 — most blocks never
+    /// reach tier 3).
     pub(crate) fn begin_block(&mut self, cube: Vec<(egg::Id, Polarity)>) {
         self.scratch = None;
         self.current_cube = cube;
@@ -870,7 +880,19 @@ impl<'a> VerifyContext<'a> {
             // cube marks the block path infeasible, so its goals hold vacuously.
             egraph.union(*id, lit);
         }
+        let t_rebuild = std::time::Instant::now();
         egraph.rebuild();
+        if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
+            eprintln!(
+                "[scratch-build] ground {}n/{}c ids {} cube {} | clone+union {:?} rebuild {:?}",
+                self.egraph.total_number_of_nodes(),
+                self.egraph.number_of_classes(),
+                watermark,
+                cube.len(),
+                t_clone.elapsed() - t_rebuild.elapsed(),
+                t_rebuild.elapsed(),
+            );
+        }
         self.current_cube = cube;
         self.scratch = Some(BlockScratch {
             egraph,
@@ -895,7 +917,18 @@ impl<'a> VerifyContext<'a> {
         let _scope = rewrite::ScratchScope::resume(sc.scope);
         let _t = std::time::Instant::now();
         let before = self.alloc.stats.sat_iterations;
+        let (n0, c0) = (sc.egraph.total_number_of_nodes(), sc.egraph.number_of_classes());
         sc.egraph = self.saturate_flat(sc.egraph);
+        if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
+            eprintln!(
+                "[scratch-sat] {n0}n/{c0}c -> {}n/{}c  (ground {}n/{}c, {} iters)",
+                sc.egraph.total_number_of_nodes(),
+                sc.egraph.number_of_classes(),
+                self.egraph.total_number_of_nodes(),
+                self.egraph.number_of_classes(),
+                self.alloc.stats.sat_iterations - before,
+            );
+        }
         self.alloc.stats.block_scratch_saturations += 1;
         self.alloc.stats.block_scratch_iterations += self.alloc.stats.sat_iterations - before;
         sc.dirty = false;
@@ -917,12 +950,22 @@ impl<'a> VerifyContext<'a> {
         let _scope = rewrite::ScratchScope::resume(sc.scope);
         let _t = std::time::Instant::now();
         let egraph = std::mem::take(&mut sc.egraph);
+        let (n0, c0) = (egraph.total_number_of_nodes(), egraph.number_of_classes());
         let (egraph, iterations) = run_rules(
             egraph,
             self.static_reduce.iter().chain(self.alloc.rules()),
             None,
         );
         sc.egraph = egraph;
+        if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
+            eprintln!(
+                "[scratch-red] {n0}n/{c0}c -> {}n/{}c  (ground {}n/{}c)",
+                sc.egraph.total_number_of_nodes(),
+                sc.egraph.number_of_classes(),
+                self.egraph.total_number_of_nodes(),
+                self.egraph.number_of_classes(),
+            );
+        }
         self.alloc.stats.record_run(&iterations);
         // A reduce is not a saturation: leave `dirty` set so the next obligation
         // still runs the full rule set.

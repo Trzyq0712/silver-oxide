@@ -38,8 +38,7 @@ pub struct VerifyStats {
     /// egg `Runner` iterations spent inside `probe_saturations` (subset of
     /// `sat_iterations`).
     pub probe_iterations: u64,
-    /// Per-block scratch e-graph experiment (`SILVER_OXIDE_BLOCK_SCRATCH`):
-    /// ground clones taken to build a block scratch (one per block that reaches
+    /// Per-block scratch e-graph: ground clones taken to build a block scratch (one per block that reaches
     /// tier-3), full-rule-set saturations of that shared scratch, and the egg
     /// iterations they cost. `block_scratch_freehits` counts obligations
     /// discharged straight off the saturated scratch with no per-obligation
