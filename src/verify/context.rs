@@ -548,6 +548,26 @@ impl<'a> VerifyContext<'a> {
             .expect("true present")
     }
 
+    /// One `[tier3]` line per tier-3 obligation: ground size when tier 3 was
+    /// reached versus the scratch size the obligation reasons over, and how far the
+    /// scratch had to be run (`reduce` = the cheap reductions sufficed).
+    fn trace_tier3(&self, g0: (usize, usize, usize), fresh: bool, ran: &str) {
+        let sc = self.scratch.as_ref().expect("scratch live");
+        let st = sc.egraph.find(sc.true_id);
+        eprintln!(
+            "[tier3] ground {}n/{}c true={} | scratch {}n/{}c true={} | ratio {:.2} | {} | {}",
+            g0.0,
+            g0.1,
+            g0.2,
+            sc.egraph.total_number_of_nodes(),
+            sc.egraph.number_of_classes(),
+            sc.egraph[st].nodes.len(),
+            sc.egraph.total_number_of_nodes() as f64 / g0.0.max(1) as f64,
+            ran,
+            if fresh { "built" } else { "warm" },
+        );
+    }
+
     pub(crate) fn add(&mut self, node: Symbolic) -> egg::Id {
         let before = self.egraph.total_size();
         // Keep `node` for the scratch mirror only when a scratch is live (the
@@ -989,6 +1009,21 @@ impl<'a> VerifyContext<'a> {
     /// Obligations carrying extra pc literals (a perm-`Select` branch condition)
     /// clone the *warm* scratch and assume only those, then saturate.
     fn prove_via_scratch(&mut self, goal: egg::Id, pc_lits: &[(egg::Id, Polarity)]) -> bool {
+        // Ground size at the moment tier 3 is reached, before the scratch is built or
+        // touched — paired below with the scratch size the obligation actually
+        // reasons over (`SILVER_OXIDE_TRACE_SCRATCH`).
+        let trace = std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some();
+        let g0 = if trace {
+            let t = self.egraph.find(self.true_id_cached());
+            (
+                self.egraph.total_number_of_nodes(),
+                self.egraph.number_of_classes(),
+                self.egraph[t].nodes.len(),
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let fresh = self.scratch.is_none();
         self.ensure_scratch();
         // Translate goal + pc into scratch space first: `tr` may *import* ground
         // operands (a lazy/structural ground surfaces rule-canonical leaders),
@@ -1007,10 +1042,16 @@ impl<'a> VerifyContext<'a> {
             let sc = self.scratch.as_ref().expect("scratch live");
             if sc.egraph.find(tg) == sc.egraph.find(sc.true_id) {
                 self.alloc.stats.block_scratch_freehits += 1;
+                if trace {
+                    self.trace_tier3(g0, fresh, "reduce");
+                }
                 return true;
             }
         }
         self.saturate_scratch();
+        if trace {
+            self.trace_tier3(g0, fresh, "saturate");
+        }
 
         let sc = self.scratch.as_ref().expect("scratch live");
         // A contradictory cube (or a mirrored union that conflicts under it)
