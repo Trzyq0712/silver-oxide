@@ -1086,6 +1086,23 @@ fn heap_subtract_inner(
             ctx.saturate();
             return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, false);
         }
+        // Last resort: the demanded address may match a held chunk **only under the
+        // pc**. A `&mut` reborrow taken inside a branch arm is exactly this shape — the
+        // arm's `p_Ref_mutable_assign` gives `snap(arm_ref) == arbitrary_value(param, ..)`
+        // as a *pc-guarded* fact, and address matching is ground e-class equality, which
+        // cannot see it. `chunk_under_pc` (already used on the read side) resolves it.
+        //
+        // Consuming through it goes down the invariant-7 path with an empty partner set:
+        // sufficiency is proven under the pc and the debit is **gated** by the pc, so
+        // off-path — where the two addresses are unrelated — nothing is taken.
+        let pc_match = ctx
+            .chunk_under_pc(h1.chunks_of(kind), chunk2.addr, pc_lits)
+            .cloned();
+        if let Some(c) = pc_match {
+            return heap_subtract_pc_aliased(
+                ctx, h1, out, kind, &c, chunk2, chunk2_perm, &[], pc_lits,
+            );
+        }
         if std::env::var_os("SILVER_OXIDE_TRACE_MISS").is_some() {
             eprintln!(
                 "[miss] group {:?} demanded addr:\n{}held addrs ({}):",
