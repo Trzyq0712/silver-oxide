@@ -1382,9 +1382,15 @@ impl<'a> VerifyContext<'a> {
     /// re-split twice on one path).
     fn split_prove(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
         self.alloc.stats.prove_tier4 += 1;
+        if std::env::var_os("SILVER_OXIDE_TRACE_TIER4").is_some() {
+            eprintln!("[TIER4-ATTEMPT]");
+        }
         let mut assumed: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
         if self.split_goal(probe, goal, &mut assumed) {
             self.alloc.stats.prove_splits += 1;
+            if std::env::var_os("SILVER_OXIDE_TRACE_TIER4").is_some() {
+                eprintln!("[TIER4-SUCCESS]");
+            }
             return true;
         }
         false

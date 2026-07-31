@@ -299,7 +299,25 @@ impl Applier<Symbolic, ConstFold> for TimedApplier {
 /// The static structural rule set. Per-ADT cons/proj/tag reductions are minted
 /// by the registry (`verify::mono`) and appended by `VerifyContext::new`.
 pub fn rules() -> Vec<Rule> {
-    static_rules().into_iter().map(timed).collect()
+    static_rules().into_iter().filter(kept).map(timed).collect()
+}
+
+/// Ablation gate: `SILVER_OXIDE_DROP_RULES=name1,name2` removes those rules from
+/// the saturation and reduction sets. Dropping a rewrite is incomplete, never
+/// unsound, so a run under the flag that still verifies every member says the
+/// rule was redundant *on that corpus* — the point of the measurement.
+fn kept(rule: &Rule) -> bool {
+    use std::sync::OnceLock;
+    static DROP: OnceLock<HashSet<String>> = OnceLock::new();
+    let drop = DROP.get_or_init(|| {
+        std::env::var("SILVER_OXIDE_DROP_RULES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    drop.is_empty() || !drop.contains(rule.name.as_str())
 }
 
 /// The terminating structural reductions used to **normalize** the e-graph after
@@ -310,7 +328,11 @@ pub fn rules() -> Vec<Rule> {
 /// appended by `VerifyContext::new`. Kept separate from [`rules`] so that future
 /// *non-terminating* rules are run only during full saturation, never here.
 pub fn reduce_rules() -> Vec<Rule> {
-    terminating_ite_rules().into_iter().map(timed).collect()
+    terminating_ite_rules()
+        .into_iter()
+        .filter(kept)
+        .map(timed)
+        .collect()
 }
 
 /// Build the projection reduction `accessor(ctor(a0..an)) ⇒ a_index` for a
@@ -858,6 +880,17 @@ fn known_bool(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Option<bool> {
 
 struct IteReduceApplier;
 
+/// Measurement gate for the two nested same-condition `ite` shapes
+/// (`ite(c, ite(c, x, y), _)` and its mirror). Set `SILVER_OXIDE_NO_NESTED_ITE=1`
+/// to drop them and cost out the nested branch-class scan. Dropping a rewrite is
+/// incomplete, never unsound, so a run under the flag that still verifies every
+/// member is a fair timing comparison.
+fn nested_ite_shapes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SILVER_OXIDE_NO_NESTED_ITE").is_none())
+}
+
 impl Applier<Symbolic, ConstFold> for IteReduceApplier {
     fn apply_one(
         &self,
@@ -948,8 +981,9 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
             // branch classes tiny. Sound either way (skipping a rewrite is
             // incomplete, not unsound).
             const NESTED_SCAN_BOUND: usize = 64;
-            let scan_t = egraph[t].nodes.len() <= NESTED_SCAN_BOUND;
-            let scan_e = egraph[e].nodes.len() <= NESTED_SCAN_BOUND;
+            let nested = nested_ite_shapes_enabled();
+            let scan_t = nested && egraph[t].nodes.len() <= NESTED_SCAN_BOUND;
+            let scan_e = nested && egraph[e].nodes.len() <= NESTED_SCAN_BOUND;
             //   c ? (c ? x : y) : e
             for inner in scan_t.then(|| &egraph[t].nodes).into_iter().flatten() {
                 let Symbolic::Ite([c2, x, y]) = inner else {
