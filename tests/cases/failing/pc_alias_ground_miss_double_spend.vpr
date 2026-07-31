@@ -1,0 +1,21 @@
+// Soundness canary for the pc-alias *ground-miss* consume path (the one taken when no
+// held chunk sits at the demanded address on ground). That path sums the whole alias
+// set, so it must not sum a fraction twice: with only `1/1` in the group, two full
+// consumes through the alias cannot both succeed.
+//
+// Positive counterpart: passing/permissions/pc_alias_consume_prefers_holder.vpr, which
+// is this program with an `inhale acc(P(y), 1/1)` between the two exhales.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref, y: Ref, z: Ref)
+    requires acc(P(x), 1/1)
+{
+    if (x == y) {
+        if (y == z) {
+            exhale acc(P(y), 1/1)
+            exhale acc(P(z), 1/1)
+        }
+    }
+}

@@ -1,0 +1,33 @@
+// A consume whose demanded address is held by NO ground chunk resolves through the
+// pc-alias probe. Several held chunks can coincide with the demand under the pc, so
+// the probe must sum the whole alias *set* — taking the first hit is order-dependent,
+// not merely incomplete.
+//
+// Here the first `exhale` drains `P(x)` through the alias (a pc-*gated* debit, so the
+// chunk survives with remainder `pc ? 0 : 1/1`), and the `inhale` parks a full `1/1` at
+// `P(y)`. The second consume's demand `P(z)` then aliases both, with the drained chunk
+// first in heap order. Summing finds the permission; taking the head reports
+// "insufficient permission".
+//
+// Real-world shape: `m_world_kick_slowest` in `benchmarks/rust/vpr/physics_step.vpr`,
+// where consecutive `&mut` reborrows of a branch-selected body each mint a fresh ref
+// that is only pc-equal to the one before, and every call's `#requires` exhale /
+// `#ensures` inhale pair leaves another alias behind.
+//
+// Companions: pc_alias_consume_predicate.vpr (demand held on ground),
+// pc_alias_inhale_then_consume.vpr (alias sum on the ordinary path).
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+method m(x: Ref, y: Ref, z: Ref)
+    requires acc(P(x), 1/1)
+{
+    if (x == y) {
+        if (y == z) {
+            exhale acc(P(y), 1/1)
+            inhale acc(P(y), 1/1)
+            exhale acc(P(z), 1/1)
+        }
+    }
+}

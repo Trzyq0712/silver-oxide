@@ -1090,18 +1090,34 @@ fn heap_subtract_inner(
         // pc**. A `&mut` reborrow taken inside a branch arm is exactly this shape — the
         // arm's `p_Ref_mutable_assign` gives `snap(arm_ref) == arbitrary_value(param, ..)`
         // as a *pc-guarded* fact, and address matching is ground e-class equality, which
-        // cannot see it. `chunk_under_pc` (already used on the read side) resolves it.
+        // cannot see it. The pc probe (`chunk_under_pc`'s set-valued sibling) resolves it.
         //
-        // Consuming through it goes down the invariant-7 path with an empty partner set:
-        // sufficiency is proven under the pc and the debit is **gated** by the pc, so
-        // off-path — where the two addresses are unrelated — nothing is taken.
-        let pc_match = ctx
-            .chunk_under_pc(h1.chunks_of(kind), chunk2.addr, pc_lits)
-            .cloned();
-        if let Some(c) = pc_match {
-            return heap_subtract_pc_aliased(
-                ctx, h1, out, kind, &c, chunk2, chunk2_perm, &[], pc_lits,
-            );
+        // Consuming through it goes down the invariant-7 path: sufficiency is proven
+        // under the pc and the debit is **gated** by the pc, so off-path — where the
+        // addresses are unrelated — nothing is taken.
+        //
+        // The whole pc-alias *set* is collected, not the first hit, for the same
+        // reason invariant 7 sums partners when the demanded chunk exists: several
+        // held chunks can coincide with the demand under the pc, and only their sum
+        // is the permission at that location. A first-hit lookup is not merely
+        // incomplete but order-dependent — `world_kick_slowest` in
+        // `benchmarks/rust/vpr/physics_step.vpr` consumes the same `&mut`-reborrowed
+        // body twice in a row, and the second consume's first hit is the chunk the
+        // first consume already drained (its pc-gated remainder is `0` on-path),
+        // while the full permission sits in the chunk the intervening
+        // `#ensures` inhale produced. Summing finds it; taking the head does not.
+        let alias_set = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
+        if let Some((head, partners)) = alias_set.split_first() {
+            let head = h1
+                .chunks_of(kind)
+                .iter()
+                .find(|c| ctx.egraph.find(c.addr) == ctx.egraph.find(*head))
+                .cloned();
+            if let Some(head) = head {
+                return heap_subtract_pc_aliased(
+                    ctx, h1, out, kind, &head, chunk2, chunk2_perm, partners, pc_lits,
+                );
+            }
         }
         if std::env::var_os("SILVER_OXIDE_TRACE_MISS").is_some() {
             eprintln!(
@@ -1272,6 +1288,16 @@ fn heap_subtract_pc_aliased(
     let true_ = ctx.true_();
     let sufficient = ctx.add(Symbolic::Ite([lt, false_, true_]));
     if !ctx.prove_under_pc(sufficient, pc_lits) {
+        if crate::verify::viz::dump_perm_enabled() {
+            eprintln!(
+                "[perm-dump] insufficient in pc-aliased subtract, group {:?}, {} partner(s)\n\
+                 total:\n{}needed:\n{}",
+                kind.group,
+                partners.len(),
+                crate::verify::viz::dump_term(ctx, total, 64),
+                crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
+            );
+        }
         return Err(VerifyError::InsufficientPermission);
     }
     // Golden rule, but only where the locations coincide.
