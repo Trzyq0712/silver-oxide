@@ -3,7 +3,7 @@
 Realistic spec-less Rust, encoded to Viper by Prusti, for measuring verifier cost on
 programs that do more computation than a bare enum match. Built to answer whether the
 lazy / sticky / dominator-scoped scratch e-graph designs have anything to work with
-(`design/block-vmir/82-two-egraph-block-model.md`, `analysis/scratch_mode_2026-07-30/`).
+(the block-VMIR two-e-graph design notes; those live outside the repo).
 
     src/*.rs        hand-written and generated sources (committed)
     vpr/*.vpr       their Prusti encodings (committed — measurement needs no Prusti)

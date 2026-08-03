@@ -1,3 +1,11 @@
 /target
 /test
 /log
+
+# Working notes and design docs: kept on disk, deliberately not tracked.
+# Root-level .md only -- README.md and the per-corpus READMEs stay.
+/*.md
+!/README.md
+/design/
+/memory/
+/.githooks/
