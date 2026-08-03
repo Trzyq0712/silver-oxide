@@ -76,7 +76,19 @@ Every program here that calls a helper taking `&mut` — most of them — failed
    unsoundness side, `tests/cases/failing/pc_alias_ground_miss_double_spend.vpr`.
    Cleared `physics_step::m_world_kick_slowest` and `inventory::m_slots_move`.
 
-All three are why the sources here are written as ordinary Rust rather than around the
+4. **Re-reading a field after a call.** Prusti wraps every `&mut` field access in
+   `make_concrete_T` / `unfold` / read / `fold` / `make_generic_T`, and that pair relates
+   the before/after predicate snapshots only through the snap *function* `p_T_snap`. The
+   `f%pre` token that gates unfolding `p_T_snap`'s body is emitted as an orphan recipe
+   step, and `RecipeBuilder::slice` -- backward closure from the result -- pruned it as
+   unreachable, so an occurrence introduced by a method contract had no token and stayed
+   opaque. Two reads of one *unchanged* field were therefore provably unrelated. Fixed by
+   `slice_with_tokens`; pinned by
+   `tests/cases/passing/functions/resource_recipe_keeps_pre_token.vpr`. Cleared
+   `physics_step::m_body_apply_impulse` and three `panic_free` probes
+   (`frame_other_field`, `write_then_read`, `enum_rematch`).
+
+All four are why the sources here are written as ordinary Rust rather than around the
 verifier. If any gap returns, those cases fail before the corpus does.
 
 ## Checking the corpus
@@ -87,9 +99,8 @@ verifier. If any gap returns, those cases fail before the corpus does.
 Holds the corpus to the rule above — every member verifies — against the reviewed
 exception list in `expected_failures.txt`. Fails on a member that regressed *and* on a
 listed member that now passes, so a closed gap has to be deleted from the list rather
-than left to rot. Currently **2885 verified, 1 known-failing**
-(`physics_step::m_body_apply_impulse` — a divide-by-zero guard whose divisor is a field
-reached through a `&mut`).
+than left to rot. Currently **2886 verified, 0 known-failing** — every member of the
+corpus verifies, so `expected_failures.txt` is empty.
 
 Not part of `cargo test`: the corpus takes minutes and its `vpr/` is large, so it is a
 pre-merge check rather than a unit-test-suite member.

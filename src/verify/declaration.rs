@@ -365,11 +365,15 @@ fn eval_pure_inst(
                     args: args.clone(),
                 });
                 if let Some(g_pre) = g_pre {
-                    rb.emit(AxiomPure::App {
+                    let tok = rb.emit(AxiomPure::App {
                         func: g_pre,
                         type_args: Vec::new(),
                         args,
                     });
+                    // The token's value is never consumed, so `RecipeBuilder::slice`
+                    // would prune it as unreachable from the result. Register it as
+                    // a slice root.
+                    rb.record_token_step(tok);
                 }
                 Some(call)
             } else {
@@ -3121,7 +3125,7 @@ pub(crate) fn verify_resource(
         ))?;
     Ok(Some(ResourceDefinition {
         footprint,
-        bool: rb.slice(&bool_r)?,
+        bool: rb.slice_with_tokens(&bool_r)?,
     }))
 }
 

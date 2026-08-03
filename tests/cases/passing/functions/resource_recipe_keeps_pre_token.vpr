@@ -1,0 +1,105 @@
+// A function application introduced by a *resource* body (a method contract) must
+// carry its `f%pre` presence token, or the callee's body never unfolds there.
+//
+// `RecipeBuilder::slice` builds a resource's body recipe by backward closure from the
+// result value. The `g%pre` token emitted alongside a callee application is deliberately
+// an *orphan* -- nothing consumes its value -- so reachability pruned it, and a resource
+// recipe replayed at a client minted `p_S_snap(a, h)` with no token. The definitional
+// union is gated on that token, so `p_S_snap` stayed opaque and never connected to
+// `s_S_cons(<field value>)`.
+//
+// Silicon cannot hit this: it emits the same stamp as a `decider.assume(f%precondition)`
+// side effect while *evaluating* the application (`Evaluator.scala`, and `Producer.scala`
+// evaluates a produced assertion the same way), and an assumption on the path-condition
+// stack has no consumer to be reachable from.
+//
+// This is Prusti's encoding of every `&mut` field access: `make_generic_T`/`make_concrete_T`
+// relate the before/after predicate snapshots only through the snap *function*, so two
+// reads of one unchanged field were provably unrelated. It cost the whole
+// benchmarks/rust corpus one member plus three panic_free probes
+// (frame_other_field, write_then_read, enum_rematch).
+
+domain s_Int_i32 { }
+
+adt s_S { s_S_cons(s_S_0: s_Int_i32) }
+
+function s_S_field_0(self: Ref): Ref
+  ensures (self == null) == (result == null)
+
+field p_Int_i32_val: s_Int_i32
+
+predicate p_Int_i32(self: Ref) { acc(self.p_Int_i32_val, write) }
+
+function p_Int_i32_snap(self: Ref): s_Int_i32
+  requires acc(p_Int_i32(self), write)
+{ (unfolding acc(p_Int_i32(self), write) in self.p_Int_i32_val) }
+
+predicate p_S(self: Ref) { acc(p_Int_i32(s_S_field_0(self)), write) }
+
+function p_S_snap(self: Ref): s_S
+  requires acc(p_S(self), write)
+{ (unfolding acc(p_S(self), write) in s_S_cons(p_Int_i32_snap(s_S_field_0(self)))) }
+
+// Hands the predicate back with its snapshot preserved, stated only at the
+// snap-function level -- what make_generic_T/make_concrete_T achieve together.
+method passthrough(a: Ref)
+  requires acc(p_S(a), write)
+  ensures  acc(p_S(a), write)
+  ensures  old(p_S_snap(a)) == p_S_snap(a)
+
+// The regression: two reads of the same unchanged field across the round trip.
+method reread_across_snapshot_roundtrip(a: Ref)
+  requires acc(p_S(a), write)
+{
+  var v1: s_Int_i32
+  var v2: s_Int_i32
+  unfold acc(p_S(a), write)
+  v1 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+
+  passthrough(a)
+
+  unfold acc(p_S(a), write)
+  v2 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+
+  assert v1 == v2
+}
+
+// Control that passed even before the fix: explicit value-position calls to p_S_snap
+// mint the token themselves. Kept so a regression is attributable.
+method reread_with_explicit_snap_calls(a: Ref)
+  requires acc(p_S(a), write)
+{
+  var v1: s_Int_i32
+  var v2: s_Int_i32
+  var junk: s_S
+  unfold acc(p_S(a), write)
+  v1 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+  junk := p_S_snap(a)
+
+  passthrough(a)
+
+  junk := p_S_snap(a)
+  unfold acc(p_S(a), write)
+  v2 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+
+  assert v1 == v2
+}
+
+// Control: no round trip between the reads -- the fold/unfold identity alone suffices.
+method reread_no_roundtrip(a: Ref)
+  requires acc(p_S(a), write)
+{
+  var v1: s_Int_i32
+  var v2: s_Int_i32
+  unfold acc(p_S(a), write)
+  v1 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+  unfold acc(p_S(a), write)
+  v2 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+  assert v1 == v2
+}

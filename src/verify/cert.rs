@@ -203,6 +203,14 @@ pub(crate) struct RecipeBuilder {
     /// callees stay dormant, discharged by congruence rather than by unfolding.
     /// A regular function body (value position) sets this `false` and propagates.
     spec: bool,
+    /// Orphan steps that must survive [`Self::slice`]'s backward closure: the
+    /// `g%pre` precondition tokens emitted alongside a callee application. Their
+    /// value is never consumed, so reachability-from-the-result would prune them
+    /// -- and then a resource recipe replayed at a client mints the callee
+    /// application without its token, leaving the callee's body permanently
+    /// un-unfolded at that occurrence (function bodies are unaffected: they keep
+    /// every step via `into_function_parts`).
+    token_steps: Vec<Val>,
 }
 
 impl RecipeBuilder {
@@ -223,11 +231,18 @@ impl RecipeBuilder {
             post_meta,
             pending_slots: Vec::new(),
             spec: false,
+            token_steps: Vec::new(),
         }
     }
 
     /// Mark this recipe as a spec (contract-function) body — suppresses
     /// precondition-propagation token emission (see [`Self::spec`]).
+    /// Record an orphan `g%pre` token step so [`Self::slice`] keeps it (see
+    /// [`Self::token_steps`]).
+    pub(crate) fn record_token_step(&mut self, v: Val) {
+        self.token_steps.push(v);
+    }
+
     pub(crate) fn mark_spec(&mut self) {
         self.spec = true;
     }
@@ -360,6 +375,19 @@ impl RecipeBuilder {
     /// `seed_refs`, reached steps re-emit densely in original (topological)
     /// order. Unlike the old `RTree` flatten, shared subterms stay shared.
     pub(crate) fn slice(&self, out: &Val) -> Result<BodyRecipe, VerifyError> {
+        self.slice_impl(out, false)
+    }
+
+    /// [`Self::slice`], additionally keeping the orphan `g%pre` token steps (see
+    /// [`Self::token_steps`]). Only for a resource's **body boolean**: a footprint
+    /// slot's recipe resolves `SeedRef::SlotValue(j)` against the slot values built
+    /// so far, so pulling a token that mentions a later slot into a slot recipe
+    /// would index past the end.
+    pub(crate) fn slice_with_tokens(&self, out: &Val) -> Result<BodyRecipe, VerifyError> {
+        self.slice_impl(out, true)
+    }
+
+    fn slice_impl(&self, out: &Val, keep_tokens: bool) -> Result<BodyRecipe, VerifyError> {
         let Val::Temp(root) = out else {
             return Ok(BodyRecipe {
                 seed_refs: Vec::new(),
@@ -370,6 +398,14 @@ impl RecipeBuilder {
         let n = self.n_params + self.steps.len();
         let mut reach = vec![false; n];
         let mut stack = vec![*root];
+        if keep_tokens {
+            // Token steps are roots in their own right (see `token_steps`).
+            for t in &self.token_steps {
+                if let Val::Temp(i) = t {
+                    stack.push(*i);
+                }
+            }
+        }
         while let Some(i) = stack.pop() {
             if reach[i] {
                 continue;

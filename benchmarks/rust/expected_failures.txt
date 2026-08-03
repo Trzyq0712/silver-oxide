@@ -8,22 +8,4 @@
 #
 # Keep each entry's reason current. An entry with no live reason is a bug report.
 
-# A divide-by-zero guard whose divisor is a struct field reached through a `&mut`.
-#
-#     pub fn body_apply_impulse(b: &mut Body, j: &Vec2) {
-#         if 0 < b.mass { b.vel.x = b.vel.x + j.x / b.mass; ... }
-#     }
-#
-# The guard's read of `b.mass` and the obligation's read land in different e-classes
-# through the mutable-ref indirection, so the order fact `0 < mass` never reaches the
-# `mass == 0` check. A/B over one Prusti encoding isolates it to the `&mut` alone —
-# not to the write between the divisions, and not to there being two of them:
-#
-#     divisor a parameter          (`param_div`, `param_div_pure`)   verifies
-#     field through `&Body`        (`field_div_pure`)                 verifies
-#     field through `&mut Body`    (with or without a write between)  FAILS
-#
-# `m_body_damp` is the same source shape but divides by a parameter, which is why it
-# verifies. Distinct from the `e == false` goal-spelling gap that used to hide this
-# one (fixed by rewrite.rs `eq-false-is-not-*`); this is framing, not spelling.
-physics_step m_body_apply_impulse
+# (empty -- every member of the corpus verifies)
