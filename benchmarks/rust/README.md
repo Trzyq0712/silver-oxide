@@ -64,5 +64,32 @@ Every program here that calls a helper taking `&mut` — most of them — failed
    gated by the pc. Pinned by
    `tests/cases/passing/permissions/mut_reborrow_call_in_branch.vpr`.
 
-Both are why the sources here are written as ordinary Rust rather than around the
-verifier. If either gap returns, those two cases fail before the corpus does.
+3. **Consecutive calls on a branch-selected reborrow.** Each `&mut` reborrow of a
+   branch-selected place mints a fresh ref that is only *pc-equal* to the one before, and
+   every call's `#requires` exhale / `#ensures` inhale pair leaves another alias behind.
+   The ground-miss fallback from (2) then took the **first** chunk its probe matched —
+   order-dependent, and the first hit was the chunk an earlier consume had already
+   drained (a pc-gated debit leaves it as `pc ? 0 : 1/1`), while the full permission sat
+   in the chunk the intervening inhale produced. Fixed in `894a300` by collecting the
+   whole pc-alias set and proving sufficiency over its sum. Pinned by
+   `tests/cases/passing/permissions/pc_alias_consume_prefers_holder.vpr` and, on the
+   unsoundness side, `tests/cases/failing/pc_alias_ground_miss_double_spend.vpr`.
+   Cleared `physics_step::m_world_kick_slowest` and `inventory::m_slots_move`.
+
+All three are why the sources here are written as ordinary Rust rather than around the
+verifier. If any gap returns, those cases fail before the corpus does.
+
+## Checking the corpus
+
+    ./check.sh                   # all of vpr/
+    ./check.sh physics_step      # one stem
+
+Holds the corpus to the rule above — every member verifies — against the reviewed
+exception list in `expected_failures.txt`. Fails on a member that regressed *and* on a
+listed member that now passes, so a closed gap has to be deleted from the list rather
+than left to rot. Currently **2885 verified, 1 known-failing**
+(`physics_step::m_body_apply_impulse` — a divide-by-zero guard whose divisor is a field
+reached through a `&mut`).
+
+Not part of `cargo test`: the corpus takes minutes and its `vpr/` is large, so it is a
+pre-merge check rather than a unit-test-suite member.
