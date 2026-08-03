@@ -1,0 +1,10 @@
+// The soundness side of `eq-false-is-not-*` / `eq-true-is-self-*`: normalising the
+// spelling must not make an *unproven* boolean goal provable. Without the guard
+// `0 < x` there is nothing to contradict, so `(x == 0) == false` must be rejected
+// exactly as `!(x == 0)` is. Companion to
+// `passing/branching/goal_spelling_eq_false.vpr`.
+
+method eq_false_unguarded(x: Int)
+{
+    assert (x == 0) == false
+}

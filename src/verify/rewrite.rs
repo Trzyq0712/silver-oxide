@@ -458,6 +458,24 @@ fn static_rules() -> Vec<Rule> {
         rw!("eq-true-union"; "(== ?a ?b)" => {
             UnionEqArgs { a: var("?a"), b: var("?b") }
         }),
+        // Boolean-literal equality is *spelling*, not content: `b == false` and
+        // `!b` denote the same proposition, and `!b` lowers to `ite(b, false, true)`
+        // (`translate/pure_exp.rs`, `UnOp::Not`). These are equivalences, not
+        // implications — an unconditional union, no `Known` gate.
+        //
+        // Not cosmetic: `split_candidates` collects **`Ite` conditions** reachable
+        // from the goal, so a goal spelled `(x == 0) == false` offers the splitter
+        // nothing to split on and never reaches the pc contradiction that the same
+        // goal spelled `!(x == 0)` reaches immediately. Prusti's MIR asserts are
+        // emitted in the `== false` spelling (`exhale s_Bool_value(_t) == false`
+        // for a divide-by-zero guard), so without this every such obligation under
+        // an order-fact pc is out of reach. See
+        // `findings_2026-07-30_panic_freedom.md` §2.
+        rw!("eq-false-is-not-r"; "(== ?b false)" => "(ite ?b false true)"),
+        rw!("eq-false-is-not-l"; "(== false ?b)" => "(ite ?b false true)"),
+        // `b == true` is `b` itself — a pure union, minting no node.
+        rw!("eq-true-is-self-r"; "(== ?b true)" => "?b"),
+        rw!("eq-true-is-self-l"; "(== true ?b)" => "?b"),
         // The boolean decompositions (and-true, or-false, not-true) live in the
         // fused `ite-reduce` pass — they are `Ite`-bucket shapes conditioned on
         // the class's proven boolean, exactly what its applier already inspects.

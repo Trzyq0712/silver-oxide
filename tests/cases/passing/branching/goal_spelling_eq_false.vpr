@@ -1,0 +1,52 @@
+// `e == false` and `!e` are the same goal, and both must reach a pc contradiction.
+//
+// Negation lowers to `ite(e, false, true)` (translate/pure_exp.rs, UnOp::Not), and
+// `split_candidates` collects *ite conditions* reachable from the goal. So before
+// `eq-false-is-not-*`, a goal spelled `(x == 0) == false` offered the splitter nothing
+// to split on and could not reach the `0 < x` contradiction that the identical goal
+// spelled `!(x == 0)` reached immediately. Prusti emits MIR asserts in the `== false`
+// spelling, so this gap held back every divide-by-zero obligation it generates
+// (findings_2026-07-30_panic_freedom.md §2).
+
+method not_spelling(x: Int)
+{
+    if (0 < x) {
+        assert !(x == 0)
+    }
+}
+
+method eq_false_spelling(x: Int)
+{
+    if (0 < x) {
+        assert (x == 0) == false
+    }
+}
+
+// The literal on the left: `eq-false-mirror` only fires on a *disproven* Eq class, so
+// the operand order needs its own rule rather than riding on the mirror.
+method eq_false_spelling_flipped(x: Int)
+{
+    if (0 < x) {
+        assert false == (x == 0)
+    }
+}
+
+// Through a local, which is how Prusti actually spells it: the MIR comparison is
+// assigned to a temporary and the assert is on that temporary.
+method eq_false_via_local(x: Int)
+{
+    var b: Bool
+    if (0 < x) {
+        b := x == 0
+        assert b == false
+    }
+}
+
+// The `== true` counterpart, which is a pure union onto the operand's own class.
+method eq_true_spelling(x: Int)
+{
+    if (x == 0) {
+        assert (x == 0) == true
+        assert true == (x == 0)
+    }
+}
