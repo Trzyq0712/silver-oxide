@@ -1,0 +1,56 @@
+// A negation proven FALSE must yield its operand: `!x ≡ false ⟹ x ≡ true`.
+//
+// `ite-reduce` already had the `Some(true)` half (`!x` proven true ⟹ x false) and not
+// its mirror. That mirror is not a corner case: it is how Prusti spells *every* taken
+// branch. `switchInt` lowers to
+//
+//     if (s_Bool_value(_t) == false) { else-arm } else { then-arm }
+//
+// so the arm where the guard *holds* sits under the negation of `value(_t) == false` --
+// a negation proven false. Without the mirror, no Prusti-generated guard ever produced
+// its positive fact, and a contradiction between two guards was unreachable.
+//
+// Depends on `eq-false-is-not-*` (see goal_spelling_eq_false.vpr) to put
+// `g == false` and `ite(g, false, true)` in one class in the first place.
+
+method negation_false_gives_operand(b: Bool)
+{
+    if (b == false) {
+        // nothing
+    } else {
+        assert b
+    }
+}
+
+// Two guards in Prusti's spelling, contradicting each other.
+method two_guards_negative_spelling(x: Int)
+{
+    if ((x == 5) == false) {
+        // nothing
+    } else {
+        if ((x == 7) == false) {
+            // nothing
+        } else {
+            assert false
+        }
+    }
+}
+
+// The positive spelling, which worked before the mirror. Kept so a regression is
+// attributable to the negative form specifically.
+method two_guards_positive_spelling(x: Int)
+{
+    if (x == 5) {
+        if (x == 7) {
+            assert false
+        }
+    }
+}
+
+// The `Some(true)` half, which was already present.
+method negation_true_gives_operand_false(b: Bool)
+{
+    if (!b) {
+        assert b == false
+    }
+}

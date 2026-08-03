@@ -943,6 +943,16 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
                 Some(true) if t_lit == Some(false) && e_lit == Some(true) => {
                     unions.push((c, Target::False));
                 }
+                // (!x) proven false => x true.  The mirror of the arm above: a
+                // *negative* path-condition literal on a negation is exactly how
+                // Prusti spells a taken branch -- `switchInt` emits
+                // `if (value(t) == false) { else } else { then }`, so the arm where
+                // the guard *holds* sits under `!(value(t) == false)`, i.e. under a
+                // negation proven false. Without this, no guard Prusti generates
+                // ever yields its positive fact.
+                Some(false) if t_lit == Some(false) && e_lit == Some(true) => {
+                    unions.push((c, Target::True));
+                }
                 // (a || b) proven false => a, b each false.  a || b is a ? true : b.
                 Some(false) if t_lit == Some(true) => {
                     unions.push((c, Target::False));
