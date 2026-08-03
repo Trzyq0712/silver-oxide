@@ -2044,11 +2044,31 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
                         changed.push(egraph.find(eclass));
                     }
                 }
-                // Recursive function: frame the full occurrence to its limited twin
-                // `f(args) == f'(args)`. `f'` has no unfold rule, so a limited call
-                // produced by unfolding `f`'s body never re-unfolds (bounding
-                // saturation); the frame lets a materialized `f(args)` value flow to
-                // any `f'(args)` a sibling unfold produced.
+            }
+            // Recursive function: frame the full occurrence to its limited twin
+            // `f(args) == f'(args)`. `f'` has no unfold rule, so a limited call
+            // produced by unfolding `f`'s body never re-unfolds (bounding
+            // saturation); the frame lets a materialized `f(args)` value flow to
+            // any `f'(args)` a sibling unfold produced.
+            //
+            // **Ungated**, matching Silicon's `limitedAxiom`
+            // (`supporters/functions/FunctionData.scala`):
+            // `∀ s,args :: {f(s,args)} f'(s,args) == f(s,args)`, emitted after
+            // phase 1 for every function and triggered on the *non-limited*
+            // application. The precondition is an implication *inside* Silicon's
+            // post/definitional axioms, never a gate on this equality — so this
+            // union must NOT sit behind the `f%pre` presence token that gates the
+            // definitional union above. The token is minted only at a
+            // value-position call, so gating it here strands a recursive
+            // function's post fact (stated on `f'`, see `declaration.rs`
+            // `spec_post_definition`) in limited space whenever the occurrence
+            // arrived via a callee's `ensures` rather than a direct call.
+            //
+            // Cannot reintroduce unbounded unfolding: this mints `f'` *from* an
+            // existing `f` node, never the reverse, and the unfold rule filters
+            // on `FuncApp(f)` — so an `f'(args')` class produced by unrolling a
+            // body still holds no `f` node and stays inert.
+            if !self.limited_post {
                 if let Some(lim) = self.def.limited {
                     let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.into()));
                     if egraph.union(eclass, twin) {

@@ -1,0 +1,69 @@
+// A recursive function's postcondition must be reachable from a goal written in
+// non-limited terms, however the occurrence was introduced.
+//
+// The post fact of a recursive function is stated on its limited twin `f'`
+// (`declaration.rs`, `limited.unwrap_or_else(..)`), so a goal mentioning `f` reaches it
+// only through the frame `f(args) == f'(args)`. That frame used to sit inside the
+// definitional-union block, gated on the `f%pre` presence token — and that token is
+// minted only at a *value-position call*. An occurrence introduced by a callee method's
+// `ensures` mints no token, so the postcondition stayed stranded in `f'` space and the
+// goal could never meet it.
+//
+// Silicon emits the same equality as `limitedAxiom` — unconditional, triggered on the
+// non-limited application, with the precondition an implication *inside* the post and
+// definitional axioms rather than a gate on this one
+// (`supporters/functions/FunctionData.scala`). We now match that.
+//
+// Prusti hits this on every `&mut` field access: its `make_generic_s_T`/`make_concrete_s_T`
+// pair is mutually recursive through their postconditions, and each access introduces
+// them through the `make_concrete_T`/`make_generic_T` *method* postconditions.
+
+domain s_Body { }
+domain s_Param { }
+
+// Mutually recursive through their postconditions alone — no bodies.
+function rec_mg(self: s_Body): s_Param
+  ensures rec_mc(result) == self
+
+function rec_mc(snap: s_Param): s_Body
+  ensures rec_mg(result) == snap
+
+// Self-recursive through its own postcondition.
+function self_f(x: s_Body): s_Body
+  ensures self_f(result) == x
+
+method gen_rec(s: s_Body) returns (p: s_Param)
+  ensures rec_mg(s) == p
+
+method gen_self(s: s_Body) returns (r: s_Body)
+  ensures self_f(s) == r
+
+// The regression: occurrence introduced only by the callee's `ensures`.
+method mutual_via_method_ensures(s1: s_Body)
+{
+  var p: s_Param
+  p := gen_rec(s1)
+  assert rec_mc(p) == s1
+}
+
+// Mutual recursion is not required — a self-loop is enough.
+method selfrec_via_method_ensures(s1: s_Body)
+{
+  var r: s_Body
+  r := gen_self(s1)
+  assert self_f(r) == s1
+}
+
+// Controls that passed even before the fix, kept so a regression is attributable:
+// the same occurrence introduced by a direct call, and by an `assume`.
+method mutual_via_direct_call(s1: s_Body)
+{
+  var p: s_Param := rec_mg(s1)
+  assert rec_mc(p) == s1
+}
+
+method mutual_via_assume(s1: s_Body, p: s_Param)
+{
+  assume rec_mg(s1) == p
+  assert rec_mc(p) == s1
+}
