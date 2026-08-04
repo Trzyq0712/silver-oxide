@@ -5,20 +5,30 @@
 //! a later linearization pass walks this CFG (topologically — it is a DAG) to
 //! emit PathCond-gated straight-line VMIR.
 //!
-//! Loops are rejected: a `goto` that forms a back-edge makes the block graph
-//! cyclic, which is reported as [`CfgError::Loop`]. (A source `while` is
-//! desugared into that same back-edge form before it reaches here, so it lands
-//! on the same rejection.)
+//! Loops are **detected**, not rejected: a `goto` forming a back edge (and a
+//! `while`, which is desugared into that same shape here) makes the block graph
+//! cyclic, and [`viper::loops`](crate::viper::loops) identifies the back edges.
+//! Cutting them leaves a DAG, so [`Cfg::topo_order`] and [`Cfg::predecessors`]
+//! — and hence the `preds precede` invariant the VMIR lowering and the verifier
+//! both assume — stay valid whether or not the method loops. Every loop head is
+//! normalised to a single in-edge by a pre-header.
+//!
+//! Only genuinely irreducible control flow (a cycle entered at more than one
+//! point) is rejected, as [`CfgError::Irreducible`].
 
 use std::collections::{HashMap, HashSet};
 
 use derive_more::{From, Into};
 use lasso::Spur;
-use petgraph::algo::{tarjan_scc, toposort};
+use petgraph::algo::toposort;
 use petgraph::prelude::DiGraphMap;
 use typed_index_collections::TiVec;
 
+use crate::viper::loops::LoopError;
 use crate::viper::typed::{PureMethodExp, SpatialMethodExp, Statement, StmtBlock};
+
+/// The loop structure of a method body, over its block ids.
+pub type Loops = crate::viper::loops::Loops<BlockId>;
 
 /// Index of a basic block within a [`Cfg`].
 #[derive(Debug, From, Into, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -53,20 +63,24 @@ pub struct BasicBlock {
     pub invs: Vec<SpatialMethodExp>,
 }
 
-/// The basic-block control-flow graph of a method body. Acyclic by
-/// construction (loops are rejected during the build).
+/// The basic-block control-flow graph of a method body. Cyclic exactly when the
+/// method loops; `loops.back_edges` are the edges to cut to get a DAG back.
 #[derive(Debug, Clone)]
 pub struct Cfg {
     pub blocks: TiVec<BlockId, BasicBlock>,
     pub entry: BlockId,
     pub labels: HashMap<Spur, BlockId>,
+    /// Loop structure. Empty for a loop-free method, which is the case every
+    /// ordering question below degenerates to.
+    pub loops: Loops,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfgError {
-    /// A `goto` forms a back-edge: the method contains a loop. Carries the
-    /// blocks of one cyclic strongly-connected component.
-    Loop(Vec<BlockId>),
+    /// A cycle entered at more than one point, carrying those entries. Rust MIR
+    /// from `loop`/`while`/`for` is always reducible, so this only arises from
+    /// hand-written `goto` spaghetti.
+    Irreducible(Vec<BlockId>),
     /// A `goto` targets a label that is never declared.
     UndefinedLabel(Spur),
 }
@@ -83,22 +97,36 @@ pub enum EdgeSide {
 
 impl Cfg {
     /// Blocks in topological (dependency) order — every block precedes its
-    /// successors. Infallible: the graph is acyclic by construction.
+    /// successors.
+    ///
+    /// Taken over the graph with back edges cut, so this is total even for a
+    /// looping method: a loop head precedes its body, and the body's back-edge
+    /// tail is a leaf. Infallible, since cutting the back edges of a reducible
+    /// CFG always leaves a DAG.
     pub fn topo_order(&self) -> Vec<BlockId> {
-        let g = block_graph(&self.blocks);
-        toposort(&g, None).expect("CFG is acyclic by construction")
+        toposort(&forward_graph(self), None).expect("cutting back edges leaves a DAG")
     }
 
     /// For each block, its predecessors paired with the edge that reaches it.
+    ///
+    /// **Back edges are excluded.** A loop head's entry state is the cut state —
+    /// the havoc plus the invariant — not a merge of where control came from, so
+    /// a back edge contributes nothing to reach it. That is what lets a head be
+    /// lowered from its single forward predecessor.
     pub fn predecessors(&self) -> TiVec<BlockId, Vec<(BlockId, EdgeSide)>> {
         let mut preds: TiVec<BlockId, Vec<(BlockId, EdgeSide)>> =
             self.blocks.iter().map(|_| Vec::new()).collect();
         for (id, blk) in self.blocks.iter_enumerated() {
+            let mut push = |t: BlockId, side| {
+                if !self.loops.is_back_edge(id, t) {
+                    preds[t].push((id, side));
+                }
+            };
             match &blk.term {
-                Terminator::Goto(t) => preds[*t].push((id, EdgeSide::Goto)),
+                Terminator::Goto(t) => push(*t, EdgeSide::Goto),
                 Terminator::Branch { then_, else_, .. } => {
-                    preds[*then_].push((id, EdgeSide::Then));
-                    preds[*else_].push((id, EdgeSide::Else));
+                    push(*then_, EdgeSide::Then);
+                    push(*else_, EdgeSide::Else);
                 }
                 Terminator::Return => {}
             }
@@ -309,17 +337,98 @@ impl Builder {
             })
             .collect();
 
-        // Loop rejection: the block graph must be acyclic.
-        let graph = block_graph(&blocks);
-        if toposort(&graph, None).is_err() {
-            return Err(CfgError::Loop(cyclic_blocks(&graph)));
+        // Detect loops rather than reject them. Cutting the back edges leaves a
+        // DAG, which is what keeps `topo_order` (and the `preds precede`
+        // invariant the VMIR lowering and verifier both assume) valid.
+        let mut blocks = blocks;
+        let mut loops = detect(&blocks, entry)?;
+
+        // Give every loop head a single in-edge, so the lowering has one place
+        // to establish the invariant and one frame to restore on exit. Distinct
+        // in-edges would otherwise each carry their own residual heap.
+        if insert_preheaders(&mut blocks, &mut loops, entry) {
+            // Block ids moved; re-derive rather than patching the structure.
+            loops = detect(&blocks, entry)?;
         }
 
         Ok(Cfg {
             blocks,
             entry,
             labels,
+            loops,
         })
+    }
+}
+
+/// Natural-loop detection over the block graph, mapping the analysis' error into
+/// a [`CfgError`].
+fn detect(blocks: &TiVec<BlockId, BasicBlock>, entry: BlockId) -> Result<Loops, CfgError> {
+    Loops::detect(&block_graph(blocks), entry).map_err(|e| match e {
+        LoopError::Irreducible(doors) => CfgError::Irreducible(doors),
+    })
+}
+
+/// Insert a pre-header before every loop head reached by more than one forward
+/// (non-back) edge: a fresh block that all those edges are redirected to, which
+/// then falls through to the head.
+///
+/// Returns whether anything was inserted.
+///
+/// A head is left alone when it already has a single in-edge — the common case,
+/// and the one where adding a block would only cost a redundant join.
+fn insert_preheaders(
+    blocks: &mut TiVec<BlockId, BasicBlock>,
+    loops: &Loops,
+    entry: BlockId,
+) -> bool {
+    let mut inserted = false;
+    for l in &loops.loops {
+        let head = l.head;
+        // Forward predecessors only: a back edge is the loop repeating, not an
+        // entry into it.
+        let in_edges: Vec<BlockId> = blocks
+            .iter_enumerated()
+            .filter(|(id, b)| {
+                successors(&b.term).contains(&head) && !loops.is_back_edge(*id, head)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        // The entry block being the head means control also arrives from outside
+        // the graph, which counts as an in-edge.
+        if in_edges.len() + usize::from(head == entry) <= 1 {
+            continue;
+        }
+        let pre = blocks.push_and_get_key(BasicBlock {
+            stmts: Vec::new(),
+            term: Terminator::Goto(head),
+            label: None,
+            invs: Vec::new(),
+        });
+        for p in in_edges {
+            retarget(&mut blocks[p].term, head, pre);
+        }
+        inserted = true;
+    }
+    inserted
+}
+
+/// Repoint every `from` successor of a terminator at `to`.
+fn retarget(term: &mut Terminator, from: BlockId, to: BlockId) {
+    match term {
+        Terminator::Goto(b) => {
+            if *b == from {
+                *b = to;
+            }
+        }
+        Terminator::Branch { then_, else_, .. } => {
+            if *then_ == from {
+                *then_ = to;
+            }
+            if *else_ == from {
+                *else_ = to;
+            }
+        }
+        Terminator::Return => {}
     }
 }
 
@@ -344,14 +453,14 @@ fn block_graph(blocks: &TiVec<BlockId, BasicBlock>) -> DiGraphMap<BlockId, ()> {
     g
 }
 
-/// The blocks of one cyclic SCC (size > 1, or a self-loop), for error reporting.
-fn cyclic_blocks(g: &DiGraphMap<BlockId, ()>) -> Vec<BlockId> {
-    for scc in tarjan_scc(g) {
-        if scc.len() > 1 || (scc.len() == 1 && g.contains_edge(scc[0], scc[0])) {
-            return scc;
-        }
+/// The block graph with every back edge removed — a DAG, even when the method
+/// loops. This is the graph every ordering question is asked of.
+fn forward_graph(cfg: &Cfg) -> DiGraphMap<BlockId, ()> {
+    let mut g = block_graph(&cfg.blocks);
+    for &(u, v) in &cfg.loops.back_edges {
+        g.remove_edge(u, v);
     }
-    Vec::new()
+    g
 }
 
 #[cfg(test)]
@@ -439,11 +548,98 @@ mod tests {
     }
 
     #[test]
-    fn backward_goto_is_a_loop() {
+    fn backward_goto_is_detected_as_a_loop() {
         let mut r = Rodeo::default();
         let l = r.get_or_intern("L");
         let body = block(vec![Statement::Label(l, vec![]), nop(), Statement::Goto(l)]);
-        assert!(matches!(build_cfg(&body), Err(CfgError::Loop(_))));
+        let cfg = build_cfg(&body).expect("a back edge is a loop, not an error");
+        assert_eq!(cfg.loops.loops.len(), 1);
+        let head = cfg.loops.loops[0].head;
+        assert_eq!(cfg.blocks[head].label, Some(l), "the label is the head");
+        assert_eq!(cfg.loops.back_edges.len(), 1);
+    }
+
+    /// The property the whole lowering strategy rests on: whatever the method
+    /// does, ordering questions are asked of a DAG.
+    #[test]
+    fn topo_order_is_total_over_a_loop() {
+        let mut r = Rodeo::default();
+        let l = r.get_or_intern("L");
+        let body = block(vec![Statement::Label(l, vec![]), nop(), Statement::Goto(l)]);
+        let cfg = build_cfg(&body).unwrap();
+        assert_eq!(cfg.topo_order().len(), cfg.blocks.len());
+    }
+
+    /// A loop head's entry state is the cut state, so a back edge is not one of
+    /// its predecessors.
+    #[test]
+    fn back_edge_is_not_a_predecessor() {
+        let mut r = Rodeo::default();
+        let l = r.get_or_intern("L");
+        let body = block(vec![Statement::Label(l, vec![]), nop(), Statement::Goto(l)]);
+        let cfg = build_cfg(&body).unwrap();
+        let head = cfg.loops.loops[0].head;
+        let preds = cfg.predecessors();
+        let (tail, _) = *cfg.loops.back_edges.iter().next().unwrap();
+        assert!(
+            !preds[head].iter().any(|(p, _)| *p == tail),
+            "the back-edge tail must not reach the head as a predecessor"
+        );
+    }
+
+    /// `while` becomes head/body/back-edge blocks, with the invariants on the
+    /// head and no label minted for it.
+    #[test]
+    fn while_lowers_to_a_loop_head_without_a_label() {
+        let body = block(vec![Statement::While(cond(), vec![], block(vec![nop()]))]);
+        let cfg = build_cfg(&body).unwrap();
+        assert_eq!(cfg.loops.loops.len(), 1);
+        let head = cfg.loops.loops[0].head;
+        assert!(cfg.blocks[head].label.is_none(), "a while head needs no name");
+        assert!(matches!(cfg.blocks[head].term, Terminator::Branch { .. }));
+        assert!(cfg.labels.is_empty());
+    }
+
+    /// Two forward edges into one head collapse onto a single pre-header, so the
+    /// lowering has one place to establish the invariant and one frame.
+    #[test]
+    fn multiple_in_edges_get_a_preheader() {
+        let mut r = Rodeo::default();
+        let l = r.get_or_intern("L");
+        // if (c) { goto L } ; label L ; nop ; goto L
+        let body = block(vec![
+            Statement::If(cond(), block(vec![Statement::Goto(l)]), None),
+            Statement::Label(l, vec![]),
+            nop(),
+            Statement::Goto(l),
+        ]);
+        let cfg = build_cfg(&body).unwrap();
+        let head = cfg.loops.loops[0].head;
+        let preds = cfg.predecessors();
+        assert_eq!(
+            preds[head].len(),
+            1,
+            "every forward edge into the head goes through one pre-header"
+        );
+    }
+
+    #[test]
+    fn irreducible_control_flow_is_rejected() {
+        let mut r = Rodeo::default();
+        let (a, b) = (r.get_or_intern("A"), r.get_or_intern("B"));
+        // if (c) { goto A } else { goto B } ; label A ; goto B ; label B ; goto A
+        let body = block(vec![
+            Statement::If(
+                cond(),
+                block(vec![Statement::Goto(a)]),
+                Some(block(vec![Statement::Goto(b)])),
+            ),
+            Statement::Label(a, vec![]),
+            Statement::Goto(b),
+            Statement::Label(b, vec![]),
+            Statement::Goto(a),
+        ]);
+        assert!(matches!(build_cfg(&body), Err(CfgError::Irreducible(_))));
     }
 
     #[test]

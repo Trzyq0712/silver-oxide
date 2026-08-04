@@ -233,8 +233,17 @@ pub(crate) fn lower_method(
     // per-predecessor merge is a later stage), off-path contributions gated to 0
     // permission (see `Sink::gate_perm`).
     let cfg = cfg::build_cfg(body).map_err(|_| {
-        TranslationError::Unsupported("method control flow (loop or undefined label)")
+        TranslationError::Unsupported("method control flow (irreducible or undefined label)")
     })?;
+    // `viper::cfg` now identifies loops instead of rejecting them, but nothing
+    // here consumes that structure yet: the cut (establish the invariant, havoc,
+    // re-inhale into an empty heap, exhale on the back edge) is not wired, so
+    // lowering a back edge would silently produce a heap that never accounts for
+    // the loop. Reject until then.
+    // TODO(loops): remove once the loop cut lands; see design/loops/PLAN.md.
+    if !cfg.loops.is_empty() {
+        return Err(TranslationError::Unsupported("loop"));
+    }
 
     let mut sink = Sink::new(0, 0);
 
