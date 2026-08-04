@@ -1,0 +1,14 @@
+// A local the loop never writes keeps its value across the loop. Only the
+// written set is havoc'd, so `x` is untouched — contrast
+// failing/loops/havoc_loses_value.vpr, where the variable IS written.
+adt Nat { Zero() Succ(pred: Nat) }
+
+method peano_unwritten_survives(n: Nat)
+{
+    var x: Int := 5
+    var c: Nat := n
+    while (!c.isZero)
+      invariant true
+    { c := c.pred }
+    assert x == 5
+}

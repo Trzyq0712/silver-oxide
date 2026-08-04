@@ -1,0 +1,20 @@
+// CAPTURED variable: `k` is never written by the loop, so it is not havoc'd and
+// the fact `k == 7` established before the loop is still available *inside* the
+// body — without being restated in the invariant.
+//
+// This is the property that in-place lowering buys over encoding the body as a
+// separate method, where `k` would arrive as an unconstrained parameter.
+adt Nat { Zero() Succ(pred: Nat) }
+
+method peano_captured_var(n: Nat, k: Int)
+  requires k == 7
+{
+    var c: Nat := n
+    while (!c.isZero)
+      invariant true
+    {
+        assert k == 7
+        c := c.pred
+    }
+    assert k == 7
+}

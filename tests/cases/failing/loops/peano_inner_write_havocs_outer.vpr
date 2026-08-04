@@ -1,0 +1,26 @@
+// A variable written only by the INNER loop must still be havoc'd at the OUTER
+// loop's cut — the outer loop's written set is over its whole body, nested
+// loops included. If `loop_written_vars` missed nested writes, `y == 5` would
+// survive and this would wrongly verify.
+//
+// Must FAIL.
+adt Nat { Zero() Succ(pred: Nat) }
+
+method peano_inner_write_havocs_outer(n: Nat, m: Nat)
+{
+    var y: Int := 5
+    var i: Nat := n
+    while (!i.isZero)
+      invariant true
+    {
+        var j: Nat := m
+        while (!j.isZero)
+          invariant true
+        {
+            y := 1
+            j := j.pred
+        }
+        i := i.pred
+    }
+    assert y == 5
+}
