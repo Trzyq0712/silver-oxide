@@ -1,4 +1,5 @@
 pub mod cfg;
+pub mod loops;
 pub mod parsed;
 pub mod typed;
 pub mod walk;
