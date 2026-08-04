@@ -771,8 +771,14 @@ fn lower_stmt(
             };
             lower_new(b, env, sink, current_heap, name, sof)
         }
-        S::If(_, _, _) => Err(TranslationError::Unsupported("if statement")),
-        S::Block(_) => Err(TranslationError::Unsupported("nested block")),
+        // Control flow never reaches straight-line lowering. `viper::cfg`'s
+        // `Builder::process` consumes every one of these into block structure —
+        // branches and terminators — and only the statements it *pushes* into a
+        // `BasicBlock` land here. `old[L]` is likewise bound from the block's
+        // own `label` field at the top of the block walk, not from `S::Label`.
+        S::If(..) | S::Block(..) | S::Label(..) | S::Goto(..) => {
+            unreachable!("control flow is resolved into blocks by viper::cfg: {stmt:?}")
+        }
         S::Fold(pwp) => lower_fold_unfold(b, env, sink, current_heap, baseline, labeled, pwp, true),
         S::Unfold(pwp) => {
             lower_fold_unfold(b, env, sink, current_heap, baseline, labeled, pwp, false)
@@ -817,14 +823,6 @@ fn lower_stmt(
             }
             Ok(current_heap)
         }
-        // A `label L` marks the current heap state for later `old[L](...)`.
-        S::Label(l) => {
-            labeled.insert(*l, current_heap);
-            Ok(current_heap)
-        }
-        // Control flow is linearized via the CFG (`viper::cfg`) before reaching
-        // straight-line lowering; a bare `goto` here is not yet wired.
-        S::Goto(_) => Err(TranslationError::Unsupported("goto statement")),
         // Inhale: add the assertion's heap delta to the current heap and assume
         // its boolean. Heap-dependent sub-expressions are evaluated against the
         // growing heap (`ReadHeap::Track`), so later conjuncts can observe the
