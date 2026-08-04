@@ -617,6 +617,7 @@ fn collect_var_types(
                     collect_var_types(names, &e.0, out);
                 }
             }
+            S::While(_, _, body) => collect_var_types(names, &body.0, out),
             S::Block(inner) => collect_var_types(names, &inner.0, out),
             _ => {}
         }
@@ -776,7 +777,7 @@ fn lower_stmt(
         // branches and terminators — and only the statements it *pushes* into a
         // `BasicBlock` land here. `old[L]` is likewise bound from the block's
         // own `label` field at the top of the block walk, not from `S::Label`.
-        S::If(..) | S::Block(..) | S::Label(..) | S::Goto(..) => {
+        S::If(..) | S::While(..) | S::Block(..) | S::Label(..) | S::Goto(..) => {
             unreachable!("control flow is resolved into blocks by viper::cfg: {stmt:?}")
         }
         S::Fold(pwp) => lower_fold_unfold(b, env, sink, current_heap, baseline, labeled, pwp, true),

@@ -395,8 +395,21 @@ impl<'a> Display for Show<'a, &'a Statement> {
             Statement::Block(b) => write!(f, "{}", self.with(b)),
             Statement::Fold(p) => write!(f, "fold {}", self.with(p)),
             Statement::Unfold(p) => write!(f, "unfold {}", self.with(p)),
-            Statement::Label(l) => write!(f, "label {}", self.interner.resolve(l)),
+            Statement::Label(l, invs) => {
+                write!(f, "label {}", self.interner.resolve(l))?;
+                for inv in invs {
+                    write!(f, " invariant {}", self.with(inv))?;
+                }
+                Ok(())
+            }
             Statement::Goto(l) => write!(f, "goto {}", self.interner.resolve(l)),
+            Statement::While(cond, invs, body) => {
+                write!(f, "while ({})", self.with(cond))?;
+                for inv in invs {
+                    write!(f, " invariant {}", self.with(inv))?;
+                }
+                write!(f, " {{ {} }}", self.with(body))
+            }
         }
     }
 }

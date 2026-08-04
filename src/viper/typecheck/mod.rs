@@ -1490,9 +1490,19 @@ fn lower_statement(
         }
 
         // A `label L` marks the current heap state; its name was already
-        // collected by `collect_labels` for `old[L]` validation. Invariants on
-        // the label are loop-related and out of scope (ignored).
-        S::Label(decl, _invs) => Ok(typed::Statement::Label(decl.0.id())),
+        // collected by `collect_labels` for `old[L]` validation. Invariants
+        // attached to the label (`label L invariant A`) are loop invariants;
+        // they are assertions in the scope at the label, so they typecheck
+        // exactly like a method's `requires`/`ensures` clauses do — except that
+        // they are kept apart rather than conjoined, since a later pass exhales
+        // and inhales them individually.
+        S::Label(decl, invs) => {
+            let invs = invs
+                .iter_mut()
+                .map(|inv| ctx.typecheck_spatial::<MethodBodyExt>(&mut inv.0))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(typed::Statement::Label(decl.0.id(), invs))
+        }
 
         // `if (c) { .. } else { .. }`: the condition is a pure Bool; both arms
         // are lowered in the same (flat, method-level) scope. Control flow is
@@ -1511,9 +1521,27 @@ fn lower_statement(
             ))
         }
         S::Goto(idn) => Ok(typed::Statement::Goto(idn.id())),
-        S::While(..) => Err(TypeError::Other(
-            "statement not yet supported in initial scope".to_string(),
-        )),
+        // `while (c) invariant A { .. }`: condition and body typecheck exactly
+        // like an `if`'s; the invariants are assertions in the scope at the loop
+        // head, so they go through the same path as a label's. Kept structured —
+        // `viper::cfg` builds the head/body/back-edge blocks, which is where the
+        // single downstream loop shape is established.
+        //
+        // `decreases` is accepted and dropped.
+        // TODO(loops): termination.
+        S::While(cond, invs, _decreases, body) => {
+            let cond = ctx.typecheck_pure::<MethodBodyExt>(cond, &Type::Bool, None)?;
+            let invs = invs
+                .iter_mut()
+                .map(|inv| ctx.typecheck_spatial::<MethodBodyExt>(&mut inv.0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let body = lower_stmt_block(&mut body.0, ctx)?;
+            Ok(typed::Statement::While(
+                cond,
+                invs,
+                typed::StmtBlock(body),
+            ))
+        }
     }
 }
 

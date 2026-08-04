@@ -6,8 +6,9 @@
 //! emit PathCond-gated straight-line VMIR.
 //!
 //! Loops are rejected: a `goto` that forms a back-edge makes the block graph
-//! cyclic, which is reported as [`CfgError::Loop`]. (Source `while` never
-//! reaches the typed AST — typecheck rejects it.)
+//! cyclic, which is reported as [`CfgError::Loop`]. (A source `while` is
+//! desugared into that same back-edge form before it reaches here, so it lands
+//! on the same rejection.)
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +18,7 @@ use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::prelude::DiGraphMap;
 use typed_index_collections::TiVec;
 
-use crate::viper::typed::{PureMethodExp, Statement, StmtBlock};
+use crate::viper::typed::{PureMethodExp, SpatialMethodExp, Statement, StmtBlock};
 
 /// Index of a basic block within a [`Cfg`].
 #[derive(Debug, From, Into, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -47,6 +48,9 @@ pub struct BasicBlock {
     /// The source label this block is the target of, if any (also an `old[L]`
     /// heap-capture point).
     pub label: Option<Spur>,
+    /// The invariants declared on that label (`label L invariant A`). Empty
+    /// unless this block is a labelled loop head.
+    pub invs: Vec<SpatialMethodExp>,
 }
 
 /// The basic-block control-flow graph of a method body. Acyclic by
@@ -142,6 +146,7 @@ struct BlockData {
     stmts: Vec<Statement>,
     term: Option<Terminator>,
     label: Option<Spur>,
+    invs: Vec<SpatialMethodExp>,
 }
 
 impl Builder {
@@ -215,9 +220,13 @@ impl Builder {
                 Statement::Block(inner) => {
                     cur = self.process(&inner.0, cur);
                 }
-                Statement::Label(l) => {
+                Statement::Label(l, invs) => {
                     self.defined.insert(*l);
                     let lb = self.label_block(*l);
+                    // The block may already exist (a `goto` referenced the label
+                    // before its declaration); the declaration is what carries
+                    // the invariants.
+                    self.blocks[lb].invs = invs.clone();
                     if let Some(b) = cur {
                         self.open_seal(b, Terminator::Goto(lb));
                     }
@@ -228,6 +237,42 @@ impl Builder {
                     let b = self.ensure(&mut cur);
                     self.open_seal(b, Terminator::Goto(lb));
                     cur = None;
+                }
+                // `while (c) invariant A { BODY }` becomes the block structure a
+                // hand-written `goto` loop already produces, so everything past
+                // this point sees exactly one loop shape:
+                //
+                //   pred ──> head[invs] ──c──> body ──> (back edge) ──> head
+                //                        └─!c─> exit
+                //
+                // The head needs no name — the CFG identifies blocks by
+                // `BlockId`, and invariants ride on the block, not on a label.
+                // That is why `while` is desugared *here* rather than earlier:
+                // rewriting it to `label`+`goto` upstream would have to mint a
+                // synthetic identifier for nothing.
+                Statement::While(cond, invs, body) => {
+                    let b = self.ensure(&mut cur);
+                    let head = self.new_block();
+                    self.blocks[head].invs = invs.clone();
+                    self.open_seal(b, Terminator::Goto(head));
+
+                    let body_e = self.new_block();
+                    let exit = self.new_block();
+                    self.open_seal(
+                        head,
+                        Terminator::Branch {
+                            cond: cond.clone(),
+                            then_: body_e,
+                            else_: exit,
+                        },
+                    );
+                    // The back edge — the whole point of the construct. A body
+                    // that ends unreachable (`goto`/`return`) has none, exactly
+                    // as with an `if` arm.
+                    if let Some(bx) = self.process(&body.0, Some(body_e)) {
+                        self.open_seal(bx, Terminator::Goto(head));
+                    }
+                    cur = Some(exit);
                 }
                 // Everything else is straight-line: append to the current block.
                 _ => {
@@ -260,6 +305,7 @@ impl Builder {
                 stmts: bd.stmts,
                 term: bd.term.unwrap_or(Terminator::Return),
                 label: bd.label,
+                invs: bd.invs,
             })
             .collect();
 
@@ -386,7 +432,7 @@ mod tests {
     fn forward_goto_is_acyclic() {
         let mut r = Rodeo::default();
         let l = r.get_or_intern("L");
-        let body = block(vec![Statement::Goto(l), nop(), Statement::Label(l), nop()]);
+        let body = block(vec![Statement::Goto(l), nop(), Statement::Label(l, vec![]), nop()]);
         let cfg = build_cfg(&body).unwrap();
         assert_eq!(cfg.labels.get(&l).copied(), Some(BlockId(1)));
         assert!(matches!(cfg.blocks[cfg.entry].term, Terminator::Goto(b) if b == BlockId(1)));
@@ -396,7 +442,7 @@ mod tests {
     fn backward_goto_is_a_loop() {
         let mut r = Rodeo::default();
         let l = r.get_or_intern("L");
-        let body = block(vec![Statement::Label(l), nop(), Statement::Goto(l)]);
+        let body = block(vec![Statement::Label(l, vec![]), nop(), Statement::Goto(l)]);
         assert!(matches!(build_cfg(&body), Err(CfgError::Loop(_))));
     }
 
@@ -415,7 +461,7 @@ mod tests {
         // if (c) { goto L } ; label L ; nop
         let body = block(vec![
             Statement::If(cond(), block(vec![Statement::Goto(l)]), None),
-            Statement::Label(l),
+            Statement::Label(l, vec![]),
             nop(),
         ]);
         let cfg = build_cfg(&body).unwrap();

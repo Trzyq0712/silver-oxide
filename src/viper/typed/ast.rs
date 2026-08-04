@@ -293,9 +293,28 @@ pub enum Statement {
     Unfold(PredicateWithPerm<MethodBodyExt>),
     /// Label marking a heap state for `old[L](...)` to refer back to; also a
     /// jump target for `goto`.
-    Label(Spur),
+    ///
+    /// A label may carry loop invariants (`label L invariant A invariant B`) —
+    /// Silver's `Label(name, invs)`. They are the invariants of the loop whose
+    /// head this label is, and every `goto L` reaching it must re-establish
+    /// them. This is how Prusti transmits loop invariants, since it emits
+    /// goto-CFGs with no `while` at all.
+    Label(Spur, Vec<SpatialMethodExp>),
     /// `goto L`: unconditional jump to the block labelled `L`.
     Goto(Spur),
+    /// `while (c) invariant A { .. }`.
+    ///
+    /// Kept structured all the way to CFG construction rather than desugared
+    /// earlier: a `while` head needs no name (the CFG identifies blocks by
+    /// `BlockId`), so rewriting it to `label`+`goto` would mint a synthetic
+    /// identifier for nothing and lose the source shape that diagnostics want.
+    /// `viper::cfg` turns it into the same head/body/back-edge block structure
+    /// a hand-written `goto` loop produces, so there is still exactly one loop
+    /// shape downstream of the CFG.
+    ///
+    /// `decreases` clauses are dropped by typechecking.
+    // TODO(loops): termination — `decreases` is parsed and ignored.
+    While(PureMethodExp, Vec<SpatialMethodExp>, StmtBlock),
 }
 
 #[derive(Debug, Clone, PartialEq)]
