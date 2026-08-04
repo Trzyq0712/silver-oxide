@@ -612,14 +612,16 @@ fn merge_chunks(
 }
 
 /// A location chunk extracted from a heap for the location axioms: its
-/// permission, the location group tag, its argument e-classes, and its bound.
+/// permission, the location group tag, its canonical address, and its bound.
 struct LocationChunk {
     /// Kept **structural** — a bounded location's axiom is assumed per leaf, and
     /// non-aliasing only fires for bare (`Leaf`) perms, so a join `Select` never
     /// materializes as an `ite` in the graph.
     perm: ChunkPerm,
     group: lasso::Spur,
-    args: Vec<egg::Id>,
+    /// The canonical address e-class. Non-aliasing is stated over *locations*,
+    /// never over decomposed address arguments — see [`assume_location_axioms`].
+    addr: egg::Id,
     bound: Bound,
 }
 
@@ -641,26 +643,14 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
     let mut out = Vec::new();
     for (kind, chunk) in h.entries() {
         // group/bound come straight from the chunk's location kind (VMIR-sourced) —
-        // no inference. The value args for non-aliasing are read from the address
-        // application node; absent for a computed address (no such node).
-        let canon = ctx.egraph.find(chunk.addr);
-        let args = ctx.egraph[canon]
-            .nodes
-            .iter()
-            .find_map(|n| match n {
-                Symbolic::FuncApp(f, _, args)
-                    if matches!(ctx.func_ret_types.get(f), Some(Type::Addr { .. })) =>
-                {
-                    Some(args.to_vec())
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
+        // no inference. The address is the chunk's own identity, so unlike the
+        // old argument decomposition there is nothing to recover and nothing that
+        // can be missing.
         out.push(LocationChunk {
             perm: chunk.perm.clone(),
             group: kind.group,
             bound: kind.bound.clone(),
-            args,
+            addr: ctx.egraph.find(chunk.addr),
         });
     }
     out
@@ -705,10 +695,32 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
         }
     }
 
-    // Non-aliasing: same bounded location, perms sum > bound ⇒ args differ. Only
-    // fires for bare (`Leaf`) perms — a branch-structured perm would need the
-    // sum materialized; skipping is sound (it can only lose a disequality, never
-    // add one) and the merged heap holds one leaf-perm chunk per location anyway.
+    // Non-aliasing, stated over **locations**: two chunks of the same bounded
+    // group whose perms sum above the bound must sit at different addresses.
+    //
+    //     permᵢ + permⱼ > b  ⟹  addrᵢ ≠ addrⱼ
+    //
+    // encoded as `union(eq, ite(gt, false, eq))` — when `gt` folds true the `ite`
+    // collapses `eq` to `false`.
+    //
+    // The address is the chunk's own identity, so this cannot degenerate. The
+    // previous formulation decomposed both addresses into their `@addr` argument
+    // e-classes and conjoined them pairwise, which was strictly worse: those args
+    // are recoverable only for a *direct* application, and `conj_args_eq` over no
+    // arguments is the empty conjunction — `true`. Whenever the args were missing
+    // the axiom read `union(true, ite(gt, false, true))`, i.e. `true == false` as
+    // soon as the perms summed above the bound, and two `1/1` field chunks always
+    // do. Holding two permissions to one field made the unit inconsistent and
+    // every goal dischargeable.
+    //
+    // Where the two addresses are already the same e-class, `Eq(l, l)` folds to
+    // `true` and this does derive `false` — correctly: `1/1` of `x.f` plus `1/1`
+    // of `y.f` with `x == y` is `2/1` at one location, which the bound forbids,
+    // so that state is genuinely unreachable.
+    //
+    // Only fires for bare (`Leaf`) perms — a branch-structured perm would need
+    // the sum materialized; skipping is sound (it can only lose a disequality,
+    // never add one) and the merged heap holds one leaf-perm chunk per location.
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
             if chunks[i].group != chunks[j].group {
@@ -720,54 +732,23 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             let (Some(pi), Some(pj)) = (chunks[i].perm.as_leaf(), chunks[j].perm.as_leaf()) else {
                 continue;
             };
-            // Both addresses must be direct `@addr` applications with the same
-            // arity, or there is no disequality to state. `location_chunks`
-            // leaves `args` EMPTY for a computed address, and `conj_args_eq` over
-            // no arguments is the empty conjunction — `true`. Emitting the axiom
-            // then degenerates to `union(true, ite(gt, false, true))`, i.e.
-            // `true == false` the moment the perms sum above the bound, which
-            // makes the whole unit inconsistent and every goal dischargeable.
-            // Skipping is sound: it can only lose a disequality, never add one.
-            if chunks[i].args.is_empty()
-                || chunks[j].args.is_empty()
-                || chunks[i].args.len() != chunks[j].args.len()
-            {
-                continue;
-            }
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
             let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [pi, pj]));
             let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, sum]));
-            // Both arg orders (the `!=` goal's `Eq` order is source-dependent).
-            for (xs, ys) in [
-                (&chunks[i].args, &chunks[j].args),
-                (&chunks[j].args, &chunks[i].args),
+            // Both operand orders — the `!=` goal's `Eq` order is source-dependent.
+            for (x, y) in [
+                (chunks[i].addr, chunks[j].addr),
+                (chunks[j].addr, chunks[i].addr),
             ] {
-                let conj = conj_args_eq(ctx, xs, ys, true_, false_);
-                let imp = ctx.add(Symbolic::Ite([gt, false_, conj]));
-                ctx.union(conj, imp);
+                let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [x, y]));
+                let imp = ctx.add(Symbolic::Ite([gt, false_, eq]));
+                ctx.union(eq, imp);
             }
         }
     }
     ctx.egraph.rebuild();
 }
 
-/// Build `xs0==ys0 && xs1==ys1 && …` as a right-nested `ite(eq, rest, false)`
-/// chain (seeded `true`). For a single argument this is `ite(a==b, true, false)`,
-/// which `ite-ident` collapses to `a==b`.
-fn conj_args_eq(
-    ctx: &mut VerifyContext<'_>,
-    xs: &[egg::Id],
-    ys: &[egg::Id],
-    true_: egg::Id,
-    false_: egg::Id,
-) -> egg::Id {
-    let mut acc = true_;
-    for k in (0..xs.len()).rev() {
-        let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [xs[k], ys[k]]));
-        acc = ctx.add(Symbolic::Ite([eq, acc, false_]));
-    }
-    acc
-}
 
 /// The consolidating chunk lookup shared by [`heap_union`] and
 /// [`heap_subtract`]: find the chunk at `addr` (canonical-address match) in
