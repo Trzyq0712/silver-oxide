@@ -1,0 +1,15 @@
+// REGRESSION (soundness). Reading a location we gave up must fail — and the
+// value must not be provably anything we like. `b.f` was 42 before the exhale;
+// afterwards we hold nothing, so `b.f == 43` is not provable.
+//
+// This verified while two same-field permissions made the state inconsistent.
+//
+// Must FAIL.
+field f: Int
+
+method read_value_after_exhale(a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f) && b.f == 42
+{
+    exhale acc(b.f)
+    assert b.f == 43
+}

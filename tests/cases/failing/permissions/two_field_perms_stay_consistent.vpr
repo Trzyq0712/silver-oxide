@@ -1,0 +1,19 @@
+// REGRESSION (soundness). Holding two permissions to the SAME field used to
+// make the state inconsistent on arrival, so every later assertion passed
+// vacuously — `assert false` verified.
+//
+// Cause: the non-aliasing axiom stated `permi + permj > b ==> args differ` by
+// decomposing both addresses into their `@addr` argument e-classes. Those args
+// are recoverable only for a direct application, and the empty conjunction is
+// `true`, so with args missing the axiom read `union(true, ite(gt, false,
+// true))` — literally `true == false` once two 1/1 chunks summed past the
+// bound. Fixed by stating non-aliasing over locations instead (73bd5cb).
+//
+// Must FAIL.
+field f: Int
+
+method two_field_perms_stay_consistent(a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+{
+    assert false
+}

@@ -1,0 +1,17 @@
+// The non-aliasing axiom's actual job: two full permissions to one field cannot
+// sit at the same location, so the receivers differ.
+//
+// This is the positive counterpart to
+// failing/permissions/two_field_perms_stay_consistent.vpr. Keep both — the
+// failing case alone would be satisfied by simply deleting the axiom, and this
+// one alone was satisfied vacuously while the axiom made the state
+// inconsistent. Only the pair pins the behaviour down.
+//
+// Silicon verifies this.
+field f: Int
+
+method two_full_perms_imply_distinct(a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+{
+    assert a != b
+}

@@ -1,0 +1,18 @@
+// REGRESSION (soundness). Asserting permission we no longer hold must fail.
+// This verified while the non-aliasing axiom could union `true` with `false`
+// (see two_field_perms_stay_consistent.vpr) — every obligation after the
+// inconsistency was discharged at tier 1.
+//
+// The surviving `a.f` chunk is what makes this distinct from the single-ref
+// case, which always failed correctly: the bug needed two chunks of the same
+// field group to sum past the bound.
+//
+// Must FAIL.
+field f: Int
+
+method assert_acc_after_exhale(a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+{
+    exhale acc(b.f)
+    assert acc(b.f)
+}
