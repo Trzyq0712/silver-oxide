@@ -1,0 +1,21 @@
+// Linked-list traversal — the `mlen` shape, and the flagship loop that needs no
+// quantified permissions: a recursive predicate carries the unbounded tail, and
+// the body `unfold`s one node per iteration, handing permission along.
+//
+// This is what known_limitations/loops/list_walk.vpr is, minus its `n >= 0`
+// counter. That counter is the only thing blocking it — the traversal, the
+// unfold under the cut, and the invariant's conditional permission all work.
+field next: Ref
+predicate list(x: Ref) { acc(x.next) && (x.next != null ==> acc(list(x.next))) }
+
+method walk(x: Ref)
+  requires x != null ==> acc(list(x))
+{
+    var cur: Ref := x
+    while (cur != null)
+      invariant cur != null ==> acc(list(cur))
+    {
+        unfold acc(list(cur))
+        cur := cur.next
+    }
+}
