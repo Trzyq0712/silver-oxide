@@ -49,9 +49,8 @@ pub enum Symbolic {
     /// types never merge, so they want no e-class) and *not* in the discriminant
     /// (which would fragment egg's `classes_by_op` op-index per instantiation).
     /// Distinctness — `mk[Int]` ≠ `mk[Bool]` — comes from the enode's derived
-    /// `Eq`/`Hash` via egg's congruence `memo` (a `HashMap<L, Id>` keyed by the
-    /// full enode), so two instantiations never dedup/merge. `children()` returns
-    /// only the value args; the [`Discriminant`] is the concept `FuncId` alone.
+    /// `Eq`/`Hash` via egg's congruence `memo`. `children()` returns only the
+    /// value args; the [`Discriminant`] is the concept `FuncId` alone.
     /// Addresses are ordinary function applications too: a field/predicate's
     /// address function (its own `FuncId`) over its args, with the rich
     /// `Type::Addr{group,value,bound}` as its return type (recorded in
@@ -66,13 +65,12 @@ pub enum Symbolic {
     /// (so two alpha-equivalent `forall`s with the same captures are one
     /// e-class).
     ///
-    /// The trigger is deliberately **not** part of the identity: it is
-    /// operational (when to instantiate), not propositional (what the quantifier
-    /// means). Trigger sets are unioned on the recipe entry instead, so two
-    /// foralls that denote the same proposition share an e-class and one being
-    /// assumed `true` releases the other's instances. Instantiation adds the
-    /// guarded clause `Ite(forall, body[caps, σ], true) == true` — the instance
-    /// is only released once this node merges `true`.
+    /// The trigger is deliberately **not** part of the identity: it is operational
+    /// (when to instantiate), not propositional. Trigger sets are unioned on the
+    /// recipe entry instead, so two foralls denoting the same proposition share an
+    /// e-class. Instantiation adds the guarded clause
+    /// `Ite(forall, body[caps, σ], true) == true`, so the instance is released only
+    /// once this node merges `true`.
     Forall(RecipeId, Box<[Id]>),
 }
 

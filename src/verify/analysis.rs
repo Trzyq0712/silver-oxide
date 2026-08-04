@@ -14,21 +14,15 @@ use crate::vmir::{BinOp, Literal, MemberId, Type};
 /// - `Unknown`: not (yet) a constant.
 /// - `Known(lit)`: folds to `lit`.
 /// - `Ctor(f, tys)`: the e-class holds an application of ADT constructor `f` at
-///   instantiation `tys`. This is what gives us **constructor distinctness**
-///   without the SMT tag encoding: an SMT solver cannot enumerate the terms of an
-///   equivalence class, so it must project class membership into a `tag(..)` term
-///   and pay O(variants) axioms plus a trigger to fire them. Here the closure is
-///   the data structure, so a variant clash is just a lattice conflict — no
-///   axioms, no `tag` term needed, and it is detected even when the program never
-///   mentions a discriminator.
+///   instantiation `tys`. This gives **constructor distinctness** with no `tag`
+///   term and no O(variants) axioms — a variant clash is a lattice conflict, and
+///   it is detected even when the program never mentions a discriminator.
 /// - `Inconsistent`: two **same-typed** literals of differing value were merged
-///   (e.g. `true == false`, `5 == 6`), or two **different constructors of one ADT
-///   head at one instantiation** were merged (ADT constructors are free, so
-///   `Cons(..) == Nil` is a contradiction) — the e-class, and thus the whole
-///   verification unit, is contradictory. Merging across *different* types
-///   (literals of different types, or constructors of different heads /
-///   instantiations) is instead a verifier panic: a genuine type error, not a
-///   fact about the program.
+///   (`true == false`, `5 == 6`), or two **different constructors of one ADT head
+///   at one instantiation** (constructors are free, so `Cons(..) == Nil` is a
+///   contradiction) — the e-class, and thus the whole verification unit, is
+///   contradictory. Merging across *different* types is instead a verifier panic:
+///   a type error, not a fact about the program.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Data {
     Unknown,

@@ -324,9 +324,8 @@ impl Chunk {
 /// outer `im::HashMap` is itself structurally shared.
 ///
 /// Within a group, identity is the chunk's `addr` e-class — today at most one
-/// chunk per address (the same-address merge happens in `declaration.rs`). The
-/// vec shape is the prerequisite for the lazy Σ-ite permission model (chunks
-/// accumulating per `acc`), which lands later.
+/// chunk per address (the same-address merge happens in `declaration.rs`); the vec
+/// shape is a prerequisite for the lazy Σ-ite permission model.
 ///
 /// A chunk's reachability is carried by its own [`Chunk::guard`] (a flat cube),
 /// not by a heap-level path condition — the join merge appends the branch literal

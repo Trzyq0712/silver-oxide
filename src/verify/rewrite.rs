@@ -20,42 +20,25 @@ fn var(name: &str) -> Var {
     name.parse().expect("valid pattern var")
 }
 
-// Applier-memo scoping ("already instantiated this call/σ").
+// Applier-memo scoping ("already instantiated this call/σ"). A pure cost guard
+// keyed on canonical e-class ids; re-instantiating is idempotent.
 //
-// The memo is a pure cost guard — re-instantiating is idempotent (adds
-// hash-cons, unions no-op) — keyed on canonical e-class ids. Two facts govern
-// its lifetime:
+// - **Live** runs write to a **base** set that survives across runs: the live
+//   e-graph of a unit only grows, so an entry stays valid for the whole unit.
+// - **Scratch** runs (tier-3 probes, forall-WD checks) saturate a throwaway
+//   clone and write to an **overlay** instead. A leaked scratch entry would be a
+//   completeness bug: the clone's ids can collide with ids the live graph mints
+//   later. Reading the base from a scratch run is fine.
 //
-// - The **live** e-graph of one verification unit only ever grows, so an
-//   entry recorded by a live run stays valid for the whole unit: the instance
-//   it stands for was built on this very graph and its unions persist. Live
-//   entries therefore go to a **base** set that survives across runs (this is
-//   what makes repeated saturations cheap — instances are not rebuilt per run).
-// - A **scratch** run (a tier-3 probe, a forall-WD check) saturates a clone
-//   that is thrown away. Its instantiations must not reach the base: the
-//   clone's new e-class ids can collide with ids the live graph mints later
-//   (egg ids are sequential), so a leaked entry could silently suppress a
-//   *live* instantiation — a completeness bug. Scratch entries go to an
-//   **overlay** keyed to the scope that recorded them. Reading the base from
-//   a scratch run is fine (the clone contains every live instance).
+// Scopes nest, and a nested clone contains everything its parent's graph does,
+// so overlays form a stack: a run reads the base plus every active overlay and
+// writes to the top one. A scope's overlay lives as long as its id is on the
+// stack — the long-lived per-block scratch `resume`s one id across all of its
+// runs so its instances stay remembered (a fresh scope per run measured ~2×
+// slower on `structs_enums.vpr`).
 //
-// Scopes **nest** (a probe cloned off a block scratch, a probe inside a WD
-// check), and a nested clone contains everything its parent's graph contains —
-// so the overlays form a **stack**: a run reads the base plus every overlay on
-// the active stack, and writes only to the top one. A scope is identified by an
-// id, and a scope's overlay lives exactly as long as that id stays on the stack.
-//
-// This matters for the **block scratch**, whose graph is long-lived (it persists
-// across every obligation in the block, unlike a probe). Its runs `resume` one
-// scope id for the block's whole lifetime, so instances it built on an earlier
-// obligation are still remembered on the next one. Giving each run a fresh scope
-// instead would discard the memo while the instances stay in the graph, and every
-// run would rebuild terms that hash-cons straight back onto themselves — measured
-// at ~2× the verification time of `structs_enums.vpr`.
-//
-// All state is thread-local: rules (and their memos behind `Arc`) never cross
-// threads — one verification runs on one thread; the `Mutex` in [`Memo`] only
-// satisfies egg's `Send + Sync` bounds.
+// All state is thread-local; the `Mutex` in [`Memo`] only satisfies egg's
+// `Send + Sync` bounds.
 thread_local! {
     /// Bumped per verification unit (`VerifyContext::new`): unit boundaries
     /// switch to a fresh e-graph, so all remembered ids are meaningless.
@@ -304,8 +287,7 @@ pub fn rules() -> Vec<Rule> {
 
 /// Ablation gate: `SILVER_OXIDE_DROP_RULES=name1,name2` removes those rules from
 /// the saturation and reduction sets. Dropping a rewrite is incomplete, never
-/// unsound, so a run under the flag that still verifies every member says the
-/// rule was redundant *on that corpus* — the point of the measurement.
+/// unsound.
 fn kept(rule: &Rule) -> bool {
     use std::sync::OnceLock;
     static DROP: OnceLock<HashSet<String>> = OnceLock::new();
@@ -321,12 +303,9 @@ fn kept(rule: &Rule) -> bool {
 }
 
 /// The terminating structural reductions used to **normalize** the e-graph after
-/// heap-producing ops (`fold`/`unfold`): the terminating `ite`/optional
-/// simplifications (which peel the `(perm>0) ? Some(v) : None` wrapper down to
-/// `v` whenever the permission is statically positive). The registry's ADT
-/// reductions (which collapse `cons(proj(cons(..)))` snapshot towers) are
-/// appended by `VerifyContext::new`. Kept separate from [`rules`] so that future
-/// *non-terminating* rules are run only during full saturation, never here.
+/// heap-producing ops (`fold`/`unfold`). The registry's ADT reductions are
+/// appended by `VerifyContext::new`. Kept separate from [`rules`] so that
+/// *non-terminating* rules run only during full saturation.
 pub fn reduce_rules() -> Vec<Rule> {
     terminating_ite_rules()
         .into_iter()
@@ -336,9 +315,8 @@ pub fn reduce_rules() -> Vec<Rule> {
 }
 
 /// Build the projection reduction `accessor(ctor(a0..an)) ⇒ a_index` for a
-/// single (possibly verifier-synthesised, e.g. monomorphic) member id. Lets the
-/// verifier register reductions for member ids minted after `VerifyContext`
-/// construction (monomorphic Option instances).
+/// single member id, including ones minted after `VerifyContext` construction
+/// (monomorphic Option instances).
 pub fn proj_rule(accessor: FuncId, ctor: FuncId, index: usize) -> Rule {
     timed(
         Rewrite::new(
@@ -354,13 +332,10 @@ pub fn proj_rule(accessor: FuncId, ctor: FuncId, index: usize) -> Rule {
 /// applications of the same constructor unions their arguments pairwise
 /// (`C(a..) ≡ C(b..) ⟹ aᵢ ≡ bᵢ`). Sound because ADT constructors are free.
 ///
-/// Congruence alone only runs *forward* (equal args ⟹ equal applications), and
-/// [`proj_rule`] recovers the backward direction only where a `projᵢ`
-/// application happens to exist in the graph. Two constructor terms can land in
-/// one class with no projection over them — e.g. a predicate snapshot function's
-/// body (`cons(snap(f0), snap(f1))`) meeting the value it was assigned
-/// (`cons(x, y)` from some other function's body) — and then the component
-/// equalities are only reachable through this rule.
+/// Congruence runs only *forward*, and [`proj_rule`] recovers the backward
+/// direction only where a `projᵢ` application exists. Two constructor terms can
+/// land in one class with no projection over them, and then the component
+/// equalities are reachable only through this rule.
 pub fn inj_rule(ctor: FuncId) -> Rule {
     timed(
         Rewrite::new(
@@ -389,11 +364,10 @@ pub fn tag_rule(tag_fn: FuncId, ctor_tags: HashMap<FuncId, usize>) -> Rule {
 fn static_rules() -> Vec<Rule> {
     let mut rules = terminating_ite_rules();
     rules.extend(vec![
-        // Arithmetic identities. Every operator names its operand sort (`+i` /
-        // `+r`), so each identity is written once per sort and a rule that
-        // *produces* a literal knows which one to produce — an integer `0` and a
-        // permission `0/1` are different literals, and merging them into one
-        // e-class is a type error the analysis panics on.
+        // Arithmetic identities, written once per operand sort (`+i` / `+r`) so
+        // that a rule producing a literal produces the right one: an integer `0`
+        // and a permission `0/1` are different literals, and merging them into
+        // one e-class is a type error the analysis panics on.
         //
         // x + 0 => x
         rw!("add-zero-int-r"; "(+i ?x 0)" => "?x"),
@@ -403,33 +377,24 @@ fn static_rules() -> Vec<Rule> {
         // x - 0 => x
         rw!("sub-zero-int"; "(-i ?x 0)" => "?x"),
         rw!("sub-zero-real"; "(-r ?x 0/1)" => "?x"),
-        // x * 1 => x  (resource-delta perm scaling by a full permission `write`
-        // folds away)
+        // x * 1 => x
         rw!("mul-one-real-r"; "(*r ?x 1/1)" => "?x"),
         rw!("mul-one-real-l"; "(*r 1/1 ?x)" => "?x"),
         rw!("mul-one-int-r"; "(*i ?x 1)" => "?x"),
         rw!("mul-one-int-l"; "(*i 1 ?x)" => "?x"),
-        // x * 0 => 0  (a resource delta scaled by `none`). Kept for completeness
-        // of the identity set, at negligible cost.
+        // x * 0 => 0
         rw!("mul-zero-real-r"; "(*r ?x 0/1)" => "0/1"),
         rw!("mul-zero-real-l"; "(*r 0/1 ?x)" => "0/1"),
         rw!("mul-zero-int-r"; "(*i ?x 0)" => "0"),
         rw!("mul-zero-int-l"; "(*i 0 ?x)" => "0"),
-        // x / 1 => x. Note there is deliberately no `x / x => 1` or `0 / x => 0`:
-        // division by zero is unspecified (see `eval_binary`), so neither holds
-        // at `x = 0`.
+        // x / 1 => x. No `x / x => 1` or `0 / x => 0`: division by zero is
+        // unspecified (see `eval_binary`), so neither holds at `x = 0`.
         rw!("div-one-real"; "(/r ?x 1/1)" => "?x"),
         rw!("div-one-int"; "(/i ?x 1)" => "?x"),
-        // Permission consolidation: a consume followed by a produce of the
-        // same amount at the same location (the generic/concrete predicate
-        // conversion ping-pong, a carried resource through a call) leaves the
-        // chunk's permission as `(x - p) + p` — cancel it, so the chunk stays
-        // at its simple pre-cycle form instead of accumulating a sum the
-        // sufficiency check can only crack by case-splitting. Sound over
-        // reals (total ops), strictly shrinking. Both operand orders are spelled
-        // out: there is deliberately no commutativity rule (it blows the graph
-        // up), so a give-back landing on the other side of the `+` would
-        // otherwise never cancel.
+        // (x - p) + p => x, and mirrors. A consume/produce cycle at one location
+        // leaves the chunk's permission in this shape. Both operand orders are
+        // spelled out because there is no commutativity rule (it blows the graph
+        // up).
         rw!("add-sub-cancel-int-r"; "(+i (-i ?x ?p) ?p)" => "?x"),
         rw!("add-sub-cancel-int-l"; "(+i ?p (-i ?x ?p))" => "?x"),
         rw!("add-sub-cancel-real-r"; "(+r (-r ?x ?p) ?p)" => "?x"),
@@ -438,39 +403,26 @@ fn static_rules() -> Vec<Rule> {
         rw!("sub-add-cancel-int-l"; "(-i (+i ?p ?x) ?p)" => "?x"),
         rw!("sub-add-cancel-real-r"; "(-r (+r ?x ?p) ?p)" => "?x"),
         rw!("sub-add-cancel-real-l"; "(-r (+r ?p ?x) ?p)" => "?x"),
-        // x - x => 0. The cancel rules above need a `-` and a `+` nested in each
-        // other; neither reaches a bare self-subtraction. That shape is what a
-        // give-back leaves when the returned share is not syntactically the outer
-        // addend — e.g. a predicate re-fold arriving as `(p - p) + 1/1`, which
-        // *is* `1/1` but whose leading summand would otherwise stay an opaque
-        // leaf, so a sufficiency check could only crack it by case-splitting.
+        // x - x => 0. The cancel rules above need nested `-`/`+` and so miss a
+        // bare self-subtraction, which is what a give-back leaves when the
+        // returned share is not the outer addend (`(p - p) + 1/1`).
         rw!("sub-self-int"; "(-i ?x ?x)" => "0"),
         rw!("sub-self-real"; "(-r ?x ?x)" => "0/1"),
-        // x < x => false   (irreflexivity; the `<` companion to `eq-refl`, and
-        // like it, it also fires once congruence has merged the two operands)
+        // x < x => false   (irreflexivity)
         rw!("lt-irrefl-real"; "(<r ?x ?x)" => "false"),
         rw!("lt-irrefl-int"; "(<i ?x ?x)" => "false"),
-        // x == x => true   (reflexivity; also fires when congruence has already
-        // merged the two operands into one e-class, e.g. a return var copied from
-        // a param: `ensures r == a` after `r := a`).
+        // x == x => true   (reflexivity; also fires once congruence has merged
+        // the two operands into one e-class)
         rw!("eq-refl"; "(== ?x ?x)" => "true"),
         // (a == b) proven true  =>  a ≡ b   (congruence)
         rw!("eq-true-union"; "(== ?a ?b)" => {
             UnionEqArgs { a: var("?a"), b: var("?b") }
         }),
-        // Boolean-literal equality is *spelling*, not content: `b == false` and
-        // `!b` denote the same proposition, and `!b` lowers to `ite(b, false, true)`
-        // (`translate/pure_exp.rs`, `UnOp::Not`). These are equivalences, not
-        // implications — an unconditional union, no `Known` gate.
-        //
-        // Not cosmetic: `split_candidates` collects **`Ite` conditions** reachable
-        // from the goal, so a goal spelled `(x == 0) == false` offers the splitter
-        // nothing to split on and never reaches the pc contradiction that the same
-        // goal spelled `!(x == 0)` reaches immediately. Prusti's MIR asserts are
-        // emitted in the `== false` spelling (`exhale s_Bool_value(_t) == false`
-        // for a divide-by-zero guard), so without this every such obligation under
-        // an order-fact pc is out of reach. See
-        // `findings_2026-07-30_panic_freedom.md` §2.
+        // `b == false` is `!b`, which lowers to `ite(b, false, true)`
+        // (`translate/pure_exp.rs`, `UnOp::Not`). An equivalence, so no `Known`
+        // gate. Load-bearing for splitting: `split_candidates` only collects
+        // `Ite` conditions, so a goal left in the `== false` spelling (how Prusti
+        // emits MIR asserts) offers the splitter nothing.
         rw!("eq-false-is-not-r"; "(== ?b false)" => "(ite ?b false true)"),
         rw!("eq-false-is-not-l"; "(== false ?b)" => "(ite ?b false true)"),
         // `b == true` is `b` itself — a pure union, minting no node.
@@ -481,11 +433,7 @@ fn static_rules() -> Vec<Rule> {
         // the class's proven boolean, exactly what its applier already inspects.
     ]);
     // Disequality reasoning over disproven `==` classes — standalone rules that
-    // share the `Eq` bucket + the `Known(false)` gate. (A same-condition
-    // `ite-then/else-context` pruning pair used to sit here, gated opt-in for a
-    // heap-join model that *materialized* select towers into the graph; the
-    // block-merge fork proves selects per leaf and never lowers them, so that
-    // pruning had nothing to fire on and was removed.)
+    // share the `Eq` bucket + the `Known(false)` gate.
     rules.push(
         Rewrite::new("eq-false-mirror", EqBucketSearcher, EqFalseMirrorApplier)
             .expect("eq-false-mirror rule"),
@@ -503,15 +451,9 @@ fn static_rules() -> Vec<Rule> {
 }
 
 /// Unit propagation from a **disproven** `==` through `ite` towers — NOT
-/// eq-over-ite distribution (unguarded pattern forms blow the graph up ~75x on
-/// real programs: every pair of ite-towers under an `==` cross-multiplies —
-/// see the applier doc). Split by which arm the other operand matches; nested
-/// towers unwind one level per saturation iteration (the derived disequality
-/// re-enters the `Eq` bucket).
-///
-/// (There used to be a companion `lt-ite` that distributed `<` over an ite
-/// tower; the block-merge fork proves scaled permissions per leaf, so no
-/// `<`-over-`ite` tower ever forms and the rule was removed.)
+/// eq-over-ite distribution (see the applier doc). Split by which arm the other
+/// operand matches; nested towers unwind one level per saturation iteration (the
+/// derived disequality re-enters the `Eq` bucket).
 fn disequality_unit_prop_rules() -> Vec<Rule> {
     vec![
         Rewrite::new(
@@ -535,20 +477,15 @@ fn disequality_unit_prop_rules() -> Vec<Rule> {
     ]
 }
 
-/// Terminating `ite` simplifications. Shared by the saturation rule set and the
-/// post-`fold`/`unfold` reduction set. Under an assumed branch literal (on the
-/// instruction's path condition) `ite-true`/`ite-false` reduce a gated
-/// permission `b ? p : 0` to `p` (resp. `0`), which is what discharges a
-/// conditional `acc`'s permission ≥ 0 obligation and peels the optional snapshot
-/// member's discriminant.
-/// The terminating `ite` simplifications, fused into **one** rule that scans
-/// the `Ite` op bucket once per iteration and node-checks every shape. The
-/// twelve equivalent `rw!` patterns cost ~70% of all search time on real
-/// programs: `implication()` encodes every guard as an `Ite` tower, so the
-/// bucket holds thousands of classes, and the nested two-level patterns
-/// (`ite-collapse-*`, `ite-nested-*`) pay a backtracking cross-product over it
-/// per pattern per iteration. The fused pass is linear in the bucket (plus the
-/// nodes of the two branch classes for the nested shapes) and union-only.
+/// Terminating `ite` simplifications, shared by the saturation rule set and the
+/// post-`fold`/`unfold` reduction set. Under an assumed branch literal these
+/// reduce a gated permission `b ? p : 0` to `p` (resp. `0`).
+///
+/// Fused into **one** rule that scans the `Ite` op bucket once per iteration and
+/// node-checks every shape: as twelve `rw!` patterns they cost ~70% of all search
+/// time, since the nested two-level patterns pay a backtracking cross-product
+/// over a bucket holding thousands of classes. The fused pass is linear in the
+/// bucket (plus the two branch classes' nodes) and union-only.
 ///
 /// Shapes (c ⋄ t ⋄ e over one node, plus one nested level):
 /// - `ite(true, x, y) ⇒ x`, `ite(false, x, y) ⇒ y` (via `ConstFold` on `c`)
@@ -656,11 +593,9 @@ impl Searcher<Symbolic, ConstFold> for EqBucketSearcher {
 
 /// Applier for `eq-false-mirror`: **disequality symmetry**. A disproven
 /// `a == b` implies the mirrored `b == a` is false too — land it in the same
-/// class so a goal built in the other operand order (Prusti's
-/// `requires 0 != value(arg2)` vs a div obligation's `Eq(b, 0)`) sees the known
-/// boolean. Proven equalities need no mirror — `eq-true-union` merges the args
-/// and congruence collapses both orders. Standalone (was fused into the old `eq-ite`);
-/// shares the `Eq`-bucket searcher and the `Known(false)` gate.
+/// class so a goal built in the other operand order sees the known boolean.
+/// Proven equalities need no mirror — `eq-true-union` merges the args and
+/// congruence collapses both orders.
 struct EqFalseMirrorApplier;
 
 impl Applier<Symbolic, ConstFold> for EqFalseMirrorApplier {
@@ -705,21 +640,14 @@ impl Applier<Symbolic, ConstFold> for EqFalseMirrorApplier {
 /// (it would have to case-split on *which* argument differs — the true/false
 /// asymmetry), so we fire **only when the disjunction collapses to a unit**:
 /// when every argument pair but one is already proven equal (`aᵢ ≡ bᵢ`), the
-/// lone remaining pair must differ — `aⱼ == bⱼ` is false. The unary rule is the
-/// zero-other-args case of this. Sound for **any** `f`, injective or not — the
-/// contrapositive of congruence needs no injectivity (that is what distinguishes
-/// it from [`inj_rule`], which runs the *forward*, proven-equal direction and so
-/// requires a free constructor).
+/// lone remaining pair must differ — `aⱼ == bⱼ` is false. Sound for **any** `f`,
+/// injective or not; unlike [`inj_rule`] the contrapositive of congruence needs
+/// no free constructor.
 ///
-/// This is the only sound disequality inference through a function, and it flows
-/// backward only. Connects an unboxed comparison to its boxed source:
-/// `value(v) != 0` with the axiom instance `value(cons(0)) ≡ 0` in `0`'s class
-/// disproves `v == cons(0)`, which then (a) feeds `eq-false-then/else`'s ite unit
-/// propagation when `v` is an ite of constructions, and (b) collapses a
-/// predicate-body disjunction tower `ite(v == cons(0), true, rest) ≡ true` down
-/// to its live arm via `ite-reduce`. Standalone (was fused into the old `eq-ite`);
-/// demand-driven — only same-function applications straddling an
-/// already-disproven equality, and only when exactly one argument pair differs.
+/// Connects an unboxed comparison to its boxed source: `value(v) != 0` with the
+/// axiom instance `value(cons(0)) ≡ 0` in `0`'s class disproves `v == cons(0)`,
+/// which then feeds `eq-false-then/else`'s ite unit propagation and collapses
+/// predicate-body disjunction towers via `ite-reduce`.
 struct ContraCongruenceApplier {
     /// Cost guard, keyed by the function and the canonical argument pair it
     /// disproved (re-deriving is idempotent — the unions no-op).
@@ -755,12 +683,11 @@ impl Applier<Symbolic, ConstFold> for ContraCongruenceApplier {
                     if lf != rf || ltys != rtys || largs.len() != rargs.len() {
                         continue;
                     }
-                    // Narrowing: collect the argument positions that are not yet
-                    // proven equal. If exactly one differs, the disjunction is a
-                    // unit — that pair must be disequal. Zero differing means the
-                    // apps are congruent (`ConstFold` handles the resulting
-                    // `Known(false)` == congruent-true conflict); two or more is a
-                    // genuine disjunction the e-graph cannot represent, so skip.
+                    // Narrowing: collect the argument positions not yet proven
+                    // equal. Exactly one differing ⟹ the disjunction is a unit and
+                    // that pair is disequal. Zero means the apps are congruent
+                    // (`ConstFold` handles the conflict); two or more is a
+                    // disjunction the e-graph cannot represent, so skip.
                     let mut diff: Option<[Id; 2]> = None;
                     let mut multiple = false;
                     for (la, ra) in largs.iter().zip(rargs.iter()) {
@@ -807,19 +734,15 @@ impl Applier<Symbolic, ConstFold> for ContraCongruenceApplier {
 /// - else side (`y ≡ z`) ⟹ `c = true ∧ (x == z) = false` (mirrored)
 ///
 /// The second consequence recurses down a nested ite tower (a 3+-variant enum
-/// discriminator) — the derived disequality lands back in the `Eq` bucket with
-/// `Known(false)` data, so the next saturation iteration picks it up (one
-/// level per iteration; no in-applier worklist). Two assumed disequalities
-/// that pin `c` both ways make the graph inconsistent — which is exactly
-/// enum-match exhaustiveness (`assert false` after excluding every tag). The
-/// disproven inputs are fed by `contra-congruence` (boxed discriminators) or
-/// an assumed `d != tag` directly.
+/// discriminator): the derived disequality lands back in the `Eq` bucket, so the
+/// next saturation iteration picks it up, one level per iteration. Two assumed
+/// disequalities pinning `c` both ways make the graph inconsistent — which is
+/// enum-match exhaustiveness.
 ///
-/// Deliberately **not** implemented as syntactic distribution
+/// Deliberately **not** syntactic distribution
 /// (`(ite c x y) == z ⇒ ite c (x==z) (y==z)`): the pattern form cross-multiplies
-/// the ite guard towers `implication()` builds (~75x node blowup, trips egg's
-/// node limit and *loses* previously-proven goals); this derivation adds at
-/// most one `Eq` node per step and otherwise only unions.
+/// the ite guard towers `implication()` builds (~75x node blowup). This
+/// derivation adds at most one `Eq` node per step and otherwise only unions.
 struct EqFalseUnitApplier {
     /// Which arm of the ite the other operand must match (see rule doc).
     then_side: bool,
@@ -900,9 +823,7 @@ struct IteReduceApplier;
 
 /// Measurement gate for the two nested same-condition `ite` shapes
 /// (`ite(c, ite(c, x, y), _)` and its mirror). Set `SILVER_OXIDE_NO_NESTED_ITE=1`
-/// to drop them and cost out the nested branch-class scan. Dropping a rewrite is
-/// incomplete, never unsound, so a run under the flag that still verifies every
-/// member is a fair timing comparison.
+/// to drop them and cost out the nested branch-class scan.
 fn nested_ite_shapes_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -943,13 +864,10 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
                 Some(true) if t_lit == Some(false) && e_lit == Some(true) => {
                     unions.push((c, Target::False));
                 }
-                // (!x) proven false => x true.  The mirror of the arm above: a
-                // *negative* path-condition literal on a negation is exactly how
-                // Prusti spells a taken branch -- `switchInt` emits
+                // (!x) proven false => x true.  Mirror of the arm above; this is
+                // how Prusti spells a taken branch (`switchInt` emits
                 // `if (value(t) == false) { else } else { then }`, so the arm where
-                // the guard *holds* sits under `!(value(t) == false)`, i.e. under a
-                // negation proven false. Without this, no guard Prusti generates
-                // ever yields its positive fact.
+                // the guard holds sits under a negation proven false).
                 Some(false) if t_lit == Some(false) && e_lit == Some(true) => {
                     unions.push((c, Target::True));
                 }
@@ -992,22 +910,15 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
                 unions.push((eclass, Target::False));
             }
             // Nested same-condition ite in one branch — `c ? (c ? x : y) : e` and
-            // its mirror. Every arm here collapses the *whole* class (to `t` or
-            // `e`), so the first hit makes any further match in this `apply_one`
-            // redundant: stop scanning `t`'s nodes on the first collapse, and skip
-            // the else-branch scan entirely if the then-branch already produced
-            // one. (There is no per-class index of "nodes conditioned on `c`", so
-            // the scan of a branch class's nodes cannot be targeted — but it is one
-            // class's nodes, ends early, and is bounded below.)
+            // its mirror. Every arm collapses the whole class, so the first hit
+            // makes any further match redundant: stop on the first collapse and
+            // skip the else-branch scan if the then-branch produced one.
             let mut collapsed = false;
-            // The nested-collapse shapes need an inner `Ite` conditioned on the
-            // *same* `c` sitting in a branch class. Branch classes that hoard many
-            // nodes (the `true` class alone reaches ~1600 on enum-match) almost
-            // never hold such an inner ite, so scanning them per outer-ite per
-            // iteration is the cubic cost (55% of runtime). Skip the scan on large
-            // branch classes: the load-bearing structural-join shape keeps its
-            // branch classes tiny. Sound either way (skipping a rewrite is
-            // incomplete, not unsound).
+            // Large branch classes (the `true` class alone reaches ~1600 nodes on
+            // enum-match) almost never hold an inner ite on the same `c`, so
+            // scanning them per outer-ite per iteration was 55% of runtime. Skip
+            // them — the load-bearing structural-join shape keeps its branch
+            // classes tiny, and skipping a rewrite is incomplete, not unsound.
             const NESTED_SCAN_BOUND: usize = 64;
             let nested = nested_ite_shapes_enabled();
             let scan_t = nested && egraph[t].nodes.len() <= NESTED_SCAN_BOUND;
@@ -1229,10 +1140,6 @@ impl Applier<Symbolic, ConstFold> for TagApplier {
     }
 }
 
-/// Applier for the projection reduction: if the argument's e-class holds the
-/// matching constructor `ctor`, union the `accessor(..)` e-class with that
-/// constructor's `index`-th value argument. (Type args are not children, so the
-/// value args start at 0.)
 /// Applier for [`inj_rule`]: unions the arguments of every pair of same-ctor
 /// applications sharing the matched e-class. Grouped by type args — two
 /// instantiations of a generic constructor are different operators, and only
@@ -1280,6 +1187,10 @@ impl Applier<Symbolic, ConstFold> for InjApplier {
     }
 }
 
+/// Applier for the projection reduction: if the argument's e-class holds the
+/// matching constructor `ctor`, union the `accessor(..)` e-class with that
+/// constructor's `index`-th value argument. (Type args are not children, so the
+/// value args start at 0.)
 struct ProjApplier {
     ctor: FuncId,
     index: usize,
@@ -1290,22 +1201,16 @@ impl ProjApplier {
     /// result (adding `ite` nodes as needed). Either the ctor is directly present
     /// (return the field arg), or the class holds an `ite` whose both arms extract
     /// recursively — the projection commutes into the `ite`
-    /// (`projᵢ(ite(c, cons(a..), cons(b..))) ⇒ ite(c, aᵢ, bᵢ)`). That commuting arm
-    /// is what connects an enum discriminator's boxed `ite` body to a switch that
-    /// compares the *unboxed* value: without it the `proj∘cons` reduction never
-    /// fires (the arg class holds an `Ite`, not the ctor) and exhaustiveness
-    /// `assert false` can't see the case split.
+    /// (`projᵢ(ite(c, cons(a..), cons(b..))) ⇒ ite(c, aᵢ, bᵢ)`). The commuting arm
+    /// connects an enum discriminator's boxed `ite` body to a switch comparing the
+    /// *unboxed* value; without it `proj∘cons` never fires, since the arg class
+    /// holds an `Ite` rather than the ctor.
     ///
-    /// The argument class is frequently a **shared** `ite`-DAG (e.g. the join
-    /// snapshot of a `match` that mutates a `&mut` enum — an arm's heap reuses
-    /// substructure from the entry heap, so the same sub-class is reachable by
-    /// many root→leaf paths). `memo` caches the per-class result so each class is
-    /// visited once; without it a DAG with `d` shared classes is walked over its
-    /// (up to `2^d`) distinct paths, which was ~half of `structs_enums`'s
-    /// `m_shape_grow` time. `seen` is the in-progress cycle guard: a class whose
-    /// extraction depends on an active cycle is *not* memoized (its `acyclic`
-    /// return is `false`), so cycle semantics match the former path-stack walk on
-    /// pathological graphs while the common acyclic case memoizes cleanly.
+    /// The argument class is frequently a **shared** `ite`-DAG, so `memo` caches
+    /// the per-class result — otherwise a DAG with `d` shared classes is walked
+    /// over up to `2^d` distinct paths. `seen` is the in-progress cycle guard: a
+    /// class whose extraction depends on an active cycle is *not* memoized (its
+    /// `acyclic` return is `false`).
     ///
     /// Returns `(result, acyclic)`: `result` is the extracted class (or `None` if
     /// not projectable); `acyclic` is `false` iff the computation short-circuited
@@ -1413,10 +1318,9 @@ pub(crate) enum AxiomPure {
 /// One instruction of a prepared body: a value-producing pure step, an
 /// assumption (stitched from a callee's `#ensures`) merged with `true`, or a
 /// nested `forall` — materialized as a [`Symbolic::Forall`] node whose capture
-/// children are resolved through the *enclosing* instance's temps. That last arm
-/// is all closure-converted nesting needs: an outer instantiation builds the
-/// inner quantifier with the outer σ baked into its children, and the generic
-/// rule picks the new node up on the next iteration.
+/// children are resolved through the *enclosing* instance's temps, so an outer
+/// instantiation bakes its σ into the inner quantifier and the generic rule picks
+/// the new node up on the next iteration.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum AxiomInst {
     Val(AxiomPure),
@@ -1744,9 +1648,8 @@ fn match_term_anywhere(
 /// Searcher for the **single** quantifier-instantiation rule: every e-class
 /// holding a `Forall` node, found through `classes_for_op` (one bucket per
 /// recipe — indexed, no whole-graph scan). Quantifiers are *data*, not rules, so
-/// a `forall` materialized mid-run by an outer instantiation or a certificate
-/// graft is picked up on the very next iteration — the thing per-quantifier
-/// rules structurally cannot do (egg forbids rule injection mid-`Runner`).
+/// a `forall` materialized mid-run is picked up on the next iteration; egg
+/// forbids injecting rules mid-`Runner`.
 struct ForallSearcher {
     table: Arc<RecipeTable>,
 }
@@ -1906,21 +1809,18 @@ pub(crate) fn forall_rule(table: Arc<RecipeTable>) -> Rule {
 
 // ---- Function-call unfolding (lazy, rewrite-rule triggered) ---------------
 
-/// Applier: for each ground `FuncApp(self.func, tys, args)` node in the matched
-/// e-class, rebuild the function's **definition recipe** with `build_instance`
-/// (params → args, `Generic(i)` → `tys`) and union the result with the matched
-/// e-class — installing `f(args) == body` lazily, the moment an occurrence is
-/// seen during saturation, instead of eagerly at translation-walk time. Unlike
-/// the old certificate graft this is **add-only** (`build_instance` imports no
-/// e-classes), so precondition-derived merges from the body's own verification
-/// never ride along (Finding B). Works uniformly for heap-free and
-/// heap-dependent `f`: the recipe already resolved every `Deref`/`Unfold`/`Snap`
-/// into pure terms over the params + snapshot. Memoized per canonicalized
-/// `(tys, args)` tuple (a saturation-cost guard; rebuilding is idempotent).
 /// A canonicalized call key: the ground `(type_args, value_args)` an occurrence
 /// of the function was applied to. Memoized so the recipe rebuilds once per call.
 type CallKey = (Box<[Type]>, Vec<Id>);
 
+/// Applier: for each ground `FuncApp(self.func, tys, args)` node in the matched
+/// e-class, rebuild the function's **definition recipe** with `build_instance`
+/// (params → args, `Generic(i)` → `tys`) and union the result with the matched
+/// e-class, installing `f(args) == body` lazily as occurrences are seen during
+/// saturation. **Add-only** (`build_instance` imports no e-classes), so merges
+/// derived while verifying the body itself never ride along. Works uniformly for
+/// heap-free and heap-dependent `f`: the recipe already resolved every
+/// `Deref`/`Unfold`/`Snap` into pure terms over the params + snapshot.
 struct FunctionUnfoldApplier {
     func: FuncId,
     def: Arc<FunctionDefinition>,
@@ -1939,12 +1839,9 @@ struct FunctionUnfoldApplier {
     /// The function's uniform pre-token `f%pre` (`FuncRegistry::fn_pre_token`),
     /// used as a `forall`-style **presence** trigger: the definitional
     /// `f(fargs)==body` union+build fires only when a `FuncApp(f%pre, fargs)` node
-    /// is present in the e-graph for the *same* `fargs` — i.e. this occurrence was
-    /// reached from a genuine value-position call (which is the only place the
-    /// token node is ever added). A spec-only occurrence never has the token node,
-    /// so its body is neither built nor unioned (Silicon's `f%pre ⟹ f==body`,
-    /// with `f%pre` assumed only at call sites). `None` on the facts-only rule,
-    /// where there is no definitional union to gate.
+    /// is present for the *same* `fargs`, i.e. this occurrence came from a genuine
+    /// value-position call. Mirrors Silicon's `f%pre ⟹ f==body`. `None` on the
+    /// facts-only rule, where there is no definitional union to gate.
     pre_token: Option<FuncId>,
 }
 
@@ -2006,18 +1903,12 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
         let mut changed = Vec::new();
         for (tys, args) in calls {
             debug_assert_eq!(args.len(), self.def.n_params, "function unfold arity");
-            // Presence trigger: the definitional union fires only when a
-            // `FuncApp(f%pre, args)` node is present for the *same* args — i.e.
-            // this occurrence was reached from a genuine value-position call (the
-            // only place the token node is minted). Presence, NOT truth: the token
-            // is released `assume_guarded` under the call-site PC, so its class is
-            // an `ite(pc, tok, ..)` shape, never unconditionally `true`. A
-            // spec-only occurrence has no token node → its body stays folded
-            // (Silicon's limited symbol). Type args are not in the `FuncApp`
-            // congruence key, so `[]` matches any instantiation.
-            // `pre_token = None` ⇒ ungated (a contract `#requires`/`#ensures`
-            // defined boolean, whose whole role is to inline its formula — it must
-            // unfold freely, as before). `Some(tok)` ⇒ gated on token presence.
+            // Presence trigger (see `pre_token`). Presence, NOT truth: the token is
+            // released `assume_guarded` under the call-site PC, so its class is an
+            // `ite(pc, tok, ..)` shape, never unconditionally `true`. Type args are
+            // not in the `FuncApp` congruence key, so `[]` matches any
+            // instantiation. `pre_token = None` ⇒ ungated (a contract
+            // `#requires`/`#ensures` boolean, whose role is to inline its formula).
             let has_token = self.pre_token.is_none_or(|tok| {
                 egraph
                     .lookup(Symbolic::FuncApp(tok, Box::new([]), args.clone().into()))
@@ -2061,23 +1952,15 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             // saturation); the frame lets a materialized `f(args)` value flow to
             // any `f'(args)` a sibling unfold produced.
             //
-            // **Ungated**, matching Silicon's `limitedAxiom`
-            // (`supporters/functions/FunctionData.scala`):
-            // `∀ s,args :: {f(s,args)} f'(s,args) == f(s,args)`, emitted after
-            // phase 1 for every function and triggered on the *non-limited*
-            // application. The precondition is an implication *inside* Silicon's
-            // post/definitional axioms, never a gate on this equality — so this
-            // union must NOT sit behind the `f%pre` presence token that gates the
-            // definitional union above. The token is minted only at a
-            // value-position call, so gating it here strands a recursive
-            // function's post fact (stated on `f'`, see `declaration.rs`
-            // `spec_post_definition`) in limited space whenever the occurrence
+            // **Ungated**, matching Silicon's `limitedAxiom`. It must NOT sit
+            // behind the `f%pre` presence token: the token is minted only at a
+            // value-position call, so gating strands a recursive function's post
+            // fact (stated on `f'`) in limited space whenever the occurrence
             // arrived via a callee's `ensures` rather than a direct call.
             //
             // Cannot reintroduce unbounded unfolding: this mints `f'` *from* an
             // existing `f` node, never the reverse, and the unfold rule filters
-            // on `FuncApp(f)` — so an `f'(args')` class produced by unrolling a
-            // body still holds no `f` node and stays inert.
+            // on `FuncApp(f)`.
             if !self.limited_post {
                 if let Some(lim) = self.def.limited {
                     let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.into()));
@@ -2124,9 +2007,8 @@ pub(crate) fn function_rule(
 /// facts, no definitional union. Two users:
 /// - the limited-twin post rule of a recursive function ([`function_post_rule`]);
 /// - the spec-derived post rule installed for each SCC member **during** a
-///   recursive batch's own verification (Silicon's phase-1 `post` axiom is
-///   available while checking the body — that is what makes induction over a
-///   recursive call work).
+///   recursive batch's own verification, which is what makes induction over a
+///   recursive call work (Silicon's phase-1 `post` axiom).
 pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>) -> Rule {
     let searcher = AxiomTriggerSearcher { func };
     let applier = FunctionUnfoldApplier {

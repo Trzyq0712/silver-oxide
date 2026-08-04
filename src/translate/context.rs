@@ -2,12 +2,10 @@
 //! (`resource.rs`/`method.rs`/`pure_exp.rs`/`spatial.rs`) consumes. It **owns**
 //! its maps (`name_map`, `contracts`, ...), built up progressively by the
 //! coordinator (`mod.rs`) folding each `Translator::declare`'s `Meta` as
-//! members are declared — it is a genuinely separate value from `Builder`
-//! (the write side: `decls`/`vmir_interner`/`decl_names`/`groups`), not a
-//! borrowed view of it. That separation is what lets a `Translator::define`
-//! take `&TranslationContext` and `&mut impl Definer` (effectively `&mut
-//! Builder`) in the same call without an aliasing conflict — the two values
-//! share no lifetime.
+//! members are declared. A genuinely separate value from `Builder` (the write
+//! side), not a borrowed view of it, which is what lets a `Translator::define`
+//! take `&TranslationContext` and `&mut impl Definer` in one call without an
+//! aliasing conflict.
 
 use std::collections::HashMap;
 

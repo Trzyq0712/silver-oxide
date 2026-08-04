@@ -304,13 +304,11 @@ pub enum Statement {
     Goto(Spur),
     /// `while (c) invariant A { .. }`.
     ///
-    /// Kept structured all the way to CFG construction rather than desugared
-    /// earlier: a `while` head needs no name (the CFG identifies blocks by
-    /// `BlockId`), so rewriting it to `label`+`goto` would mint a synthetic
-    /// identifier for nothing and lose the source shape that diagnostics want.
-    /// `viper::cfg` turns it into the same head/body/back-edge block structure
-    /// a hand-written `goto` loop produces, so there is still exactly one loop
-    /// shape downstream of the CFG.
+    /// Kept structured all the way to CFG construction: a `while` head needs no
+    /// name, so an earlier `label`+`goto` rewrite would mint a synthetic identifier
+    /// for nothing and lose the source shape diagnostics want. `viper::cfg` turns it
+    /// into the same head/body/back-edge structure a hand-written `goto` loop
+    /// produces, so there is one loop shape downstream of the CFG.
     ///
     /// `decreases` clauses are dropped by typechecking.
     // TODO(loops): termination — `decreases` is parsed and ignored.

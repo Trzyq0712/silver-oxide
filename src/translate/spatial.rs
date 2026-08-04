@@ -169,10 +169,8 @@ pub(crate) fn lower_spatial_ensures(
 /// Lower a `SpatialExp` into a heap delta and an optional boolean.
 ///
 /// `None` means the spatial expression carries no logical content beyond its
-/// heap chunks — i.e. the boolean is trivially `true`. Returning `Option`
-/// instead of always emitting a `Pure` ternary lets us collapse
-/// `acc(...) && acc(...)` and similar all-permission expressions to just the
-/// heap delta with no boolean witness.
+/// heap chunks — i.e. the boolean is trivially `true`, so an all-permission
+/// expression like `acc(..) && acc(..)` lowers to the heap delta alone.
 ///
 /// A branch is encoded into permission fractions rather than a heap multiplexer:
 /// the enclosing `with_cond` path condition gates every `acc`'s permission (see

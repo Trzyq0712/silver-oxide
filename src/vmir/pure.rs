@@ -12,12 +12,11 @@ pub enum Val {
 /// A binary operator, **tagged with the sort of its operands** (`I` = `Int`,
 /// `R` = `Real`, i.e. Viper's `Perm`).
 ///
-/// Viper writes one `+` for both integer and permission addition, and the sort
-/// is recovered during lowering, where the typed AST still has it. Carrying it
-/// on the operator rather than re-deriving it later is what lets an e-graph
-/// rewrite *produce* a literal: `x - x => 0` has no operand literal to read a
-/// sort off, and picking the wrong one puts an `Int` and a `Real` literal in one
-/// e-class — a type error the analysis panics on. See `verify::rewrite`.
+/// Viper writes one `+` for both integer and permission addition; the sort is
+/// recovered during lowering, where the typed AST still has it. Carrying it on the
+/// operator is what lets an e-graph rewrite *produce* a literal: `x - x => 0` has
+/// no operand literal to read a sort off, and the wrong choice puts an `Int` and a
+/// `Real` literal in one e-class — a type error the analysis panics on.
 ///
 /// `Eq` is deliberately **not** tagged: it also compares `Bool`, `Ref`, ADTs and
 /// snapshots, so a two-sort tag does not fit it, and none of its rules need to

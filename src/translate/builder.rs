@@ -3,28 +3,22 @@
 //! later fill each declaration. `Builder` implements the [`Declarator`] /
 //! [`Definer`] interfaces the translators drive.
 //!
-//! `Builder` and `DeclSlot` live in the *same* module on purpose — that
-//! co-location is what makes the capability sound (see below), so they cannot
-//! be split apart.
+//! `Builder` and `DeclSlot` live in the *same* module on purpose: the
+//! co-location is what makes the capability unforgeable (see below).
 //!
 //! ## `DeclSlot` — an unforgeable, affine write capability
 //!
 //! A [`DeclSlot<T>`] is a write-capability token for exactly one declaration
 //! slot, tagged with the payload type `T` it will hold. It is `#[must_use]`,
-//! non-`Clone`, and consumed by value: `Definer::define_*` takes a
-//! `DeclSlot<T>` by move, so a slot can be filled **at most once** (a second
-//! fill is a move error). That every reserved slot is filled **at least once**
-//! is checked in one place — [`Builder::finalize`], which panics (naming the
-//! member) on any slot left empty. On a translation *error* an unfilled slot is
-//! simply dropped and the whole `Builder` discarded, so no per-slot cleanup is
-//! needed.
+//! non-`Clone`, and consumed by value, so a slot can be filled **at most once**
+//! (a second fill is a move error). Filled **at least once** is checked in
+//! [`Builder::finalize`], which panics (naming the member) on any slot left
+//! empty. On a translation *error* the whole `Builder` is discarded.
 //!
 //! **Unforgeable.** `DeclSlot::new` and `DeclSlot::fill` are private to *this*
-//! module, and `Builder` (the only `Declarator`/`Definer` impl) lives here too.
-//! The translator submodules (`decl::field`, `decl::adt`, …) are *not*
-//! descendants of this module, so they cannot reach the private constructor or
-//! filler: a translator can only receive a slot and hand it to `define_*` — it
-//! can neither fabricate nor fill one. This makes `Builder::alloc_slot` the
+//! module, as is `Builder`, the only `Declarator`/`Definer` impl. The translator
+//! submodules are not descendants of this module, so a translator can only
+//! receive a slot and hand it to `define_*`, making `Builder::alloc_slot` the
 //! single source of every slot.
 
 use std::marker::PhantomData;

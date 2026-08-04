@@ -153,10 +153,8 @@ impl Sink {
     /// conditions gate; a separating-conjunction `Fact` keeps the bare permission.
     ///
     /// A concrete [`Perm::Amount`] gates by emitting a `Val` ternary via
-    /// [`Sink::gate_perm_val`] — byte-for-byte the pre-`Perm` behavior, so every
-    /// non-wildcard program's e-graph term and purify recipe are unchanged. A
-    /// wildcard-bearing permission gates *structurally* as [`Perm::Ite`] so the
-    /// wildcard survives to the verifier.
+    /// [`Sink::gate_perm_val`]; a wildcard-bearing permission gates *structurally*
+    /// as [`Perm::Ite`] so the wildcard survives to the verifier.
     pub(crate) fn gate_perm(&mut self, perm: Perm) -> Perm {
         if let Perm::Amount(v) = perm {
             return Perm::Amount(self.gate_perm_val(v));

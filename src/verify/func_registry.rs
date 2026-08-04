@@ -11,14 +11,12 @@
 //! per concept, and its ground type arguments ride in the `FuncApp` operator
 //! identity (the discriminant, `Symbolic::FuncApp(FuncId, Box<[Type]>, _)`), not as
 //! children. Distinctness across instantiations (`Box[Int]` vs `Box[Bool]`) comes
-//! from the differing discriminant — not from per-instance ids, and with no type
-//! e-classes. The reductions are instantiation-agnostic (one per concept).
+//! from the differing discriminant, so the reductions are instantiation-agnostic.
 //!
 //! The allocator is owned by `verify::verify` and threaded `&mut` through each
 //! (sequential) verification unit, so a concept gets the **same** id wherever it
 //! appears — required for a resource certificate's grafted nodes to
-//! congruence-match the caller (`transplant` carries the id verbatim). Contexts
-//! never run concurrently, so a plain `&mut` suffices (no interior mutability).
+//! congruence-match the caller.
 
 use std::collections::HashMap;
 
@@ -260,11 +258,9 @@ impl FuncRegistry {
     /// on first use). `f'` is **uninterpreted** — no unfold rule is ever
     /// registered for it — so a recursive call routed through `f'` never unfolds
     /// further, bounding saturation. A full `f`'s unfold rule additionally frames
-    /// `f(x) == f'(x)` so a materialized `f(x)` value flows to its twin. Distinct
-    /// `classes_by_op` bucket from `f`, and from every ADT concept id, since it is
-    /// minted from the same monotonic counter. `name` is the function's source
-    /// name (the registry holds no interner), used only for the display label
-    /// `name#lim`.
+    /// `f(x) == f'(x)` so a materialized `f(x)` value flows to its twin. `name` is
+    /// the function's source name (the registry holds no interner), used only for
+    /// the display label `name#lim`.
     pub fn limited(&mut self, func: MemberId, name: &str) -> FuncId {
         if let Some(&id) = self.limited.get(&func) {
             return id;
@@ -279,14 +275,12 @@ impl FuncRegistry {
     /// and the snapshot (minted on first use, keyed on the resource — each
     /// heap-dependent function has exactly one).
     ///
-    /// Uninterpreted on purpose (Silicon's `f%precondition`): unlike a heap-free
-    /// function's `f#requires`, which is a *defined* boolean function and so can
-    /// guard exported facts by itself, "the precondition holds here" is not a
-    /// function of `(args, s)` — it also demands the footprint, which the
-    /// snapshot's values do not record. So the token is *stamped* where a
+    /// Uninterpreted on purpose (Silicon's `f%precondition`): "the precondition
+    /// holds here" is not a function of `(args, s)` — it also demands the footprint,
+    /// which the snapshot's values do not record. The token is *stamped* where a
     /// `Snap`'s implicit check passed (`declaration::eval_snap` assumes it) and
-    /// is what every fact exported from the function's body is guarded by. No
-    /// rule is ever registered for it.
+    /// guards every fact exported from the function's body. No rule is ever
+    /// registered for it.
     pub fn pre_token(&mut self, resource: MemberId, name: &str) -> FuncId {
         if let Some(&id) = self.pre_token.get(&resource) {
             return id;

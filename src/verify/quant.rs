@@ -9,9 +9,8 @@
 //! children) but never a new *recipe* — nesting is closure-converted at
 //! translation, so the inner body is already interned. That is what lets the
 //! single instantiation rule hold a plain `Arc` snapshot of the table with no
-//! staleness risk, and what kills the old "eager transitive preload" workaround:
-//! egg cannot inject rules into a running `Runner`, but it happily sees a new
-//! *e-node* on the next iteration.
+//! staleness risk: egg cannot inject rules into a running `Runner`, but it does
+//! see a new *e-node* on the next iteration.
 
 use std::collections::HashMap;
 use std::sync::Arc;

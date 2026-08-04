@@ -13,8 +13,8 @@
 //! # What the caller gets
 //!
 //! - [`Loops::back_edges`] — the edges to cut. Removing them leaves a DAG, which
-//!   is what keeps the existing topological block order (and the
-//!   `preds precede` invariant the VMIR lowering and verifier both assume) valid.
+//!   keeps the topological block order (and the `preds precede` invariant the VMIR
+//!   lowering and verifier both assume) valid.
 //! - [`Loops::loops`] — one [`Loop`] per head, with its natural-loop body.
 //! - [`Loops::classify`] — per edge: which loops it leaves and which it enters,
 //!   innermost-first and outermost-first respectively. An edge leaving two loops

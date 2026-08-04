@@ -341,11 +341,10 @@ impl Builder {
                 //   pred ──> head[invs] ──c──> body ──> (back edge) ──> head
                 //                        └─!c─> exit
                 //
-                // The head needs no name — the CFG identifies blocks by
-                // `BlockId`, and invariants ride on the block, not on a label.
-                // That is why `while` is desugared *here* rather than earlier:
-                // rewriting it to `label`+`goto` upstream would have to mint a
-                // synthetic identifier for nothing.
+                // Desugared here rather than upstream because the head needs no
+                // name: the CFG identifies blocks by `BlockId` and invariants ride
+                // on the block, so a `label`+`goto` rewrite would mint a synthetic
+                // identifier for nothing.
                 Statement::While(cond, invs, body) => {
                     let b = self.ensure(&mut cur);
                     let head = self.new_block();

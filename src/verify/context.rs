@@ -74,11 +74,10 @@ pub(crate) struct VerifyContext<'a> {
     pub(crate) has_wildcard: bool,
     /// `SILVER_OXIDE_OOB_MEMO`: keep proven **conditional** obligations in an
     /// out-of-band set instead of unioning `pc ⇒ goal` into the `true` e-class.
-    /// The union memoized the proof but dragged the whole `ite(pc.., goal, true)`
-    /// chain permanently into `true` (the measured #1 growth driver — the graph
-    /// has no GC). The set memoizes the *verdict* without materializing the
-    /// scaffolding. Empty-pc goals still union (that path is productive:
-    /// `eq-true-union`/congruence off a proven `Eq`).
+    /// The union memoizes the proof but drags the whole `ite(pc.., goal, true)`
+    /// chain permanently into `true` (the #1 growth driver — the graph has no GC),
+    /// where the set memoizes the *verdict* alone. Empty-pc goals still union
+    /// (productive: `eq-true-union`/congruence off a proven `Eq`).
     oob_memo: bool,
     /// Canonical class ids of implications already proven `true`, consulted at
     /// tier 1 when `oob_memo` is on. Keyed by `egraph.find(imp)`: two distinct
@@ -135,12 +134,10 @@ struct BlockRecord {
 /// Id-space handling: ids present at build time are identical in both graphs
 /// (clone preserves them), so a ground id below `watermark` translates to itself.
 /// Ids minted after the build are mirrored through the `add`/`union` hooks into
-/// `map`. A ground id at-or-above `watermark` that is *not* in the map is either a
-/// rule-derived operand the scratch never received (ground *is* saturated in-block
-/// under the ground-first model) or an unmirrored recipe `build`:
-/// [`VerifyContext::tr`] imports it on demand from `id_to_node` — the node minted at
-/// that exact uncanonical id, never a canonical-class representative — so the scratch
-/// is a valid clone base under any ground state.
+/// `map`. A ground id at-or-above `watermark` that is *not* in the map (a
+/// rule-derived operand, or an unmirrored recipe `build`) is imported on demand by
+/// [`VerifyContext::tr`] from `id_to_node` — the node minted at that exact
+/// uncanonical id, never a canonical-class representative.
 struct BlockScratch {
     egraph: egg::EGraph<Symbolic, ConstFold>,
     /// ground id → scratch id, for mints recorded since the clone.
@@ -316,13 +313,10 @@ impl<'a> VerifyContext<'a> {
             }
         }
         // Miss: an unmirrored ground mint — recipe `build`s add straight to
-        // `ctx.egraph`, bypassing the `add`/`union` hooks (invariant 1's remaining
-        // gap; closing it means routing `build` through the mirror). Import it
-        // **faithfully**: `id_to_node(g)` is the node *minted at that id*, whereas
-        // `self.egraph[g].nodes[0]` picks an arbitrary member of `g`'s canonical
-        // class — once any union merged `g` into the `true` class that representative
-        // is `Lit(true)`, so the import would silently turn the imported term into
-        // `true` (and any mirrored union over it into `true == true`).
+        // `ctx.egraph`, bypassing the `add`/`union` hooks. Import it **faithfully**
+        // via `id_to_node(g)`, the node *minted at that id*: `self.egraph[g].nodes[0]`
+        // picks an arbitrary member of `g`'s canonical class, which is `Lit(true)`
+        // once any union merged `g` into the `true` class.
         use egg::Language as _;
         let node = self.egraph.id_to_node(g).clone();
         let kids: Vec<egg::Id> = node.children().to_vec();
@@ -356,10 +350,6 @@ impl<'a> VerifyContext<'a> {
     /// `assume`/`inhale` fact holds there outright — no need to make `ite-reduce`
     /// release it from under a guard first. Ground keeps the PC-guarded implication, so
     /// the fact cannot leak to a sibling path — see [`Self::assume_guarded`].
-    ///
-    /// Unconditional since 2026-07-30 (was `SILVER_OXIDE_TWO_EGRAPH`): measured
-    /// behaviour- and perf-identical either way once the scratch became a tier-3
-    /// fallback rather than the sole prover, so the knob only obscured the model.
     fn scratch_assume_unguarded(&mut self, fact: egg::Id) {
         if self.scratch.is_none() {
             return;
@@ -695,12 +685,9 @@ impl<'a> VerifyContext<'a> {
     /// Assume `fact` holds under `guards` — the **only** sanctioned way to record
     /// an assumption in the live e-graph. Merges `guards ==> fact` with `true`
     /// (via [`Self::implication`]), never `fact` itself: a raw `union(fact,
-    /// true)` would assert `fact` on *every* path, including those where its
-    /// guards do not hold, letting the verifier assume what it must prove (a
-    /// resource inhaled only inside an `if` arm, an `assume` under a branch, a
-    /// predicate `unfold`ed conditionally). With empty `guards` this degenerates
-    /// to an unconditional assumption, which is correct only when the fact truly
-    /// holds on all paths (e.g. a domain axiom).
+    /// true)` would assert `fact` on *every* path, letting the verifier assume what
+    /// it must prove. With empty `guards` this degenerates to an unconditional
+    /// assumption, correct only when the fact holds on all paths (a domain axiom).
     ///
     /// `guards` are in innermost-first fold order, matching [`Self::implication`].
     pub(crate) fn assume_guarded(
@@ -735,16 +722,6 @@ impl<'a> VerifyContext<'a> {
         self.egraph.rebuild();
     }
 
-    /// Prove `goal == true` under the hypotheses `pc_lits`, using a throwaway
-    /// clone of the e-graph so the assumptions never touch live state. On
-    /// success, commit the proven implication `pc ==> goal` into the live graph
-    /// (so it can fire later once the PC is established) and return `true`.
-    ///
-    /// A PC literal whose value already folds to the opposite boolean means the
-    /// path is unsatisfiable: the goal then holds vacuously, so we short-circuit
-    /// to `true` (and still commit the vacuously-true implication). This also
-    /// avoids `ConstFold`'s conflicting-value panic when unioning into the
-    /// `true`/`false` eclass.
     /// Prove `pc ⇒ goal` against the live e-graph, escalating through three
     /// tiers (cheapest first) and **memoizing** the result:
     /// 1. is the implication already known `true`? (O(1) — a prior identical
@@ -757,6 +734,10 @@ impl<'a> VerifyContext<'a> {
     ///
     /// On success the implication is merged with `true` in the live graph so the
     /// next identical obligation hits tier 1. (Tiers 1/2 already have it merged.)
+    ///
+    /// A PC literal that already folds to the opposite boolean means the path is
+    /// unsatisfiable, so the goal holds vacuously and we short-circuit — which also
+    /// avoids `ConstFold`'s conflicting-value panic.
     #[track_caller]
     pub(crate) fn prove_under_pc(
         &mut self,
@@ -816,15 +797,11 @@ impl<'a> VerifyContext<'a> {
 
         // Inside a method block, discharge tier-3 against the per-block scratch
         // graph (reused across the block's obligations) instead of cloning ground
-        // per obligation. The scratch is the strictly better clone base: warm,
-        // cube-assumed, and kept in sync with ground. Its `tr` translation imports
-        // any ground operand it is missing (`find` can surface rule-derived leader
-        // ids the mirror never received), so it is always a valid clone base.
+        // per obligation: it is warm, cube-assumed and kept in sync with ground, and
+        // its `tr` imports any ground operand it is missing.
         //
         // Functions/resources have no CFG — a whole-body scratch would just equal
-        // ground — so they keep the per-obligation clone path below, load-bearing
-        // there for function-precondition, division side-condition, and
-        // `acc`-non-negativity obligations.
+        // ground — so they keep the per-obligation clone path below.
         if self.in_block {
             let proven = self.prove_via_scratch(goal, pc_lits);
             if proven {
@@ -833,16 +810,11 @@ impl<'a> VerifyContext<'a> {
             return proven;
         }
 
-        // Tier 3 shortcut: if every PC literal already carries its required
-        // polarity in the just-saturated live graph, assuming the PC adds
-        // nothing — the probe would re-saturate an identical graph and reach
-        // the tier-2 verdict again. Skip straight to tier 3.5 / the function
-        // case split (an empty-pc goal — a branching function's exit post —
-        // is exactly the shape that reaches here).
-        //
-        // Only functions/resources reach here (method obligations returned via the
-        // scratch above), and their tier-2 always ran the full rule set, so the
-        // shortcut's premise (the live graph is fully saturated) holds.
+        // Tier 3 shortcut: if every PC literal already carries its required polarity
+        // in the just-saturated live graph, assuming the PC adds nothing — skip
+        // straight to tier 3.5 / the function case split. Only functions/resources
+        // reach here, and their tier-2 always ran the full rule set, so the premise
+        // (the live graph is fully saturated) holds.
         if pc_lits.iter().all(|(id, pol)| {
             matches!(
                 self.egraph[*id].data.known(),
@@ -903,9 +875,8 @@ impl<'a> VerifyContext<'a> {
     /// Enter a method block: record its control cube (shared pc of all its
     /// insts) and drop any previous block's scratch (sibling cubes are mutually
     /// exclusive, so it cannot be reused). The scratch itself is built lazily, on
-    /// the block's first tier-3 obligation: building it at entry measured 1.8x
-    /// slower on `structs_enums` (2284 clones instead of 14 — most blocks never
-    /// reach tier 3).
+    /// the block's first tier-3 obligation — most blocks never reach tier 3, and
+    /// building at entry measured 1.8x slower on `structs_enums`.
     ///
     /// `idom` is the walk-order index of the block's immediate dominator (`None` for
     /// the entry block), used only by the dominator-reuse measurement below.
@@ -945,8 +916,7 @@ impl<'a> VerifyContext<'a> {
     ///
     /// Strict-subset is the soundness condition: a superset cube means strictly more
     /// assumptions, so every fact the ancestor derived still holds here. Sibling arms
-    /// never qualify (their cubes are incomparable), which is why a join has to fall
-    /// back to ground — the arms' derived facts hold only under their own cube.
+    /// never qualify, which is why a join falls back to ground.
     fn dom_reuse_source(&self) -> Option<usize> {
         self.dom_ancestor(true)
     }
@@ -1248,14 +1218,13 @@ impl<'a> VerifyContext<'a> {
     /// Default (and always for an **empty-pc** goal, where `imp == goal`): union
     /// `imp` with `true`. That path is *productive* — a proven `Eq`/discriminator
     /// goal must collapse its argument classes via `eq-true-union` /
-    /// `contra-congruence` — and it is not the growth problem.
+    /// `contra-congruence`.
     ///
     /// Under `oob_memo`, a **conditional** obligation (`imp` is an
-    /// `ite(pc.., goal, true)` chain) is instead recorded out of band. Unioning
-    /// it would drag the whole chain permanently into the `true` class — the
-    /// measured #1 growth driver — while the verdict is all we need for the memo.
-    /// We lose auto-propagation of `goal` once its pc later lands unconditionally,
-    /// at the cost of a re-prove; soundness/completeness are unaffected.
+    /// `ite(pc.., goal, true)` chain) is instead recorded out of band: unioning it
+    /// drags the whole chain permanently into the `true` class (the measured #1
+    /// growth driver) when the verdict alone is what the memo needs. The cost is
+    /// losing auto-propagation of `goal` once its pc lands unconditionally.
     fn record_proven(&mut self, imp: egg::Id, true_: egg::Id, pc_empty: bool) {
         if self.oob_memo && !pc_empty {
             let canon = self.egraph.find(imp);
@@ -1275,19 +1244,16 @@ impl<'a> VerifyContext<'a> {
     /// - `ite(c, e, true)  ⟸  e` proven under `c`   (this is `c ⟹ e`, i.e. a
     ///   guarded fact / implication under a branch)
     ///
-    /// Unlike a syntactic reader (which `ite-reduce` already subsumes), this
-    /// *assumes* the one condition and re-saturates the single surviving arm —
-    /// half of a tier-4 split, with the split variable read off the goal rather
-    /// than searched, and only one branch explored. It then loops on the
-    /// surviving arm, so a nested guard chain `c₁ ⟹ c₂ ⟹ … ⟹ φ` telescopes
-    /// by accumulating assumptions, one per iteration. The two `false`-constant
-    /// shapes are omitted: they need `¬c`/`c` to hold outright (a conjunction,
-    /// not an assumption), which `ite-reduce` + saturation already deliver.
+    /// This *assumes* the one condition and re-saturates the single surviving arm —
+    /// half of a tier-4 split, with the split variable read off the goal rather than
+    /// searched. It then loops on the surviving arm, so a nested guard chain
+    /// `c₁ ⟹ c₂ ⟹ … ⟹ φ` telescopes one assumption per iteration. The two
+    /// `false`-constant shapes are omitted: they need `¬c`/`c` to hold outright,
+    /// which `ite-reduce` + saturation already deliver.
     ///
     /// Terminates without a depth cap: each iteration assumes one
-    /// *previously-unknown* condition, and the e-graph has finitely many; the
-    /// `assumed` set makes that explicit and stops a re-pick that would not make
-    /// progress. `SILVER_OXIDE_NO_TIER35=1` disables it.
+    /// *previously-unknown* condition and the e-graph has finitely many, which the
+    /// `assumed` set makes explicit. `SILVER_OXIDE_NO_TIER35=1` disables it.
     fn tier35(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
         if std::env::var_os("SILVER_OXIDE_NO_TIER35").is_some() {
             return false;
@@ -1366,20 +1332,15 @@ impl<'a> VerifyContext<'a> {
     /// `ite` whose condition is an unconstrained boolean stays opaque, so a
     /// fact that holds in *both* branches is never concluded on its own.
     ///
-    /// The block-merge fork discharges every *method* CFG join structurally
-    /// (per-leaf proving through the path condition — see the block walker), so
-    /// the obligations that still reach here come from **branching pure
-    /// functions**: a `?:` whose arms establish `result` under different
-    /// conditions (`x>=0 ? x : -x` with `ensures result>=0`), or an arm calling
-    /// a function whose precondition only holds on that branch. Silicon forks
-    /// the path per branch; we case-split the goal instead.
+    /// Method CFG joins are discharged structurally by the block walker, so the
+    /// obligations reaching here come from **branching pure functions**: a `?:` whose
+    /// arms establish `result` under different conditions (`x>=0 ? x : -x` with
+    /// `ensures result>=0`), or an arm calling a function whose precondition only
+    /// holds on that branch. Silicon forks the path per branch; we split the goal.
     ///
-    /// Unlike the retired method-oriented split, the candidate conditions are
-    /// read off **the goal term only** — not the whole path-condition cone —
-    /// and there is no probe budget or iterative deepening: a function goal
-    /// nests only a handful of conditions. The split is depth-first, guarded for
-    /// termination by an `assumed` set (finitely many distinct conditions, none
-    /// re-split twice on one path).
+    /// Candidate conditions are read off **the goal term only**, and there is no
+    /// probe budget or iterative deepening — a function goal nests only a handful of
+    /// conditions. Depth-first, terminating via an `assumed` set.
     fn split_prove(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
         self.alloc.stats.prove_tier4 += 1;
         if std::env::var_os("SILVER_OXIDE_TRACE_TIER4").is_some() {
@@ -1460,15 +1421,13 @@ impl<'a> VerifyContext<'a> {
     /// address. Zero extra cost, no clone.
     ///
     /// Slow path (a miss, and only then): clone, assume the path condition, and
-    /// saturate. An assumed branch literal such as `x == y` fires
-    /// `eq-true-union`, which merges `x` and `y`; congruence then merges `f(x)`
-    /// and `f(y)`, so the chunk `acc(x.f)` produced answers a read of `y.f`.
-    /// This is what lets a predicate body like `acc(x.f) && x == y && y.f == 10`
-    /// frame its `y.f` deref (guarded by the `x == y` branch literal).
+    /// saturate. An assumed `x == y` fires `eq-true-union`, congruence then merges
+    /// `f(x)` and `f(y)`, so the chunk `acc(x.f)` answers a read of `y.f` — which is
+    /// what lets a predicate body like `acc(x.f) && x == y && y.f == 10` frame its
+    /// `y.f` deref.
     ///
-    /// The returned chunk's `perm`/`value` ids are live-graph ids (the probe is
-    /// a clone that never touches live state), so they are valid to use — and
-    /// discharge obligations over — in the live graph.
+    /// The returned chunk's `perm`/`value` ids are live-graph ids (the probe never
+    /// touches live state), so they are valid to discharge obligations over.
     pub(crate) fn chunk_under_pc<'c>(
         &mut self,
         chunks: &'c [crate::verify::heap::Chunk],
@@ -1506,10 +1465,8 @@ impl<'a> VerifyContext<'a> {
     /// ground-equal. These are the partners a consume may draw on (invariant 7): at
     /// a state where the pc holds they are the *same* location as `addr`, so their
     /// fractions add, while on ground they stay distinct and must not be merged.
-    /// Returns their addresses (stable keys into the heap group).
-    ///
-    /// Same probe shape as [`Self::chunk_under_pc`], but collects every match rather
-    /// than the first: sufficiency needs the whole sum, not one partner.
+    /// Returns their addresses (stable keys into the heap group). Same probe shape as
+    /// [`Self::chunk_under_pc`], but collects every match: sufficiency needs the sum.
     pub(crate) fn pc_alias_partners(
         &mut self,
         chunks: &[crate::verify::heap::Chunk],
@@ -1565,13 +1522,12 @@ impl<'a> VerifyContext<'a> {
     /// graph, restoring the live graph — and its fixpoint cache, which `f`'s
     /// scratch runs would otherwise clobber — afterwards. The whole extent is
     /// a scratch memo scope.
+    ///
     /// The block scratch is **detached** for the extent: inside `f` the "ground"
     /// graph is a throwaway whose ids are restored away afterwards, so mirroring
-    /// into the scratch would record `map` entries keyed by ids that cease to mean
-    /// anything — a stale entry then makes `tr` hand back an unrelated class
-    /// (invariant 1). With the scratch detached, `f`'s obligations take the
-    /// non-block path (saturate + clone the throwaway), which is what the swapped
-    /// universe wants anyway.
+    /// would leave `map` entries keyed by ids that cease to mean anything, and a
+    /// stale entry makes `tr` hand back an unrelated class. Detached, `f`'s
+    /// obligations take the non-block path (saturate + clone the throwaway).
     pub(crate) fn with_scratch_graph<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let _scope = crate::verify::rewrite::ScratchScope::enter();
         let live = self.egraph.clone();

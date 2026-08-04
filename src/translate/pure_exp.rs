@@ -393,9 +393,6 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
     }
 }
 
-/// Per-context lowering of pure-expression extensions (`old`, `result`,
-/// `perm`, etc.). `hctx` carries the value/perm heaps; `ty` is the expression's
-/// result type.
 /// Lower a Silver `function` application to a VMIR `FunctionCall` (monomorphic,
 /// no `type_args`). Calls are always pure: a **heap-dependent** callee (one
 /// whose `requires` grants permission) receives the snapshot of its `#requires`
@@ -933,8 +930,7 @@ impl PureExt for typed::FuncEnsuresExt {
 ///
 /// There is deliberately **no** use-site `assume ensures(..)`: postconditions
 /// are delivered by the verifier as guarded rewrites keyed on the function
-/// symbol (transitive call sites get them too) — see the facts replay in
-/// `verify::rewrite`.
+/// symbol — see the facts replay in `verify::rewrite`.
 pub(crate) struct FnContract {
     pub requires: Option<vmir::MemberId>,
     pub ensures: Option<vmir::MemberId>,

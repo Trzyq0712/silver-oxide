@@ -9,11 +9,10 @@
 //! naming the instruction.
 //!
 //! All snapshots for one method are accumulated and emitted (on drop) as a
-//! single **multi-page** PDF `<dir>/<method>.pdf` — one instruction per page,
-//! with **variable page sizes** so a large e-graph isn't clipped. Each page is
-//! rendered individually with `dot -Tpdf` (cairo sizes the page to the graph)
-//! and the pages are merged with `pdfunite`. The combined `.dot` source is also
-//! written. Best-effort: a missing `dot`/`pdfunite` leaves the `.dot` on disk.
+//! single **multi-page** PDF `<dir>/<method>.pdf`, one instruction per page.
+//! Pages are rendered individually with `dot -Tpdf` (so each is sized to its
+//! graph) and merged with `pdfunite`; the combined `.dot` source is written too.
+//! Best-effort: a missing `dot`/`pdfunite` leaves the `.dot` on disk.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -341,11 +340,8 @@ pub(crate) fn dump_perm_enabled() -> bool {
 /// one line per e-class, each showing its e-nodes with children referenced by
 /// `@class`. Shared subterms print once (BFS over canonical classes). `depth`
 /// bounds the frontier; a class first reached deeper than `depth` is listed
-/// (so the root's shape is complete) but its children are not expanded.
-///
-/// This is the on-switch form of the by-hand perm dumps in
-/// `findings_2026-07-15.md` §6.2/§7 — used to read the permission tower at a
-/// failing sufficiency check.
+/// (so the root's shape is complete) but its children are not expanded. Used to
+/// read the permission tower at a failing sufficiency check.
 pub(crate) fn dump_term(ctx: &VerifyContext<'_>, root: egg::Id, depth: usize) -> String {
     use std::collections::VecDeque;
     let eg = &ctx.egraph;

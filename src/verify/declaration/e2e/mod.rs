@@ -3,11 +3,8 @@
 //! specific `VerifyError` variants. The e-graph unit tests stay in `super`'s
 //! `mod tests`.
 //!
-//! The bulk of the existing (~2026-07-14 and earlier) tests stay in this
-//! file by historical accident of not having been moved yet — new topic-
-//! focused tests go in the submodules below instead, which share this
-//! file's `lower()`/`verify_named_*` helpers via `use super::*;` (private
-//! items are visible to descendant modules in Rust, no `pub(super)` needed).
+//! New topic-focused tests go in the submodules below, which share this file's
+//! `lower()`/`verify_named_*` helpers via `use super::*;`.
 
 mod branching;
 mod functions;
@@ -328,8 +325,7 @@ fn old_over_heap_dependent_function_binds_pre_state() {
     // `old(get(this))` applies a heap-dependent function under `old`: the
     // ensures body reads the pre-state via `Snap` on the `FromSnap`-widened
     // snapshot parameter, which must congruence-collapse to the caller's real
-    // pre-state values at the exhale graft (regression: the old `old_reads`
-    // mechanism recorded only direct `Deref`s and left these unbound).
+    // pre-state values at the exhale graft.
     let unchanged = r#"
 field v: Int
 
@@ -1673,9 +1669,8 @@ method m(x: Ref)
 // (`Outer{ Inner(x) }`) or recursive (`List{ .. List(this.next) }`) — is folded
 // by consuming the already-held inner chunk as one opaque footprint slot (its
 // value = the inner predicate's snapshot). Folding is NOT recursive: the inner
-// instance must already be folded, and is never expanded here. So a
-// nested-predicate slot is structurally identical to a field slot, and
-// recursion works for free (the self-referential snapshot type is opaque).
+// instance must already be folded. A nested-predicate slot is therefore
+// structurally identical to a field slot, and recursion works for free.
 // ============================================================================
 
 /// A recursive linked-list predicate lowers through the whole pipeline without
@@ -2593,10 +2588,8 @@ fn forall_in_a_function_body_instantiates_at_a_call_site() {
     // certificate: the purified recipe carries a `Forall` step, so unfolding `q(3)`
     // at the call site rebuilds the quantifier e-node with the caller's argument as
     // its capture — and the single generic rule instantiates it in that unit, mid-run.
-    //
-    // This was impossible while quantifiers were rewrite rules: a rule cannot be
-    // injected into a running egg `Runner`, so a certificate-grafted quantifier
-    // never fired.
+    // Impossible while quantifiers were rewrite rules: a rule cannot be injected into
+    // a running egg `Runner`.
     let input = r#"
 domain D { function g(a: Int, i: Int): Bool }
 
@@ -2988,11 +2981,9 @@ method p3(c: Bool, x: Int) { if (c) { assume x > 0  assert x > 0 } }
 
 #[test]
 fn both_arms_establishing_a_fact_verifies_via_structural_join() {
-    // Both arms inhale `x > 0`, so it genuinely holds at the merge. The
-    // structural block join (fork model) recombines `c ⇒ x>0` and `¬c ⇒ x>0`
-    // into `x > 0` without a case split — the incompleteness that used to force
-    // this to fail (recorded here as a KNOWN LIMITATION until branch joins
-    // landed) is gone. Silicon proves it too.
+    // Both arms inhale `x > 0`, so it genuinely holds at the merge: the structural
+    // block join recombines `c ⇒ x>0` and `¬c ⇒ x>0` into `x > 0` with no case
+    // split. Silicon proves it too.
     let input = r#"
 method give(x: Int) ensures x > 0
 method p2(c: Bool, x: Int) { if (c) { give(x) } else { give(x) }  assert x > 0 }
@@ -3005,12 +2996,11 @@ method p2(c: Bool, x: Int) { if (c) { give(x) } else { give(x) }  assert x > 0 }
 
 #[test]
 fn function_definition_does_not_leak_precondition_into_call_site() {
-    // Finding B. `f`'s body has a divisor obligation (`g(x)/g(x)`) discharged from
+    // `f`'s body has a divisor obligation (`g(x)/g(x)`) discharged from
     // `requires g(x) == 5`, so verifying `f` saturates `g(x) ≡ 5` into its e-graph.
-    // The OLD certificate cloned that e-graph and `transplant`ed it, installing
-    // `g(3) ≡ 5` unconditionally when `f(3)` unfolds (the rule is pc-blind), so the
-    // empty-pc `assert g(3) == 5` passed even though `m` never establishes it. A
-    // purified recipe imports no e-classes, so the merge cannot ride along.
+    // A certificate that cloned that e-graph would install `g(3) ≡ 5`
+    // unconditionally when `f(3)` unfolds, passing the empty-pc `assert g(3) == 5`
+    // that `m` never establishes. A purified recipe imports no e-classes.
     let input = r#"
 function g(x: Int): Int
 function f(x: Int): Int requires g(x) == 5 { g(x) / g(x) }
@@ -3330,11 +3320,9 @@ fn heap_dep_post_under_a_branch_via_case_split() {
     // `ite(e2, V, e6) ≡ V` is unbranched, so chaining
     // `!e2 ⟹ token ⟹ (e6 == V)` into it needs a case split on `e2` — the
     // token is never *defined*, so unlike a heap-free guard it cannot be
-    // re-derived where the pc doesn't hold. Tier 4 splits on `e2`: the `e2`
-    // arm folds, the `!e2` arm releases the token. (Silicon never meets this —
-    // it forks the path and proves the post once per branch.) This is also
-    // what unlocks *branching* recursive heap-dep functions (base case +
-    // recursive case).
+    // re-derived where the pc doesn't hold. Tier 4 splits on `e2`: the `e2` arm
+    // folds, the `!e2` arm releases the token. Also what unlocks *branching*
+    // recursive heap-dep functions.
     let input = r#"
 field f: Int
 
@@ -3354,14 +3342,12 @@ function g(x: Ref, b: Bool): Int
 
 #[test]
 fn branchless_recursive_heap_dep_function_verifies_by_induction() {
-    // Recursion over a snapshot works — it is the *branch*, not the recursion,
-    // that the pre-token cannot cross on its own (tier 4 now bridges it — see
-    // `heap_dep_post_under_a_branch_via_case_split`). With the
-    // recursive `Snap` at empty pc the token is released unconditionally, so the
-    // in-batch post rule (the induction hypothesis, keyed on the full id and
-    // installed while the body is checked) gives `rf(x, next(n), s') == x.f`,
-    // which discharges the exit assert. The call site in `m` then gets the post
-    // from the certificate's own post fact.
+    // Recursion over a snapshot works — it is the *branch*, not the recursion, that
+    // the pre-token cannot cross on its own (bridged by tier 4, see
+    // `heap_dep_post_under_a_branch_via_case_split`). With the recursive `Snap` at
+    // empty pc the token is released unconditionally, so the in-batch post rule (the
+    // induction hypothesis) gives `rf(x, next(n), s') == x.f`, discharging the exit
+    // assert. The call site in `m` gets the post from the certificate's post fact.
     let input = r#"
 domain D {
     function next(n: Int): Int

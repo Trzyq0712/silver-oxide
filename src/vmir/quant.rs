@@ -13,11 +13,10 @@ use std::fmt::{self, Display, Formatter};
 /// the binders (`Temp(n_caps..n_caps + bound.len())`), then its own steps.
 ///
 /// Nesting needs no extra mechanism: an inner `forall` is a `PureInst::Forall`
-/// inside the outer's body, and its `captures` are outer-body `Val`s (the outer
-/// binders and captures). The verifier encodes a `forall` as a single e-node
-/// whose payload is its compiled body ("recipe") and whose children are the
-/// capture e-classes, so an outer instantiation materializes the inner
-/// quantifier with the outer σ baked into the children.
+/// inside the outer's body, with the outer binders and captures as its own
+/// `captures`. The verifier encodes a `forall` as a single e-node (payload = the
+/// compiled body, children = the capture e-classes), so an outer instantiation
+/// materializes the inner quantifier with the outer σ baked into the children.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Forall {
     /// The captured enclosing values, in the enclosing temp space. They occupy

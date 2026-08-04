@@ -294,12 +294,10 @@ fn eval_pure_inst(
             // empty for a monomorphic call. Always heap-free: a heap-dependent
             // function receives its precondition snapshot as an ordinary arg.
             //
-            // Just add the uninterpreted application — for abstract, heap-free,
-            // and heap-dependent callees alike. A verified callee's definitional
+            // Just add the uninterpreted application, for abstract, heap-free and
+            // heap-dependent callees alike. A verified callee's definitional
             // equality `f(args) == body` is installed lazily by its own
-            // `rewrite::function_rule` (registered into `ctx.axiom_rules` by
-            // `assume_axioms` from `ctx.fn_certs`) the next time saturation runs
-            // over this occurrence, not eagerly here.
+            // `rewrite::function_rule`, not eagerly here.
             let args: Vec<egg::Id> = fc.args.iter().map(|v| state.get_val(ctx, v)).collect();
             let func_id = crate::verify::func_registry::func_id_for_member(fc.function);
             let id = ctx.add_func_app_id(
@@ -309,13 +307,10 @@ fn eval_pure_inst(
                 args.clone().into(),
             );
             // Presence trigger (Silicon's `f%pre`, assumed only at call sites):
-            // every genuine value-position call — in a method body OR a regular
-            // function body (both must compute the callee's value) — mints the
-            // callee's `f%pre(args)` token node, whose presence lets
-            // `rewrite::function_rule` unfold the body at this occurrence. The one
-            // non-value position is a **contract-function body** (a lowered
-            // pre/post): its calls are handled below (no propagation), and its own
-            // token is never minted by a client, so it stays dormant there.
+            // every genuine value-position call mints the callee's `f%pre(args)`
+            // token node, whose presence lets `rewrite::function_rule` unfold the
+            // body here. The one non-value position is a **contract-function body**
+            // (a lowered pre/post), handled below.
             {
                 let name = ctx.member_name(fc.function);
                 let tok = ctx.alloc.fn_pre_token(fc.function, &name);
@@ -573,11 +568,10 @@ fn perm_recipe(
 /// `value = (p0 > 0) ? v0 : v1` (intentionally asymmetric), and an assumed
 /// `(p0 > 0 && p1 > 0) ==> (v0 == v1)`.
 ///
-/// The assume is emitted by unioning the (desugared) implication with `true`;
-/// it is not an eager `union(v0, v1)`. When both fractions are positive,
-/// saturation folds the antecedent, collapses the implication to `v0 == v1`,
-/// and `eq-true-union` fuses the values — erasing the ternary's asymmetry by
-/// congruence. When a fraction is zero, the antecedent is `false` and the
+/// The assume is emitted by unioning the (desugared) implication with `true`, not
+/// as an eager `union(v0, v1)`: with both fractions positive, saturation collapses
+/// the implication to `v0 == v1` and `eq-true-union` fuses the values, erasing the
+/// ternary's asymmetry; with a fraction zero the antecedent is `false` and the
 /// asymmetric pick selects the genuinely-held value. `BinOp` has no `>`/`&&`/
 /// `==>`, so these desugar to `Lt(0, p)` and `Ite` forms.
 fn merge_chunks(
@@ -666,8 +660,7 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
 ///   `union(conj, (b < sum) ? false : conj)` where `conj = a0==b0 && a1==b1 …`.
 ///   When `b < sum` folds true the `ite` collapses `conj` to `false`. For arity
 ///   1 this is the single-`Eq` collapse (drives `a0 != a1`); for higher arity it
-///   sets the whole conjunction false (the de-Morgan disjunction — the e-graph
-///   won't pick a branch, SMT does later).
+///   sets the whole conjunction false.
 ///
 /// Unbounded locations (predicates) never participate.
 fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
@@ -703,24 +696,19 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     // encoded as `union(eq, ite(gt, false, eq))` — when `gt` folds true the `ite`
     // collapses `eq` to `false`.
     //
-    // The address is the chunk's own identity, so this cannot degenerate. The
-    // previous formulation decomposed both addresses into their `@addr` argument
-    // e-classes and conjoined them pairwise, which was strictly worse: those args
-    // are recoverable only for a *direct* application, and `conj_args_eq` over no
-    // arguments is the empty conjunction — `true`. Whenever the args were missing
-    // the axiom read `union(true, ite(gt, false, true))`, i.e. `true == false` as
-    // soon as the perms summed above the bound, and two `1/1` field chunks always
-    // do. Holding two permissions to one field made the unit inconsistent and
-    // every goal dischargeable.
+    // Stated over the address (the chunk's own identity) rather than over the
+    // decomposed `@addr` arguments: those args are recoverable only for a *direct*
+    // application, and a missing-args conjunction is empty, i.e. `true` — which
+    // made the axiom read `true == false` as soon as two `1/1` field chunks summed
+    // above the bound, rendering the whole unit inconsistent.
     //
-    // Where the two addresses are already the same e-class, `Eq(l, l)` folds to
-    // `true` and this does derive `false` — correctly: `1/1` of `x.f` plus `1/1`
-    // of `y.f` with `x == y` is `2/1` at one location, which the bound forbids,
-    // so that state is genuinely unreachable.
+    // Where the two addresses are already the same e-class this does derive
+    // `false` — correctly: `1/1` of `x.f` plus `1/1` of `y.f` with `x == y` is
+    // `2/1` at one location, so that state is unreachable.
     //
     // Only fires for bare (`Leaf`) perms — a branch-structured perm would need
-    // the sum materialized; skipping is sound (it can only lose a disequality,
-    // never add one) and the merged heap holds one leaf-perm chunk per location.
+    // the sum materialized; skipping only loses a disequality, and the merged heap
+    // holds one leaf-perm chunk per location.
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
             if chunks[i].group != chunks[j].group {
@@ -758,8 +746,7 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
 /// permission checks only ever see one chunk, so the split loses permission).
 /// On a lookup miss, normalize once (`reduce`) and retry: a recipe-rebuilt
 /// snapshot address spine may only meet the held chunk's class after the
-/// terminating reductions collapse the snapshot towers, and the rebuild-time
-/// reduce is conditional on new e-nodes (see the dead-branch note below).
+/// terminating reductions collapse the snapshot towers.
 ///
 /// Returns the (possibly consolidated) heap and the chunk found at `addr`.
 ///
@@ -1038,12 +1025,10 @@ fn heap_subtract(
 /// full rule set runs — `find_chunk_consolidated`'s own retry runs the terminating
 /// reductions only, which is not enough for it.
 ///
-/// Placed *after* the provably-zero fallback, not inside the lookup: retrying at every
-/// miss cost 36x on `structs_enums` (1.48s → 53.5s), because a legitimately absent
-/// chunk (a conditional footprint slot with a false guard) is a common, cheap
-/// no-op — and it is exactly the case the zero check closes without any saturation.
-/// Here only an obligation that would otherwise *fail* pays, so the cost lands on
-/// runs that were about to error anyway.
+/// Placed *after* the provably-zero fallback, not inside the lookup: retrying at
+/// every miss cost 36x on `structs_enums` (1.48s → 53.5s), since a legitimately
+/// absent chunk is common and the zero check closes it without saturation. Here
+/// only an obligation that would otherwise *fail* pays.
 fn heap_subtract_inner(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
@@ -1086,25 +1071,19 @@ fn heap_subtract_inner(
             return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, false);
         }
         // Last resort: the demanded address may match a held chunk **only under the
-        // pc**. A `&mut` reborrow taken inside a branch arm is exactly this shape — the
-        // arm's `p_Ref_mutable_assign` gives `snap(arm_ref) == arbitrary_value(param, ..)`
-        // as a *pc-guarded* fact, and address matching is ground e-class equality, which
-        // cannot see it. The pc probe (`chunk_under_pc`'s set-valued sibling) resolves it.
+        // pc** (a `&mut` reborrow inside a branch arm, whose address equality is a
+        // pc-guarded fact that ground e-class matching cannot see). The pc probe
+        // (`chunk_under_pc`'s set-valued sibling) resolves it.
         //
         // Consuming through it goes down the invariant-7 path: sufficiency is proven
         // under the pc and the debit is **gated** by the pc, so off-path — where the
         // addresses are unrelated — nothing is taken.
         //
-        // The whole pc-alias *set* is collected, not the first hit, for the same
-        // reason invariant 7 sums partners when the demanded chunk exists: several
-        // held chunks can coincide with the demand under the pc, and only their sum
-        // is the permission at that location. A first-hit lookup is not merely
-        // incomplete but order-dependent — `world_kick_slowest` in
-        // `benchmarks/rust/vpr/physics_step.vpr` consumes the same `&mut`-reborrowed
-        // body twice in a row, and the second consume's first hit is the chunk the
-        // first consume already drained (its pc-gated remainder is `0` on-path),
-        // while the full permission sits in the chunk the intervening
-        // `#ensures` inhale produced. Summing finds it; taking the head does not.
+        // The whole pc-alias *set* is collected, not the first hit: several held
+        // chunks can coincide with the demand under the pc, and only their sum is
+        // the permission at that location. A first-hit lookup is order-dependent —
+        // it can land on a chunk an earlier consume already drained while the full
+        // permission sits in another.
         let alias_set = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
         if let Some((head, partners)) = alias_set.split_first() {
             let head = h1
@@ -1205,22 +1184,14 @@ fn heap_subtract_inner(
     //
     // The two differ because VMIR is linearized: the heap this subtract produces
     // flows on into the sibling branch, where `pc` does not hold. A guarded consume
-    // (`h13 := <c> h12 - acc a (c ? 1/1 : 0/1)`, how the frontend lowers a move
-    // inside an `if`) has remainder `1/1 - (c ? 1/1 : 0/1)` — zero under `c`, but a
-    // full `1/1` under `!c`, where the permission was never given up. Proving
-    // `remainder == 0` under `pc = <c>` and dropping the chunk loses the permission
-    // for the `!c` path, which is what made the `else` arm of
-    // `fn rect_new(a, b) { if a.x <= b.x { Rect{a,b} } else { Rect{b,a} } }` unable
-    // to reclaim `a`.
+    // has remainder `1/1 - (c ? 1/1 : 0/1)` — zero under `c`, but a full `1/1`
+    // under `!c`, where the permission was never given up, so dropping the chunk
+    // would lose it for the off-path arm.
     //
-    // Const-fold, not `prove_under_pc`: this is heap hygiene, not an obligation, so
-    // it must stay O(1). Asking the prover instead makes every subtract fall
-    // through to the tier-3 clone and the tier-4 case split — the check is run once
-    // per chunk per consume, and it dominated everything (93s vs 4s). Keeping a
-    // chunk we merely *failed to prove* empty is always sound: the remainder term
-    // evaluates to 0 on-path and to the retained permission off-path, and a
-    // zero-permission chunk is inert (`perm > 0` gates every use). An ordinary
-    // unguarded consume still folds to `1/1 - 1/1 = 0` and drops, as before.
+    // Const-fold, not `prove_under_pc`: heap hygiene, not an obligation, so it must
+    // stay O(1) — asking the prover runs once per chunk per consume and dominated
+    // everything (93s vs 4s). Keeping a chunk we merely failed to prove empty is
+    // sound: a zero-permission chunk is inert (`perm > 0` gates every use).
     let empty = perm_all_zero(ctx, &remainder);
     if empty {
         out = out.without_chunk(kind, existing.addr);
@@ -1247,13 +1218,10 @@ fn heap_subtract_inner(
 ///   was given up.
 ///
 ///   Distribution (rather than parking the whole debit on the demanded chunk as a
-///   guarded negative) is what makes every *later* operation correct without another
-///   alias probe. Parking it leaves the partner reading `1/2` when the location
-///   actually holds nothing, so `assert y.f == y.f` and even `exhale acc(y.f,1/2)`
-///   would both wrongly succeed — the latter never reaching this function at all,
-///   since the partner's own half satisfies the plain proof. Distributing drives every
-///   member of the set to its true remainder, so the unsummed per-address view stays
-///   sound and the per-chunk `≥ 0` obligation is preserved by construction.
+///   guarded negative) keeps every *later* operation correct without another alias
+///   probe: parking leaves a partner reading `1/2` when the location holds nothing,
+///   so `exhale acc(y.f,1/2)` would wrongly succeed without ever reaching this
+///   function. Distributing drives every member of the set to its true remainder.
 /// - **Value agreement** is likewise assumed only under the pc: unioning the two
 ///   values outright would claim `x.f == y.f` on the path where `x != y`.
 #[allow(clippy::too_many_arguments)]
@@ -1344,11 +1312,9 @@ fn heap_subtract_pc_aliased(
 /// cannot appear as sub-expressions. Expression-embedded obligations (a function
 /// precondition, a division check) are the only things allowed an extra suffix.
 ///
-/// Checked rather than assumed, because the lowering is where it could silently
-/// break, and a violation would mean a heap effect landing under a condition the
-/// block model does not know about. Gated on `SILVER_OXIDE_ASSERT_BLOCK_PC` so it can
-/// be run over the corpus and feature matrix in release builds (a `debug_assert`
-/// would compile out of exactly the runs that exercise interesting programs).
+/// A violation means a heap effect landing under a condition the block model does
+/// not know about. Gated on `SILVER_OXIDE_ASSERT_BLOCK_PC` so it can be run over
+/// the corpus in release builds, where a `debug_assert` would compile out.
 ///
 /// Known violating shape: `unfolding p in e` is a Viper *expression* but is lowered to
 /// a statement-level `HeapInst::Unfold`, so it can sit under an extra ternary guard.
@@ -1450,13 +1416,12 @@ fn cube_push(
 ///   `cond` in the amount (genuine perm divergence, per-leaf prove). Guard shared.
 /// - **both arms, guards differ** ⇒ genuine `(cond∧g_t)∨(¬cond∧g_e)` disjunction,
 ///   not a flat cube: fall back to the gated `guard?perm:0` amount encoding
-///   (sound, rare — counted via `MergeTrace` to see if it ever fires).
+///   (rare — counted via `MergeTrace`).
 ///
 /// The presence guard is reconstructed into the exact `guard?perm:0` obligation
 /// **transiently at each consume site** (`gate_perm_by_guard`), so merges stay
 /// flat while sufficiency/remainder keep the pre-hoist semantics. Runs only when
-/// both arms are live (a dead arm is dropped at the `Merge` inst before this is
-/// called), so an absent side is a genuine conditional footprint.
+/// both arms are live, so an absent side is a genuine conditional footprint.
 fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els: &Heap) -> Heap {
     let mut out = Heap::empty();
     let mut kinds: Vec<LocationKind> = h_then.kinds().cloned().collect();
@@ -1549,31 +1514,20 @@ fn gate_perm_by_guard(
 ///
 /// Per location kind, per canonical address:
 /// - **present in one heap only** — carried across unchanged.
-/// - **present in both, same guard** — one chunk with `perm = permₐ + perm_b`,
-///   and `valueₐ == value_b` assumed. Two chunks of one location cannot
-///   disagree, and that agreement is load-bearing: it is what lets a value
-///   established before a loop survive to the exit, where the frame carries it
-///   back. (Silicon emits the same equalities from `singleMerge`'s `snapEqs`.)
 /// - **present in both, equal guards** — one chunk with `perm = permₐ + perm_b`
 ///   under that shared guard, and `valueₐ == value_b` assumed. Two chunks of one
-///   location cannot disagree, and that agreement is load-bearing: it is what
-///   lets a value established before a loop survive to the exit, where the frame
-///   carries it back. (Silicon emits the same equalities from `singleMerge`'s
-///   `snapEqs`.)
+///   location cannot disagree, and that agreement is load-bearing: it lets a value
+///   established before a loop survive to the exit, where the frame carries it
+///   back. (Silicon emits the same equalities from `singleMerge`'s `snapEqs`.)
 /// - **present in both, guards differ** — the presence condition is a genuine
 ///   disjunction, which `Chunk.guard` (a flat cube) cannot express. Push both
 ///   guards into the *amounts* via [`gate_perm_by_guard`] and sum those, leaving
-///   the merged chunk unguarded — the same fallback `merge_heaps` uses for its
-///   differing-guard case.
+///   the merged chunk unguarded — the same fallback `merge_heaps` uses.
 ///
-/// Dropping one side instead would be sound (it only under-claims) but wrong in
-/// practice and asymmetric in `a`/`b`: at a loop exit the two sides are the
-/// frame and the invariant's footprint, so discarding either loses permission
-/// the program genuinely holds.
-///
-/// `Heap::with_chunk` replaces at a shared address (the heap keeps one chunk per
-/// address), so summing here is what preserves the total rather than silently
-/// letting one side overwrite the other.
+/// Dropping one side instead would be sound but asymmetric in `a`/`b`: at a loop
+/// exit the two sides are the frame and the invariant's footprint, so discarding
+/// either loses permission the program genuinely holds. `Heap::with_chunk`
+/// replaces at a shared address, so summing here is what preserves the total.
 fn union_heaps(ctx: &mut VerifyContext<'_>, a: &Heap, b: &Heap) -> Heap {
     let mut out = a.clone();
     for (kind, cb) in b.entries() {
@@ -2051,24 +2005,12 @@ struct FootprintResult {
     slot_recipes: Vec<Option<Val>>,
 }
 
-/// The single per-slot footprint loop behind `fold`, `unfold`, `snap` and
-/// `from_snap`. For each footprint slot of `resource(args)`: graft the slot's
-/// `(addr, perm)`, obtain the slot value from `source`, apply the slot's heap
-/// effect to the `base` accumulator (subtract for `Consume`, union for
-/// `Produce`; permission scaled by `scale` when `Some`), and thread the actual
-/// value through `subst` so a value-dependent inner address (e.g. `P(this.next)`)
-/// resolves. Finally graft the body boolean and discharge it per `direction`
-/// (`Consume` asserts under `pc_lits`, `Produce` assumes it guarded by them).
-///
-/// The caller owns everything *around* the slots: the predicate-chunk add/remove
-/// (bracketing differs — `fold` adds after, `unfold` removes before) and what to
-/// do with `heap` (`snap` discards it — functions frame, they don't consume).
 /// Whether a permission recipe mentions a `wildcard` (bare or gated) — the shape
 /// of a function-precondition footprint slot. At a `Snap` such a slot needs no
 /// permission *amount*: presence is the gating guard (`true` when bare) and
 /// sufficiency is just "the caller holds a positive share where the slot is
 /// required". Building the wildcard would leave un-collapsible `ite` residue in
-/// the persistent graph that `ite-reduce` then churns on.
+/// the persistent graph.
 fn recipe_has_wildcard(perm: &crate::verify::cert::BodyRecipe) -> bool {
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
     perm.steps
@@ -2094,6 +2036,18 @@ impl SlotPerm {
     }
 }
 
+/// The single per-slot footprint loop behind `fold`, `unfold`, `snap` and
+/// `from_snap`. For each footprint slot of `resource(args)`: graft the slot's
+/// `(addr, perm)`, obtain the slot value from `source`, apply the slot's heap
+/// effect to the `base` accumulator (subtract for `Consume`, union for
+/// `Produce`; permission scaled by `scale` when `Some`), and thread the actual
+/// value through `subst` so a value-dependent inner address (e.g. `P(this.next)`)
+/// resolves. Finally graft the body boolean and discharge it per `direction`
+/// (`Consume` asserts under `pc_lits`, `Produce` assumes it guarded by them).
+///
+/// The caller owns everything *around* the slots: the predicate-chunk add/remove
+/// (bracketing differs — `fold` adds after, `unfold` removes before) and what to
+/// do with `heap` (`snap` discards it — functions frame, they don't consume).
 #[allow(clippy::too_many_arguments)]
 fn walk_footprint(
     ctx: &mut VerifyContext<'_>,
@@ -2137,24 +2091,18 @@ fn walk_footprint(
         };
         // Heap framing is a *syntactic* e-class match (`heap_subtract`,
         // `ValueSource::ReadHeap`), so a slot address has to be in normal form
-        // before we look it up. A slot address that reaches through a snapshot —
-        // `Pt(f(r, cons(Some(unwrap(proj_0(s))))))`, the shape a Rust `&mut`
-        // reparented under `old(..)` produces — is only e-class-equal to the held
-        // chunk's address once the `proj∘cons` / `unwrap∘Some` reductions have
-        // fired.
+        // before we look it up: an address reaching through a snapshot
+        // (`Pt(f(r, cons(Some(unwrap(proj_0(s))))))`) only becomes e-class-equal to
+        // the held chunk's address once `proj∘cons` / `unwrap∘Some` have fired.
         //
-        // Reduce only when the rebuild actually introduced something to reduce.
-        // The recipe is add-only, so if `build` added no e-node then every term it
-        // named was already present — and therefore already normalized by the
-        // reduce that first introduced it. Guarding on the node count keeps repeat
-        // call sites (the common case: one resource, many uses) free; reducing
-        // unconditionally per slot re-runs the ADT rule set over the whole e-graph
-        // every time and costs ~3.5x end to end.
-        // A wildcard slot at a `Snap` (bare or gated): don't build the wildcard
-        // perm (its amount is irrelevant to the snapshot and would pollute the
-        // graph). Build its **presence** indicator instead — the same recipe with
-        // the wildcard leaf replaced by full permission `1`, so `ite(guard, 1, 0)`
-        // whose `0 < …` folds to the gating guard (`true` when unconditional).
+        // Reduce only when the rebuild actually introduced something to reduce: the
+        // recipe is add-only, so if `build` added no e-node then every term it named
+        // was already present, hence already normalized. Reducing unconditionally
+        // per slot re-runs the ADT rule set over the whole graph and costs ~3.5x.
+        // A wildcard slot at a `Snap` (bare or gated): build its **presence**
+        // indicator rather than the wildcard perm — the same recipe with the
+        // wildcard leaf replaced by full permission `1`, so `ite(guard, 1, 0)`
+        // whose `0 < …` folds to the gating guard.
         let wc_slot = is_snap && recipe_has_wildcard(&slot.perm);
         let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
@@ -2458,15 +2406,13 @@ fn eval_snap(
     )?;
     let s = build_snapshot(ctx, *resource, members);
 
-    // A certificate walk mirrors the snapshot as `cons(Some(v_i))` over the
-    // read values' recipes (a self-framed footprint is fully held, so each
-    // slot is `Some`), and exports the nested callee's pre-token as a fact:
-    // the precondition was *checked here* by this `Snap`'s implicit exhale,
-    // but that check lives in the inst, not in an `Assert`, so deriving facts
-    // from asserts would miss it. A caller who rebuilds this recipe (and
-    // thereby materializes the nested `g(args, s)`) can then discharge the
-    // guard on `g`'s own post fact without re-running the check — Silicon's
-    // `bodyPreconditionPropagationAxiom` (`FunctionData.scala:302`).
+    // A certificate walk mirrors the snapshot as `cons(Some(v_i))` over the read
+    // values' recipes (a self-framed footprint is fully held, so each slot is
+    // `Some`), and exports the nested callee's pre-token as a fact: the check lives
+    // in this inst, not in an `Assert`, so fact derivation would otherwise miss it.
+    // A caller who rebuilds this recipe can then discharge the guard on `g`'s post
+    // fact without re-running the check — Silicon's
+    // `bodyPreconditionPropagationAxiom`.
     let recipe = if ctx.recipe.is_some() {
         let def = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
         let elems: Vec<Type> = def.footprint.iter().map(|sl| sl.elem.clone()).collect();
@@ -2589,12 +2535,10 @@ fn eval_from_snap(
 ///
 /// Invariant: the eager ground-axiom evaluation below only ever sees **nullary**
 /// quantifier occurrences — axioms are closed and `let` is rejected in pure
-/// lowering, so an axiom's top-level `forall`s capture nothing. Occurrences
-/// *with* capture arguments enter the e-graph when an outer quantifier
-/// instance's body is built (`rewrite::build_instance`), or as ordinary
-/// `FuncApp` evaluation of a hosting method/resource body (v3: `forall`s in
-/// method statements and contracts capture enclosing params/locals; those
-/// bodies are evaluated per unit, never eagerly here).
+/// lowering, so an axiom's top-level `forall`s capture nothing. Occurrences with
+/// captures enter the e-graph when an outer instance's body is built
+/// (`rewrite::build_instance`) or while evaluating a hosting method/resource body,
+/// never eagerly here.
 fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result<(), VerifyError> {
     // One rule instantiates every `forall` in the program: quantifiers are
     // e-nodes (data), not rules, so one generic rule suffices — and a `forall`
@@ -2637,15 +2581,11 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
         ctx.union(res, true_);
         ctx.egraph.rebuild();
     }
-    // One lazy unfold rule per already-verified function certificate: `analyze`
-    // guarantees a function only ever calls functions verified earlier (it
-    // rejects (mutual) recursion as a dependency cycle), so every function this
-    // unit could reference already has a cert in `fn_certs` by the time its
-    // ctx is set up here — same guarantee the driver's topological order
-    // (`mod.rs`) already relies on. Each rule rebuilds the recipe's body lazily
-    // (add-only) the moment a `FuncApp(f, ..)` occurrence is seen during
-    // saturation (see `rewrite::function_rule`), instead of eagerly grafting it
-    // once at translation-walk time.
+    // One lazy unfold rule per already-verified function certificate. `analyze`
+    // guarantees a function only calls functions verified earlier, so every
+    // function this unit could reference already has a cert in `fn_certs`. Each
+    // rule rebuilds the recipe's body lazily (add-only) when a `FuncApp(f, ..)`
+    // occurrence is seen during saturation (see `rewrite::function_rule`).
     if let Some(fn_certs) = ctx.fn_certs {
         let contracts = contract_members(program);
         for (&id, def) in fn_certs.iter() {
@@ -2810,10 +2750,9 @@ pub(crate) fn prepare_body(
 /// a guard proves its own consequent's WD: `forall x :: {f(x)} x != 0 ==> f(10 / x)`
 /// discharges the division under `<x != 0>`.
 ///
-/// A nested `forall` is checked recursively here — with its encloser's binders
-/// already fresh — so no WD obligation ever survives into a recipe. That is what
-/// keeps instantiation (which runs inside a rewrite rule, where nothing can be
-/// proven) obligation-free.
+/// A nested `forall` is checked recursively here, with its encloser's binders
+/// already fresh, so no WD obligation survives into a recipe — instantiation runs
+/// inside a rewrite rule, where nothing can be proven.
 fn check_forall_wd(
     ctx: &mut VerifyContext<'_>,
     q: &vmir::Forall,
@@ -2910,10 +2849,8 @@ type EvalFn = fn(
 
 /// The single body-walk shared by all three drivers: for each instruction,
 /// discharge its side-condition [`inst_obligations`] under the path condition,
-/// then evaluate it, snapshotting for the visualizer throughout. Keeping this in
-/// one place is what makes an obligation added to `inst_obligations` impossible
-/// to skip in one driver (the `5aad7bc` division-check bug: the check existed but
-/// was wired into only one of three near-identical copies of this loop).
+/// then evaluate it, snapshotting for the visualizer throughout. One place, so an
+/// obligation added to `inst_obligations` cannot be skipped by one driver.
 ///
 /// `eval` selects the per-inst semantics (method/function vs resource body).
 /// `footprint_ops`, when `Some`, collects each `acc`'s `(loc, perm)` operand in
@@ -3207,18 +3144,13 @@ pub(crate) fn verify_resource(
 /// into an add-only recipe over the params (and the snapshot param, for
 /// heap-dependent functions): every `Deref` becomes the pure term the snapshot
 /// projects to (`unwrap(proj_i(snap))`, possibly nested through `unfolding`), and
-/// the entry `assume f#requires` is **dropped**. That drop is the whole point —
-/// the old design cloned the verified e-graph, so a precondition-derived merge
-/// (e.g. `g(x) ≡ 5` from `requires g(x)==5` once a body obligation saturated)
-/// rode into every call site via `transplant`; a recipe imports no e-classes, so
-/// it cannot leak (Finding B).
+/// the entry `assume f#requires` is **dropped** so that no precondition-derived
+/// merge can ride into a call site (a recipe imports no e-classes).
 ///
 /// Callees — including the function's own `f#requires`/`f#ensures` contract
 /// functions — are ordinary `Function` decls verified earlier in dependency
-/// order, so their recipes are already in `fn_certs`, and `assume_axioms`
-/// (called at the top of this function's own `ctx` setup) has already installed
-/// their unfold rules — saturation (triggered via `prove_under_pc`) discharges
-/// the contract obligations lazily as needed.
+/// order, so their recipes are already in `fn_certs` and their unfold rules
+/// installed; saturation discharges the contract obligations lazily.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_function(
     program: &vmir::Program,
@@ -3354,21 +3286,6 @@ pub(crate) fn verify_function(
     })))
 }
 
-/// The **pre-token** guarding every fact a function's body exports: the
-/// application `(func, args)` that must hold for the facts to fire, over the
-/// function's own param space (`Val::Temp(0..n_params)` — so recipe space too,
-/// where the params are the identity).
-///
-/// The two function flavours supply it differently, but the guard *shape* is the
-/// same single boolean application either way:
-/// - **heap-free**: `f#requires(params)`, a **defined** boolean function. A call
-///   site's `Assert f#requires(args)` passing is what makes it true there.
-/// - **heap-dependent**: `R#pre(args, s)`, an **uninterpreted** token over the
-///   `#requires` Resource (see [`FuncRegistry::pre_token`]). The precondition is
-///   not definable from `(args, s)` — it also demands the footprint — so the
-///   token is stamped by [`eval_snap`] where the check passed.
-///
-/// `None` for a function without a precondition (its facts are unguarded).
 /// The set of **contract** functions — every function's lowered
 /// `#requires`/`#ensures` (booleans carrying a pre/postcondition), collected from
 /// the contract links. Contract-function bodies are spec positions: they are left
@@ -3389,6 +3306,18 @@ fn contract_members(program: &vmir::Program) -> std::collections::HashSet<Member
     set
 }
 
+/// The **pre-token** guarding every fact a function's body exports: the
+/// application `(func, args)` that must hold for the facts to fire, over the
+/// function's own param space (`Val::Temp(0..n_params)`, i.e. recipe space).
+///
+/// - **heap-free**: `f#requires(params)`, a **defined** boolean function, made
+///   true at a call site by its `Assert f#requires(args)` passing.
+/// - **heap-dependent**: `R#pre(args, s)`, an **uninterpreted** token over the
+///   `#requires` Resource (see [`FuncRegistry::pre_token`]) — the precondition
+///   also demands the footprint, so it is not definable from `(args, s)` and the
+///   token is stamped by [`eval_snap`] where the check passed.
+///
+/// `None` for a function without a precondition (its facts are unguarded).
 fn pre_token(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     program: &vmir::Program,
@@ -3561,15 +3490,14 @@ fn inst_obligations(
                 }
             }
         }
-        // `not(perm < 0)` desugared to an `Ite`. Applies to a location combine,
-        // a resource inhale/exhale, and fold/unfold (their permission scale must
-        // be ≥ 0 — a consuming op with a negative scale would flip
-        // `heap_subtract` into permission fabrication).
-        // A wildcard is positive by construction (assumed `0 < w` at creation),
-        // and the e-graph has no real-order reasoning to *prove* `¬(w < 0)`.
-        // Silicon likewise skips the non-negativity assertion for a constrainable
-        // ARP (`PermissionSupporter.assertNotNegative`), so a wildcard-bearing
-        // permission carries no `perm ≥ 0` obligation.
+        // `not(perm < 0)` desugared to an `Ite`. Applies to a location combine, a
+        // resource inhale/exhale, and fold/unfold (a consuming op with a negative
+        // scale would flip `heap_subtract` into permission fabrication).
+        //
+        // A wildcard is positive by construction (assumed `0 < w` at creation) and
+        // the e-graph has no real-order reasoning to *prove* `¬(w < 0)`; Silicon
+        // likewise skips the assertion for a constrainable ARP, so a
+        // wildcard-bearing permission carries no `perm ≥ 0` obligation.
         InstKind::Heap(
             HeapInst::Combine { perm, .. }
             | HeapInst::Inhale { perm, .. }

@@ -70,14 +70,11 @@ fn reach_val_of(sink: &mut Sink, pc: &PathConds) -> Val {
 /// onto every cube). Returns `(dnf, pc, reach_val)`:
 ///
 /// - `dnf` — the reach as a **minimized cube set**, kept so successors can pool
-///   the raw cubes and reduce further. This is the whole point of threading a
-///   DNF instead of a single pc: a chain-decoded `n`-way `match` reaches a join
-///   with unequal-length cubes that [`merge_cubes`] cannot merge in isolation,
-///   but once a later join also pools the `else` cube the partition completes
-///   and telescopes to `<>`. Materializing the reach into one literal here would
-///   destroy that structure (a length-1 literal no longer adjacency-merges with
-///   the length-`k` `else` cube), stranding the exit under a tautological-but-
-///   opaque pc.
+///   the raw cubes and reduce further. This is why a DNF is threaded instead of a
+///   single pc: a chain-decoded `n`-way `match` reaches a join with unequal-length
+///   cubes that [`merge_cubes`] cannot merge in isolation, but once a later join
+///   also pools the `else` cube the partition completes and telescopes to `<>`.
+///   Materializing the reach into one literal here destroys that structure.
 /// - `pc` — the block's own lowering guard for `with_conds`. When the DNF is one
 ///   cube that cube *is* the conjunctive pc (a diamond → its prefix; a full
 ///   split → `<>`); otherwise the cubes are OR'd into a single materialized
@@ -191,9 +188,8 @@ fn merge_adjacent(a: &PathConds, b: &PathConds) -> Option<PathConds> {
 /// inherits from that side. Binary because the block IR normalises every join to
 /// a chain of these (a diamond is one; an n-way merge nests them).
 ///
-/// Equivalent to a two-edge `ite(cond, then_v, els_v)` phi — the block lowerer
-/// folds it right-to-left over an n-ary merge's arms, which reproduces the
-/// former k-way `ite(ev0, v0, ite(ev1, v1, … v_last))` shape.
+/// Equivalent to a two-edge `ite(cond, then_v, els_v)` phi; the block lowerer
+/// folds it right-to-left over an n-ary merge's arms.
 pub(crate) fn merge_two_envs(
     sink: &mut Sink,
     cond: Val,
