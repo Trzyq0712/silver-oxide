@@ -33,6 +33,57 @@ pub type Loops = crate::viper::loops::Loops<BlockId>;
 /// One natural loop of a method body.
 pub type Loop = crate::viper::loops::Loop<BlockId>;
 
+/// Stable identity of an invariant-bearing loop head, in source order.
+///
+/// Loop invariants become their own `Resource` declarations, and slots can only
+/// be allocated at *declare* time — before any CFG exists. So `declare` and
+/// `build_cfg` must agree on which head is which without sharing a `BlockId`.
+/// Both derive this key from the same source-order traversal
+/// ([`loop_head_keys`] and `Builder::process`), and `build_cfg` asserts the two
+/// agree, so a divergence is a loud failure rather than a mismatched resource.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LoopHeadKey {
+    /// `label L invariant …` — labels are unique within a method.
+    Label(Spur),
+    /// `while (c) invariant … { … }` — the head has no name, so it is keyed by
+    /// its index among the method's `while`s in source order.
+    While(usize),
+}
+
+/// Every invariant-bearing loop head of `body`, in source order.
+///
+/// The traversal must match `Builder::process` exactly: statements in order,
+/// an `If`'s then-arm before its else-arm, a `Block`'s contents inline, and a
+/// `While`'s head *before* its body (so an outer loop precedes the loops nested
+/// inside it).
+pub fn loop_head_keys(body: &StmtBlock) -> Vec<LoopHeadKey> {
+    let mut out = Vec::new();
+    let mut whiles = 0usize;
+    collect_head_keys(&body.0, &mut whiles, &mut out);
+    out
+}
+
+fn collect_head_keys(stmts: &[Statement], whiles: &mut usize, out: &mut Vec<LoopHeadKey>) {
+    for s in stmts {
+        match s {
+            Statement::Label(l, invs) if !invs.is_empty() => out.push(LoopHeadKey::Label(*l)),
+            Statement::While(_, _, body) => {
+                out.push(LoopHeadKey::While(*whiles));
+                *whiles += 1;
+                collect_head_keys(&body.0, whiles, out);
+            }
+            Statement::If(_, then, els) => {
+                collect_head_keys(&then.0, whiles, out);
+                if let Some(e) = els {
+                    collect_head_keys(&e.0, whiles, out);
+                }
+            }
+            Statement::Block(inner) => collect_head_keys(&inner.0, whiles, out),
+            _ => {}
+        }
+    }
+}
+
 /// Index of a basic block within a [`Cfg`].
 #[derive(Debug, From, Into, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct BlockId(pub usize);
@@ -64,6 +115,10 @@ pub struct BasicBlock {
     /// The invariants declared on that label (`label L invariant A`). Empty
     /// unless this block is a labelled loop head.
     pub invs: Vec<SpatialMethodExp>,
+    /// Source-order identity of this block as an invariant-bearing loop head.
+    /// `None` for every other block. Lets translation match a head to the
+    /// `Resource` slot allocated for it at declare time.
+    pub head_key: Option<LoopHeadKey>,
 }
 
 /// The basic-block control-flow graph of a method body. Cyclic exactly when the
@@ -160,7 +215,7 @@ pub fn build_cfg(body: &StmtBlock) -> Result<Cfg, CfgError> {
     if let Some(tail) = builder.process(&body.0, Some(entry)) {
         builder.open_seal(tail, Terminator::Return);
     }
-    builder.finish(entry)
+    builder.finish(entry, &loop_head_keys(body))
 }
 
 #[derive(Default)]
@@ -170,6 +225,10 @@ struct Builder {
     labels: HashMap<Spur, BlockId>,
     /// Labels actually declared by a `label` statement (a subset of `labels`).
     defined: HashSet<Spur>,
+    /// `while`s seen so far, for [`LoopHeadKey::While`] numbering.
+    whiles: usize,
+    /// Head keys in assignment order, checked against [`loop_head_keys`].
+    assigned_keys: Vec<LoopHeadKey>,
 }
 
 #[derive(Default)]
@@ -178,6 +237,7 @@ struct BlockData {
     term: Option<Terminator>,
     label: Option<Spur>,
     invs: Vec<SpatialMethodExp>,
+    head_key: Option<LoopHeadKey>,
 }
 
 impl Builder {
@@ -258,6 +318,11 @@ impl Builder {
                     // before its declaration); the declaration is what carries
                     // the invariants.
                     self.blocks[lb].invs = invs.clone();
+                    if !invs.is_empty() {
+                        let key = LoopHeadKey::Label(*l);
+                        self.assigned_keys.push(key.clone());
+                        self.blocks[lb].head_key = Some(key);
+                    }
                     if let Some(b) = cur {
                         self.open_seal(b, Terminator::Goto(lb));
                     }
@@ -285,6 +350,10 @@ impl Builder {
                     let b = self.ensure(&mut cur);
                     let head = self.new_block();
                     self.blocks[head].invs = invs.clone();
+                    let key = LoopHeadKey::While(self.whiles);
+                    self.whiles += 1;
+                    self.assigned_keys.push(key.clone());
+                    self.blocks[head].head_key = Some(key);
                     self.open_seal(b, Terminator::Goto(head));
 
                     let body_e = self.new_block();
@@ -315,12 +384,22 @@ impl Builder {
         cur
     }
 
-    fn finish(self, entry: BlockId) -> Result<Cfg, CfgError> {
+    fn finish(self, entry: BlockId, expected_keys: &[LoopHeadKey]) -> Result<Cfg, CfgError> {
         let Builder {
             blocks,
             labels,
             defined,
+            assigned_keys,
+            whiles: _,
         } = self;
+
+        // `declare` allocates one Resource slot per key from `loop_head_keys`;
+        // this walk assigns keys to blocks independently. They must agree, or a
+        // head would be matched to another head's invariant resource.
+        debug_assert_eq!(
+            assigned_keys, expected_keys,
+            "loop_head_keys and Builder::process disagree on loop head identity"
+        );
 
         // Every referenced label must be declared.
         for &l in labels.keys() {
@@ -337,6 +416,7 @@ impl Builder {
                 term: bd.term.unwrap_or(Terminator::Return),
                 label: bd.label,
                 invs: bd.invs,
+                head_key: bd.head_key,
             })
             .collect();
 
@@ -406,6 +486,7 @@ fn insert_preheaders(
             term: Terminator::Goto(head),
             label: None,
             invs: Vec::new(),
+            head_key: None,
         });
         for p in in_edges {
             retarget(&mut blocks[p].term, head, pre);
