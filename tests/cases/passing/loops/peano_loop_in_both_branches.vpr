@@ -1,0 +1,25 @@
+// A loop in BOTH arms. Each cut sets aside its own frame and restores it, and
+// the join then merges two heaps that each came back through a union.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_loop_in_both_branches(c: Bool, n: Nat, m: Nat, a: Ref) returns (r: Nat)
+  requires acc(a.f)
+{
+    if (c) {
+        var k: Nat := n
+        while (!k.isZero)
+          invariant acc(a.f)
+        { k := k.pred }
+        r := Succ(Zero())
+    } else {
+        var j: Nat := m
+        while (!j.isZero)
+          invariant acc(a.f)
+        { j := j.pred }
+        r := Zero()
+    }
+    assert acc(a.f)
+    assert c ==> !r.isZero
+    assert !c ==> r.isZero
+}

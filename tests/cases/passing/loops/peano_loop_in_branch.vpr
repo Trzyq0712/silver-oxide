@@ -1,0 +1,32 @@
+// A loop under a path condition. Both arms produce a value and the join must
+// reconcile them, so the loop must not disturb the enclosing branch structure:
+// the then-arm's exit sits under `c AND !guard`, the else-arm under `!c`, and
+// the outer join still has to see `c` vs `!c`.
+//
+// The branch-conditional assertions are the real test — if the loop broke the
+// path condition, `c ==> !r.isZero` would not survive the join.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_loop_in_branch(c: Bool, n: Nat, a: Ref) returns (r: Nat)
+  requires acc(a.f)
+{
+    if (c) {
+        var k: Nat := n
+        while (!k.isZero)
+          invariant acc(a.f)
+        {
+            k := k.pred
+            a.f := 1
+        }
+        r := Succ(Zero())
+    } else {
+        r := Zero()
+    }
+    // The frame must come back on the loop's arm, and the non-loop arm's heap
+    // must merge with it cleanly.
+    assert acc(a.f)
+    // Each arm's value survives its own branch condition.
+    assert c ==> !r.isZero
+    assert !c ==> r.isZero
+}

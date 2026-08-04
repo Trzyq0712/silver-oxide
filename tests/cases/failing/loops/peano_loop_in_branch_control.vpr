@@ -1,0 +1,29 @@
+// Negative control for passing/loops/peano_loop_in_branch.vpr: the branch
+// condition is used the WRONG way round. `!c` selects the arm that sets
+// `r := Zero()`, so `!r.isZero` is false there.
+//
+// If the loop had collapsed the enclosing path condition — or made the state
+// inconsistent — this would wrongly verify, and the positive case would be
+// passing for no reason.
+//
+// Must FAIL.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_loop_in_branch_control(c: Bool, n: Nat, a: Ref) returns (r: Nat)
+  requires acc(a.f)
+{
+    if (c) {
+        var k: Nat := n
+        while (!k.isZero)
+          invariant acc(a.f)
+        {
+            k := k.pred
+            a.f := 1
+        }
+        r := Succ(Zero())
+    } else {
+        r := Zero()
+    }
+    assert !c ==> !r.isZero
+}
