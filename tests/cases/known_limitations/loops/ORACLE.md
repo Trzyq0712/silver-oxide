@@ -34,6 +34,23 @@ rejects `while`. Promote each to `passing/loops/` as it starts verifying — the
 | `break_simple.vpr` | S4 `break` out of a loop | PASS | stage 6 |
 | `break_state.vpr` | S4 out edge carries live state | PASS | stage 6 |
 
+## Structural (Peano) loops — `passing/loops/`
+
+Peano naturals drive the loop by a **tag check**, so the cut is exercised with
+no integer reasoning anywhere. This is what isolates loop correctness from the
+arithmetic gap that blocks the integer cases above.
+
+| case | what it pins down | Silicon | ours |
+|---|---|---|---|
+| `peano_countdown.vpr` | data-dependent guard on a havoc'd variable; the post-loop fact comes only from the exit edge's guard negation | PASS | PASS |
+| `peano_invariant.vpr` | a **load-bearing** invariant: established, preserved across the body, consumed after | PASS | PASS |
+| `peano_havoc_control.vpr` | same program, invariant dropped — must FAIL, or the cut is not havocing | FAIL | FAIL |
+
+The last is the one that matters. `peano_invariant` passing proves the cut
+carries the invariant; `peano_havoc_control` failing proves it does not carry
+anything *else*. Without the pair, a cut that simply threaded the pre-loop state
+through unchanged would pass the first and be silently unsound.
+
 ## Must be rejected — `failing/loops/`
 
 Green today for the wrong reason (loops unsupported ⇒ pipeline error, which

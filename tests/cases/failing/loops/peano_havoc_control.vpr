@@ -1,0 +1,20 @@
+// Negative control for peano_invariant: the same program with the invariant
+// dropped. `s` is written by the body, so the cut havocs it and `!s.isZero`
+// no longer survives. Must FAIL — if it verifies, the cut is not havocing.
+adt Nat {
+    Zero()
+    Succ(pred: Nat)
+}
+
+method stays_succ_nohint(n: Nat) returns (s: Nat)
+  ensures !s.isZero
+{
+    s := Succ(n)
+    var c: Nat := n
+    while (!c.isZero)
+      invariant true
+    {
+        c := c.pred
+        s := Succ(s)
+    }
+}

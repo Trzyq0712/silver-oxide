@@ -1,0 +1,19 @@
+// Structural looping over Peano naturals: the loop is driven by a tag check,
+// so the cut is exercised with no integer reasoning anywhere.
+adt Nat {
+    Zero()
+    Succ(pred: Nat)
+}
+
+// The guard is data-dependent on a havoc'd variable, and the post-loop fact
+// comes purely from the guard's negation at the exit edge.
+method countdown(n: Nat) returns (k: Nat)
+  ensures k.isZero
+{
+    k := n
+    while (!k.isZero)
+      invariant true
+    {
+        k := k.pred
+    }
+}
