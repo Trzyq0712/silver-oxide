@@ -1,0 +1,18 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// S12: back edge to a head carrying no invariant. The body heap is empty,
+// so nothing about the pre-loop state survives. Silicon accepts the program
+// but cannot prove the assertion.
+method no_invariant(n: Int) returns (i: Int)
+  requires n >= 0
+{
+    i := 0
+    label head
+    if (i < n) {
+        i := i + 1
+        goto head
+    }
+    assert i >= 0
+}

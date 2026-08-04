@@ -1,0 +1,26 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// S2: predicate traversal, no quantified permissions.
+field next: Ref
+
+predicate list(x: Ref) {
+  acc(x.next) && (x.next != null ==> acc(list(x.next)))
+}
+
+method walk(x: Ref) returns (n: Int)
+  requires x != null ==> acc(list(x))
+  ensures  n >= 0
+{
+  var cur: Ref := x
+  n := 0
+  while (cur != null)
+    invariant n >= 0
+    invariant cur != null ==> acc(list(cur))
+  {
+    unfold acc(list(cur))
+    n := n + 1
+    cur := cur.next
+  }
+}

@@ -1,0 +1,10 @@
+// The cut havocs every variable written in the body, so the pre-loop
+// concrete value is gone even though the loop runs zero times. Must FAIL.
+method havoc_loses_value() returns (i: Int)
+{
+    i := 5
+    while (i < 0)
+        invariant i >= 0
+    { i := i - 1 }
+    assert i == 5
+}

@@ -1,0 +1,21 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// S15: read-only framing via a wildcard. The frame keeps a positive share,
+// therefore keeps the value.
+field f: Int
+
+method wildcard_ro() returns (i: Int)
+{
+  var box: Ref
+  box := new(f)
+  box.f := 10
+  i := 0
+  while (i < box.f)
+    invariant acc(box.f, wildcard)
+    invariant i <= box.f
+  { i := i + 1 }
+  assert box.f == 10
+  assert i == 10
+}

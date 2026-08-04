@@ -1,0 +1,26 @@
+// KNOWN LIMITATION: `break` (a goto out of a loop) needs `HeapInst::Union`
+// and the post-loop confluence rule — stages 5-6, NOT in the stages 0-4
+// branch. Silicon verifies this program.
+// Tracking: design/loops/PLAN.md sections 4.3 and 5 (scenarios S4, S16).
+
+// S4: `break` — a goto out of the loop body. Needs stages 5-6
+// (HeapInst::Union + post-loop confluence), so this lands in
+// known_limitations for the stages 0-4 branch.
+field f: Int
+
+method break_simple() returns (i: Int)
+{
+    var box: Ref
+    box := new(f)
+    box.f := 10
+    i := 0
+    while (i < box.f)
+        invariant acc(box.f, wildcard)
+        invariant i <= box.f
+    {
+        i := i + 1
+        if (i > 5) { goto brk }
+    }
+    label brk
+    assert box.f == 10
+}

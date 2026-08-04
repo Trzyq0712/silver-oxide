@@ -1,0 +1,19 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// S1: scalar accumulator. No heap in the invariant.
+method scalar_sum(n: Int) returns (s: Int)
+  requires n >= 0
+  ensures  s == n
+{
+  var i: Int := 0
+  s := 0
+  while (i < n)
+    invariant 0 <= i && i <= n
+    invariant s == i
+  {
+    i := i + 1
+    s := s + 1
+  }
+}

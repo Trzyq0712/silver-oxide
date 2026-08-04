@@ -1,0 +1,20 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// S3: loop nested under a path condition; outer join must stay clean.
+method loop_under_if(c: Bool, n: Int) returns (r: Int)
+  requires n >= 0
+{
+  if (c) {
+    var i: Int := 0
+    while (i < n)
+      invariant 0 <= i && i <= n
+    { i := i + 1 }
+    r := i
+    assert r == n
+  } else {
+    r := 0
+  }
+  assert r >= 0
+}

@@ -1,0 +1,14 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// S11: guard false on entry; the loop body never runs, but pre-loop
+// concrete values are still lost at the cut.
+method zero_iter() returns (i: Int)
+{
+  i := 5
+  while (i < 0)
+    invariant i >= 0
+  { i := i - 1 }
+  assert i >= 0
+}

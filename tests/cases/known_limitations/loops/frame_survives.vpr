@@ -1,0 +1,22 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// The frame — everything the invariant does not mention — is preserved
+// across the loop verbatim, values included. `other.f` is never named in the
+// invariant and never touched by the body.
+field f: Int
+
+method frame_survives(n: Int) returns (i: Int)
+  requires n >= 0
+{
+    var other: Ref
+    other := new(f)
+    other.f := 42
+    i := 0
+    while (i < n)
+        invariant 0 <= i && i <= n
+    { i := i + 1 }
+    assert acc(other.f)
+    assert other.f == 42
+}

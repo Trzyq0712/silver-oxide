@@ -1,0 +1,17 @@
+// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
+// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
+// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+
+// Prusti's emitted shape: goto CFG, invariant carried by the loop-head label.
+method goto_loop(n: Int) returns (i: Int)
+  requires n >= 0
+  ensures  i == n
+{
+  i := 0
+  label head
+    invariant 0 <= i && i <= n
+  if (i < n) {
+    i := i + 1
+    goto head
+  }
+}

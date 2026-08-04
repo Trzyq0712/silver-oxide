@@ -1,0 +1,16 @@
+// S15 negative control: with write permission in the invariant the frame
+// residual is empty, so the value is NOT retained. Must FAIL.
+field f: Int
+
+method wildcard_ro_write() returns (i: Int)
+{
+  var box: Ref
+  box := new(f)
+  box.f := 10
+  i := 0
+  while (i < box.f)
+    invariant acc(box.f)
+    invariant i <= box.f
+  { i := i + 1 }
+  assert box.f == 10
+}

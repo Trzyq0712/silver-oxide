@@ -1,0 +1,14 @@
+// S12: a back edge to a head with no invariant. The body heap is empty and
+// nothing relates i to n across the cut, so the postcondition is not
+// provable. Must FAIL.
+method no_invariant_loses(n: Int) returns (i: Int)
+  requires n >= 0
+  ensures  i == n
+{
+    i := 0
+    label head
+    if (i < n) {
+        i := i + 1
+        goto head
+    }
+}
