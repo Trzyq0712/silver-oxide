@@ -1,0 +1,30 @@
+// Nested loops. The inner loop's cut sits inside the outer loop's body, so the
+// inner head exhales from — and restores its frame into — a heap that is itself
+// the outer invariant's footprint. `b.f` is named by neither invariant and must
+// survive both exits.
+//
+// Driven by tag checks, so no integer reasoning is involved.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_nested(n: Nat, m: Nat, a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+  requires b.f == 42
+{
+    var i: Nat := n
+    while (!i.isZero)
+      invariant acc(a.f)
+    {
+        var j: Nat := m
+        while (!j.isZero)
+          invariant acc(a.f)
+        {
+            j := j.pred
+            a.f := 1
+        }
+        i := i.pred
+    }
+    assert acc(a.f)
+    assert acc(b.f)
+    assert b.f == 42
+}

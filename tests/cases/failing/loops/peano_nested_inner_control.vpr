@@ -1,0 +1,27 @@
+// Negative control for passing/loops/peano_nested.vpr: the inner loop's
+// invariant is dropped. The inner cut then rebuilds its body heap from nothing,
+// so `acc(a.f)` is gone inside it and `a.f := 1` has no permission — and the
+// outer invariant cannot be re-established on the outer back edge either.
+//
+// Must FAIL. If it verifies, the inner cut is not really cutting.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_nested_inner_control(n: Nat, m: Nat, a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+{
+    var i: Nat := n
+    while (!i.isZero)
+      invariant acc(a.f)
+    {
+        var j: Nat := m
+        while (!j.isZero)
+          invariant true
+        {
+            j := j.pred
+            a.f := 1
+        }
+        i := i.pred
+    }
+    assert acc(a.f)
+}
