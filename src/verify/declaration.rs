@@ -720,6 +720,20 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             let (Some(pi), Some(pj)) = (chunks[i].perm.as_leaf(), chunks[j].perm.as_leaf()) else {
                 continue;
             };
+            // Both addresses must be direct `@addr` applications with the same
+            // arity, or there is no disequality to state. `location_chunks`
+            // leaves `args` EMPTY for a computed address, and `conj_args_eq` over
+            // no arguments is the empty conjunction — `true`. Emitting the axiom
+            // then degenerates to `union(true, ite(gt, false, true))`, i.e.
+            // `true == false` the moment the perms sum above the bound, which
+            // makes the whole unit inconsistent and every goal dischargeable.
+            // Skipping is sound: it can only lose a disequality, never add one.
+            if chunks[i].args.is_empty()
+                || chunks[j].args.is_empty()
+                || chunks[i].args.len() != chunks[j].args.len()
+            {
+                continue;
+            }
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
             let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [pi, pj]));
             let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, sum]));
