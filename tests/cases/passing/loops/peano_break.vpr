@@ -1,0 +1,24 @@
+// `break` — a goto out of the loop body. The out edge carries the body's LIVE
+// state and does not re-establish the invariant, and it must union the frame
+// back: `b.f` is never named in the invariant, yet is still held after the
+// break. Driven by a tag check, so no integer reasoning is involved.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_break(n: Nat, a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+  requires b.f == 42
+{
+    var c: Nat := n
+    while (!c.isZero)
+      invariant acc(a.f)
+    {
+        c := c.pred
+        a.f := 1
+        if (c.isZero) { goto brk }
+    }
+    label brk
+    assert acc(a.f)
+    assert acc(b.f)
+    assert b.f == 42
+}

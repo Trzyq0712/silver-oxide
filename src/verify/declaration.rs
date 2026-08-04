@@ -1545,6 +1545,70 @@ fn gate_perm_by_guard(
     acc
 }
 
+/// The **sum** of two heaps held simultaneously (`HeapInst::Union`).
+///
+/// Per location kind, per canonical address:
+/// - **present in one heap only** — carried across unchanged.
+/// - **present in both, same guard** — one chunk with `perm = permₐ + perm_b`,
+///   and `valueₐ == value_b` assumed. Two chunks of one location cannot
+///   disagree, and that agreement is load-bearing: it is what lets a value
+///   established before a loop survive to the exit, where the frame carries it
+///   back. (Silicon emits the same equalities from `singleMerge`'s `snapEqs`.)
+/// - **present in both, equal guards** — one chunk with `perm = permₐ + perm_b`
+///   under that shared guard, and `valueₐ == value_b` assumed. Two chunks of one
+///   location cannot disagree, and that agreement is load-bearing: it is what
+///   lets a value established before a loop survive to the exit, where the frame
+///   carries it back. (Silicon emits the same equalities from `singleMerge`'s
+///   `snapEqs`.)
+/// - **present in both, guards differ** — the presence condition is a genuine
+///   disjunction, which `Chunk.guard` (a flat cube) cannot express. Push both
+///   guards into the *amounts* via [`gate_perm_by_guard`] and sum those, leaving
+///   the merged chunk unguarded — the same fallback `merge_heaps` uses for its
+///   differing-guard case.
+///
+/// Dropping one side instead would be sound (it only under-claims) but wrong in
+/// practice and asymmetric in `a`/`b`: at a loop exit the two sides are the
+/// frame and the invariant's footprint, so discarding either loses permission
+/// the program genuinely holds.
+///
+/// `Heap::with_chunk` replaces at a shared address (the heap keeps one chunk per
+/// address), so summing here is what preserves the total rather than silently
+/// letting one side overwrite the other.
+fn union_heaps(ctx: &mut VerifyContext<'_>, a: &Heap, b: &Heap) -> Heap {
+    let mut out = a.clone();
+    for (kind, cb) in b.entries() {
+        let existing = a
+            .chunks_of(kind)
+            .iter()
+            .find(|ca| ctx.egraph.find(ca.addr) == ctx.egraph.find(cb.addr))
+            .cloned();
+        let Some(ca) = existing else {
+            out = out.with_chunk(kind, cb.clone());
+            continue;
+        };
+        // Both chunks sit at one location, so their values agree — regardless of
+        // which guard each is held under.
+        ctx.union(ca.value, cb.value);
+        let (pa, pb, guard): (ChunkPerm, ChunkPerm, crate::verify::heap::HeapPc) = if ca.guard == cb.guard {
+            (ca.perm.clone(), cb.perm.clone(), ca.guard.clone())
+        } else {
+            (
+                gate_perm_by_guard(ctx, &ca.perm, &ca.guard),
+                gate_perm_by_guard(ctx, &cb.perm, &cb.guard),
+                std::rc::Rc::from(Vec::new()),
+            )
+        };
+        let (ia, ib) = (pa.to_id(ctx), pb.to_id(ctx));
+        let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [ia, ib]));
+        let mut merged = Chunk::new(ca.addr, sum, ca.value);
+        merged.guard = guard;
+        merged.recipe = ca.recipe.clone().or_else(|| cb.recipe.clone());
+        out = out.with_chunk(kind, merged);
+    }
+    ctx.egraph.rebuild();
+    out
+}
+
 /// Evaluate a heap inst. `Sub` may fail with `InsufficientPermission`.
 fn eval_heap_inst(
     ctx: &mut VerifyContext<'_>,
@@ -1553,6 +1617,14 @@ fn eval_heap_inst(
     pc: &PathConds,
 ) -> Result<Heap, VerifyError> {
     match inst {
+        // Heap SUM: both heaps are held at once, so permissions at a shared
+        // location add and values there must agree. Contrast `Merge`, which
+        // selects between mutually exclusive predecessor states.
+        HeapInst::Union { a, b } => {
+            let ha = get_heap(state, a).clone();
+            let hb = get_heap(state, b).clone();
+            Ok(union_heaps(ctx, &ha, &hb))
+        }
         // Block-IR heap join: structural per-chunk SELECT of the two predecessor
         // exit heaps. Emitted at every CFG join by the block lowering.
         HeapInst::Merge {

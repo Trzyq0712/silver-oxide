@@ -1,7 +1,7 @@
-// KNOWN LIMITATION: `break` (a goto out of a loop) needs `HeapInst::Union`
-// and the post-loop confluence rule — stages 5-6, NOT in the stages 0-4
-// branch. Silicon verifies this program.
-// Tracking: design/loops/PLAN.md sections 4.3 and 5 (scenarios S4, S16).
+// KNOWN LIMITATION: `break` itself works (see passing/loops/peano_break.vpr).
+// This fails on the pre-existing integer-range arithmetic gap in its
+// invariant, exactly like the other integer loop cases. Silicon verifies it.
+// Tracking: design/loops/PLAN.md; project_panic_freedom_boundary (tier-C).
 
 // S4: an out edge carries the body's LIVE state and does NOT re-establish
 // the invariant. `i <= 5` is violated at the break point, yet `i == 6` is

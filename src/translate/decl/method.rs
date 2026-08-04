@@ -235,13 +235,6 @@ pub(crate) fn lower_method(
     let cfg = cfg::build_cfg(body).map_err(|_| {
         TranslationError::Unsupported("method control flow (irreducible or undefined label)")
     })?;
-    // TODO(loops): an out edge (`break`, early `return`) must union the body's
-    // live heap with the frame the head set aside; that needs `HeapInst::Union`
-    // (stage 6). Until then a loop may only be left by its own guard.
-    if let Some((from, to)) = first_out_edge(&cfg) {
-        let _ = (from, to);
-        return Err(TranslationError::Unsupported("break out of a loop"));
-    }
 
     let mut sink = Sink::new(0, 0);
 
@@ -299,6 +292,10 @@ pub(crate) fn lower_method(
     // `h_out_of` records every pushed block's exit heap so a later join's
     // `Merge` can name its predecessors' heaps.
     let mut h_out_of: HashMap<vmir::BlockId, HeapVal> = HashMap::new();
+    // Per loop head (CFG block id): the exhale residual set aside at the cut.
+    // Any edge leaving that loop unions it back — see the head/exit handling in
+    // the block walk below.
+    let mut frame_of: HashMap<BlockId, HeapVal> = HashMap::new();
 
     let order = cfg.topo_order();
     let cfg_preds = cfg.predecessors();
@@ -516,19 +513,45 @@ pub(crate) fn lower_method(
         // the whole framing story, and it falls out of permission arithmetic
         // rather than any modifies analysis.
         let mut env = env;
+        // An edge that leaves a loop restores that loop's frame: the body holds
+        // the invariant's footprint, the head set the rest aside, and after the
+        // loop we hold their sum. Innermost first, since leaving nested loops
+        // must restore inner before outer.
+        let h_in = {
+            let mut h = h_in;
+            let exits: Vec<BlockId> = cfg_preds[bid]
+                .iter()
+                .filter(|(p, _)| reachable.contains(p))
+                .flat_map(|(p, _)| cfg.loops.classify(*p, bid).exits.clone())
+                .map(|li| cfg.loops.loops[li].head)
+                .collect();
+            for head in exits {
+                let Some(&frame) = frame_of.get(&head) else {
+                    continue;
+                };
+                let mark = sink.insts.len();
+                h = sink.with_conds(&pc, |sink| {
+                    sink.emit_heap_guarded(HeapInst::Union { a: h, b: frame })
+                });
+                real_join.extend(sink.take_since(mark));
+            }
+            h
+        };
         let h_in = if let Some(l) = cfg.loops.at_head(bid) {
             let mark = sink.insts.len();
             let invs = cfg.blocks[bid].invs.clone();
-            let h_in = sink.with_conds(&pc, |sink| {
+            let (frame, h_in) = sink.with_conds(&pc, |sink| {
                 let old = pure_exp::OldHeaps {
                     baseline,
                     labeled: &labeled,
                 };
                 // Established at the *pre*-havoc values: this is the entry
                 // obligation, about the state control actually arrives in.
-                let _frame = lower_invariant(b, &env, sink, h_in, &invs, true, &old)?;
-                // TODO(loops): `_frame` is the exit heap for out edges (`break`,
-                // early `return`) — needs `HeapInst::Union`, see stage 6.
+                // The residual is the FRAME — everything the invariant does not
+                // mention. It is an ordinary `HeapVal`, so any edge leaving this
+                // loop simply names it (Silicon needs an `invariantContexts`
+                // stack here only because its heap threads implicitly).
+                let frame = lower_invariant(b, &env, sink, h_in, &invs, true, &old)?;
                 for name in loop_written_vars(&cfg, l) {
                     if let Some(ty) = var_types.get(&name) {
                         let v = sink.emit_pure(ty.clone(), PureInst::Fresh);
@@ -537,9 +560,11 @@ pub(crate) fn lower_method(
                 }
                 // The body's heap *is* the invariant: an empty heap plus what the
                 // invariant grants, at the havoc'd values.
-                lower_invariant(b, &env, sink, HeapVal::Empty, &invs, false, &old)
+                let h = lower_invariant(b, &env, sink, HeapVal::Empty, &invs, false, &old)?;
+                Ok::<_, TranslationError>((frame, h))
             })?;
             real_join.extend(sink.take_since(mark));
+            frame_of.insert(bid, frame);
             h_in
         } else {
             h_in
@@ -681,21 +706,6 @@ fn collect_var_types(
     }
 }
 
-/// The first edge that leaves a loop other than by the head's own guard — a
-/// `break` or an early `return` from inside a body.
-///
-/// The head's guard edge leaves the loop too, but from the head itself, where
-/// the frame is still in hand; those are the ones the cut already handles.
-fn first_out_edge(cfg: &cfg::Cfg) -> Option<(BlockId, BlockId)> {
-    for (id, blk) in cfg.blocks.iter_enumerated() {
-        for succ in cfg::successors_of(&blk.term) {
-            if cfg.loops.at_head(id).is_none() && cfg.loops.classify(id, succ).is_exit() {
-                return Some((id, succ));
-            }
-        }
-    }
-    None
-}
 
 /// Inhale or exhale a loop invariant against `heap`, clause by clause in source
 /// order (which is what makes self-framing order-dependent, exactly as for a

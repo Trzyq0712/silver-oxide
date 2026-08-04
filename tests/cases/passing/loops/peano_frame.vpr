@@ -1,0 +1,22 @@
+// The frame — everything the invariant does NOT mention — must come back at
+// the loop exit, permission and value intact. `b.f` is never named in the
+// invariant and never touched by the body. Driven by a tag check, so no
+// integer reasoning is involved.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method peano_frame(n: Nat, a: Ref, b: Ref)
+  requires acc(a.f) && acc(b.f)
+  requires b.f == 42
+{
+    var c: Nat := n
+    while (!c.isZero)
+      invariant acc(a.f)
+    {
+        c := c.pred
+        a.f := 1
+    }
+    assert acc(b.f)
+    assert b.f == 42
+    assert acc(a.f)
+}

@@ -132,6 +132,18 @@ pub enum HeapInst {
         then_h: HeapVal,
         els_h: HeapVal,
     },
+    /// `h := union <a> <b>` — the **sum** of two heaps held simultaneously, as
+    /// opposed to [`HeapInst::Merge`], which *selects* between two alternative
+    /// predecessor states. Permissions at a shared location add; values at a
+    /// shared location are assumed equal (two chunks of one location cannot
+    /// disagree).
+    ///
+    /// Emitted where a loop is left: the body holds the invariant's footprint
+    /// and the head set the rest aside as the frame, so the state after the loop
+    /// is their sum. Silicon does the same at a `Kind.Out` edge
+    /// (`Executor.handleOutEdge`), pulling the frame off its `invariantContexts`
+    /// stack; our heaps are explicit values, so the frame is simply named.
+    Union { a: HeapVal, b: HeapVal },
 }
 
 impl HeapInst {
@@ -259,6 +271,7 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 then_h,
                 els_h,
             } => write!(f, "merge {cond} ? {then_h} : {els_h}"),
+            HeapInst::Union { a, b } => write!(f, "union {a} {b}"),
         }
     }
 }
