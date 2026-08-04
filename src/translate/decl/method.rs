@@ -5,7 +5,7 @@
 //! by a single linear heap for now. Joins are binary; an n-ary (multi-goto)
 //! merge is normalised into a chain of synthetic binary-join blocks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use lasso::Spur;
@@ -235,14 +235,12 @@ pub(crate) fn lower_method(
     let cfg = cfg::build_cfg(body).map_err(|_| {
         TranslationError::Unsupported("method control flow (irreducible or undefined label)")
     })?;
-    // `viper::cfg` now identifies loops instead of rejecting them, but nothing
-    // here consumes that structure yet: the cut (establish the invariant, havoc,
-    // re-inhale into an empty heap, exhale on the back edge) is not wired, so
-    // lowering a back edge would silently produce a heap that never accounts for
-    // the loop. Reject until then.
-    // TODO(loops): remove once the loop cut lands; see design/loops/PLAN.md.
-    if !cfg.loops.is_empty() {
-        return Err(TranslationError::Unsupported("loop"));
+    // TODO(loops): an out edge (`break`, early `return`) must union the body's
+    // live heap with the frame the head set aside; that needs `HeapInst::Union`
+    // (stage 6). Until then a loop may only be left by its own guard.
+    if let Some((from, to)) = first_out_edge(&cfg) {
+        let _ = (from, to);
+        return Err(TranslationError::Unsupported("break out of a loop"));
     }
 
     let mut sink = Sink::new(0, 0);
@@ -510,13 +508,49 @@ pub(crate) fn lower_method(
             }
         };
 
+        // --- loop head: cut the back edge ---------------------------------
+        // Establish the invariant from the (single) forward predecessor's heap,
+        // keep the residual as the frame, havoc everything the body writes, then
+        // rebuild the entry heap from the invariant alone. Anything the
+        // invariant does not mention stays in the frame, untouched — which is
+        // the whole framing story, and it falls out of permission arithmetic
+        // rather than any modifies analysis.
+        let mut env = env;
+        let h_in = if let Some(l) = cfg.loops.at_head(bid) {
+            let mark = sink.insts.len();
+            let invs = cfg.blocks[bid].invs.clone();
+            let h_in = sink.with_conds(&pc, |sink| {
+                let old = pure_exp::OldHeaps {
+                    baseline,
+                    labeled: &labeled,
+                };
+                // Established at the *pre*-havoc values: this is the entry
+                // obligation, about the state control actually arrives in.
+                let _frame = lower_invariant(b, &env, sink, h_in, &invs, true, &old)?;
+                // TODO(loops): `_frame` is the exit heap for out edges (`break`,
+                // early `return`) — needs `HeapInst::Union`, see stage 6.
+                for name in loop_written_vars(&cfg, l) {
+                    if let Some(ty) = var_types.get(&name) {
+                        let v = sink.emit_pure(ty.clone(), PureInst::Fresh);
+                        env.insert(name, v);
+                    }
+                }
+                // The body's heap *is* the invariant: an empty heap plus what the
+                // invariant grants, at the havoc'd values.
+                lower_invariant(b, &env, sink, HeapVal::Empty, &invs, false, &old)
+            })?;
+            real_join.extend(sink.take_since(mark));
+            h_in
+        } else {
+            h_in
+        };
+
         // `label L` captures the heap at block entry for later `old[L]`.
         if let Some(l) = cfg.blocks[bid].label {
             labeled.insert(l, h_in);
         }
 
         // --- body phase: lower the block's statements and terminator under pc ---
-        let mut env = env;
         let blk = &cfg.blocks[bid];
         let body_mark = sink.insts.len();
         // Fork model: push the cube as `Cube` (guards obligations, does NOT gate
@@ -572,6 +606,20 @@ pub(crate) fn lower_method(
                             !is_ctx,
                         );
                     }
+                    None
+                }
+                // A back edge re-establishes the invariant and stops. Nothing
+                // flows out: `Cfg::predecessors` excludes back edges, so this
+                // block is a leaf and no successor ever reads `heap`. Matching
+                // Silicon, the residual is not required to be empty — permission
+                // left over at the back edge is simply lost.
+                Terminator::Goto(t) if cfg.loops.is_back_edge(bid, *t) => {
+                    let old = pure_exp::OldHeaps {
+                        baseline,
+                        labeled: &labeled,
+                    };
+                    let invs = &cfg.blocks[*t].invs;
+                    heap = lower_invariant(b, &env, sink, heap, invs, true, &old)?;
                     None
                 }
                 Terminator::Goto(_) => None,
@@ -631,6 +679,85 @@ fn collect_var_types(
             _ => {}
         }
     }
+}
+
+/// The first edge that leaves a loop other than by the head's own guard — a
+/// `break` or an early `return` from inside a body.
+///
+/// The head's guard edge leaves the loop too, but from the head itself, where
+/// the frame is still in hand; those are the ones the cut already handles.
+fn first_out_edge(cfg: &cfg::Cfg) -> Option<(BlockId, BlockId)> {
+    for (id, blk) in cfg.blocks.iter_enumerated() {
+        for succ in cfg::successors_of(&blk.term) {
+            if cfg.loops.at_head(id).is_none() && cfg.loops.classify(id, succ).is_exit() {
+                return Some((id, succ));
+            }
+        }
+    }
+    None
+}
+
+/// Inhale or exhale a loop invariant against `heap`, clause by clause in source
+/// order (which is what makes self-framing order-dependent, exactly as for a
+/// conjunction). Mirrors the `S::Inhale` / `S::Exhale` arms of [`lower_stmt`]:
+/// an inhale assumes the assertion's boolean, an exhale asserts it against the
+/// pre-exhale heap.
+fn lower_invariant(
+    b: &TranslationContext<'_>,
+    env: &HashMap<Spur, Val>,
+    sink: &mut Sink,
+    heap: HeapVal,
+    invs: &[typed::SpatialMethodExp],
+    exhale: bool,
+    old: &pure_exp::OldHeaps<'_>,
+) -> Result<HeapVal, TranslationError> {
+    let mut heap = heap;
+    for inv in invs {
+        let mode = if exhale {
+            SpatialMode::Exhale { value_heap: heap }
+        } else {
+            SpatialMode::Inhale
+        };
+        let pre = heap;
+        let (h_out, bv) = spatial::lower_spatial(b, env, sink, heap, mode, Some(old), inv)?;
+        if let Some(v) = bv {
+            if exhale {
+                sink.with_heap(pre, |sink| sink.emit_assert(v));
+            } else {
+                sink.emit_assume(v);
+            }
+        }
+        heap = h_out;
+    }
+    Ok(heap)
+}
+
+/// Every variable a loop body assigns to or declares — the havoc set.
+///
+/// Over-approximating here is sound (a needlessly havoc'd variable only loses
+/// information); under-approximating is not, since a variable the body mutates
+/// would keep its pre-loop value across the cut.
+fn loop_written_vars(cfg: &cfg::Cfg, l: &cfg::Loop) -> HashSet<Spur> {
+    let mut out = HashSet::new();
+    for bid in &l.body {
+        for stmt in &cfg.blocks[*bid].stmts {
+            match stmt {
+                typed::Statement::Var(idents, _) => {
+                    out.extend(idents.iter().map(|i| i.name.0));
+                }
+                typed::Statement::Assign(lhss, _) => {
+                    out.extend(lhss.iter().filter_map(|l| match l {
+                        typed::AssignLhs::Var(i) => Some(i.0),
+                        // A field assignment mutates the heap, which the
+                        // invariant's permissions already account for.
+                        typed::AssignLhs::Field(..) => None,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn lower_stmt(

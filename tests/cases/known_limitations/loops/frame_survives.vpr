@@ -1,6 +1,8 @@
-// KNOWN LIMITATION: loops unsupported. `viper/cfg.rs` rejects the back edge
-// (`CfgError::Loop`); `typecheck` rejects `while`. Silicon verifies this program.
-// Fixed by: stages 1-4. Tracking: design/loops/PLAN.md (branch `loop-support`).
+// KNOWN LIMITATION: the loop cut works; this fails on the pre-existing
+// integer-range arithmetic gap. The same obligation fails with no loop at
+// all (`0 <= i && i <= n`, `assume i < n` |- `i + 1 <= n`), so nothing here
+// is loop-specific. Silicon verifies this program.
+// Tracking: design/loops/PLAN.md; project_panic_freedom_boundary (tier-C).
 
 // The frame — everything the invariant does not mention — is preserved
 // across the loop verbatim, values included. `other.f` is never named in the

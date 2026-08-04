@@ -30,6 +30,9 @@ use crate::viper::typed::{PureMethodExp, SpatialMethodExp, Statement, StmtBlock}
 /// The loop structure of a method body, over its block ids.
 pub type Loops = crate::viper::loops::Loops<BlockId>;
 
+/// One natural loop of a method body.
+pub type Loop = crate::viper::loops::Loop<BlockId>;
+
 /// Index of a basic block within a [`Cfg`].
 #[derive(Debug, From, Into, Eq, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct BlockId(pub usize);
@@ -430,6 +433,11 @@ fn retarget(term: &mut Terminator, from: BlockId, to: BlockId) {
         }
         Terminator::Return => {}
     }
+}
+
+/// The blocks a terminator transfers control to.
+pub fn successors_of(t: &Terminator) -> Vec<BlockId> {
+    successors(t)
 }
 
 fn successors(t: &Terminator) -> Vec<BlockId> {
