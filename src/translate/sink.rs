@@ -277,6 +277,23 @@ impl Sink {
         v
     }
 
+    /// Emit a pure instruction into a temp allocated **before** the instruction is
+    /// built. A `forall` needs this: its body shares this temp space and is
+    /// numbered from its own step's temp, so the temp has to exist first (see
+    /// [`Forall`](crate::vmir::Forall)).
+    ///
+    /// Deliberately un-memoized. A memo hit would hand back some earlier temp,
+    /// while the body just lowered was numbered against `v` — the same reason
+    /// `Fresh` is carved out of [`Sink::emit_pure`].
+    pub fn emit_pure_at(&mut self, v: &Val, ty: vmir::Type, inst: PureInst) {
+        debug_assert!(
+            matches!(v, Val::Temp(i) if *i + 1 == self.val_base + self.val_count),
+            "emit_pure_at must fill the most recently allocated temp"
+        );
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
+    }
+
     /// Emit a pure instruction whose side condition (e.g. `Deref` permission,
     /// `Div`/`Mod` divisor) must hold under the running path condition. A
     /// `Div`/`Mod` has no embedded heap, so it snapshots the current check-in heap

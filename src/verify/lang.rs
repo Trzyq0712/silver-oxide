@@ -65,10 +65,11 @@ pub enum Symbolic {
     /// (so two alpha-equivalent `forall`s with the same captures are one
     /// e-class).
     ///
-    /// The trigger is deliberately **not** part of the identity: it is operational
-    /// (when to instantiate), not propositional. Trigger sets are unioned on the
-    /// recipe entry instead, so two foralls denoting the same proposition share an
-    /// e-class. Instantiation adds the guarded clause
+    /// Triggers *are* part of a recipe's identity: they are validated, never
+    /// inferred, so two `forall`s that denote the same proposition but were written
+    /// with different patterns stay separate recipes — pooling their trigger sets
+    /// would instantiate one on a pattern its author never wrote.
+    /// Instantiation adds the guarded clause
     /// `Ite(forall, body[caps, σ], true) == true`, so the instance is released only
     /// once this node merges `true`.
     Forall(RecipeId, Box<[Id]>),

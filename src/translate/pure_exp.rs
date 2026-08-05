@@ -560,12 +560,16 @@ impl PureExt for typed::AxiomExt {
 }
 
 /// Lower a pure `forall` into an inline [`PureInst::Forall`] step of the
-/// enclosing stream: a boolean value whose captures are the enclosing values its
-/// body and triggers reference. The body is lowered in an inner sink with the
-/// captures as `Val::Temp(0..n_caps)` and the bound variables as
-/// `Temp(n_caps..n_caps + n)`, so a nested `forall` is simply a `PureInst::Forall`
-/// of *that* stream, capturing this level's binders — no id budget, no
-/// declaration lifting.
+/// enclosing stream. Capture is **implicit**: the body is lowered in an inner sink
+/// that continues *this* sink's temp numbering, so a free identifier resolves
+/// through the enclosing `env` to the very temp it already has — nothing to
+/// collect, nothing to remap.
+///
+/// The step's own temp `p` is allocated first, since the body is numbered from it
+/// (`binder_base == p + 1`, see [`vmir::Forall`]). This sink's counter is left at
+/// `p + 1`, so the enclosing stream shadows the body's temps rather than skipping
+/// past them; the two scopes never overlap in time, so that is sound and it keeps
+/// the verifier's positional value table dense.
 fn lower_forall(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
@@ -573,38 +577,21 @@ fn lower_forall(
     q: &typed::Forall,
 ) -> Result<Val, TranslationError> {
     let n = q.bound.len();
-    let mut bound = Vec::with_capacity(n);
-    let mut binder_idx: HashMap<Spur, usize> = HashMap::new();
+    let bound: Vec<vmir::Type> = q.bound.iter().map(|bv| b.lower_type(&bv.ty)).collect();
+
+    // The step's temp, then the frame it opens.
+    let step = sink.next_val_temp();
+    let Val::Temp(p) = step else {
+        unreachable!("next_val_temp yields a temp")
+    };
+    let binder_base = p + 1;
+
+    // The body's environment: the enclosing one, with the binders bound to the
+    // frame's leading temps. Shadowing an enclosing name is exactly what `insert`
+    // does here, and matches Silver's scoping.
+    let mut inner_env = env.clone();
     for (k, bv) in q.bound.iter().enumerate() {
-        binder_idx.insert(bv.name.0, k);
-        bound.push(b.lower_type(&bv.ty));
-    }
-
-    // Capture discovery: the free identifiers of the trigger terms and the body,
-    // in first-appearance order — triggers first, so their captures get the
-    // smallest indices. A doubly-nested `forall`'s captures of *this* level's
-    // variables surface here too (they are free in this body), so every level
-    // captures exactly what its subtree needs.
-    let mut captures: Vec<(Spur, vmir::Type)> = Vec::new();
-    let mut cap_idx: HashMap<Spur, usize> = HashMap::new();
-    {
-        let mut scope: Vec<Spur> = binder_idx.keys().copied().collect();
-        for group in &q.triggers {
-            for term in group {
-                collect_captures(b, term, &mut scope, &mut captures, &mut cap_idx);
-            }
-        }
-        collect_captures(b, &q.body, &mut scope, &mut captures, &mut cap_idx);
-    }
-    let n_caps = captures.len();
-
-    // The capture arguments: each capture resolved in the enclosing environment.
-    let mut cap_args = Vec::with_capacity(n_caps);
-    for (name, _) in &captures {
-        let v = env
-            .get(name)
-            .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(name).to_string()))?;
-        cap_args.push(v.clone());
+        inner_env.insert(bv.name.0, Val::Temp(binder_base + k));
     }
 
     // Trigger groups: alternatives, each a conjunctive multi-pattern. Typecheck
@@ -614,25 +601,16 @@ fn lower_forall(
     for group in &q.triggers {
         let terms = group
             .iter()
-            .map(|t| lower_trig_term(b, t, &binder_idx, &cap_idx))
+            .map(|t| lower_trig_term(b, t, &inner_env))
             .collect::<Result<Vec<_>, _>>()?;
         triggers.push(vmir::QuantTrigger {
             terms: terms.into(),
         });
     }
 
-    // The quantifier body's environment: captures then binders.
-    let mut inner_env: HashMap<Spur, Val> = HashMap::new();
-    for (c, (name, _)) in captures.iter().enumerate() {
-        inner_env.insert(*name, Val::Temp(c));
-    }
-    for (k, bv) in q.bound.iter().enumerate() {
-        inner_env.insert(bv.name.0, Val::Temp(n_caps + k));
-    }
-
-    // Lower the body in an inner sink whose params (captures ++ binders) occupy
-    // `Val::Temp(0..n_caps + n)`.
-    let mut inner = Sink::new(n_caps + n, 0);
+    // Lower the body in an inner sink whose params (everything up to and including
+    // the binders) occupy `Val::Temp(0..binder_base + n)`.
+    let mut inner = Sink::new(binder_base + n, 0);
     let hctx = HeapCtx {
         value: HeapVal::Empty,
         perm: HeapVal::Empty,
@@ -646,105 +624,46 @@ fn lower_forall(
         res,
     };
 
-    Ok(sink.emit_pure(
+    sink.emit_pure_at(
+        &step,
         vmir::Type::Bool,
         PureInst::Forall(Box::new(vmir::Forall {
-            captures: cap_args,
-            cap_types: captures.into_iter().map(|(_, ty)| ty).collect(),
+            binder_base,
             bound: bound.into(),
             triggers: triggers.into(),
             body,
         })),
-    ))
+    );
+    Ok(step)
 }
 
-/// Collect the free identifiers of `exp` — those bound neither in `scope` nor
-/// by any construct on the path to their occurrence — into `captures`/`cap_idx`
-/// in first-appearance order, with their lowered types. Descends nested
-/// `forall`s (extending the scope with their binders; their triggers and body
-/// may reference this level's variables) and `let` bindings.
-fn collect_captures(
-    b: &TranslationContext<'_>,
-    exp: &typed::TypedPureExp<typed::AxiomExt>,
-    scope: &mut Vec<Spur>,
-    captures: &mut Vec<(Spur, vmir::Type)>,
-    cap_idx: &mut HashMap<Spur, usize>,
-) {
-    use typed::PureExpKind as P;
-    match exp.exp.as_ref() {
-        P::Ident(id) => {
-            if !scope.contains(&id.0) && !cap_idx.contains_key(&id.0) {
-                cap_idx.insert(id.0, captures.len());
-                captures.push((id.0, b.lower_type(&exp.ty)));
-            }
-        }
-        P::Const(_) => {}
-        P::Unary(_, e) | P::AdtDestructor(e, _) | P::AdtDiscriminator(e, _) => {
-            collect_captures(b, e, scope, captures, cap_idx)
-        }
-        P::Binary(_, l, r) => {
-            collect_captures(b, l, scope, captures, cap_idx);
-            collect_captures(b, r, scope, captures, cap_idx);
-        }
-        P::Ternary { if_, then, else_ } => {
-            collect_captures(b, if_, scope, captures, cap_idx);
-            collect_captures(b, then, scope, captures, cap_idx);
-            collect_captures(b, else_, scope, captures, cap_idx);
-        }
-        P::LetIn { binder, value, exp } => {
-            collect_captures(b, value, scope, captures, cap_idx);
-            scope.push(binder.0);
-            collect_captures(b, exp, scope, captures, cap_idx);
-            scope.pop();
-        }
-        P::DomainFunctionCall(call) | P::AdtConstructor(call) => {
-            for a in &call.args {
-                collect_captures(b, a, scope, captures, cap_idx);
-            }
-        }
-        P::Ext(typed::AxiomExt::FunctionCall(call)) => {
-            for a in &call.args {
-                collect_captures(b, a, scope, captures, cap_idx);
-            }
-        }
-        P::Ext(typed::AxiomExt::Forall(inner)) => {
-            let depth = scope.len();
-            scope.extend(inner.bound.iter().map(|bv| bv.name.0));
-            for group in &inner.triggers {
-                for t in group {
-                    collect_captures(b, t, scope, captures, cap_idx);
-                }
-            }
-            collect_captures(b, &inner.body, scope, captures, cap_idx);
-            scope.truncate(depth);
-        }
-    }
-}
-
-/// Lower one trigger term into its VMIR pattern tree. A variable resolves to the
-/// binder it names (`Bound`) or to its capture slot (`Capture` — every free
-/// variable of a trigger was assigned one during capture discovery); a literal to
-/// `Lit`; anything else is an application, lowered to the same head the body's
-/// `PureInst` would produce, with its arguments lowered recursively (a trigger
-/// may nest arbitrarily). Shapes outside this grammar were rejected at typecheck
-/// (`check_triggers`).
+/// Lower one trigger term into its VMIR pattern tree. A variable resolves through
+/// `env` to the temp it names — a binder or an enclosing value, told apart later
+/// by `binder_base` alone; a literal to `Lit`; anything else is an application,
+/// lowered to the same head the body's `PureInst` would produce, with its
+/// arguments lowered recursively (a trigger may nest arbitrarily). Shapes outside
+/// this grammar were rejected at typecheck (`check_triggers`).
 fn lower_trig_term(
     b: &TranslationContext<'_>,
     term: &typed::TypedPureExp<typed::AxiomExt>,
-    binder_idx: &HashMap<Spur, usize>,
-    cap_idx: &HashMap<Spur, usize>,
+    env: &HashMap<Spur, Val>,
 ) -> Result<vmir::TrigTerm, TranslationError> {
     use typed::PureExpKind as P;
     let lower_args = |args: &[typed::TypedPureExp<typed::AxiomExt>]| {
         args.iter()
-            .map(|a| lower_trig_term(b, a, binder_idx, cap_idx))
+            .map(|a| lower_trig_term(b, a, env))
             .collect::<Result<Vec<_>, _>>()
     };
     match term.exp.as_ref() {
-        P::Ident(id) => Ok(match binder_idx.get(&id.0) {
-            Some(&i) => vmir::TrigTerm::Bound(i),
-            None => vmir::TrigTerm::Capture(cap_idx[&id.0]),
-        }),
+        P::Ident(id) => match env.get(&id.0) {
+            Some(Val::Temp(k)) => Ok(vmir::TrigTerm::Var(*k)),
+            // A trigger variable bound to a literal cannot happen: `env` maps
+            // params, locals and binders, all of them temps.
+            Some(Val::Literal(lit)) => Ok(vmir::TrigTerm::Lit(lit.clone())),
+            None => Err(TranslationError::UnknownIdent(
+                b.interner.resolve(&id.0).to_string(),
+            )),
+        },
         P::Const(lit) => Ok(vmir::TrigTerm::Lit(lower_literal(lit)?)),
         P::DomainFunctionCall(call) | P::Ext(typed::AxiomExt::FunctionCall(call)) => {
             let function = *b.name_map.get(&call.name.0).ok_or_else(|| {
@@ -780,7 +699,7 @@ fn lower_trig_term(
                     field,
                 },
                 type_args: adt_type_args(b, &base.ty),
-                args: Box::new([lower_trig_term(b, base, binder_idx, cap_idx)?]),
+                args: Box::new([lower_trig_term(b, base, env)?]),
             })
         }
         // `{ e.isCons }` triggers on the tag application the discriminator reads
@@ -794,7 +713,7 @@ fn lower_trig_term(
                     adt: b.name_map[&adt_spur],
                 },
                 type_args: adt_type_args(b, &base.ty),
-                args: Box::new([lower_trig_term(b, base, binder_idx, cap_idx)?]),
+                args: Box::new([lower_trig_term(b, base, env)?]),
             })
         }
         P::Unary(..)

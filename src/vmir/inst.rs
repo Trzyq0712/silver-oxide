@@ -77,6 +77,23 @@ impl Inst {
             kind,
         }
     }
+
+    /// Visit every `Val` this instruction reads, path condition included, in
+    /// source order. A nested `forall` is descended into: its triggers and body
+    /// mention temps of *this* stream, which is what makes implicit capture work
+    /// across nesting levels (see [`Forall::free_temps`](crate::vmir::Forall)).
+    pub fn for_each_operand(&self, f: &mut impl FnMut(&Val)) {
+        for (v, _) in &self.pc.conds {
+            f(v);
+        }
+        match &self.kind {
+            InstKind::Pure(_, pi) => pi.for_each_operand(f),
+            InstKind::Assume(v) | InstKind::Assert(v) | InstKind::Refute(v) => f(v),
+            // Heap instructions cannot occur in a quantifier body, the only place
+            // operand walking is used today.
+            InstKind::Heap(_) => {}
+        }
+    }
 }
 
 // ======================

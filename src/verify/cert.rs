@@ -492,7 +492,7 @@ fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
 }
 
 /// Rebuild a pure recipe step with each `Val` operand translated by `tr`.
-fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomInst {
+pub(crate) fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomInst {
     match inst {
         AxiomInst::Val(p) => AxiomInst::Val(match p {
             AxiomPure::Binary(op, l, r) => AxiomPure::Binary(*op, tr(l), tr(r)),

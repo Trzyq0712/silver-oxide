@@ -174,9 +174,39 @@ pub enum PureInst {
         base: Val,
     },
     /// An inline, nestable pure `forall` (see [`Forall`](crate::vmir::Forall)).
-    /// Produces the quantified `Bool`; its captures are values of *this* temp
-    /// space, its body a self-contained stream in its own.
+    /// Produces the quantified `Bool`. Its body shares *this* temp space —
+    /// capture is implicit, so a free occurrence is just the enclosing temp.
     Forall(Box<crate::vmir::Forall>),
+}
+
+impl PureInst {
+    /// Visit every `Val` operand, in source order. A `Forall` yields the enclosing
+    /// temps its triggers and body mention (its own binders and steps stay
+    /// inside), which is exactly its implicit capture list.
+    pub fn for_each_operand(&self, f: &mut impl FnMut(&Val)) {
+        match self {
+            PureInst::Fresh => {}
+            PureInst::Binary(_, l, r) => {
+                f(l);
+                f(r);
+            }
+            PureInst::Ternary(c, t, e) => {
+                f(c);
+                f(t);
+                f(e);
+            }
+            PureInst::RealCast(v)
+            | PureInst::Deref(_, v)
+            | PureInst::Perm(_, v)
+            | PureInst::AdtProj { base: v, .. }
+            | PureInst::AdtTag { base: v, .. } => f(v),
+            PureInst::FunctionCall(fc) => fc.args.iter().for_each(&mut *f),
+            PureInst::Snap { args, .. } | PureInst::AdtCons { args, .. } => {
+                args.iter().for_each(&mut *f)
+            }
+            PureInst::Forall(q) => q.free_temps().iter().for_each(|k| f(&Val::Temp(*k))),
+        }
+    }
 }
 
 // ======================

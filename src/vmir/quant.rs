@@ -4,33 +4,96 @@ use std::fmt::{self, Display, Formatter};
 
 /// A pure `forall`, **inline** in the enclosing instruction stream (it is an
 /// ordinary [`PureInst`](crate::vmir::PureInst) producing a `Bool`, not a
-/// declaration). Closure-converted: `captures` are values of the *enclosing*
-/// temp space — every outer-scope term the body or the triggers mention — and
-/// the body reads them back as its own leading temps.
+/// declaration). Capture is **implicit**: the body shares the enclosing temp
+/// space, so a free occurrence of an outer value is simply that value's temp —
+/// there is no capture list to build or keep in sync.
 ///
-/// The body is a pure, heap-free inst stream whose `res` is the quantified
-/// boolean. Its temps are the captures (`Val::Temp(0..captures.len())`), then
-/// the binders (`Temp(n_caps..n_caps + bound.len())`), then its own steps.
+/// Let `p` be the temp of the `forall` step itself. It is allocated *before* the
+/// body is lowered, which makes it the scope boundary:
+///
+/// | temp | meaning |
+/// |---|---|
+/// | `< p` | free — an enclosing value (this is the capture) |
+/// | `p` | the quantifier's own boolean; never referenced from inside |
+/// | `binder_base .. binder_base + bound.len()` | a binder |
+/// | `>= binder_base + bound.len()` | a body-local step |
+///
+/// with `binder_base == p + 1`. The enclosing stream resumes numbering at `p + 1`
+/// too, so the body's temps are **shadowed** by whatever follows the quantifier —
+/// ordinary lexical scoping, and harmless because the two scopes never overlap in
+/// time: the body can only mention temps that already exist when the quantifier is
+/// reached.
 ///
 /// Nesting needs no extra mechanism: an inner `forall` is a `PureInst::Forall`
-/// inside the outer's body, with the outer binders and captures as its own
-/// `captures`. The verifier encodes a `forall` as a single e-node (payload = the
-/// compiled body, children = the capture e-classes), so an outer instantiation
-/// materializes the inner quantifier with the outer σ baked into the children.
+/// inside the outer's body, and since its own `binder_base` is larger, the outer's
+/// binders and captures read as *free* to it under the same rule. The verifier
+/// encodes a `forall` as a single e-node (payload = the compiled body, children =
+/// the e-classes of [`Forall::free_temps`]), so an outer instantiation materializes
+/// the inner quantifier with the outer σ baked into the children.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Forall {
-    /// The captured enclosing values, in the enclosing temp space. They occupy
-    /// the body's leading temps.
-    pub captures: Vec<Val>,
-    /// The types of `captures`, positionally.
-    pub cap_types: Box<[Type]>,
-    /// The binder types; they occupy `Val::Temp(captures.len()..)`.
+    /// The first temp this quantifier owns — one past the `forall` step's own
+    /// temp. Redundant with that step's position in the enclosing stream, but kept
+    /// here so a `Forall` is self-contained: it is passed around alone (recipe
+    /// interning, well-definedness checking) with no access to its host.
+    pub binder_base: usize,
+    /// The binder types; binder `i` is `Val::Temp(binder_base + i)`.
     pub bound: Box<[Type]>,
     /// The trigger groups, in source order — **alternatives**: a match of *any*
     /// one of them instantiates the quantifier. Never empty and never inferred:
     /// a `forall` without a usable trigger is a type error.
     pub triggers: Box<[QuantTrigger]>,
     pub body: FunctionBody,
+}
+
+impl Forall {
+    /// One past the last temp this quantifier owns for binders.
+    pub fn step_base(&self) -> usize {
+        self.binder_base + self.bound.len()
+    }
+
+    /// The enclosing temps this quantifier's triggers and body mention, in
+    /// first-appearance order — **triggers first**, so a trigger's variables get
+    /// the leading slots. This is the capture list, derived rather than stored:
+    /// the verifier resolves each entry against the enclosing evaluation state to
+    /// get the e-node's children.
+    ///
+    /// A nested `forall` contributes whatever *its* subtree mentions below **our**
+    /// `binder_base` — the two levels are filtered by the same rule, so an inner
+    /// reference to an outer binder stops here rather than escaping further out.
+    pub fn free_temps(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut visit = |v: &Val| {
+            if let Val::Temp(k) = v
+                && *k < self.binder_base
+                && seen.insert(*k)
+            {
+                out.push(*k);
+            }
+        };
+        for group in self.triggers.iter() {
+            for term in group.terms.iter() {
+                term.for_each_var(&mut visit);
+            }
+        }
+        for inst in &self.body.insts {
+            inst.for_each_operand(&mut visit);
+        }
+        out
+    }
+}
+
+impl TrigTerm {
+    /// Visit every variable position of the pattern, outermost-first, as the
+    /// `Val::Temp` it names.
+    pub fn for_each_var(&self, f: &mut impl FnMut(&Val)) {
+        match self {
+            TrigTerm::Var(k) => f(&Val::Temp(*k)),
+            TrigTerm::Lit(_) => {}
+            TrigTerm::App { args, .. } => args.iter().for_each(|a| a.for_each_var(f)),
+        }
+    }
 }
 
 /// One trigger group — a conjunctive multi-pattern (`{f(x), g(x)}`): the
@@ -42,16 +105,16 @@ pub struct QuantTrigger {
     pub terms: Box<[TrigTerm]>,
 }
 
-/// A trigger pattern term. Matching it against a ground e-class, at a ground
-/// `forall` node: a `Bound(i)` position determines σ(i) = the matched class, a
-/// `Capture(j)` position requires that class to equal the node's `j`-th capture
-/// child, a `Lit` requires the literal, and an `App` requires an application of
-/// that head whose arguments recursively match — so a trigger may nest
-/// arbitrarily (`{f(g(x), c)}`).
+/// A trigger pattern term. A `Var` is a temp of the enclosing space, classified
+/// exactly as the body's operands are (see [`Forall`]): at or above the
+/// quantifier's `binder_base` it is a binder — matching it determines σ — and
+/// below it is a free occurrence, which the match must reproduce. A `Lit`
+/// requires the literal, and an `App` requires an application of that head whose
+/// arguments recursively match, so a trigger may nest arbitrarily
+/// (`{f(g(x), c)}`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TrigTerm {
-    Bound(usize),
-    Capture(usize),
+    Var(usize),
     Lit(crate::vmir::Literal),
     App {
         head: TrigHead,
@@ -79,15 +142,14 @@ pub enum TrigHead {
     },
 }
 
-/// A trigger term, rendered against the enclosing quantifier's capture arity
-/// (`n_caps`): a capture prints as `e{c}`, a binder as `e{n_caps + i}` — the same
-/// variable syntax the body uses.
-impl<'a> Display for VmirDisplay<'a, (usize, &'a TrigTerm)> {
+/// A trigger term, rendered in the enclosing temp syntax: every variable is an
+/// `e{k}`, whether it names a binder or a free enclosing value — the same
+/// notation the body uses, since they share one space.
+impl<'a> Display for VmirDisplay<'a, &'a TrigTerm> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let (n_caps, term) = self.item;
+        let term = self.item;
         match term {
-            TrigTerm::Bound(i) => write!(f, "e{}", n_caps + i),
-            TrigTerm::Capture(c) => write!(f, "e{c}"),
+            TrigTerm::Var(k) => write!(f, "e{k}"),
             TrigTerm::Lit(lit) => write!(f, "{lit}"),
             TrigTerm::App {
                 head,
@@ -121,7 +183,7 @@ impl<'a> Display for VmirDisplay<'a, (usize, &'a TrigTerm)> {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", self.with((n_caps, a)))?;
+                    write!(f, "{}", self.with(a))?;
                 }
                 write!(f, ")")
             }
@@ -129,34 +191,28 @@ impl<'a> Display for VmirDisplay<'a, (usize, &'a TrigTerm)> {
     }
 }
 
-/// An inline `forall`, rendered as a nested block:
+/// An inline `forall`, rendered as a nested block. Free occurrences are just the
+/// enclosing temps — there is no capture list to print:
 ///
 /// ```text
-///   e4: Bool := forall(e0 := e1) e1: Int :: {f(e1)} {
-///     e2: Bool := f(e1)
-///     result: e2
+///   e1: Bool := forall e2: Int :: {f(e0, e2)} {
+///     e3: Bool := f(e0, e2)
+///     result: e3
 ///   }
 /// ```
 ///
-/// The capture bindings map the body's leading temps (`e0..`) to the values they
-/// take in the *enclosing* space; the binders continue the body's numbering.
+/// The binders and the body continue the enclosing numbering from the `forall`
+/// step's own temp (`e1` here), and the enclosing stream resumes at `e2` — so the
+/// nesting, not the numbering, is what tells the two scopes apart.
 impl<'a> Display for VmirDisplay<'a, &'a Forall> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let q = self.item;
-        let n_caps = q.captures.len();
-        write!(f, "forall(")?;
-        for (k, (val, ty)) in q.captures.iter().zip(q.cap_types.iter()).enumerate() {
-            if k > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "e{k}: {} := {val}", self.with(ty))?;
-        }
-        write!(f, ") ")?;
+        write!(f, "forall ")?;
         for (k, ty) in q.bound.iter().enumerate() {
             if k > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "e{}: {}", n_caps + k, self.with(ty))?;
+            write!(f, "e{}: {}", q.binder_base + k, self.with(ty))?;
         }
         // Trigger groups, alternatives side by side: `{f(e1), g(e1)}{h(e1)}`.
         write!(f, " :: ")?;
@@ -166,19 +222,18 @@ impl<'a> Display for VmirDisplay<'a, &'a Forall> {
                 if k > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "{}", self.with((n_caps, term)))?;
+                write!(f, "{}", self.with(term))?;
             }
             write!(f, "}}")?;
         }
         writeln!(f, " {{")?;
-        // The body's own temps continue after the captures and binders,
-        // rendered one nesting level deeper so an inner `forall` indents
-        // further than its parent.
+        // The body's own steps continue after the binders, rendered one nesting
+        // level deeper so an inner `forall` indents further than its parent.
         let body_indent = self.with_nested(()).indent();
         write!(
             f,
             "{}",
-            self.with_nested((n_caps + q.bound.len(), 0usize, &q.body.insts[..]))
+            self.with_nested((q.step_base(), 0usize, &q.body.insts[..]))
         )?;
         writeln!(f, "{body_indent}result: {}", q.body.res)?;
         write!(f, "{}}}", self.indent())

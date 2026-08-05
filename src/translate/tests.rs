@@ -1060,11 +1060,15 @@ domain D {
     );
     let q = axiom_forall(&p, "basic");
     assert_eq!(q.bound.len(), 1, "one binder");
-    assert!(q.captures.is_empty(), "top-level forall captures nothing");
+    assert!(
+        q.free_temps().is_empty(),
+        "top-level forall reads nothing enclosing"
+    );
+    assert_eq!(q.binder_base, 1, "the step's own temp is 0, its binder is 1");
     let foo_id = p.id("foo").expect("missing foo");
     let (head, args) = only_app(only_group(q));
     assert_eq!(*head, vmir::TrigHead::Func(foo_id), "trigger is foo");
-    assert_eq!(args, &[vmir::TrigTerm::Bound(0)], "arg 0 binds bound var 0");
+    assert_eq!(args, &[vmir::TrigTerm::Var(1)], "arg 0 binds the binder");
 
     // The axiom's result is the forall's own value.
     let ax_id = p.id("basic").expect("missing axiom basic");
@@ -1079,7 +1083,7 @@ domain D {
 
     // Display path must not panic and should render the quantifier inline.
     let s = format!("{p}");
-    assert!(s.contains("forall("), "rendered:\n{s}");
+    assert!(s.contains("forall e1: Int ::"), "rendered:\n{s}");
 }
 
 #[test]
@@ -1102,16 +1106,17 @@ method m(x: Int) {
     let [q] = foralls(&insts)[..] else {
         panic!("expected one forall in the method body");
     };
-    assert_eq!(q.captures.len(), 1, "captures the method param x");
-    assert_eq!(&*q.cap_types, &[vmir::Type::Int]);
+    // `x` is the method's `Temp(0)`; the body names it directly, so the derived
+    // capture list is just that temp — no remapping.
+    assert_eq!(q.free_temps(), vec![0], "reads the method param x");
     assert_eq!(q.bound.len(), 1, "one binder");
     let g_id = p.id("g").expect("missing g");
     let (head, args) = only_app(only_group(q));
     assert_eq!(*head, vmir::TrigHead::Func(g_id));
     assert_eq!(
         args,
-        &[vmir::TrigTerm::Capture(0), vmir::TrigTerm::Bound(0)],
-        "trigger is g(capture x, bound i)"
+        &[vmir::TrigTerm::Var(0), vmir::TrigTerm::Var(q.binder_base)],
+        "trigger is g(enclosing x, binder i)"
     );
 }
 
@@ -1137,7 +1142,7 @@ domain D {
         &[vmir::TrigTerm::App {
             head: vmir::TrigHead::Func(g_id),
             type_args: Vec::new(),
-            args: Box::new([vmir::TrigTerm::Bound(0)]),
+            args: Box::new([vmir::TrigTerm::Var(q.binder_base)]),
         }],
         "trigger is f(g(i)) — the binder sits under the nested call"
     );
@@ -1190,7 +1195,7 @@ domain D {
     for (group, name) in q.triggers.iter().zip(["f", "g"]) {
         let (head, args) = only_app(group);
         assert_eq!(*head, vmir::TrigHead::Func(p.id(name).unwrap()));
-        assert_eq!(args, &[vmir::TrigTerm::Bound(0)]);
+        assert_eq!(args, &[vmir::TrigTerm::Var(q.binder_base)]);
     }
 }
 
@@ -1205,11 +1210,12 @@ domain D {
 }
 "#;
     let p = run(input);
-    let (_, args) = only_app(only_group(axiom_forall(&p, "lit")));
+    let q = axiom_forall(&p, "lit");
+    let (_, args) = only_app(only_group(q));
     assert_eq!(
         args,
         &[
-            vmir::TrigTerm::Bound(0),
+            vmir::TrigTerm::Var(q.binder_base),
             vmir::TrigTerm::Lit(vmir::Literal::Int(0.into())),
         ]
     );
@@ -1217,8 +1223,8 @@ domain D {
 
 #[test]
 fn nested_forall_lowers_inside_its_encloser() {
-    // An inner `forall` is a step of the outer's *body*, capturing the outer
-    // binder — closure conversion, no lifting, no id budget.
+    // An inner `forall` is a step of the outer's *body*, reading the outer binder
+    // as an ordinary enclosing temp — implicit capture, no lifting, no id budget.
     let input = r#"
 domain D {
     function g(i: Int, j: Int): Bool
@@ -1228,30 +1234,35 @@ domain D {
     let p = run(input);
     let outer = axiom_forall(&p, "nest");
 
-    // Outer: no captures, one binder, trigger g(i, i).
-    assert!(outer.captures.is_empty(), "outer captures nothing");
+    // Outer: reads nothing enclosing, one binder at `e1`, trigger g(i, i).
+    assert!(outer.free_temps().is_empty(), "outer reads nothing enclosing");
+    assert_eq!(outer.binder_base, 1);
     assert_eq!(outer.bound.len(), 1);
     assert_eq!(
         only_app(only_group(outer)).1,
-        &[vmir::TrigTerm::Bound(0), vmir::TrigTerm::Bound(0)]
+        &[vmir::TrigTerm::Var(1), vmir::TrigTerm::Var(1)]
     );
 
-    // The inner forall lives in the outer's body, capturing the outer binder —
-    // which, with no outer captures, is the outer body's `Temp(0)`.
+    // The inner forall lives in the outer's body and continues its numbering: the
+    // outer's frame is `e1` (binder) + `e2..` (steps), so the inner step is `e2`
+    // and its own binder `e3`. The outer binder `e1` is simply free to it.
     let [inner] = foralls(&outer.body.insts)[..] else {
         panic!("expected the inner forall inside the outer body");
     };
-    assert_eq!(&inner.captures[..], &[vmir::Val::Temp(0)], "captures i");
-    assert_eq!(&*inner.cap_types, &[vmir::Type::Int]);
+    assert_eq!(inner.binder_base, 3);
+    assert_eq!(inner.free_temps(), vec![1], "reads the outer binder");
     assert_eq!(inner.bound.len(), 1);
     assert_eq!(
         only_app(only_group(inner)).1,
-        &[vmir::TrigTerm::Capture(0), vmir::TrigTerm::Bound(0)]
+        &[vmir::TrigTerm::Var(1), vmir::TrigTerm::Var(3)]
     );
 
-    // Display path must not panic and should render the nested block.
+    // Display path must not panic and should render the nested block with no
+    // capture list — a free occurrence is just the enclosing temp.
     let s = format!("{p}");
-    assert!(s.contains("forall(e0: Int := e0)"), "rendered:\n{s}");
+    assert!(s.contains("forall e1: Int ::"), "rendered:\n{s}");
+    assert!(s.contains("forall e3: Int ::"), "rendered:\n{s}");
+    assert!(!s.contains("forall("), "no capture list, rendered:\n{s}");
 }
 
 #[test]
@@ -1281,15 +1292,19 @@ domain D {
         panic!("expected two top-level foralls");
     };
     assert_eq!(*only_app(only_group(first)).0, vmir::TrigHead::Func(g_id));
-    assert!(first.captures.is_empty());
+    assert!(first.free_temps().is_empty());
     assert_eq!(*only_app(only_group(second)).0, vmir::TrigHead::Func(h_id));
-    assert!(second.captures.is_empty());
+    assert!(second.free_temps().is_empty());
+    // Sibling scopes shadow: the second `forall` opens its frame at the temp the
+    // first one's frame already used, because neither reserves.
+    assert_eq!(first.binder_base, 1);
+    assert_eq!(second.binder_base, 2);
 
     let [inner] = foralls(&first.body.insts)[..] else {
         panic!("expected one nested forall in the first");
     };
     assert_eq!(*only_app(only_group(inner)).0, vmir::TrigHead::Func(g_id));
-    assert_eq!(inner.captures.len(), 1, "captures the outer binder");
+    assert_eq!(inner.free_temps(), vec![1], "reads the outer binder");
     assert!(
         foralls(&second.body.insts).is_empty(),
         "the sibling has no nested forall"

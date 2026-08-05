@@ -103,6 +103,25 @@ impl EvalState {
         }
     }
 
+    /// The evaluation state a quantifier body starts from. Capture is implicit —
+    /// the body indexes *this* table directly (see [`vmir::Forall`]) — so the frame
+    /// is this state cut to `binder_base`, with the one slot in between filled by
+    /// `dead`: that is the `forall` step's own boolean, which nothing inside it can
+    /// name. Heaps are dropped; a quantifier body is heap-free by construction.
+    fn frame_for(&self, q: &vmir::Forall, dead: egg::Id) -> Self {
+        let mut frame = Self {
+            vals: self.vals.clone(),
+            val_types: self.val_types.clone(),
+            recipes: self.recipes.clone(),
+            heaps: Vec::new(),
+            dead_heaps: std::collections::HashSet::new(),
+        };
+        frame.vals.resize(q.binder_base, dead);
+        frame.val_types.resize(q.binder_base, Type::Bool);
+        frame.recipes.resize(q.binder_base, None);
+        frame
+    }
+
     fn push_val(&mut self, id: egg::Id, ty: Type, recipe: Option<Val>) {
         self.vals.push(id);
         self.val_types.push(ty);
@@ -384,14 +403,15 @@ fn eval_pure_inst(
         // quantifier e-node with the caller's arguments as capture children.
         PureInst::Forall(q) => {
             let table = std::sync::Arc::clone(ctx.alloc.quant_table());
-            let recipe_id = table
-                .id_of(q)
+            let (recipe_id, free) = table
+                .entry_of(q)
                 .expect("every syntactic forall is interned by FuncRegistry::new");
-            let caps: Box<[egg::Id]> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
+            let recipe_id = *recipe_id;
+            let free: Vec<Val> = free.iter().map(|&k| Val::Temp(k)).collect();
+            let caps: Box<[egg::Id]> = free.iter().map(|v| state.get_val(ctx, v)).collect();
             let id = ctx.add(Symbolic::Forall(recipe_id, caps));
             let recipe = if ctx.recipe.is_some() {
-                let caps: Vec<Val> = q
-                    .captures
+                let caps: Vec<Val> = free
                     .iter()
                     .map(|v| state.require_recipe(v, OPERAND_RECIPE))
                     .collect::<Result<_, _>>()?;
@@ -2747,15 +2767,19 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
 
 /// Resolve a trigger pattern term's heads to verifier `FuncId`s — the same
 /// mapping [`prepare_body`] applies to the corresponding `PureInst`, so a
-/// pattern matches exactly the nodes a body would build.
+/// pattern matches exactly the nodes a body would build — and canonicalize its
+/// variables into recipe space: at or above `binder_base` a variable is a binder
+/// (`Bound`), below it a free enclosing value whose capture slot is `slot`.
 pub(crate) fn prepare_trig_term(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     term: &vmir::TrigTerm,
+    binder_base: usize,
+    slot: &std::collections::HashMap<usize, usize>,
 ) -> crate::verify::rewrite::PreparedTerm {
     use crate::verify::rewrite::PreparedTerm;
     match term {
-        vmir::TrigTerm::Bound(i) => PreparedTerm::Bound(*i),
-        vmir::TrigTerm::Capture(c) => PreparedTerm::Capture(*c),
+        vmir::TrigTerm::Var(k) if *k >= binder_base => PreparedTerm::Bound(k - binder_base),
+        vmir::TrigTerm::Var(k) => PreparedTerm::Capture(slot[k]),
         vmir::TrigTerm::Lit(lit) => PreparedTerm::Lit(lit.clone()),
         vmir::TrigTerm::App {
             head,
@@ -2775,7 +2799,10 @@ pub(crate) fn prepare_trig_term(
             PreparedTerm::App {
                 func,
                 type_args: type_args.iter().cloned().collect(),
-                args: args.iter().map(|a| prepare_trig_term(alloc, a)).collect(),
+                args: args
+                    .iter()
+                    .map(|a| prepare_trig_term(alloc, a, binder_base, slot))
+                    .collect(),
             }
         }
     }
@@ -2793,11 +2820,14 @@ pub(crate) fn prepare_body(
     let mut out = Vec::with_capacity(insts.len());
     for inst in insts {
         // A nested `forall` is a step like any other: it materializes the inner
-        // e-node with the enclosing instance's values as capture children.
+        // e-node with the enclosing instance's values as capture children. Its
+        // capture list is derived (`Forall::free_temps`) and cached on the table by
+        // the innermost-first intern that ran just before this one.
         if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
+            let (recipe, free) = quants.entry_of(q)?;
             out.push(AxiomInst::Forall {
-                recipe: quants.id_of(q)?,
-                caps: q.captures.clone(),
+                recipe: *recipe,
+                caps: free.iter().map(|&k| Val::Temp(k)).collect(),
             });
             continue;
         }
@@ -2867,13 +2897,14 @@ pub(crate) fn prepare_body(
 /// for free, with no seeding policy and no pollution of the real graph: whatever
 /// the binders' fresh values touch dies with the scratch graph.
 ///
-/// The binders become fresh values and the captures keep their real e-classes, so
-/// the body's side conditions are discharged *for an arbitrary binding*. Those
-/// conditions are exactly a pure expression's: `Div`/`Mod` divisors, and the
-/// `assert f#requires(..)` stitched at a call to a contract-bearing function.
-/// Body-local path conditions come along (short-circuit lowering emits them), so
-/// a guard proves its own consequent's WD: `forall x :: {f(x)} x != 0 ==> f(10 / x)`
-/// discharges the division under `<x != 0>`.
+/// The binders become fresh values while every enclosing value keeps its real
+/// e-class, so the body's side conditions are discharged *for an arbitrary
+/// binding*. Those conditions are exactly a pure expression's: `Div`/`Mod`
+/// divisors, and the `assert f#requires(..)` stitched at a call to a
+/// contract-bearing function. Body-local path conditions come along (short-circuit
+/// lowering emits them), so a guard proves its own consequent's WD:
+/// `forall x :: {f(x)} x != 0 ==> f(10 / x)` discharges the division under
+/// `<x != 0>`.
 ///
 /// A nested `forall` is checked recursively here, with its encloser's binders
 /// already fresh, so no WD obligation survives into a recipe — instantiation runs
@@ -2881,7 +2912,7 @@ pub(crate) fn prepare_body(
 fn check_forall_wd(
     ctx: &mut VerifyContext<'_>,
     q: &vmir::Forall,
-    caps: &[egg::Id],
+    host: &EvalState,
     host_pc: &[(egg::Id, Polarity)],
 ) -> Result<(), VerifyError> {
     // `ctx.egraph` is a scratch clone for the duration; the live graph, its
@@ -2889,7 +2920,7 @@ fn check_forall_wd(
     // The certificate recipe (if one is being built) is paused: the WD walk's
     // scratch evaluation must not mirror steps into the host's recipe.
     let recipe = ctx.recipe.take();
-    let res = ctx.with_scratch_graph(|ctx| check_forall_wd_in_scratch(ctx, q, caps, host_pc));
+    let res = ctx.with_scratch_graph(|ctx| check_forall_wd_in_scratch(ctx, q, host, host_pc));
     ctx.recipe = recipe;
     res
 }
@@ -2897,13 +2928,13 @@ fn check_forall_wd(
 fn check_forall_wd_in_scratch(
     ctx: &mut VerifyContext<'_>,
     q: &vmir::Forall,
-    caps: &[egg::Id],
+    host: &EvalState,
     host_pc: &[(egg::Id, Polarity)],
 ) -> Result<(), VerifyError> {
-    let mut state = EvalState::new();
-    for (id, ty) in caps.iter().zip(q.cap_types.iter()) {
-        state.push_val(*id, ty.clone(), None);
-    }
+    // Capture is implicit: the body indexes the *enclosing* value table directly,
+    // so the body's state is that table cut to the quantifier's frame. The one slot
+    // between is the `forall` step's own boolean, which its body cannot mention.
+    let mut state = host.frame_for(q, ctx.true_());
     for ty in q.bound.iter() {
         let fresh = ctx.fresh_symbolic_value(ty.clone());
         state.push_val(fresh, ty.clone(), None);
@@ -2924,12 +2955,7 @@ fn check_forall_wd_in_scratch(
             // A nested quantifier: check it under this level's fresh binders, then
             // build its node like any other step.
             InstKind::Pure(ty, pi @ PureInst::Forall(inner)) => {
-                let inner_caps: Vec<egg::Id> = inner
-                    .captures
-                    .iter()
-                    .map(|v| state.get_val(ctx, v))
-                    .collect();
-                check_forall_wd(ctx, inner, &inner_caps, &pc_lits)?;
+                check_forall_wd(ctx, inner, &state, &pc_lits)?;
                 let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits)?;
                 state.push_val(id, ty.clone(), None);
             }
@@ -3037,8 +3063,7 @@ fn walk_body(
         // needs the path condition — and here it cannot be forgotten by one of the
         // three drivers. Axiom bodies never reach this walk: they stay trusted.
         if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
-            let caps: Vec<egg::Id> = q.captures.iter().map(|v| state.get_val(ctx, v)).collect();
-            if let Err(err) = check_forall_wd(ctx, q, &caps, &pc_lits) {
+            if let Err(err) = check_forall_wd(ctx, q, state, &pc_lits) {
                 let inst_text = inst_text(program);
                 if snap.enabled() {
                     let heaps = display_heaps(state, &inst.kind, heaps_before);

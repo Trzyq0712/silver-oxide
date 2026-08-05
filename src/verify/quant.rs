@@ -3,14 +3,20 @@
 //! by a [`RecipeId`] that rides in the payload of a
 //! [`Symbolic::Forall`](crate::verify::lang::Symbolic::Forall) e-node.
 //!
+//! A VMIR `forall` body shares its *enclosing* temp space (capture is implicit,
+//! see [`vmir::Forall`]); a recipe lives in a canonical `caps ++ binders ++ steps`
+//! space. [`intern`] does that renaming, which is what makes the same quantifier
+//! stated at two program points one entry — and what turns the derived capture
+//! list into the node's children.
+//!
 //! The table is built **before any verification unit runs** (`verify::verify`) and
 //! frozen thereafter: instantiation can materialize new forall *nodes* mid-run
 //! (an outer instance builds its inner quantifier with the outer σ as capture
-//! children) but never a new *recipe* — nesting is closure-converted at
-//! translation, so the inner body is already interned. That is what lets the
-//! single instantiation rule hold a plain `Arc` snapshot of the table with no
-//! staleness risk: egg cannot inject rules into a running `Runner`, but it does
-//! see a new *e-node* on the next iteration.
+//! children) but never a new *recipe* — a nested body is interned innermost-first
+//! along with its encloser. That is what lets the single instantiation rule hold a
+//! plain `Arc` snapshot of the table with no staleness risk: egg cannot inject
+//! rules into a running `Runner`, but it does see a new *e-node* on the next
+//! iteration.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,26 +32,35 @@ use crate::vmir::{self, InstKind, PureInst, Val};
 
 /// A compiled `forall` body: the pure steps, the boolean result, the binder arity,
 /// and the trigger groups (alternatives — a match of any one instantiates).
-/// Temps: the captures first (they are the node's children, so their count is the
-/// node's arity), then the `n_bound` binders (σ), then one per step.
+///
+/// A recipe lives in a **canonical** temp space, independent of the program point
+/// the quantifier was stated at: the captures first (they are the node's children,
+/// so `n_caps` is the node's arity), then the `n_bound` binders (σ), then one per
+/// step. [`intern`] renames the VMIR body — which shares its *enclosing* space, see
+/// [`vmir::Forall`] — into it, which is what makes two structurally identical
+/// quantifiers at different program points share one entry.
 pub(crate) struct QuantRecipe {
+    /// The capture arity: the number of enclosing values the body reads, hence the
+    /// arity of every `Symbolic::Forall` node naming this recipe.
+    pub(crate) n_caps: usize,
     pub(crate) n_bound: usize,
     /// Alternative trigger groups; each group is a conjunctive multi-pattern.
-    /// Grown when a second `forall` dedups onto this entry with a different
-    /// trigger (triggers are not part of a recipe's identity — see [`BodyKey`]).
     pub(crate) groups: Vec<Vec<PreparedTerm>>,
     pub(crate) insts: Vec<AxiomInst>,
     pub(crate) res: Val,
 }
 
-/// The identity of a recipe — the body, **without** the triggers. Two `forall`s
-/// that denote the same proposition (same body, same arities) share one entry,
-/// hence one e-node, so assuming either releases both trigger sets' instances.
-/// Alpha-equivalence is free: binders are already positional temps.
+/// The identity of a recipe: the canonicalized body **and** its triggers. Two
+/// `forall`s dedup onto one entry only when they denote the same proposition *and*
+/// were written with the same patterns — a body match alone must not pool trigger
+/// sets, or a quantifier silently instantiates on a trigger its author never wrote.
+/// Alpha-equivalence and program-point independence are free: canonicalization has
+/// already made binders and captures positional.
 #[derive(PartialEq, Eq, Hash)]
-struct BodyKey {
+struct RecipeKey {
     n_caps: usize,
     n_bound: usize,
+    groups: Vec<Vec<PreparedTerm>>,
     insts: Vec<AxiomInst>,
     res: Val,
 }
@@ -53,11 +68,13 @@ struct BodyKey {
 #[derive(Default)]
 pub(crate) struct RecipeTable {
     recipes: TiVec<RecipeId, QuantRecipe>,
-    /// Dedup index: body ⟹ recipe. Trigger groups merge onto the hit.
-    by_body: HashMap<BodyKey, RecipeId>,
-    /// Lookup index for the eval walk: the syntactic `forall` ⟹ its recipe. A
-    /// `vmir::Forall` is `Hash + Eq`, so no id bookkeeping is needed on the IR.
-    by_forall: HashMap<vmir::Forall, RecipeId>,
+    /// Dedup index: canonicalized recipe ⟹ id.
+    by_key: HashMap<RecipeKey, RecipeId>,
+    /// Lookup index for the eval walk: the syntactic `forall` ⟹ its recipe and its
+    /// derived capture list ([`vmir::Forall::free_temps`], in the *enclosing* temp
+    /// space). A `vmir::Forall` is `Hash + Eq`, so no id bookkeeping is needed on
+    /// the IR, and caching the free list keeps a re-walked body from rescanning.
+    by_forall: HashMap<vmir::Forall, (RecipeId, Arc<[usize]>)>,
 }
 
 impl RecipeTable {
@@ -73,15 +90,15 @@ impl RecipeTable {
         self.recipes.is_empty()
     }
 
-    /// The recipe of an already-interned `forall`. Every syntactic `forall` is
-    /// interned by [`build_recipe_table`] before any unit is walked, so a miss is
-    /// a bug, not a program error.
-    pub(crate) fn id_of(&self, q: &vmir::Forall) -> Result<RecipeId, VerifyError> {
+    /// The recipe of an already-interned `forall`, with its capture list. Every
+    /// syntactic `forall` is interned by [`build_recipe_table`] before any unit is
+    /// walked, so a miss is a bug, not a program error.
+    pub(crate) fn entry_of(&self, q: &vmir::Forall) -> Result<&(RecipeId, Arc<[usize]>), VerifyError> {
         self.by_forall
             .get(q)
-            .copied()
             .ok_or(VerifyError::Unimplemented("forall recipe not interned"))
     }
+
 }
 
 /// Compile every `forall` in the program into the table, in one pass over all
@@ -129,54 +146,77 @@ fn intern_insts(
 }
 
 /// Compile one `forall` and intern it, **innermost-first**: its nested `forall`s
-/// are interned first, so `prepare_body` can name each of them by id while
-/// compiling this body. Merges the trigger groups into an existing entry when the
-/// body dedups. Idempotent.
+/// are interned first, so this body can name each of them by id (and read back its
+/// capture list) while compiling. Idempotent.
+///
+/// The VMIR body lives in the *enclosing* temp space (capture is implicit); the
+/// recipe lives in the canonical `caps ++ binders ++ steps` space the applier
+/// replays. Canonicalization is the whole job here:
+///
+/// ```text
+///   free:   e0, e2   (Forall::free_temps, triggers first)  -->  t0, t1
+///   binder: e5                          (binder_base = 5)  -->  t2
+///   steps:  e6, e7                                         -->  t3, t4
+/// ```
 fn intern(
     alloc: &mut FuncRegistry,
     table: &mut RecipeTable,
     q: &vmir::Forall,
 ) -> Result<RecipeId, VerifyError> {
     intern_insts(alloc, table, &q.body.insts)?;
+    if let Some((id, _)) = table.by_forall.get(q) {
+        return Ok(*id);
+    }
 
-    let insts = prepare_body(alloc, table, &q.body.insts)?;
+    let free = q.free_temps();
+    let n_caps = free.len();
+    let slot: HashMap<usize, usize> = free.iter().copied().zip(0..).collect();
+    // Canonicalize one operand. Below `binder_base` it is a capture, and its slot
+    // is its position in `free`; at or above, it is a binder or a step, which keep
+    // their order after the captures.
+    let rename = |v: &Val| match v {
+        Val::Temp(k) if *k < q.binder_base => Val::Temp(slot[k]),
+        Val::Temp(k) => Val::Temp(n_caps + (k - q.binder_base)),
+        lit => lit.clone(),
+    };
+
+    let insts: Vec<AxiomInst> = prepare_body(alloc, table, &q.body.insts)?
+        .iter()
+        .map(|i| crate::verify::cert::map_operands(i, &rename))
+        .collect();
     let groups: Vec<Vec<PreparedTerm>> = q
         .triggers
         .iter()
         .map(|g| {
             g.terms
                 .iter()
-                .map(|t| prepare_trig_term(alloc, t))
+                .map(|t| prepare_trig_term(alloc, t, q.binder_base, &slot))
                 .collect()
         })
         .collect();
-    let key = BodyKey {
-        n_caps: q.captures.len(),
+    let res = rename(&q.body.res);
+
+    let key = RecipeKey {
+        n_caps,
         n_bound: q.bound.len(),
+        groups: groups.clone(),
         insts: insts.clone(),
-        res: q.body.res.clone(),
+        res: res.clone(),
     };
-    let id = match table.by_body.get(&key) {
-        Some(&id) => {
-            let entry = &mut table.recipes[id];
-            for g in groups {
-                if !entry.groups.contains(&g) {
-                    entry.groups.push(g);
-                }
-            }
-            id
-        }
+    let id = match table.by_key.get(&key) {
+        Some(&id) => id,
         None => {
             let id = table.recipes.push_and_get_key(QuantRecipe {
+                n_caps,
                 n_bound: q.bound.len(),
                 groups,
                 insts,
-                res: q.body.res.clone(),
+                res,
             });
-            table.by_body.insert(key, id);
+            table.by_key.insert(key, id);
             id
         }
     };
-    table.by_forall.insert(q.clone(), id);
+    table.by_forall.insert(q.clone(), (id, free.into()));
     Ok(id)
 }

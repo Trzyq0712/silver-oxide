@@ -1778,6 +1778,11 @@ impl Applier<Symbolic, ConstFold> for ForallApplier {
         let mut changed = Vec::new();
         for (rid, vals) in instances {
             let recipe = self.table.get(rid);
+            debug_assert_eq!(
+                vals.len(),
+                recipe.n_caps + recipe.n_bound,
+                "instance seed is captures ++ sigma"
+            );
             let res = build_instance(egraph, &recipe.insts, &recipe.res, &vals, &mut changed);
             let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
             let guard = egraph.add(Symbolic::Ite([eclass, res, true_]));

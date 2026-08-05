@@ -2637,6 +2637,76 @@ method m(y: Ref)
 }
 
 #[test]
+fn statements_after_a_forall_shadow_its_body_temps() {
+    // The quantifier's frame is not reserved: the enclosing stream resumes
+    // numbering at `binder_base`, so a later statement reuses the very temps the
+    // body used: `x + 1` here lands on the very temp the binder had. The two scopes
+    // never overlap in time, so both walks resolve their own `Temp(k)` — the body
+    // against the frame, the method against its own table — and the quantifier
+    // still instantiates at the shadowed term.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    function bar(i: Int): Bool
+}
+method m(x: Int) {
+    inhale forall i: Int :: {foo(i)} foo(i)
+    assert foo(3)
+    inhale bar(x + 1)
+    assert bar(x + 1)
+    assert foo(x + 1)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn identical_bodies_with_different_triggers_do_not_pool_them() {
+    // Two quantifiers with the same body but different patterns are separate
+    // recipes: `{foo(i)}` must not start firing on `bar(i)` because someone else
+    // wrote that trigger over the same proposition. Only `bar` is ever applied
+    // here, so the `{foo(i)}` occurrence stays uninstantiated and the goal fails.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    function bar(i: Int): Bool
+    function p(i: Int): Bool
+}
+method m() {
+    inhale forall i: Int :: {foo(i)} p(i)
+    inhale bar(3)
+    assert p(3)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::AssertionFailed)),
+        "expected AssertionFailed (no trigger match), got {result:?}"
+    );
+
+    // The same proposition stated with the trigger that *is* matched does fire —
+    // so the failure above is the trigger, not the encoding.
+    let input = r#"
+domain D {
+    function foo(i: Int): Bool
+    function bar(i: Int): Bool
+    function p(i: Int): Bool
+}
+method m() {
+    inhale forall i: Int :: {bar(i)} p(i)
+    inhale bar(3)
+    assert p(3)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
 fn method_assert_forall_fails_gracefully() {
     // Proving a `forall` goal is out of scope: the occurrence never merges
     // `true`, so the assert fails cleanly (no crash, no unsound success).
