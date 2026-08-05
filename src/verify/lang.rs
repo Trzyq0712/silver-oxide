@@ -89,9 +89,12 @@ pub enum Discriminant {
     /// the full-enode `Eq`/`Hash` in the congruence memo (see [`Symbolic::FuncApp`]).
     FuncApp(FuncId),
     RealCast,
-    /// The recipe alone: one `classes_by_op` bucket per quantifier body, which is
-    /// exactly the index the single instantiation rule scans.
-    Forall(RecipeId),
+    /// Every quantifier, in one `classes_by_op` bucket. The recipe is deliberately
+    /// *not* in the discriminant: the single instantiation rule re-reads each
+    /// matched node for its recipe and captures anyway, so per-recipe bucketing
+    /// bought nothing — and it made the searcher enumerate every recipe in the
+    /// program, including the quantifiers of methods this unit will never touch.
+    Forall,
 }
 
 impl Language for Symbolic {
@@ -108,7 +111,7 @@ impl Language for Symbolic {
             S::Ite(_) => D::Ite,
             S::FuncApp(id, _, _) => D::FuncApp(*id),
             S::RealCast(_) => D::RealCast,
-            S::Forall(r, _) => D::Forall(*r),
+            S::Forall(..) => D::Forall,
         }
     }
 

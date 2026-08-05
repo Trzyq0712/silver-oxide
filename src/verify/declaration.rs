@@ -402,11 +402,9 @@ fn eval_pure_inst(
         // it is a `Forall` step: replayed at each call site, it rebuilds the
         // quantifier e-node with the caller's arguments as capture children.
         PureInst::Forall(q) => {
-            let table = std::sync::Arc::clone(ctx.alloc.quant_table());
-            let (recipe_id, free) = table
-                .entry_of(q)
-                .expect("every syntactic forall is interned by FuncRegistry::new");
-            let recipe_id = *recipe_id;
+            // Compile the quantifier the first time the walk reaches it. Its
+            // capture list is derived, not stored — see `Forall::free_temps`.
+            let (recipe_id, free) = crate::verify::quant::intern_forall(ctx.alloc, q)?;
             let free: Vec<Val> = free.iter().map(|&k| Val::Temp(k)).collect();
             let caps: Box<[egg::Id]> = free.iter().map(|v| state.get_val(ctx, v)).collect();
             let id = ctx.add(Symbolic::Forall(recipe_id, caps));
@@ -2690,11 +2688,13 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
     // materialized *during* saturation (by an outer instantiation, or by a
     // certificate graft) is picked up on the next iteration, which per-quantifier
     // rules structurally could not do (egg forbids mid-run rule injection).
-    if !ctx.alloc.quant_table().is_empty() {
-        let table = std::sync::Arc::clone(ctx.alloc.quant_table());
-        ctx.axiom_rules
-            .push(crate::verify::rewrite::forall_rule(table));
-    }
+    // Registered unconditionally: the table is filled lazily, so "empty right now"
+    // says nothing about whether this unit will state a quantifier. The rule costs
+    // nothing until a `Forall` node exists — its searcher scans one
+    // `classes_by_op` bucket.
+    let table = std::sync::Arc::clone(ctx.alloc.quant_table());
+    ctx.axiom_rules
+        .push(crate::verify::rewrite::forall_rule(table));
     for decl in program.decls.iter() {
         let vmir::Declaration::Axiom(ax) = decl else {
             continue;

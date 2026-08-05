@@ -1,7 +1,7 @@
 //! Structural egg rewrite rules for the verifier.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use egg::{
     Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
@@ -1650,9 +1650,7 @@ fn match_term_anywhere(
 /// recipe — indexed, no whole-graph scan). Quantifiers are *data*, not rules, so
 /// a `forall` materialized mid-run is picked up on the next iteration; egg
 /// forbids injecting rules mid-`Runner`.
-struct ForallSearcher {
-    table: Arc<RecipeTable>,
-}
+struct ForallSearcher;
 
 impl Searcher<Symbolic, ConstFold> for ForallSearcher {
     fn search_with_limit(
@@ -1660,27 +1658,22 @@ impl Searcher<Symbolic, ConstFold> for ForallSearcher {
         egraph: &EGraph<Symbolic, ConstFold>,
         limit: usize,
     ) -> Vec<SearchMatches<'_, Symbolic>> {
-        let mut ms = Vec::new();
-        let mut limit = limit;
-        for rid in self.table.ids() {
-            let Some(classes) = egraph.classes_for_op(&Discriminant::Forall(rid)) else {
-                continue;
-            };
-            for eclass in classes {
-                if limit == 0 {
-                    return ms;
-                }
-                limit -= 1;
-                ms.push(SearchMatches {
-                    eclass,
-                    // One empty subst: the applier reads the node itself (recipe
-                    // + captures), which an egg `Subst` cannot carry.
-                    substs: vec![Subst::default()],
-                    ast: None,
-                });
-            }
-        }
-        ms
+        // Every quantifier shares one `classes_by_op` bucket, so the scan is
+        // proportional to the `forall`s *present in this graph* — not to the
+        // recipes the program happens to contain.
+        let Some(classes) = egraph.classes_for_op(&Discriminant::Forall) else {
+            return Vec::new();
+        };
+        classes
+            .take(limit)
+            .map(|eclass| SearchMatches {
+                eclass,
+                // One empty subst: the applier reads the node itself (recipe
+                // + captures), which an egg `Subst` cannot carry.
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+            .collect()
     }
 
     fn search_eclass_with_limit(
@@ -1714,8 +1707,13 @@ impl Searcher<Symbolic, ConstFold> for ForallSearcher {
 ///
 /// Memoized per `(recipe, caps ++ σ)` (canonicalized at insert) — a saturation-cost
 /// guard only, since instances are idempotent.
+///
+/// The table is interned into as bodies are walked, so this holds it behind the
+/// shared lock rather than a snapshot. Only reads happen here: a nested recipe is
+/// interned innermost-first with its encloser, on the eval walk, never from inside
+/// a rule.
 struct ForallApplier {
-    table: Arc<RecipeTable>,
+    table: Arc<RwLock<RecipeTable>>,
     memo: Arc<Memo<(RecipeId, Vec<Id>)>>,
 }
 
@@ -1739,10 +1737,11 @@ impl Applier<Symbolic, ConstFold> for ForallApplier {
             })
             .collect();
 
+        let table = self.table.read().expect("recipe table lock");
         // Collect the instances first: `build_instance` needs `&mut egraph`.
         let mut instances: Vec<(RecipeId, Vec<Id>)> = Vec::new();
         for (rid, caps) in &quants {
-            let recipe = self.table.get(*rid);
+            let recipe = table.get(*rid);
             let caps: Vec<Id> = caps.iter().map(|&c| egraph.find(c)).collect();
             for group in &recipe.groups {
                 let Some((anchor, rest)) = group.split_first() else {
@@ -1777,7 +1776,7 @@ impl Applier<Symbolic, ConstFold> for ForallApplier {
 
         let mut changed = Vec::new();
         for (rid, vals) in instances {
-            let recipe = self.table.get(rid);
+            let recipe = table.get(rid);
             debug_assert_eq!(
                 vals.len(),
                 recipe.n_caps + recipe.n_bound,
@@ -1801,10 +1800,8 @@ impl Applier<Symbolic, ConstFold> for ForallApplier {
 /// The one rule that instantiates **every** `forall` in the program. Quantifiers
 /// are e-nodes, so this replaces the old per-quantifier, per-trigger-group rule
 /// minting entirely.
-pub(crate) fn forall_rule(table: Arc<RecipeTable>) -> Rule {
-    let searcher = ForallSearcher {
-        table: Arc::clone(&table),
-    };
+pub(crate) fn forall_rule(table: Arc<RwLock<RecipeTable>>) -> Rule {
+    let searcher = ForallSearcher;
     let applier = ForallApplier {
         table,
         memo: Arc::new(Memo::new()),

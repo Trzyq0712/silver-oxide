@@ -75,12 +75,13 @@ pub struct FuncRegistry {
     /// which is why [`FuncRegistry::new`] mints every head eagerly rather than on
     /// first use.
     ctor_head: HashMap<FuncId, MemberId>,
-    /// Every `forall` in the program, compiled once (see
-    /// [`crate::verify::quant`]). Built here — the registry already walks the
-    /// whole program and owns the `FuncId` minting a recipe's steps and triggers
-    /// need — and frozen afterwards, so the single instantiation rule can hold a
-    /// plain `Arc` snapshot.
-    quant_table: std::sync::Arc<crate::verify::quant::RecipeTable>,
+    /// The `forall`s **reached so far**, compiled on demand (see
+    /// [`crate::verify::quant::intern_forall`]). It lives here because interning a
+    /// recipe needs the `FuncId` minting this registry owns. Shared with the single
+    /// instantiation rule, which only reads: a recipe is added on the eval walk,
+    /// never from inside a rule, and egg sees the resulting e-node on the next
+    /// iteration either way.
+    quant_table: std::sync::Arc<std::sync::RwLock<crate::verify::quant::RecipeTable>>,
     /// Verifier cost metrics, accumulated across every unit of the run (the
     /// allocator is the per-run shared state threaded into each `VerifyContext`).
     pub(crate) stats: crate::verify::VerifyStats,
@@ -173,18 +174,16 @@ impl FuncRegistry {
         for head in heads {
             registry.ensure(head);
         }
-        // Compile every `forall` (needs the heads above, since a body or trigger
-        // may mention an ADT op). A quantifier body is pure and heap-free by
-        // construction — typecheck rejects heap/old/perm inside one, and translate
-        // rejects a heap-dependent call — so compiling it cannot fail.
-        registry.quant_table = crate::verify::quant::build_recipe_table(&mut registry, program)
-            .expect("a quantifier body is pure by construction");
         registry
     }
 
-    /// The program's compiled `forall`s. Cheap to clone (`Arc`); frozen once
-    /// [`FuncRegistry::new`] returns.
-    pub(crate) fn quant_table(&self) -> &std::sync::Arc<crate::verify::quant::RecipeTable> {
+    /// The program's compiled `forall`s, filled in **as bodies are walked** —
+    /// a recipe exists only once the quantifier that needs it has been reached.
+    /// Cheap to clone (`Arc`); the single instantiation rule holds the same handle
+    /// and only ever reads through it.
+    pub(crate) fn quant_table(
+        &self,
+    ) -> &std::sync::Arc<std::sync::RwLock<crate::verify::quant::RecipeTable>> {
         &self.quant_table
     }
 

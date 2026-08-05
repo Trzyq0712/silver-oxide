@@ -82,18 +82,21 @@ impl RecipeTable {
         &self.recipes[id]
     }
 
-    pub(crate) fn ids(&self) -> impl Iterator<Item = RecipeId> + '_ {
-        self.recipes.keys()
+    /// How many recipes have been compiled so far — i.e. how many distinct
+    /// quantifiers the run has actually reached. Observes laziness; tests only.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.recipes.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.recipes.is_empty()
-    }
-
-    /// The recipe of an already-interned `forall`, with its capture list. Every
-    /// syntactic `forall` is interned by [`build_recipe_table`] before any unit is
-    /// walked, so a miss is a bug, not a program error.
-    pub(crate) fn entry_of(&self, q: &vmir::Forall) -> Result<&(RecipeId, Arc<[usize]>), VerifyError> {
+    /// The recipe of an already-interned `forall`, with its capture list. A miss is
+    /// a bug: every read is either preceded by [`intern_forall`] on the same
+    /// quantifier, or reads a nested one that its encloser's innermost-first
+    /// interning has already compiled.
+    pub(crate) fn entry_of(
+        &self,
+        q: &vmir::Forall,
+    ) -> Result<&(RecipeId, Arc<[usize]>), VerifyError> {
         self.by_forall
             .get(q)
             .ok_or(VerifyError::Unimplemented("forall recipe not interned"))
@@ -101,35 +104,23 @@ impl RecipeTable {
 
 }
 
-/// Compile every `forall` in the program into the table, in one pass over all
-/// declarations. Bodies are heap-free and pure, so only the pure inst streams
-/// matter.
-pub(crate) fn build_recipe_table(
+/// Compile `q` if it has not been compiled yet, and hand back its recipe id and
+/// derived capture list. This is the *only* way a recipe enters the table, and it
+/// runs on the eval walk — so a quantifier a unit never reaches costs that unit
+/// nothing, and a quantifier stated later in a body cannot be scanned for before
+/// the walk gets there.
+///
+/// The write lock is taken once for the whole (recursive, innermost-first)
+/// operation: `std::sync::RwLock` is not reentrant, and nothing under here touches
+/// the e-graph, so no rule can be running.
+pub(crate) fn intern_forall(
     alloc: &mut FuncRegistry,
-    program: &vmir::Program,
-) -> Result<Arc<RecipeTable>, VerifyError> {
-    let mut table = RecipeTable::default();
-    for decl in program.decls.iter() {
-        match decl {
-            vmir::Declaration::Axiom(ax) => intern_insts(alloc, &mut table, &ax.body.insts)?,
-            vmir::Declaration::Function(f) => {
-                if let Some(body) = &f.body {
-                    intern_insts(alloc, &mut table, &body.insts)?;
-                }
-            }
-            vmir::Declaration::Resource(r) => {
-                if let Some(body) = &r.body {
-                    intern_insts(alloc, &mut table, &body.insts)?;
-                }
-            }
-            // Methods are block-structured; the trigger table is order-agnostic,
-            // so intern the flattened stream (method verification itself is
-            // disconnected on this branch — see `verify_method`).
-            vmir::Declaration::Method(m) => intern_insts(alloc, &mut table, &m.flatten())?,
-            vmir::Declaration::Domain(_) | vmir::Declaration::Adt(_) => {}
-        }
-    }
-    Ok(Arc::new(table))
+    q: &vmir::Forall,
+) -> Result<(RecipeId, Arc<[usize]>), VerifyError> {
+    let table = Arc::clone(alloc.quant_table());
+    let mut table = table.write().expect("recipe table lock");
+    intern(alloc, &mut table, q)?;
+    Ok(table.entry_of(q)?.clone())
 }
 
 fn intern_insts(

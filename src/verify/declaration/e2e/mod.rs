@@ -2637,6 +2637,64 @@ method m(y: Ref)
 }
 
 #[test]
+fn a_forall_is_compiled_only_when_the_walk_reaches_it() {
+    // Recipes are interned on the eval walk, not up front. A quantifier this unit
+    // never reaches costs it nothing — previously every `forall` in the program was
+    // compiled before verification started, and the instantiation rule's searcher
+    // enumerated all of them on every search.
+    let input = r#"
+domain D { function foo(i: Int): Bool }
+method plain() {
+    assert true
+}
+method quantified() {
+    inhale forall i: Int :: {foo(i)} foo(i)
+    assert foo(3)
+}
+"#;
+    let program = lower(input);
+    let method = |name: &str| {
+        let id = program.id(name).expect("missing method");
+        let vmir::Declaration::Method(m) = &program.decls[id] else {
+            panic!("{name} must be a Method");
+        };
+        m
+    };
+    let mut alloc = crate::verify::func_registry::FuncRegistry::new(&program);
+    let recipes = |alloc: &crate::verify::func_registry::FuncRegistry| {
+        alloc.quant_table().read().expect("recipe table lock").len()
+    };
+    assert_eq!(recipes(&alloc), 0, "nothing compiled by registry construction");
+
+    let (certs, fn_certs) = build_all_certs(&program, &mut alloc);
+    verify_method(
+        &program,
+        "plain",
+        method("plain"),
+        &certs,
+        &fn_certs,
+        &mut alloc,
+    )
+    .expect("plain verifies");
+    assert_eq!(
+        recipes(&alloc),
+        0,
+        "another method's quantifier is not this unit's cost"
+    );
+
+    verify_method(
+        &program,
+        "quantified",
+        method("quantified"),
+        &certs,
+        &fn_certs,
+        &mut alloc,
+    )
+    .expect("quantified verifies");
+    assert_eq!(recipes(&alloc), 1, "reached, hence compiled");
+}
+
+#[test]
 fn statements_after_a_forall_shadow_its_body_temps() {
     // The quantifier's frame is not reserved: the enclosing stream resumes
     // numbering at `binder_base`, so a later statement reuses the very temps the
