@@ -404,7 +404,12 @@ fn eval_pure_inst(
         PureInst::Forall(q) => {
             // Compile the quantifier the first time the walk reaches it. Its
             // capture list is derived, not stored — see `Forall::free_temps`.
-            let (recipe_id, free) = crate::verify::quant::intern_forall(ctx.alloc, q)?;
+            // Name resolution rides on copies of the two shared refs, so it does
+            // not borrow `ctx` across the `&mut ctx.alloc`.
+            let (interner, decls) = (ctx.interner, ctx.decls);
+            let names = move |m| crate::verify::context::member_name_in(interner, decls, m);
+            let (recipe_id, free) =
+                crate::verify::quant::intern_forall(ctx.alloc, &names, q)?;
             let free: Vec<Val> = free.iter().map(|&k| Val::Temp(k)).collect();
             let caps: Box<[egg::Id]> = free.iter().map(|v| state.get_val(ctx, v)).collect();
             let id = ctx.add(Symbolic::Forall(recipe_id, caps));
@@ -2810,10 +2815,13 @@ pub(crate) fn prepare_trig_term(
 
 /// Lower an axiom/quantifier body's inst stream into registry-resolved pure
 /// steps (every callee down to its verifier `FuncId`), ready for the applier —
-/// which has no registry access at rule-application time.
+/// which has no registry access at rule-application time. `names` resolves a
+/// member to its source name, needed for the display label of a minted `f%pre`
+/// token (the registry holds no interner).
 pub(crate) fn prepare_body(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     quants: &crate::verify::quant::RecipeTable,
+    names: &dyn Fn(MemberId) -> String,
     insts: &[vmir::Inst],
 ) -> Result<Vec<crate::verify::rewrite::AxiomInst>, VerifyError> {
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
@@ -2831,16 +2839,31 @@ pub(crate) fn prepare_body(
             });
             continue;
         }
+        // A call is two steps, exactly as on the eval walk (`eval_pure_inst`'s
+        // `FunctionCall` arm): the application, plus the callee's `f%pre(args)`
+        // presence token that lets `rewrite::function_rule` unfold its body *here*.
+        // Without the token an instance materializes `f(σ)` opaquely and the callee
+        // never unfolds under the quantifier. The token step occupies no temp slot,
+        // so the application keeps this inst's slot.
+        if let InstKind::Pure(_, PureInst::FunctionCall(fc)) = &inst.kind {
+            let args: Vec<Val> = fc.args.iter().cloned().collect();
+            out.push(AxiomInst::Val(AxiomPure::App {
+                func: crate::verify::func_registry::func_id_for_member(fc.function),
+                type_args: fc.type_args.clone(),
+                args: args.clone(),
+            }));
+            out.push(AxiomInst::Token {
+                func: alloc.fn_pre_token(fc.function, &names(fc.function)),
+                args,
+            });
+            continue;
+        }
         let prepared = match &inst.kind {
             InstKind::Pure(_, pi) => AxiomInst::Val(match pi {
                 PureInst::Binary(op, l, r) => AxiomPure::Binary(*op, l.clone(), r.clone()),
                 PureInst::Ternary(c, t, e) => AxiomPure::Ternary(c.clone(), t.clone(), e.clone()),
                 PureInst::RealCast(v) => AxiomPure::RealCast(v.clone()),
-                PureInst::FunctionCall(fc) => AxiomPure::App {
-                    func: crate::verify::func_registry::func_id_for_member(fc.function),
-                    type_args: fc.type_args.clone(),
-                    args: fc.args.iter().cloned().collect(),
-                },
+                PureInst::FunctionCall(_) => unreachable!("handled above"),
                 PureInst::AdtCons {
                     adt,
                     type_args,

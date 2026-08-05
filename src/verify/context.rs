@@ -13,6 +13,21 @@ use crate::{
 use lasso::{Rodeo, Spur};
 use typed_index_collections::TiVec;
 
+/// Display name for a member id, off a bare `(interner, decls)` pair — the same
+/// resolution [`VerifyContext::member_name`] does, callable where only the two
+/// shared refs are at hand (e.g. under a `&mut ctx.alloc` borrow).
+pub(crate) fn member_name_in(
+    interner: &Rodeo,
+    decls: &TiVec<MemberId, Declaration>,
+    m: MemberId,
+) -> String {
+    if usize::from(m) < decls.len() {
+        interner.resolve(&decls[m].name()).to_string()
+    } else {
+        format!("d{}", m.0)
+    }
+}
+
 pub(crate) struct VerifyContext<'a> {
     pub(crate) egraph: egg::EGraph<Symbolic, ConstFold>,
     /// Static structural rules. The ADT cons/proj/tag reductions are pulled from
@@ -399,11 +414,7 @@ impl<'a> VerifyContext<'a> {
     /// Display name for a member id. Registry-minted ids (outside the interner)
     /// resolve via the registry's name table.
     pub(crate) fn member_name(&self, m: MemberId) -> String {
-        if usize::from(m) < self.decls.len() {
-            self.interner.resolve(&self.decls[m].name()).to_string()
-        } else {
-            format!("d{}", m.0)
-        }
+        member_name_in(self.interner, self.decls, m)
     }
 
     /// Display name for an e-graph function id: a real declaration index resolves

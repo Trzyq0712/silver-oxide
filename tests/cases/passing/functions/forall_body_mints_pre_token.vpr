@@ -1,0 +1,19 @@
+// A function called from a `forall` body must unfold at the instantiation.
+//
+// Instantiating the quantifier at i := y materializes `double(y)` — a node the
+// method body never wrote. Concluding `y + y` from it needs `double`'s body,
+// which the unfold rule only grants where the callee's `double%pre(y)` presence
+// token is present. The body-preparation path (`declaration::prepare_body`) must
+// therefore mint that token alongside the application, exactly as the eval walk
+// does at an ordinary call site.
+function double(x: Int): Int
+{ x + x }
+
+// Uninterpreted, so the trigger fires without itself supplying `double(y)`.
+function id(x: Int): Int
+
+method m(y: Int)
+  requires forall i: Int :: {id(i)} id(i) == double(i)
+{
+  assert id(y) == y + y
+}

@@ -488,6 +488,7 @@ fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
         },
         AxiomInst::Forall { caps, .. } => caps.iter().for_each(f),
         AxiomInst::Assume(v) => f(v),
+        AxiomInst::Token { args, .. } => args.iter().for_each(f),
     }
 }
 
@@ -514,5 +515,9 @@ pub(crate) fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomI
             caps: caps.iter().map(&tr).collect(),
         },
         AxiomInst::Assume(v) => AxiomInst::Assume(tr(v)),
+        AxiomInst::Token { func, args } => AxiomInst::Token {
+            func: *func,
+            args: args.iter().map(&tr).collect(),
+        },
     }
 }

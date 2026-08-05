@@ -1325,7 +1325,19 @@ pub(crate) enum AxiomPure {
 pub(crate) enum AxiomInst {
     Val(AxiomPure),
     Assume(Val),
-    Forall { recipe: RecipeId, caps: Vec<Val> },
+    Forall {
+        recipe: RecipeId,
+        caps: Vec<Val>,
+    },
+    /// A callee's `f%pre(args)` presence token, materialized alongside the
+    /// application it accompanies (the eval walk's `declaration.rs` counterpart
+    /// adds both at a value-position call). Like [`Self::Assume`] it occupies **no**
+    /// temp slot: its value is never read, so temp numbering stays the inst
+    /// numbering of the body it was prepared from.
+    Token {
+        func: FuncId,
+        args: Vec<Val>,
+    },
 }
 
 /// Searcher: any e-class containing an application of the trigger function
@@ -1514,6 +1526,10 @@ fn build_instance_vals_impl(
                 let caps: Box<[Id]> = caps.iter().map(|v| get(egraph, &vals, v)).collect();
                 let id = egraph.add(Symbolic::Forall(*recipe, caps));
                 vals.push(id);
+            }
+            AxiomInst::Token { func, args } => {
+                let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
+                egraph.add(Symbolic::FuncApp(*func, Box::new([]), args));
             }
         }
     }

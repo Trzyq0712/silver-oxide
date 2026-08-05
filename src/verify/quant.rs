@@ -115,22 +115,24 @@ impl RecipeTable {
 /// the e-graph, so no rule can be running.
 pub(crate) fn intern_forall(
     alloc: &mut FuncRegistry,
+    names: &dyn Fn(vmir::MemberId) -> String,
     q: &vmir::Forall,
 ) -> Result<(RecipeId, Arc<[usize]>), VerifyError> {
     let table = Arc::clone(alloc.quant_table());
     let mut table = table.write().expect("recipe table lock");
-    intern(alloc, &mut table, q)?;
+    intern(alloc, &mut table, names, q)?;
     Ok(table.entry_of(q)?.clone())
 }
 
 fn intern_insts(
     alloc: &mut FuncRegistry,
     table: &mut RecipeTable,
+    names: &dyn Fn(vmir::MemberId) -> String,
     insts: &[vmir::Inst],
 ) -> Result<(), VerifyError> {
     for inst in insts {
         if let InstKind::Pure(_, PureInst::Forall(q)) = &inst.kind {
-            intern(alloc, table, q)?;
+            intern(alloc, table, names, q)?;
         }
     }
     Ok(())
@@ -152,9 +154,10 @@ fn intern_insts(
 fn intern(
     alloc: &mut FuncRegistry,
     table: &mut RecipeTable,
+    names: &dyn Fn(vmir::MemberId) -> String,
     q: &vmir::Forall,
 ) -> Result<RecipeId, VerifyError> {
-    intern_insts(alloc, table, &q.body.insts)?;
+    intern_insts(alloc, table, names, &q.body.insts)?;
     if let Some((id, _)) = table.by_forall.get(q) {
         return Ok(*id);
     }
@@ -171,7 +174,7 @@ fn intern(
         lit => lit.clone(),
     };
 
-    let insts: Vec<AxiomInst> = prepare_body(alloc, table, &q.body.insts)?
+    let insts: Vec<AxiomInst> = prepare_body(alloc, table, names, &q.body.insts)?
         .iter()
         .map(|i| crate::verify::cert::map_operands(i, &rename))
         .collect();
