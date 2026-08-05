@@ -1,0 +1,19 @@
+// Companion to passing/loops/half_perm_frame.vpr: the exit union must sum the
+// frame's half and the loop's half to EXACTLY `1/1`, not more. Demanding
+// `1/1 && 1/2` afterwards must not be satisfiable.
+//
+// Must FAIL with insufficient permission.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method half_perm_over_exhale(n: Nat, a: Ref)
+  requires acc(a.f)
+  ensures acc(a.f) && acc(a.f, 1/2)
+{
+    var k: Nat := n
+    while (!k.isZero)
+      invariant acc(a.f, 1/2)
+    {
+        k := k.pred
+    }
+}

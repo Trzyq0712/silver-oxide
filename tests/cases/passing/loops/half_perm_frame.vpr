@@ -1,0 +1,31 @@
+// The invariant takes HALF the permission; the frame keeps the other half. At
+// the exit the two chunks are held SIMULTANEOUSLY (`1/2` each, both provably
+// positive), which is the one case where equating their values is justified —
+// and it is load-bearing: the loop can never reach write permission, so `a.f`
+// genuinely cannot have changed, and the frame's half carries the value across a
+// loop whose invariant says nothing about it.
+//
+// Contrast failing/loops/cond_inv_frame_value.vpr, where the two chunks are held
+// under complementary conditions and the same equality is unsound.
+//
+// Also pins the permission arithmetic: `1/2 + 1/2` must come back as exactly
+// `1/1`, so the full-permission assert succeeds. Over-exhale is covered by
+// half_perm_over_exhale.vpr; the body's inability to write, by
+// half_perm_body_write.vpr.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method half_perm_frame(n: Nat, a: Ref)
+  requires acc(a.f)
+  ensures acc(a.f)
+{
+    a.f := 7
+    var k: Nat := n
+    while (!k.isZero)
+      invariant acc(a.f, 1/2)
+    {
+        k := k.pred
+    }
+    assert acc(a.f)
+    assert a.f == 7
+}

@@ -1,0 +1,26 @@
+// Not-vacuous control for cond_inv_frame_value: the same shape asserting a value
+// that was never written anywhere. This already fails today.
+//
+// Its job is to catch a "fix" that makes the exit block's cube refutable, or the
+// state inconsistent, rather than actually restoring the havoc — under either,
+// cond_inv_frame_value would start failing for the wrong reason while this stays
+// failing and nobody would notice. If this ever verifies, the exit state is
+// inconsistent.
+//
+// Must FAIL.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method cond_inv_havoc_control(n: Nat, a: Ref, b: Bool)
+  requires b ==> acc(a.f)
+{
+    if (b) { a.f := 7 }
+    var k: Nat := n
+    while (!k.isZero)
+      invariant b ==> acc(a.f)
+    {
+        k := k.pred
+        if (b) { a.f := 1 }
+    }
+    assert b ==> a.f == 999
+}

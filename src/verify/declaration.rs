@@ -584,6 +584,57 @@ fn merge_chunks(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Chunk {
     let perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p0, p1]));
+    let value = merge_values(ctx, p0, v0, p1, v1, pc_lits);
+    Chunk::new(addr, perm, value)
+}
+
+/// The value of a location covered by two chunks, when it is **not** already
+/// known that both are held.
+///
+/// Yields `p0 > 0 ? v0 : v1` and assumes `(PC ∧ p0 > 0 ∧ p1 > 0) ==> v0 == v1`.
+/// Shared by the inhale path ([`merge_chunks`]) and the loop frame restore
+/// ([`union_heaps`]); the two used to disagree, and the latter's unconditional
+/// `union(v0, v1)` was unsound — see the note there.
+///
+/// Silicon's `combineSnapshots` splits the same three ways and, when neither
+/// fraction is definitely positive, mints a *fresh* snapshot constrained by both
+/// implications, with the comment "it is not sound to use t1 or t2 and constrain
+/// it". The asymmetric ternary is the same statement made total: the value is
+/// case-analysed on `p0 > 0` rather than left unconstrained, which is strictly
+/// more precise and needs no fresh symbol.
+/// Assume `(PC ∧ p > 0) ==> v == other`, where `v` is the value of a chunk already
+/// known to be held and `p` is the *other* chunk's fraction.
+///
+/// The one-sided half of [`merge_values`], for when one side's positivity is
+/// settled: the ternary would reduce to `v` anyway, so only the conditional
+/// agreement is left to state. Silicon's `combineSnapshots` cases `(True, b2)` and
+/// `(b1, True)` are exactly this.
+fn assume_values_agree(
+    ctx: &mut VerifyContext<'_>,
+    p: egg::Id,
+    v: egg::Id,
+    other: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) {
+    let zero = zero_real(ctx);
+    let p_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, p]));
+    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [v, other]));
+    let antecedents = [(p_pos, Polarity::Positive)]
+        .into_iter()
+        .chain(pc_lits.iter().rev().copied());
+    let imp = ctx.implication(eq, antecedents);
+    let true_ = ctx.true_();
+    ctx.union(imp, true_);
+}
+
+fn merge_values(
+    ctx: &mut VerifyContext<'_>,
+    p0: egg::Id,
+    v0: egg::Id,
+    p1: egg::Id,
+    v1: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> egg::Id {
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
         num::BigInt::from(0),
     ))));
@@ -602,7 +653,7 @@ fn merge_chunks(
     let imp = ctx.implication(eq, antecedents);
     ctx.union(imp, true_);
 
-    Chunk::new(addr, perm, value)
+    value
 }
 
 /// A location chunk extracted from a heap for the location axioms: its
@@ -1126,6 +1177,9 @@ fn heap_subtract_inner(
             return Err(VerifyError::InsufficientPermission);
         }
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2_perm, existing_perm]));
+        // Unconditional union is safe here on both counts: `held > 0` was just
+        // proven, a wildcard `needed` is positive by construction, so this is the
+        // both-held case anyway — and `chunk2.value` is fresh besides.
         ctx.union(existing.value, chunk2.value);
         let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
         // Assume `needed < held` and, because the e-graph has no real-order
@@ -1174,6 +1228,16 @@ fn heap_subtract_inner(
         return Err(VerifyError::InsufficientPermission);
     }
 
+    // Unconditional, unlike the guarded rule `union_heaps` and `merge_chunks` use.
+    // Sound here because the two sides are not symmetric: `chunk2.value` is minted
+    // fresh by `heap_acc` for *this* consume and carries no prior meaning, so the
+    // union constrains only the fresh symbol and cannot corrupt `existing.value`.
+    // (The loop frame restore's bug was the symmetric case — two pre-existing
+    // values, one of them a havoc symbol something downstream reads.) Note this is
+    // NOT implied by the sufficiency proof above: `held ≥ needed` permits
+    // `needed == 0`, so a conditional exhale does bind the slot value off-path.
+    // Probed with complementary conditional exhales and with a call whose `requires`
+    // has a conditional footprint; both are correctly rejected.
     ctx.union(existing.value, chunk2.value);
 
     // Remainder stays structural (leaves get `SubR`); never an `ite` in the graph.
@@ -1515,10 +1579,7 @@ fn gate_perm_by_guard(
 /// Per location kind, per canonical address:
 /// - **present in one heap only** — carried across unchanged.
 /// - **present in both, equal guards** — one chunk with `perm = permₐ + perm_b`
-///   under that shared guard, and `valueₐ == value_b` assumed. Two chunks of one
-///   location cannot disagree, and that agreement is load-bearing: it lets a value
-///   established before a loop survive to the exit, where the frame carries it
-///   back. (Silicon emits the same equalities from `singleMerge`'s `snapEqs`.)
+///   under that shared guard.
 /// - **present in both, guards differ** — the presence condition is a genuine
 ///   disjunction, which `Chunk.guard` (a flat cube) cannot express. Push both
 ///   guards into the *amounts* via [`gate_perm_by_guard`] and sum those, leaving
@@ -1528,7 +1589,40 @@ fn gate_perm_by_guard(
 /// exit the two sides are the frame and the invariant's footprint, so discarding
 /// either loses permission the program genuinely holds. `Heap::with_chunk`
 /// replaces at a shared address, so summing here is what preserves the total.
-fn union_heaps(ctx: &mut VerifyContext<'_>, a: &Heap, b: &Heap) -> Heap {
+///
+/// # Values: only equate what is simultaneously held
+///
+/// Two chunks of one location agree **only where both are actually held**, i.e.
+/// under `permₐ > 0 ∧ perm_b > 0`. Collapsing the values outright (`ctx.union`)
+/// whenever the addresses match was unsound: `heap_subtract` keeps a chunk whose
+/// remainder it merely *failed to const-fold* to zero (see `perm_all_zero` — a
+/// fold, not a prove, for cost reasons), justified by a zero-permission chunk
+/// being inert. Reading such a chunk's **value** is exactly what breaks that
+/// inertness. With a conditional invariant footprint the frame's residual is
+/// `b ? 0 : 1/1`, so the stale pre-loop value survived here and was fused with the
+/// loop's havoc'd symbol — erasing the havoc on the branch where the loop ran.
+/// See `tests/cases/failing/loops/cond_inv_frame_value.vpr`; Silicon rejects it.
+///
+/// So the equality is earned, not assumed:
+/// - **both fractions provably positive** — `ctx.union`, collapsing the classes.
+///   This is the common case (`half_perm_frame`, `peano_frame`), where the
+///   agreement is genuinely load-bearing: it carries a value established before a
+///   loop across a cut whose invariant never mentions it. [`prove_perm_positive`]
+///   decides it per leaf, so a join `Select` never materializes, and its
+///   `known_real` fast path settles literal fractions without a prove call.
+/// - **otherwise** — [`merge_values`]: `permₐ > 0 ? valueₐ : value_b`, plus the
+///   guarded equality, which still fuses the two once saturation establishes both
+///   fractions positive.
+///
+/// The pc-alias consume path states the same rule for the same reason (see
+/// [`heap_subtract_pc_aliased`]): unioning outright would claim `x.f == y.f` on
+/// the path where `x != y`.
+fn union_heaps(
+    ctx: &mut VerifyContext<'_>,
+    a: &Heap,
+    b: &Heap,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Heap {
     let mut out = a.clone();
     for (kind, cb) in b.entries() {
         let existing = a
@@ -1540,9 +1634,6 @@ fn union_heaps(ctx: &mut VerifyContext<'_>, a: &Heap, b: &Heap) -> Heap {
             out = out.with_chunk(kind, cb.clone());
             continue;
         };
-        // Both chunks sit at one location, so their values agree — regardless of
-        // which guard each is held under.
-        ctx.union(ca.value, cb.value);
         let (pa, pb, guard): (ChunkPerm, ChunkPerm, crate::verify::heap::HeapPc) = if ca.guard == cb.guard {
             (ca.perm.clone(), cb.perm.clone(), ca.guard.clone())
         } else {
@@ -1552,9 +1643,35 @@ fn union_heaps(ctx: &mut VerifyContext<'_>, a: &Heap, b: &Heap) -> Heap {
                 std::rc::Rc::from(Vec::new()),
             )
         };
+        // Decided against the *guard-gated* fractions: a chunk held only under its
+        // guard is not held where the guard fails, however positive its bare amount.
+        let a_held = prove_perm_positive(ctx, &pa, pc_lits);
+        let b_held = prove_perm_positive(ctx, &pb, pc_lits);
         let (ia, ib) = (pa.to_id(ctx), pb.to_id(ctx));
+        let value = match (a_held, b_held) {
+            // Both definitely held: the values agree outright, so collapse the
+            // classes. No ternary, no implication — the cheap common case.
+            (true, true) => {
+                ctx.union(ca.value, cb.value);
+                ca.value
+            }
+            // One side definitely held: take its value and make the agreement
+            // conditional on the *other* fraction. Equivalent to what `merge_values`
+            // would build (its ternary reduces once the positive side is known), but
+            // without minting the `Ite` — worth it, because a loop under a path
+            // condition hits this on every exit.
+            (true, false) => {
+                assume_values_agree(ctx, ib, ca.value, cb.value, pc_lits);
+                ca.value
+            }
+            (false, true) => {
+                assume_values_agree(ctx, ia, cb.value, ca.value, pc_lits);
+                cb.value
+            }
+            (false, false) => merge_values(ctx, ia, ca.value, ib, cb.value, pc_lits),
+        };
         let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [ia, ib]));
-        let mut merged = Chunk::new(ca.addr, sum, ca.value);
+        let mut merged = Chunk::new(ca.addr, sum, value);
         merged.guard = guard;
         merged.recipe = ca.recipe.clone().or_else(|| cb.recipe.clone());
         out = out.with_chunk(kind, merged);
@@ -1577,7 +1694,15 @@ fn eval_heap_inst(
         HeapInst::Union { a, b } => {
             let ha = get_heap(state, a).clone();
             let hb = get_heap(state, b).clone();
-            Ok(union_heaps(ctx, &ha, &hb))
+            // The block cube is load-bearing here, not decorative: a loop exit's
+            // union runs under `<!guard>`, and both the positivity decision and the
+            // guarded value equality have to be relative to it.
+            let pc_lits: Vec<(egg::Id, Polarity)> = pc
+                .conds
+                .iter()
+                .map(|(v, p)| (state.get_val(ctx, v), *p))
+                .collect();
+            Ok(union_heaps(ctx, &ha, &hb, &pc_lits))
         }
         // Block-IR heap join: structural per-chunk SELECT of the two predecessor
         // exit heaps. Emitted at every CFG join by the block lowering.

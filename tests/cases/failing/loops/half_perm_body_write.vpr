@@ -1,0 +1,22 @@
+// Companion to passing/loops/half_perm_frame.vpr: with only `1/2` inside, the
+// body cannot write. This is what makes the value equality at the exit sound —
+// the frame's half caps the loop at half, so `a.f` provably cannot change.
+//
+// The body's heap is `empty + invariant`, so the frame's half is NOT visible
+// inside (matching Silicon, whose loop body is verified from `havoc; inhale inv`).
+//
+// Must FAIL with insufficient permission.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method half_perm_body_write(n: Nat, a: Ref)
+  requires acc(a.f)
+{
+    var k: Nat := n
+    while (!k.isZero)
+      invariant acc(a.f, 1/2)
+    {
+        k := k.pred
+        a.f := 1
+    }
+}

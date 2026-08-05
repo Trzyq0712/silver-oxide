@@ -1,0 +1,22 @@
+// cond_inv_frame_value with the body write deleted. Still must FAIL: `a.f` is
+// inside the invariant's footprint under `b`, so the cut havocs its value, and
+// the invariant says nothing about it. Compare passing/loops/half_perm_frame.vpr,
+// where the frame keeps a fraction and the value legitimately survives.
+//
+// Guards against a fix that only blocks the case where a write is visible in the
+// body — the leak is the stale frame value, not the write.
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method cond_inv_frame_value_nowrite(n: Nat, a: Ref, b: Bool)
+  requires b ==> acc(a.f)
+{
+    if (b) { a.f := 7 }
+    var k: Nat := n
+    while (!k.isZero)
+      invariant b ==> acc(a.f)
+    {
+        k := k.pred
+    }
+    assert b ==> a.f == 7
+}

@@ -1,0 +1,27 @@
+// A CONDITIONAL invariant footprint. The frame residual is `b ? 0 : 1/1` —
+// symbolic, so `perm_all_zero`'s const-fold cannot drop the frame chunk, and it
+// survives into the exit union still carrying the pre-loop value 7.
+//
+// The frame and the loop's chunk are held under COMPLEMENTARY conditions (frame
+// positive only under `!b`, loop's only under `b`), so equating their values is
+// wrong on both branches. Under `b` the loop may write 1, and `a.f`'s exit value
+// is the head's havoc'd symbol — `== 7` must not be provable.
+//
+// Must FAIL. Silicon agrees: "Assert might fail. Assertion b ==> a.f == 7 might
+// not hold."
+adt Nat { Zero() Succ(pred: Nat) }
+field f: Int
+
+method cond_inv_frame_value(n: Nat, a: Ref, b: Bool)
+  requires b ==> acc(a.f)
+{
+    if (b) { a.f := 7 }
+    var k: Nat := n
+    while (!k.isZero)
+      invariant b ==> acc(a.f)
+    {
+        k := k.pred
+        if (b) { a.f := 1 }
+    }
+    assert b ==> a.f == 7
+}
