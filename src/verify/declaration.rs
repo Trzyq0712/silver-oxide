@@ -440,14 +440,13 @@ fn eval_pure_inst(
             }
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
-            let id = state
-                .loc_kind(loc)
-                .and_then(|k| {
-                    ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
-                        .map(|c| c.perm.clone())
-                })
-                .map(|p| p.to_id(ctx))
-                .unwrap_or_else(|| zero_real(ctx));
+            let id = match state.loc_kind(loc) {
+                Some(k) => {
+                    let chunks = heap.chunks_of(&k).to_vec();
+                    perm_held_at(ctx, &chunks, addr, pc_lits)
+                }
+                None => zero_real(ctx),
+            };
             (id, None)
         }
         // Semantic ADT nodes. Each is a `FuncApp` over a verifier-minted **concept**
@@ -1595,6 +1594,58 @@ fn gate_perm_by_guard(
         };
     }
     acc
+}
+
+/// The permission held at `addr`, as a term — what `perm(loc)` evaluates to, and
+/// hence what `assert acc(loc, p)` compares against.
+///
+/// Every chunk at that address contributes, each **gated by its presence guard**
+/// (`guard ? perm : 0`). The guard-hoisted merge stores a conditionally-held chunk
+/// as a flat guard cube over a guard-free amount, so reading `Chunk.perm` raw
+/// reports a conditional footprint as fully held — `assert acc(x.f, write)` would
+/// then succeed on a state where `exhale acc(x.f)` fails. `heap_subtract_inner`
+/// reconstructs exactly this gating at every consume; a read has to match it.
+///
+/// Ground-address matches are summed: several stored chunks can have collapsed
+/// into one address class since insertion (the same split
+/// [`find_chunk_consolidated`] re-merges), and only their sum is the permission
+/// at the location. Only with no ground match at all do the pc-alias partners
+/// contribute, each additionally gated by the pc — off-path they are unrelated
+/// locations, which is how an invariant-7 consume treats them too.
+fn perm_held_at(
+    ctx: &mut VerifyContext<'_>,
+    chunks: &[Chunk],
+    addr: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> egg::Id {
+    let canon = ctx.egraph.find(addr);
+    let mut held: Vec<Chunk> = chunks
+        .iter()
+        .filter(|c| ctx.egraph.find(c.addr) == canon)
+        .cloned()
+        .collect();
+    // Ground miss: fall back to the chunks that alias `addr` only under the pc.
+    let pc_gated = held.is_empty();
+    if pc_gated {
+        for a in ctx.pc_alias_partners(chunks, addr, pc_lits) {
+            let ca = ctx.egraph.find(a);
+            if let Some(c) = chunks.iter().find(|c| ctx.egraph.find(c.addr) == ca) {
+                held.push(c.clone());
+            }
+        }
+    }
+    let mut total: Option<egg::Id> = None;
+    for c in held {
+        let mut p = gate_perm_by_guard(ctx, &c.perm, c.guard()).to_id(ctx);
+        if pc_gated {
+            p = ctx.gate_amount_by_pc(p, pc_lits);
+        }
+        total = Some(match total {
+            None => p,
+            Some(t) => ctx.add(Symbolic::Binary(BinOp::AddR, [t, p])),
+        });
+    }
+    total.unwrap_or_else(|| zero_real(ctx))
 }
 
 /// The **sum** of two heaps held simultaneously (`HeapInst::Union`).

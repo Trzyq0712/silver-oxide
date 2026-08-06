@@ -115,3 +115,74 @@ method m(y: Ref)
         "a positive fractional share satisfies a wildcard precondition, got {result:?}"
     );
 }
+
+#[test]
+fn conditionally_held_perm_reads_back_gated() {
+    // A guard-hoisted merge stores a conditionally-held chunk as a flat guard
+    // cube over a guard-free `1/1` amount. A `perm()` read must reconstruct that
+    // gating (`perm_held_at`), or it reports the chunk as fully held on the arm
+    // that gave it away — and `assert acc(x.f, write)` then succeeds on a state
+    // where `exhale acc(x.f)` fails.
+    let input = r#"
+field f: Int
+
+method client(x: Ref, b: Bool)
+    requires acc(x.f)
+{
+    if (b) { } else { exhale acc(x.f) }
+
+    assert acc(x.f, write)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(
+        result.is_err(),
+        "permission is only held on the `b` arm, got {result:?}"
+    );
+}
+
+#[test]
+fn conditionally_held_perm_expression_is_not_write() {
+    // Same defect through the `perm()` expression itself: the amount is
+    // `b ? 1/1 : 0`, so neither `== write` nor `== none` is provable.
+    let input = r#"
+field f: Int
+
+method client(x: Ref, b: Bool)
+    requires acc(x.f)
+{
+    if (b) { } else { exhale acc(x.f) }
+
+    assert perm(x.f) == write
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(
+        result.is_err(),
+        "perm(x.f) is `b ? 1/1 : 0`, got {result:?}"
+    );
+}
+
+#[test]
+fn unconditionally_held_perm_still_reads_back_full() {
+    // Guard-gating must not cost the ordinary case: with both arms keeping the
+    // permission the chunk carries no residual guard and reads back as `write`.
+    let input = r#"
+field f: Int
+
+method client(x: Ref, b: Bool)
+    requires acc(x.f)
+{
+    if (b) { } else { }
+
+    assert acc(x.f, write)
+    assert perm(x.f) == write
+    exhale acc(x.f, write)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "client");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
