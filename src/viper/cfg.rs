@@ -730,6 +730,40 @@ mod tests {
         assert!(matches!(build_cfg(&body), Err(CfgError::Irreducible(_))));
     }
 
+    /// The Prusti-emitted goto shape: an `if` whose arms both `goto` leaves an
+    /// unreachable fall-through continuation, and the block it flows into sits in
+    /// a loop. That dead edge is not a second entry, so the loop is reducible.
+    #[test]
+    fn dead_if_continuation_flowing_into_a_loop_is_accepted() {
+        let mut r = Rodeo::default();
+        let (h, x, y, e) = (
+            r.get_or_intern("H"),
+            r.get_or_intern("X"),
+            r.get_or_intern("Y"),
+            r.get_or_intern("E"),
+        );
+        // label H ; if (c) { goto E } else { goto X } ; label X ; goto Y ;
+        // label Y ; goto H ; label E
+        //
+        // The block after the `if` is unreachable and falls through into `X`,
+        // which is inside the `H` loop.
+        let body = block(vec![
+            Statement::Label(h, vec![]),
+            Statement::If(
+                cond(),
+                block(vec![Statement::Goto(e)]),
+                Some(block(vec![Statement::Goto(x)])),
+            ),
+            Statement::Label(x, vec![]),
+            Statement::Goto(y),
+            Statement::Label(y, vec![]),
+            Statement::Goto(h),
+            Statement::Label(e, vec![]),
+        ]);
+        let cfg = build_cfg(&body).expect("a dead in-edge does not make the loop irreducible");
+        assert_eq!(cfg.loops.loops.len(), 1);
+    }
+
     #[test]
     fn goto_undefined_label_rejected() {
         let mut r = Rodeo::default();

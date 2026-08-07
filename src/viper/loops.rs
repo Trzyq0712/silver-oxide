@@ -237,13 +237,32 @@ where
 /// exactly one of its nodes is reachable from outside it (counting the CFG entry
 /// as an outside reference when it lies inside the component). Nested loops share
 /// one SCC and still have a single entry, so this does not reject them.
+///
+/// **Only live nodes count.** Dead code is not control flow, so a `goto` from an
+/// unreachable block into a loop is not a second door. Prusti emits exactly that
+/// shape: an `if` whose arms both `goto` leaves an unreachable fall-through
+/// continuation, and that continuation flows into the next labelled block, which
+/// may be a loop header. Everything downstream agrees — [`Loops::detect`] skips a
+/// back edge with an unreachable tail, and the lowering never walks a block
+/// `Cfg::reachable` excludes.
 fn check_reducible<N>(graph: &DiGraphMap<N, ()>, entry: N) -> Result<(), LoopError<N>>
 where
     N: Copy + Ord + Hash,
 {
+    let mut live: HashSet<N> = HashSet::new();
+    let mut stack = vec![entry];
+    while let Some(n) = stack.pop() {
+        if live.insert(n) && graph.contains_node(n) {
+            stack.extend(graph.neighbors(n));
+        }
+    }
     for scc in tarjan_scc(graph) {
-        let members: HashSet<N> = scc.iter().copied().collect();
-        let cyclic = members.len() > 1 || scc.first().is_some_and(|&n| graph.contains_edge(n, n));
+        let members: HashSet<N> = scc.into_iter().filter(|n| live.contains(n)).collect();
+        let cyclic = members.len() > 1
+            || members
+                .iter()
+                .next()
+                .is_some_and(|&n| graph.contains_edge(n, n));
         if !cyclic {
             continue;
         }
@@ -251,7 +270,7 @@ where
         for &n in &members {
             let entered_from_outside = graph
                 .neighbors_directed(n, petgraph::Direction::Incoming)
-                .any(|p| !members.contains(&p));
+                .any(|p| live.contains(&p) && !members.contains(&p));
             if entered_from_outside || n == entry {
                 doors.push(n);
             }
@@ -424,6 +443,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A `goto` from *dead* code into a loop is not a second entry. This is the
+    /// shape Prusti emits — the unreachable fall-through continuation of an `if`
+    /// whose arms both `goto` flows into the next labelled block, here the loop
+    /// header `1`. The loop is still single-entry and must be accepted.
+    #[test]
+    fn dead_edge_into_a_loop_is_not_a_second_entry() {
+        // live: 0 → 1 → 2 → 1 (back edge), 1 → 3.  dead: 4 → 2.
+        let r = Loops::detect(&g(&[(0, 1), (1, 2), (2, 1), (1, 3), (4, 2)]), 0);
+        let ls = r.expect("a dead in-edge does not make the loop irreducible");
+        assert_eq!(ls.loops.len(), 1);
+        assert_eq!(ls.loops[0].head, 1);
+    }
+
+    /// The liveness filter must not let a *genuinely* irreducible cycle through:
+    /// both doors of `1 ⇄ 2` are reachable here.
+    #[test]
+    fn irreducible_with_dead_code_present_is_still_rejected() {
+        let r = Loops::detect(&g(&[(0, 1), (0, 2), (1, 2), (2, 1), (9, 1)]), 0);
+        assert!(matches!(r, Err(LoopError::Irreducible(_))));
     }
 
     /// Dead code behind a `goto` has no dominators; it must be skipped rather
