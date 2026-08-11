@@ -427,6 +427,27 @@ fn lower_func_app<Ext: PureExt>(
         // A quantifier body has no heap to narrow, and could not have one (see
         // `HeapCtx::in_quantifier`). A binder-dependent footprint would need
         // quantified permissions besides.
+        //
+        // The obvious workaround — emit the `Snap` in the *host* scope and let
+        // `vmir::Forall::free_temps` capture it — does not work, for two reasons
+        // worth recording so they are not re-derived:
+        //
+        //  * `Snap` bundles two jobs: it narrows the footprint to a snapshot
+        //    *and* asserts the resource's boolean. Those pull opposite ways here.
+        //    The snapshot wants to be binder-free (one captured value), but the
+        //    boolean must be checked per-binding **under the quantifier's
+        //    antecedent** — for `get(xs, i)` it is typically `0 <= i && i < len(xs)`,
+        //    which only the antecedent establishes. Hoisting asserts it outside the
+        //    antecedent, so it fails exactly where the feature would be wanted.
+        //  * `f#requires` is parameterized by the callee's *whole* param list, so a
+        //    `Snap` for `get(xs, i)` carries `args = [xs, i]` and mentions the
+        //    binder even when no footprint slot does. Hoisting is therefore only
+        //    ever applicable to calls that are already fully binder-free.
+        //
+        // Supporting this properly means splitting those two jobs: a
+        // param-independence analysis over the footprint recipes, a snapshot term
+        // that omits the irrelevant params, and per-binding checking of the
+        // resource boolean under the antecedent.
         if hctx.in_quantifier {
             return Err(TranslationError::HeapDepFunctionInQuantifier(
                 b.interner.resolve(&call.name.0).to_string(),

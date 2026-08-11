@@ -212,9 +212,18 @@ pub enum HeapExt {
 
 /// The extensions allowed in a domain axiom: a call to a Silver `function`
 /// (Viper's only restriction on such calls is that the callee has **no
-/// precondition** — checked after lowering — which also makes it heap-free),
-/// and a pure `forall` quantifier. Field access, `unfolding`, `old`, `perm`,
-/// and `result` remain illegal.
+/// precondition**, which also makes it heap-free), and a pure `forall`
+/// quantifier. Field access, `unfolding`, `old`, `perm`, and `result` remain
+/// illegal.
+///
+/// The no-precondition rule is enforced during **typechecking**, by
+/// `check_axiom_function_calls` (`viper::typecheck`, raising
+/// `TypeError::PreconditionedFunctionInAxiom`) — not after lowering. That check
+/// runs *only* over domain axioms, and it bars **any** precondition, heap-free
+/// ones included. A `forall` hosted in a contract, a statement, or a predicate
+/// body is `AxiomExt`-typed too but never reaches it; there the only gate on a
+/// heap-dependent callee is at lowering (see `translate::pure_exp`'s
+/// `in_quantifier` rejection).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AxiomExt {
     FunctionCall(Call<AxiomExt>),
