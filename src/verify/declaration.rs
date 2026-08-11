@@ -221,9 +221,11 @@ const OPERAND_RECIPE: &str = "purify: operand without a recipe";
 /// Evaluate a `PureInst` into its symbolic e-class id, plus — when a
 /// certificate recipe is being built (`ctx.recipe`) — the recipe-space `Val`
 /// mirroring it (the single-walk replacement of the old purify pass). `pc_lits`
-/// is the path condition of the owning instruction — a `Deref` consults it to
+/// is the path condition of the owning instruction. A `Deref` consults it to
 /// resolve an address that only aliases a held chunk under the branch (e.g.
-/// `y.f` where `x == y` holds on this path); every other variant ignores it.
+/// `y.f` where `x == y` holds on this path); a `FunctionCall` assumes the
+/// callee's `f%pre` token under it (the token's truth is what releases the
+/// callee's body equality and exported facts). Every other variant ignores it.
 fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
@@ -325,15 +327,25 @@ fn eval_pure_inst(
                 ty.clone(),
                 args.clone().into(),
             );
-            // Presence trigger (Silicon's `f%pre`, assumed only at call sites):
-            // every genuine value-position call mints the callee's `f%pre(args)`
-            // token node, whose presence lets `rewrite::function_rule` unfold the
-            // body here. The one non-value position is a **contract-function body**
-            // (a lowered pre/post), handled below.
+            // Silicon's `f%pre`, assumed only at call sites. Every genuine
+            // value-position call mints the callee's `f%pre(args)` token node,
+            // whose *presence* lets `rewrite::function_rule` materialize the
+            // callee's body here, and whose *truth* is what releases the resulting
+            // axioms (`tok ==> f == body`, `tok ==> each exported fact`). The one
+            // non-value position is a **contract-function body** (a lowered
+            // pre/post), handled below.
+            //
+            // The truth is assumed under this call's path condition, so a call
+            // under a ternary/implication cannot release the callee's facts onto a
+            // sibling intra-block path. This is the only place a pc enters the
+            // function-unfold encoding; every axiom above inherits it transitively
+            // through the token. `.rev()` because `pc_lits` is outermost-first and
+            // `implication` folds innermost-first (cf. `InstKind::Assume`).
             {
                 let name = ctx.member_name(fc.function);
                 let tok = ctx.alloc.fn_pre_token(fc.function, &name);
-                ctx.add(Symbolic::FuncApp(tok, Box::new([]), args.into()));
+                let tok_id = ctx.add(Symbolic::FuncApp(tok, Box::new([]), args.into()));
+                ctx.assume_token_guarded(tok_id, pc_lits.iter().rev().copied());
             }
             let recipe = if ctx.recipe.is_some() {
                 let args: Vec<Val> = fc
@@ -3593,7 +3605,7 @@ pub(crate) fn verify_function(
     // entry `assume f#requires` was dropped (Finding B — `Assume` emits no
     // recipe step, so the precondition cannot leak into callers).
     let rb = ctx.recipe.take().expect("function walk builds a recipe");
-    let (steps, facts) = rb.into_function_parts()?;
+    let (steps, facts, token_steps) = rb.into_function_parts()?;
     let res = state
         .recipe_of(&body.res)
         .ok_or(VerifyError::Unimplemented(
@@ -3611,6 +3623,7 @@ pub(crate) fn verify_function(
         steps,
         res: Some(res),
         limited,
+        token_steps,
         facts,
     })))
 }
@@ -3747,6 +3760,8 @@ fn contract_post_definition(
         steps,
         res: None,
         limited,
+        // An abstract function has no body, hence no propagated callee tokens.
+        token_steps: Vec::new(),
         facts: vec![Fact {
             guards,
             cond,

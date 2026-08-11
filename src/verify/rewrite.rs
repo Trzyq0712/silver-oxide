@@ -1414,6 +1414,39 @@ pub(crate) fn build_instance(
     resolve_val(egraph, &vals, res)
 }
 
+/// [`build_instance`], additionally releasing the truth of each temp in
+/// `token_steps` — the orphan `g%pre(gargs)` tokens a resource recipe carries
+/// (see [`BodyRecipe::token_steps`](crate::verify::cert::BodyRecipe::token_steps)).
+/// Rebuilding a step only *adds* the token node, which makes `g` materializable;
+/// merging it with `true` is what activates `g`'s own axioms, and is what lets a
+/// contract-introduced function application unfold at a client.
+///
+/// Released unguarded — a resource graft has no enclosing `f%pre` truth to
+/// inherit, and the call-site pc gating exists to confine a function's *facts*,
+/// not a resource footprint.
+pub(crate) fn build_instance_releasing_tokens(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    insts: &[AxiomInst],
+    res: &Val,
+    vals_seed: &[Id],
+    token_steps: &[Val],
+    changed: &mut Vec<Id>,
+) -> Id {
+    // Most recipes propagate no callee token, and then this *is* `build_instance`.
+    if token_steps.is_empty() {
+        return build_instance(egraph, insts, res, vals_seed, changed);
+    }
+    let vals = build_instance_vals(egraph, insts, vals_seed, changed);
+    for tv in token_steps {
+        let tok = resolve_val(egraph, &vals, tv);
+        let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+        if egraph.union(tok, true_) {
+            changed.push(egraph.find(tok));
+        }
+    }
+    resolve_val(egraph, &vals, res)
+}
+
 /// [`build_instance`], but every `AxiomPure::Wildcard` step is replaced by the
 /// fixed id `wildcard_repl` instead of a fresh positive wildcard. Used to build a
 /// footprint slot's **presence** term (`wildcard → 1`, so `ite(guard, 1, 0)`
@@ -1427,7 +1460,8 @@ pub(crate) fn build_instance_subst(
     changed: &mut Vec<Id>,
     wildcard_repl: Id,
 ) -> Id {
-    let vals = build_instance_vals_impl(egraph, insts, vals_seed, changed, Some(wildcard_repl));
+    let vals =
+        build_instance_vals_impl(egraph, insts, vals_seed, changed, Some(wildcard_repl), None);
     resolve_val(egraph, &vals, res)
 }
 
@@ -1448,17 +1482,35 @@ pub(crate) fn build_instance_vals(
     vals_seed: &[Id],
     changed: &mut Vec<Id>,
 ) -> Vec<Id> {
-    build_instance_vals_impl(egraph, insts, vals_seed, changed, None)
+    build_instance_vals_impl(egraph, insts, vals_seed, changed, None, None)
+}
+
+/// [`build_instance_vals`] with the enclosing release gate, so a `g%pre` token
+/// the body propagates is released as `token_guard ==> g%pre(gargs)` rather than
+/// outright. Pass the guard the enclosing release itself sits behind: a
+/// function unfold's `f%pre(fargs)` class, or a quantifier's own e-class. `None`
+/// releases the propagated token unguarded (status quo).
+pub(crate) fn build_instance_vals_guarded(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    insts: &[AxiomInst],
+    vals_seed: &[Id],
+    changed: &mut Vec<Id>,
+    token_guard: Option<Id>,
+) -> Vec<Id> {
+    build_instance_vals_impl(egraph, insts, vals_seed, changed, None, token_guard)
 }
 
 /// [`build_instance_vals`] with an optional wildcard substitution (see
-/// [`build_instance_subst`]). `wildcard_repl = None` mints fresh wildcards.
+/// [`build_instance_subst`]) and an optional `token_guard` (see
+/// [`build_instance_vals_guarded`]). `wildcard_repl = None` mints fresh
+/// wildcards; `token_guard = None` releases any propagated token unguarded.
 fn build_instance_vals_impl(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     vals_seed: &[Id],
     changed: &mut Vec<Id>,
     wildcard_repl: Option<Id>,
+    token_guard: Option<Id>,
 ) -> Vec<Id> {
     let mut vals: Vec<Id> = vals_seed.to_vec();
     fn get(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
@@ -1528,8 +1580,33 @@ fn build_instance_vals_impl(
                 vals.push(id);
             }
             AxiomInst::Token { func, args } => {
+                // A nested callee's `g%pre(gargs)` (Silicon's
+                // `bodyPreconditionPropagation`). Adding the node is what lets `g`
+                // materialize when *this* body is unfolded; releasing its truth is
+                // what lets `g`'s own axioms fire. Under `token_guard` the release
+                // is `outer ==> g%pre(gargs)`, so a propagated token is never
+                // truer than the release it rode in on — when the outer token is
+                // absent or already true the guard is `None` and the nested token
+                // becomes true outright, which is the old presence⇒release
+                // behavior.
+                //
+                // TODO(pre-prop-pc): the propagated token carries no *callee-
+                // internal* pc — `prepare_body` ignores `inst.pc` and a recipe
+                // token step stores only a `Val`. So a leak one level in
+                // (`function f(x) { b ? g(x) : 0 }`, with `g` exporting facts) is
+                // not closed by the call-site gating, though it is not made worse
+                // either. Closing it means per-token pc guards in the recipe,
+                // naturally shaped like `Fact`.
                 let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
-                egraph.add(Symbolic::FuncApp(*func, Box::new([]), args));
+                let tok = egraph.add(Symbolic::FuncApp(*func, Box::new([]), args));
+                let t = true_of(egraph);
+                let rel = match token_guard {
+                    Some(g) => egraph.add(Symbolic::Ite([g, tok, t])),
+                    None => tok,
+                };
+                if egraph.union(rel, t) {
+                    changed.push(egraph.find(rel));
+                }
             }
         }
     }
@@ -1798,7 +1875,18 @@ impl Applier<Symbolic, ConstFold> for ForallApplier {
                 recipe.n_caps + recipe.n_bound,
                 "instance seed is captures ++ sigma"
             );
-            let res = build_instance(egraph, &recipe.insts, &recipe.res, &vals, &mut changed);
+            // `eclass` as the token guard: a `g%pre` token this body propagates is
+            // released only under the quantifier's own truth, the same gate the
+            // instance itself sits behind below. A quantifier that is merely
+            // *present* materializes its body but activates no callee's axioms.
+            let instance_vals = build_instance_vals_guarded(
+                egraph,
+                &recipe.insts,
+                &vals,
+                &mut changed,
+                Some(eclass),
+            );
+            let res = resolve_val(egraph, &instance_vals, &recipe.res);
             let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
             let guard = egraph.add(Symbolic::Ite([eclass, res, true_]));
             if egraph.union(guard, true_) {
@@ -1833,10 +1921,13 @@ type CallKey = (Box<[Type]>, Vec<Id>);
 
 /// Applier: for each ground `FuncApp(self.func, tys, args)` node in the matched
 /// e-class, rebuild the function's **definition recipe** with `build_instance`
-/// (params → args, `Generic(i)` → `tys`) and union the result with the matched
-/// e-class, installing `f(args) == body` lazily as occurrences are seen during
-/// saturation. **Add-only** (`build_instance` imports no e-classes), so merges
-/// derived while verifying the body itself never ride along. Works uniformly for
+/// (params → args, `Generic(i)` → `tys`) and release `f(args) == body` lazily as
+/// occurrences are seen during saturation — behind the call's `f%pre` token when
+/// the function has one, so the equation lands only on paths that call it.
+/// **Imports no e-classes** (`build_instance` only adds), so merges derived while
+/// verifying the body itself never ride along. It is not literally add-only: a
+/// body's `AxiomInst::Assume` steps and its propagated callee tokens are merged
+/// with `true` here, as they were before this rule existed. Works uniformly for
 /// heap-free and heap-dependent `f`: the recipe already resolved every
 /// `Deref`/`Unfold`/`Snap` into pure terms over the params + snapshot.
 struct FunctionUnfoldApplier {
@@ -1864,14 +1955,28 @@ struct FunctionUnfoldApplier {
 }
 
 /// Replay a definition's exported facts against one built instance: for each
-/// fact, merge `guards ⟹ cond` (an `Ite` chain, innermost-first — the shape
-/// `VerifyContext::implication` builds) with `true`. Guarded, so a fact never
-/// fires outside its pre-token + path condition.
+/// fact, merge `token ⟹ guards ⟹ cond` (an `Ite` chain, innermost-first — the
+/// shape `VerifyContext::implication` builds) with `true`. Guarded, so a fact
+/// never fires outside its callee-side `#requires` + path condition, nor outside
+/// the caller-side path condition the `token` carries.
+///
+/// `token` is the callee's `f%pre(args)` class at *this* call, `None` when the
+/// definition has no pre-token (a contract function) or when no token exists for
+/// these args. It is threaded separately rather than pushed onto `Fact.guards`
+/// because those `Val`s live in the callee's recipe-temp space and resolve
+/// through `vals`, whereas this is already a caller-side `Id`.
+///
+/// It is applied **outermost**, continuing `Fact.guards`' most-global-to-most-
+/// local order (`#requires` application, then the originating assert's
+/// callee-internal pc). Nesting order is logically free — `a ⟹ b ⟹ c` is
+/// `b ⟹ a ⟹ c` — and collapse is order-insensitive too, since `ite-reduce`
+/// rewrites an `ite(g, x, true)` with `g` true at whatever depth it sits.
 fn replay_facts(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     def: &FunctionDefinition,
     only_post: bool,
     vals: &[Id],
+    token: Option<Id>,
     changed: &mut Vec<Id>,
 ) {
     let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
@@ -1886,6 +1991,9 @@ fn replay_facts(
                 Polarity::Positive => egraph.add(Symbolic::Ite([g, imp, true_])),
                 Polarity::Negative => egraph.add(Symbolic::Ite([g, true_, imp])),
             };
+        }
+        if let Some(tok) = token {
+            imp = egraph.add(Symbolic::Ite([tok, imp, true_]));
         }
         if egraph.union(imp, true_) {
             changed.push(egraph.find(imp));
@@ -1921,17 +2029,22 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
         let mut changed = Vec::new();
         for (tys, args) in calls {
             debug_assert_eq!(args.len(), self.def.n_params, "function unfold arity");
-            // Presence trigger (see `pre_token`). Presence, NOT truth: the token is
-            // released `assume_guarded` under the call-site PC, so its class is an
-            // `ite(pc, tok, ..)` shape, never unconditionally `true`. Type args are
-            // not in the `FuncApp` congruence key, so `[]` matches any
-            // instantiation. `pre_token = None` ⇒ ungated (a contract
+            // The token (see `pre_token`) plays two distinct roles, mirroring how a
+            // `Forall` e-class does: its **presence** triggers materialization of
+            // the callee's body here, and its **truth** releases the axioms that
+            // materialization produces. Type args are not in the `FuncApp`
+            // congruence key, so `[]` matches any instantiation.
+            //
+            // The token is assumed at each call site under that call's path
+            // condition (`declaration.rs`, the `FunctionCall` arm), so its class is
+            // an `ite(pc, tok, true)` shape and is unconditionally `true` only for
+            // an unconditional call. `tok_id` therefore doubles as the release
+            // guard below. `pre_token = None` ⇒ released ungated (a contract
             // `#requires`/`#ensures` boolean, whose role is to inline its formula).
-            let has_token = self.pre_token.is_none_or(|tok| {
-                egraph
-                    .lookup(Symbolic::FuncApp(tok, Box::new([]), args.clone().into()))
-                    .is_some()
+            let tok_id: Option<Id> = self.pre_token.and_then(|tok| {
+                egraph.lookup(Symbolic::FuncApp(tok, Box::new([]), args.clone().into()))
             });
+            let has_token = self.pre_token.is_none() || tok_id.is_some();
             // The body instance is needed for the definitional union (token
             // present, non-limited) and for fact replay (facts reference body
             // temps). A call with neither needs no build — and must NOT be memoized,
@@ -1951,16 +2064,65 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             if !first_build && !do_union_now {
                 continue;
             }
-            let vals = build_instance_vals(egraph, &self.def.steps, &args, &mut changed);
-            // Definitional union `f(args) == body` — unconditional once triggered:
-            // the purified body is a total function of the args (Deref became
+            let vals = build_instance_vals_guarded(
+                egraph,
+                &self.def.steps,
+                &args,
+                &mut changed,
+                tok_id,
+            );
+            // Definitional axiom `tok ==> f(args) == body`. Absent for an abstract
+            // function.
+            //
+            // With a token this cannot be an e-class merge — a merge is
+            // unconditional and there is no such thing as a conditional one — so it
+            // is stated as a guarded *equality term*: `ite(tok, f(args) == body,
+            // true) == true`. Once the token collapses to `true` (an unconditional
+            // call, or a conditional one inside the probe clone that assumes its
+            // pc), `ite-reduce` exposes `f(args) == body == true` and
+            // `eq-true-union` performs the merge.
+            //
+            // Without a token (`pre_token = None`, a contract function) it stays a
+            // direct union: the body is a total function of the args (Deref became
             // `unwrap∘proj`, div is total in the e-graph), so the equation holds
-            // even at pre-violating args. Absent for an abstract function.
+            // even at pre-violating args, and such a formula must inline freely.
             if do_union_now {
                 if let Some(res) = &self.def.res {
                     let result = resolve_val(egraph, &vals, res);
-                    if egraph.union(eclass, result) {
-                        changed.push(egraph.find(eclass));
+                    match tok_id {
+                        None => {
+                            if egraph.union(eclass, result) {
+                                changed.push(egraph.find(eclass));
+                            }
+                        }
+                        Some(tok) => {
+                            let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+                            let eq = egraph.add(Symbolic::Binary(BinOp::Eq, [eclass, result]));
+                            let rel = egraph.add(Symbolic::Ite([tok, eq, true_]));
+                            if egraph.union(rel, true_) {
+                                changed.push(egraph.find(rel));
+                            }
+                        }
+                    }
+                }
+            }
+            // Propagated callee tokens: `tok ==> g%pre(gargs)` for each nested
+            // callee this body calls (Silicon's `bodyPreconditionPropagation`).
+            // Rebuilding the step above only *added* the node, which is what makes
+            // `g` materializable here; this is what activates `g`'s own axioms, and
+            // only where this body's own release fires. Never truer than the
+            // release it accompanies, so it cannot lose a proof: if `tok` is not
+            // true, this body's equality is not released either.
+            if do_union_now || first_build {
+                for tv in &self.def.token_steps {
+                    let tok_node = resolve_val(egraph, &vals, tv);
+                    let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+                    let rel = match tok_id {
+                        Some(tok) => egraph.add(Symbolic::Ite([tok, tok_node, true_])),
+                        None => tok_node,
+                    };
+                    if egraph.union(rel, true_) {
+                        changed.push(egraph.find(rel));
                     }
                 }
             }
@@ -1989,7 +2151,14 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             }
             // Replay facts only on the first build (idempotent; guarded internally).
             if first_build {
-                replay_facts(egraph, &self.def, self.limited_post, &vals, &mut changed);
+                replay_facts(
+                    egraph,
+                    &self.def,
+                    self.limited_post,
+                    &vals,
+                    tok_id,
+                    &mut changed,
+                );
             }
         }
         changed

@@ -35,6 +35,13 @@ pub(crate) struct FunctionDefinition {
     /// recursive calls already target `f'` (uninterpreted) so unfolding halts
     /// after one level. `None` for a non-recursive function (unchanged behavior).
     pub(crate) limited: Option<crate::verify::lang::FuncId>,
+    /// Temps holding a nested callee's `g%pre(gargs)` token — Silicon's
+    /// `bodyPreconditionPropagation`, emitted as an ordinary `App` step whose
+    /// value is never read (see [`RecipeBuilder::token_steps`]). Rebuilding a step
+    /// only *adds* the node, which makes `g` materializable here; the unfold rule
+    /// additionally releases each of these under the enclosing `f%pre` truth, so a
+    /// nested callee's axioms activate exactly when this body's own do.
+    pub(crate) token_steps: Vec<Val>,
     /// Guarded facts this function's verification established, replayed at
     /// every occurrence of `f(args)` (Silicon's `bodyProp`/`post` axioms).
     /// Derived from the body's `Assert` insts — each was *proven* under
@@ -82,6 +89,15 @@ pub(crate) struct BodyRecipe {
     pub(crate) seed_refs: Vec<SeedRef>,
     pub(crate) steps: Vec<AxiomInst>,
     pub(crate) res: Val,
+    /// Temps holding an orphan `g%pre(gargs)` token kept by
+    /// [`RecipeBuilder::slice_with_tokens`] (their values are never read, so the
+    /// backward closure would otherwise prune them). Rebuilding a step only *adds*
+    /// the node; [`Self::build`] additionally releases each token's truth, which is
+    /// what lets a contract-introduced function application unfold at a client.
+    /// Released **unguarded**: a resource graft has no enclosing `f%pre` to inherit,
+    /// and it is function *facts*, not resource footprints, that the call-site pc
+    /// gating exists to confine.
+    pub(crate) token_steps: Vec<Val>,
 }
 
 impl BodyRecipe {
@@ -94,7 +110,14 @@ impl BodyRecipe {
         changed: &mut Vec<Id>,
     ) -> Id {
         let seed: Vec<Id> = self.seed_refs.iter().map(resolve).collect();
-        crate::verify::rewrite::build_instance(egraph, &self.steps, &self.res, &seed, changed)
+        crate::verify::rewrite::build_instance_releasing_tokens(
+            egraph,
+            &self.steps,
+            &self.res,
+            &seed,
+            &self.token_steps,
+            changed,
+        )
     }
 
     /// [`Self::build`], but every `wildcard` leaf is replaced by `wildcard_repl`
@@ -355,8 +378,10 @@ impl RecipeBuilder {
 
     /// Consume the builder into a function definition's parts. A function
     /// stream contains no `Seed` steps (params are pre-seeded), so it converts
-    /// 1:1 — facts index into the same shared stream, as before.
-    pub(crate) fn into_function_parts(self) -> Result<(Vec<AxiomInst>, Vec<Fact>), VerifyError> {
+    /// 1:1 — facts and `token_steps` index into the same shared stream, as before.
+    pub(crate) fn into_function_parts(
+        self,
+    ) -> Result<(Vec<AxiomInst>, Vec<Fact>, Vec<Val>), VerifyError> {
         let steps = self
             .steps
             .into_iter()
@@ -367,7 +392,7 @@ impl RecipeBuilder {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((steps, self.facts))
+        Ok((steps, self.facts, self.token_steps))
     }
 
     /// Slice the self-contained [`BodyRecipe`] computing `out` from the shared
@@ -393,6 +418,7 @@ impl RecipeBuilder {
                 seed_refs: Vec::new(),
                 steps: Vec::new(),
                 res: out.clone(),
+                token_steps: Vec::new(),
             });
         };
         let n = self.n_params + self.steps.len();
@@ -460,10 +486,21 @@ impl RecipeBuilder {
             steps.push(translated);
         }
         let res = new_val[*root].clone().expect("root is reached");
+        // Token steps are reached only when `keep_tokens`; remap them into the
+        // sliced temp space so `BodyRecipe::build` can release each one's truth.
+        let token_steps = self
+            .token_steps
+            .iter()
+            .filter_map(|t| match t {
+                Val::Temp(i) => new_val[*i].clone(),
+                Val::Literal(_) => None,
+            })
+            .collect();
         Ok(BodyRecipe {
             seed_refs,
             steps,
             res,
+            token_steps,
         })
     }
 }

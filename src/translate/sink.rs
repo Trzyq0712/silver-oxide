@@ -47,14 +47,20 @@ pub(crate) struct Sink {
     /// onto a heapless obligation's `Inst` by the emitters. `None` outside any
     /// heap-bearing region (e.g. before the first heap is threaded).
     pub heap: Option<HeapVal>,
-    /// Value-numbering memo for **total** pure insts: an identical `(ty, inst)`
-    /// pair reuses the earlier temp instead of re-emitting. Keeps the VMIR for
-    /// nested control flow linear: a block's reach-cube conjunction left-folds,
-    /// so its prefix is a memo hit and each deeper block adds O(1) insts, and
-    /// the per-heap-op perm/value gating chains dedupe to once per block.
-    /// `Fresh` (nondeterministic) and the guarded emitters (pc-dependent
-    /// obligations) are never memoized.
-    memo: HashMap<(Type, PureInst), Val>,
+    /// Value-numbering memo for **total** pure insts: an identical
+    /// `(ty, inst, pc)` triple reuses the earlier temp instead of re-emitting.
+    /// Keeps the VMIR for nested control flow linear: a block's reach-cube
+    /// conjunction left-folds, so its prefix is a memo hit and each deeper block
+    /// adds O(1) insts, and the per-heap-op perm/value gating chains dedupe to
+    /// once per block. `Fresh` (nondeterministic) and the guarded emitters
+    /// (pc-dependent obligations) are never memoized.
+    ///
+    /// The `pc` component exists for [`Sink::emit_call`]: a call inst carries its
+    /// lowering pc (the verifier assumes the callee's `f%pre` token under it), so
+    /// two occurrences of the same call under *different* pcs must not collide —
+    /// see that method for what a collision would cost. Every other emitter
+    /// passes `PathConds::default()`, so their behavior is unchanged.
+    memo: HashMap<(Type, PureInst, PathConds), Val>,
     /// Read-only (function/pure) lowering: every `acc`/unfolding permission is
     /// weakened to a `wildcard` (or `0`), since a function only ever needs *some*
     /// positive share to read. Set on the sinks of function bodies and function
@@ -261,19 +267,45 @@ impl Sink {
     /// Deterministic insts are value-numbered (see [`Sink::memo`]): a repeat
     /// `(ty, inst)` returns the earlier temp without emitting.
     pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
+        self.emit_pure_gated(ty, inst,PathConds::default())
+    }
+
+    /// Emit a **function call** carrying the running path condition. Unlike every
+    /// other total pure inst, a call's `pc` is load-bearing: the verifier assumes
+    /// the callee's `f%pre` token under it, and that token's *truth* is what
+    /// releases the callee's definitional equality and exported facts. A call
+    /// under a ternary or an implication must therefore not claim an
+    /// unconditional occurrence's pc, and vice versa.
+    ///
+    /// Value-numbered per `(ty, inst, pc)`, so an identical call at an identical
+    /// pc still dedupes, while the same call under two different pcs mints two
+    /// temps — hence two token assumptions, `pc1 ==> tok` and `pc2 ==> tok`,
+    /// i.e. the disjunction. That is what a call occurring on both paths means.
+    /// Keying on `(ty, inst)` alone would let the two collide, and whichever was
+    /// emitted first would decide the damage: conditional-then-unconditional
+    /// scopes the token to the branch and the unconditional occurrence loses its
+    /// unfold; unconditional-then-conditional makes the token unconditionally
+    /// true and lets the callee's facts leak to sibling paths.
+    pub fn emit_call(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
+        let pc = self.guard();
+        self.emit_pure_gated(ty, inst,pc)
+    }
+
+    /// Shared body of [`Sink::emit_pure`] and [`Sink::emit_call`]: emit `inst`
+    /// gated by `pc`, value-numbering on `(ty, inst, pc)`.
+    fn emit_pure_gated(&mut self, ty: vmir::Type, inst: PureInst, pc: PathConds) -> Val {
         if inst == PureInst::Fresh {
             let v = self.next_val_temp();
-            self.insts
-                .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
+            self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
             return v;
         }
-        if let Some(v) = self.memo.get(&(ty.clone(), inst.clone())) {
+        if let Some(v) = self.memo.get(&(ty.clone(), inst.clone(), pc.clone())) {
             return v.clone();
         }
         let v = self.next_val_temp();
-        self.memo.insert((ty.clone(), inst.clone()), v.clone());
-        self.insts
-            .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
+        self.memo
+            .insert((ty.clone(), inst.clone(), pc.clone()), v.clone());
+        self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
         v
     }
 

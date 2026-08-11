@@ -449,7 +449,10 @@ fn lower_func_app<Ext: PureExt>(
     // No use-site `assume f#ensures(..)`: the postcondition is delivered by the
     // verifier as a guarded rewrite keyed on `f` (the pre-token is the passed
     // `assert f#requires(args)` above), so transitive call sites get it too.
-    let ret = sink.emit_pure(
+    // `emit_call`, not `emit_pure`: the inst must carry its lowering pc so the
+    // verifier can assume the callee's `f%pre` token under it (the token's truth
+    // is what releases the callee's body equality and postcondition facts).
+    let ret = sink.emit_call(
         ty,
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
