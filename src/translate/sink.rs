@@ -314,6 +314,13 @@ impl Sink {
     /// numbered from its own step's temp, so the temp has to exist first (see
     /// [`Forall`](crate::vmir::Forall)).
     ///
+    /// Carries the running path condition. A `forall`'s **well-definedness** is
+    /// checked once per syntactic occurrence against fresh binders, and that check
+    /// reads this inst's `pc` — so a quantifier under a branch or an implication
+    /// (`b ==> (forall i :: .. 10 / n ..)`, with `n != 0` known only under `b`) must
+    /// carry the guard, or its side conditions are discharged unconditionally and
+    /// fail spuriously.
+    ///
     /// Deliberately un-memoized. A memo hit would hand back some earlier temp,
     /// while the body just lowered was numbered against `v` — the same reason
     /// `Fresh` is carved out of [`Sink::emit_pure`].
@@ -322,8 +329,8 @@ impl Sink {
             matches!(v, Val::Temp(i) if *i + 1 == self.val_base + self.val_count),
             "emit_pure_at must fill the most recently allocated temp"
         );
-        self.insts
-            .push(Inst::new(PathConds::default(), InstKind::Pure(ty, inst)));
+        let pc = self.guard();
+        self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
     }
 
     /// Emit a pure instruction whose side condition (e.g. `Deref` permission,

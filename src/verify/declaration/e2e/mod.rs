@@ -2522,6 +2522,69 @@ method m() {
 }
 
 #[test]
+fn forall_under_implication_wd_uses_the_host_path_condition() {
+    // A quantifier's WD is checked against fresh binders at the point it is
+    // stated, so it must be discharged under the path condition *reaching* that
+    // point — not just the body's own guards. Here the divisor is framed only by
+    // `b`, and the `forall` sits under `b ==>`, so the division is well-defined.
+    //
+    // The `forall` step used to be emitted with an empty `pc` (its emitter takes a
+    // pre-allocated temp and hardcoded `PathConds::default()`), which discharged
+    // this side condition unconditionally and failed spuriously.
+    let input = r#"
+domain D { function g(x: Int): Int }
+method m(n: Int, b: Bool)
+    requires b ==> n != 0
+{
+    inhale b ==> (forall i: Int :: {g(i)} g(i) == 10 / n)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn forall_in_a_branch_wd_uses_the_block_cube() {
+    // The same, reaching the quantifier as a block *cube* literal rather than a
+    // `Branch` one — the fork model lowers a block's reaching condition under
+    // `PcKind::Cube`. Both kinds are in `Sink::guard`, so both must arrive.
+    let input = r#"
+domain D { function g(x: Int): Int }
+method m(n: Int, b: Bool)
+    requires b ==> n != 0
+{
+    if (b) {
+        inhale forall i: Int :: {g(i)} g(i) == 10 / n
+    }
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+#[test]
+fn forall_under_implication_wd_still_needs_a_framing_divisor() {
+    // Non-vacuity for the two tests above: carrying the path condition must not
+    // make the obligation vanish. Nothing here establishes `n != 0` on any path,
+    // so the quantifier stays ill-defined.
+    let input = r#"
+domain D { function g(x: Int): Int }
+method m(n: Int, b: Bool)
+{
+    inhale b ==> (forall i: Int :: {g(i)} g(i) == 10 / n)
+}
+"#;
+    let program = lower(input);
+    let result = verify_named_method(&program, "m");
+    assert!(
+        matches!(result, Err(ref e) if matches!(e.root_cause(), VerifyError::SideCondition(_))),
+        "expected a division side condition, got {result:?}"
+    );
+}
+
+#[test]
 fn forall_body_callee_precondition_must_hold_for_every_binding() {
     // The other half of WD: a call inside the body stitches `assert f#requires(..)`,
     // which must hold for an arbitrary binding. The binder guard establishes it.
