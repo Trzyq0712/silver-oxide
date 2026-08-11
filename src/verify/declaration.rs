@@ -443,7 +443,7 @@ fn eval_pure_inst(
             let id = match state.loc_kind(loc) {
                 Some(k) => {
                     let chunks = heap.chunks_of(&k).to_vec();
-                    perm_held_at(ctx, &chunks, addr, pc_lits)
+                    perm_held_at(ctx, &chunks, addr)
                 }
                 None => zero_real(ctx),
             };
@@ -1167,17 +1167,31 @@ fn heap_subtract_inner(
         // it can land on a chunk an earlier consume already drained while the full
         // permission sits in another.
         let alias_set = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
-        if let Some((head, partners)) = alias_set.split_first() {
-            let head = h1
-                .chunks_of(kind)
-                .iter()
-                .find(|c| ctx.egraph.find(c.addr) == ctx.egraph.find(*head))
-                .cloned();
-            if let Some(head) = head {
-                return heap_subtract_pc_aliased(
-                    ctx, h1, out, kind, &head, chunk2, chunk2_perm, partners, pc_lits,
+        if !alias_set.is_empty() {
+            let (set, total) = pc_alias_set(ctx, h1, kind, None, &alias_set, pc_lits);
+            if !set.is_empty() {
+                return heap_subtract_summarized(
+                    ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
                 );
             }
+        }
+        // Last-last resort: summarize the *whole* group under the symbolic address
+        // gate. Nothing matched on ground and no pc-implied alias was found, but a
+        // chunk may still sit here under an equality the pc does not mention.
+        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr);
+        if !set.is_empty()
+            && let Ok(h) = heap_subtract_summarized(
+                ctx,
+                out.clone(),
+                kind,
+                &set,
+                total,
+                chunk2.clone(),
+                chunk2_perm,
+                pc_lits,
+            )
+        {
+            return Ok(h);
         }
         if std::env::var_os("SILVER_OXIDE_TRACE_MISS").is_some() {
             eprintln!(
@@ -1242,9 +1256,30 @@ fn heap_subtract_inner(
         // Tried only after the plain proof fails: no unaliased consume pays the probe.
         let partners = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
         if !partners.is_empty() {
-            return heap_subtract_pc_aliased(
-                ctx, h1, out, kind, &existing, chunk2, chunk2_perm, &partners, pc_lits,
+            let (set, total) =
+                pc_alias_set(ctx, h1, kind, Some(&existing), &partners, pc_lits);
+            return heap_subtract_summarized(
+                ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
             );
+        }
+        // The demanded chunk alone is not enough and no pc-implied alias exists, but
+        // another chunk of the group may sit at this address under an equality the pc
+        // does not mention. Fall back to the Σ-ite summary over the whole group —
+        // strictly the last resort, so no consume that succeeds outright pays for it.
+        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr);
+        if set.len() > 1
+            && let Ok(h) = heap_subtract_summarized(
+                ctx,
+                out.clone(),
+                kind,
+                &set,
+                total,
+                chunk2.clone(),
+                chunk2_perm,
+                pc_lits,
+            )
+        {
+            return Ok(h);
         }
         if crate::verify::viz::dump_perm_enabled() {
             let existing_perm = existing.perm.to_id(ctx);
@@ -1301,49 +1336,81 @@ fn heap_subtract_inner(
     Ok(out)
 }
 
-/// Consume `chunk2` when sufficiency only holds because the pc makes other chunks
-/// alias `chunk2.addr` (invariant 7 of the two-egraph block model).
+/// Build the pc-alias flavour of a [`heap_subtract_summarized`] set: `existing` (when
+/// a chunk did match on ground) followed by the pc-alias `partners`, every member
+/// gated by the *same* cube — the pc.
 ///
-/// - **Sufficiency** is proven against the *sum* over the demanded chunk and its
-///   pc-alias `partners`: at any state where the pc holds they are one location, so
-///   their fractions add (`1/2 + 1/2 ≥ 1/1`).
-/// - **The debit is guarded and _distributed_** across the alias set, greedily:
-///   each chunk gives up `min(it holds, still needed)`, gated by `pc ? take : 0`. No
-///   chunk is merged — off-path the locations are genuinely distinct and nothing there
-///   was given up.
+/// The returned total is the plain **ungated** sum, as it has always been: the
+/// sufficiency proof runs under the pc anyway ([`VerifyContext::prove_under_pc`]), so
+/// gating each addend would only grow the term.
+fn pc_alias_set(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    kind: &LocationKind,
+    existing: Option<&Chunk>,
+    partners: &[egg::Id],
+    pc_lits: &[(egg::Id, Polarity)],
+) -> (Vec<(Chunk, crate::verify::heap::HeapPc)>, egg::Id) {
+    let members: Vec<Chunk> = existing
+        .cloned()
+        .into_iter()
+        .chain(partners.iter().filter_map(|a| {
+            let canon = ctx.egraph.find(*a);
+            h1.chunks_of(kind)
+                .iter()
+                .find(|c| ctx.egraph.find(c.addr) == canon)
+                .cloned()
+        }))
+        .collect();
+    let mut total: Option<egg::Id> = None;
+    for c in &members {
+        let p = c.perm.to_id(ctx);
+        total = Some(match total {
+            None => p,
+            Some(t) => ctx.add(Symbolic::Binary(BinOp::AddR, [t, p])),
+        });
+    }
+    let cube: crate::verify::heap::HeapPc = std::rc::Rc::from(pc_lits.to_vec());
+    let set = members.into_iter().map(|c| (c, cube.clone())).collect();
+    (set, total.unwrap_or_else(|| zero_real(ctx)))
+}
+
+/// Consume `chunk2` against a **summarized** location: a set of chunks that each sit
+/// at `chunk2.addr` only *conditionally*, paired with the cube that condition is.
+///
+/// Two callers supply two different gates, and the algorithm is the same for both:
+/// - **pc-alias** (invariant 7 of the two-egraph block model) — cube = the pc.
+///   `acc(x.f,1/2)` and `acc(y.f,1/2)` are distinct chunks on ground, but under an
+///   in-branch `x == y` they are one location holding `1/1`.
+/// - **Σ-ite** — cube = `c.addr == chunk2.addr` itself, the condition the pc gate is
+///   only ever a proxy for. Strictly more precise, and it needs no probe.
+///
+/// - **Sufficiency** is proven against `total`, the sum the caller summarized: at any
+///   state where a member's cube holds it is the demanded location, so its fraction
+///   joins the sum (`1/2 + 1/2 ≥ 1/1`).
+/// - **The debit is guarded and _distributed_** across the set, greedily: each chunk
+///   gives up `min(it holds, still needed)`, gated by `cube ? take : 0`, and the demand
+///   is retired by that **gated** amount. No chunk is merged — where the cube fails the
+///   locations are genuinely distinct and nothing there was given up.
 ///
 ///   Distribution (rather than parking the whole debit on the demanded chunk as a
 ///   guarded negative) keeps every *later* operation correct without another alias
 ///   probe: parking leaves a partner reading `1/2` when the location holds nothing,
 ///   so `exhale acc(y.f,1/2)` would wrongly succeed without ever reaching this
 ///   function. Distributing drives every member of the set to its true remainder.
-/// - **Value agreement** is likewise assumed only under the pc: unioning the two
-///   values outright would claim `x.f == y.f` on the path where `x != y`.
+/// - **Value agreement** is likewise assumed only under each member's own cube:
+///   unioning the values outright would claim `x.f == y.f` where `x != y`.
 #[allow(clippy::too_many_arguments)]
-fn heap_subtract_pc_aliased(
+fn heap_subtract_summarized(
     ctx: &mut VerifyContext<'_>,
-    h1: &Heap,
     out: Heap,
     kind: &LocationKind,
-    existing: &Chunk,
+    set: &[(Chunk, crate::verify::heap::HeapPc)],
+    total: egg::Id,
     chunk2: Chunk,
     chunk2_perm: egg::Id,
-    partners: &[egg::Id],
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
-    let mut total = existing.perm.to_id(ctx);
-    for addr in partners {
-        let Some(p) = h1
-            .chunks_of(kind)
-            .iter()
-            .find(|c| ctx.egraph.find(c.addr) == ctx.egraph.find(*addr))
-            .map(|c| c.perm.clone())
-        else {
-            continue;
-        };
-        let p = p.to_id(ctx);
-        total = ctx.add(Symbolic::Binary(BinOp::AddR, [total, p]));
-    }
     // `needed ≤ total`, i.e. `!(total < needed)`, under the pc.
     let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [total, chunk2_perm]));
     let false_ = ctx.false_();
@@ -1352,44 +1419,42 @@ fn heap_subtract_pc_aliased(
     if !ctx.prove_under_pc(sufficient, pc_lits) {
         if crate::verify::viz::dump_perm_enabled() {
             eprintln!(
-                "[perm-dump] insufficient in pc-aliased subtract, group {:?}, {} partner(s)\n\
+                "[perm-dump] insufficient in summarized subtract, group {:?}, {} chunk(s)\n\
                  total:\n{}needed:\n{}",
                 kind.group,
-                partners.len(),
+                set.len(),
                 crate::verify::viz::dump_term(ctx, total, 64),
                 crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
             );
         }
         return Err(VerifyError::InsufficientPermission);
     }
-    // Golden rule, but only where the locations coincide.
-    let agree = ctx.add(Symbolic::Binary(BinOp::Eq, [existing.value, chunk2.value]));
-    ctx.assume_guarded(agree, pc_lits.iter().rev().copied());
+    // Golden rule, but only where the locations coincide — each member under its own
+    // gate, so a chunk that is only conditionally at this address claims value
+    // agreement only under that condition.
+    for (chunk, cube) in set {
+        let agree = ctx.add(Symbolic::Binary(BinOp::Eq, [chunk.value, chunk2.value]));
+        ctx.assume_guarded(agree, cube.iter().rev().copied());
+    }
 
-    // Greedy distribution over the alias set, demanded chunk first.
+    // Greedy distribution over the set, demanded chunk first.
     let mut out = out;
     let mut remaining = chunk2_perm;
-    let set: Vec<Chunk> = std::iter::once(existing.clone())
-        .chain(partners.iter().filter_map(|a| {
-            h1.chunks_of(kind)
-                .iter()
-                .find(|c| ctx.egraph.find(c.addr) == ctx.egraph.find(*a))
-                .cloned()
-        }))
-        .collect();
-    for chunk in set {
+    for (chunk, cube) in set.to_vec() {
         let hold = chunk.perm.to_id(ctx);
         // `min(hold, remaining)` — a symbolic hold needs the `ite`; concrete
         // fractions fold it away.
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [hold, remaining]));
         let take = ctx.add(Symbolic::Ite([lt, hold, remaining]));
-        let gated = ctx.gate_amount_by_pc(take, pc_lits);
+        let gated = ctx.gate_amount_by_pc(take, &cube);
         let rest = perm_sub(ctx, &chunk.perm, gated);
         // Debit `remaining` by what was actually taken — the **gated** amount, not
-        // `take`. Every member here shares one cube (the pc), so the two coincide
-        // on-path and are both `0` off-path; the distinction only bites once members
-        // can carry *different* gates, where a chunk whose gate is false gives up
-        // nothing yet would still retire part of the demand.
+        // `take`. With one shared cube (the pc-alias caller) the two coincide on-path
+        // and both are `0` off-path, so this is that path unchanged. With per-chunk
+        // cubes they diverge, and using `take` would be unsound: a member whose gate
+        // is false gives up nothing, yet would still retire part of the demand,
+        // leaving the later members to cover less than `needed` and the heap holding
+        // permission it had in fact given away.
         remaining = ctx.add(Symbolic::Binary(BinOp::SubR, [remaining, gated]));
         // Same hygiene as the plain path: drop a chunk only when the remainder is
         // *unconditionally* zero (off-path the permission was never given up).
@@ -1610,56 +1675,81 @@ fn gate_perm_by_guard(
     acc
 }
 
-/// The permission held at `addr`, as a term — what `perm(loc)` evaluates to, and
-/// hence what `assert acc(loc, p)` compares against.
+/// The **Σ-ite summary** of a location: the permission held at `addr`, summed over
+/// *every* chunk of the group, each gated by whether it sits at that address.
 ///
-/// Every chunk at that address contributes, each **gated by its presence guard**
-/// (`guard ? perm : 0`). The guard-hoisted merge stores a conditionally-held chunk
-/// as a flat guard cube over a guard-free amount, so reading `Chunk.perm` raw
-/// reports a conditional footprint as fully held — `assert acc(x.f, write)` would
-/// then succeed on a state where `exhale acc(x.f)` fails. `heap_subtract_inner`
-/// reconstructs exactly this gating at every consume; a read has to match it.
+/// ```text
+/// perm(addr) = Σ_c  ite(c.addr == addr, guard(c) ? c.perm : 0, 0)
+/// ```
 ///
-/// Ground-address matches are summed: several stored chunks can have collapsed
-/// into one address class since insertion (the same split
-/// [`find_chunk_consolidated`] re-merges), and only their sum is the permission
-/// at the location. Only with no ground match at all do the pc-alias partners
-/// contribute, each additionally gated by the pc — off-path they are unrelated
-/// locations, which is how an invariant-7 consume treats them too.
-fn perm_held_at(
+/// Two gates compose per chunk, and they are different things:
+/// - the **presence guard** (`guard ? perm : 0`, [`gate_perm_by_guard`]) — the
+///   guard-hoisted merge stores a conditionally-held chunk as a flat cube over a
+///   guard-free amount, so reading `Chunk.perm` raw reports a conditional footprint
+///   as fully held;
+/// - the **address gate** (`c.addr == addr`) — whether this chunk is *at* the
+///   location at all.
+///
+/// The address gate is resolved by the engine, not by Rust-side `find` at walk
+/// time. That distinction is the point: an inhaled `a == b` merges the two address
+/// classes only once the `eq-true-union` rewrite fires during saturation, so a
+/// walk-time `find` reads the pre-merge graph and silently drops the aliasing chunk.
+/// Leaving the condition in the term lets whatever saturation the obligation runs
+/// settle it.
+///
+/// Cheap in the common case, because the gate is decided structurally where it can be:
+/// - **ground-equal address** — ungated, contributing exactly the term the old
+///   ground-match sum built, so the fast path mints no extra nodes;
+/// - **provably distinct** — skipped outright, minting nothing. This prune is what
+///   keeps the sum from growing the `ite` tower recorded in
+///   `project_perm_collapse_root_cause`;
+/// - **otherwise** — gated, and the cube it was gated by is returned alongside, so a
+///   consume can gate its debit by the very same condition.
+fn summarize_perm_at(
     ctx: &mut VerifyContext<'_>,
     chunks: &[Chunk],
     addr: egg::Id,
-    pc_lits: &[(egg::Id, Polarity)],
-) -> egg::Id {
+) -> (egg::Id, Vec<(Chunk, crate::verify::heap::HeapPc)>) {
     let canon = ctx.egraph.find(addr);
-    let mut held: Vec<Chunk> = chunks
-        .iter()
-        .filter(|c| ctx.egraph.find(c.addr) == canon)
-        .cloned()
-        .collect();
-    // Ground miss: fall back to the chunks that alias `addr` only under the pc.
-    let pc_gated = held.is_empty();
-    if pc_gated {
-        for a in ctx.pc_alias_partners(chunks, addr, pc_lits) {
-            let ca = ctx.egraph.find(a);
-            if let Some(c) = chunks.iter().find(|c| ctx.egraph.find(c.addr) == ca) {
-                held.push(c.clone());
-            }
-        }
-    }
     let mut total: Option<egg::Id> = None;
-    for c in held {
-        let mut p = gate_perm_by_guard(ctx, &c.perm, c.guard()).to_id(ctx);
-        if pc_gated {
-            p = ctx.gate_amount_by_pc(p, pc_lits);
-        }
+    let mut set: Vec<(Chunk, crate::verify::heap::HeapPc)> = Vec::new();
+    for c in chunks {
+        let held = gate_perm_by_guard(ctx, &c.perm, c.guard()).to_id(ctx);
+        // Ground match: no address gate at all (and no `Eq` node minted).
+        let (amount, cube): (egg::Id, crate::verify::heap::HeapPc) =
+            if ctx.egraph.find(c.addr) == canon {
+                (held, std::rc::Rc::from(Vec::new()))
+            } else {
+                let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [c.addr, addr]));
+                // Disproven aliasing contributes nothing — skip before minting the gate.
+                if matches!(
+                    ctx.egraph[ctx.egraph.find(eq)].data.known(),
+                    Some(Literal::Bool(false))
+                ) {
+                    continue;
+                }
+                let cube = vec![(eq, Polarity::Positive)];
+                let gated = ctx.gate_amount_by_pc(held, &cube);
+                (gated, std::rc::Rc::from(cube))
+            };
+        set.push((c.clone(), cube));
         total = Some(match total {
-            None => p,
-            Some(t) => ctx.add(Symbolic::Binary(BinOp::AddR, [t, p])),
+            None => amount,
+            Some(t) => ctx.add(Symbolic::Binary(BinOp::AddR, [t, amount])),
         });
     }
-    total.unwrap_or_else(|| zero_real(ctx))
+    (total.unwrap_or_else(|| zero_real(ctx)), set)
+}
+
+/// The permission held at `addr`, as a term — what `perm(loc)` evaluates to.
+///
+/// This is the one place the Σ-ite summary is built **eagerly**, because it is the
+/// one place the user asked for the permission *value* rather than for a consume to
+/// succeed. Heap operations reach for it only as a fallback
+/// ([`heap_subtract_inner`]), matching Silicon's split between greedy chunk matching
+/// and `--exhaleMode=1`.
+fn perm_held_at(ctx: &mut VerifyContext<'_>, chunks: &[Chunk], addr: egg::Id) -> egg::Id {
+    summarize_perm_at(ctx, chunks, addr).0
 }
 
 /// The **sum** of two heaps held simultaneously (`HeapInst::Union`).

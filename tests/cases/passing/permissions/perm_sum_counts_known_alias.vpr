@@ -1,0 +1,19 @@
+// `perm(a.f)` must count EVERY chunk at the location, not just the ones whose
+// address already sits in the demanded address's e-class at walk time.
+//
+// Even with `a == b` given outright this used to fail: `a ≡ b` merges the two
+// `@addr` classes only once the `eq-true-union` rewrite fires during saturation,
+// and the old `perm_held_at` read `egraph.find` at walk time, before that. (The
+// consume path never showed the bug because `heap_subtract_inner` retries after a
+// `reduce()`.) Leaving the address gate in the term as `ite(b@addr == a@addr, ..)`
+// lets the engine settle it instead.
+//
+// Silicon verifies this.
+field f: Int
+
+method perm_sum_counts_known_alias(a: Ref, b: Ref)
+  requires acc(a.f, 1/2) && acc(b.f, 1/2)
+  requires a == b
+{
+    assert perm(a.f) == write
+}

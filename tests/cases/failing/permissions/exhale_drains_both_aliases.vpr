@@ -1,0 +1,15 @@
+// The counterpart to passing/permissions/exhale_full_from_aliased_halves.vpr: the
+// full exhale drew on BOTH chunks, so `b.f` must be empty afterwards too. A
+// summarized consume that parked the whole debit on the demanded chunk would leave
+// `b` reading `1/2` at a location holding nothing, and this would wrongly succeed.
+//
+// Must FAIL.
+field f: Int
+
+method exhale_drains_both_aliases(a: Ref, b: Ref)
+  requires acc(a.f, 1/2) && acc(b.f, 1/2)
+  requires a == b
+{
+    exhale acc(a.f, write)
+    exhale acc(b.f, 1/2)
+}

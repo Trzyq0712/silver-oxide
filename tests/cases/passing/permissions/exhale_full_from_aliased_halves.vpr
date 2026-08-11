@@ -1,0 +1,14 @@
+// Two half-permissions at names that are known to alias hold a full permission
+// between them, so the whole thing can be exhaled at once -- and the debit is
+// distributed, so neither name has anything left afterwards (checked by
+// failing/permissions/exhale_drains_both_aliases.vpr).
+//
+// Silicon verifies this.
+field f: Int
+
+method exhale_full_from_aliased_halves(a: Ref, b: Ref)
+  requires acc(a.f, 1/2) && acc(b.f, 1/2)
+  requires a == b
+{
+    exhale acc(a.f, write)
+}

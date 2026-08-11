@@ -1,0 +1,12 @@
+// The Σ-ite summary must not turn an unknown alias into a held permission. The sum
+// at `a.f` is `1/2 + ite(b@addr == a@addr, 1/2, 0)`, and with nothing known about
+// `a` and `b` that is not provably `>= 1/1`.
+//
+// Must FAIL.
+field f: Int
+
+method exhale_full_from_unaliased_halves(a: Ref, b: Ref)
+  requires acc(a.f, 1/2) && acc(b.f, 1/2)
+{
+    exhale acc(a.f, write)
+}

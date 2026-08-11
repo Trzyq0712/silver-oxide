@@ -1,0 +1,22 @@
+// REGRESSION (soundness). `perm(x.f)` used to report only the chunks matching the
+// demanded address by *ground* e-class equality, so with `1/2` at `x` and `1/2` at
+// `y` it folded to `1/2`. Inhaling `perm(x.f) == 1/1` then unioned `false` with
+// `true` and made the state inconsistent on arrival — every later obligation passed
+// vacuously, `assert false` among them.
+//
+// Fixed by the Σ-ite summary: `perm(x.f)` is now
+// `1/2 + ite(y@addr == x@addr, 1/2, 0)`, which is satisfiable at `1/1`, so the
+// state stays consistent and this must FAIL.
+//
+// Pairs with passing/permissions/perm_sum_counts_known_alias.vpr — that one alone
+// would be satisfied by an unsound summary, this one alone by never summing.
+//
+// Must FAIL.
+field f: Int
+
+method perm_sum_is_consistent(x: Ref, y: Ref)
+{
+    inhale acc(x.f, 1/2) && acc(y.f, 1/2)
+    inhale perm(x.f) == 1/1
+    assert false
+}
