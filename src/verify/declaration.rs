@@ -1385,7 +1385,12 @@ fn heap_subtract_pc_aliased(
         let take = ctx.add(Symbolic::Ite([lt, hold, remaining]));
         let gated = ctx.gate_amount_by_pc(take, pc_lits);
         let rest = perm_sub(ctx, &chunk.perm, gated);
-        remaining = ctx.add(Symbolic::Binary(BinOp::SubR, [remaining, take]));
+        // Debit `remaining` by what was actually taken — the **gated** amount, not
+        // `take`. Every member here shares one cube (the pc), so the two coincide
+        // on-path and are both `0` off-path; the distinction only bites once members
+        // can carry *different* gates, where a chunk whose gate is false gives up
+        // nothing yet would still retire part of the demand.
+        remaining = ctx.add(Symbolic::Binary(BinOp::SubR, [remaining, gated]));
         // Same hygiene as the plain path: drop a chunk only when the remainder is
         // *unconditionally* zero (off-path the permission was never given up).
         if perm_all_zero(ctx, &rest) {
