@@ -994,19 +994,28 @@ fn prove_perm_positive(
     })
 }
 
-/// `¬(held < 1)` (full/write permission) over a structured `held`, per leaf.
+/// `¬(held < cap)` (full/write permission) over a structured `held`, per leaf.
+/// The threshold is the location's own permission cap, not a hardcoded `1/1`:
+/// writing needs *all* the permission a cell can carry. A field's cap is `1/1`,
+/// so this is the usual obligation; an `Unbounded` location (a predicate) has no
+/// full amount to hold, so the write is never provable.
 fn prove_perm_write(
     ctx: &mut VerifyContext<'_>,
     held: &ChunkPerm,
+    bound: &Bound,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
+    let Bound::Bounded(cap) = bound else {
+        return false;
+    };
+    let cap = cap.clone();
     prove_perm_leaves(ctx, held, pc_lits, &|ctx, h, pc| {
         if let Some(hr) = known_real(ctx, h) {
-            if hr >= num::BigRational::from(num::BigInt::from(1)) {
+            if hr >= cap {
                 return true;
             }
         }
-        let write = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
+        let write = ctx.add(Symbolic::Lit(Literal::Real(cap.clone())));
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, write]));
         let false_ = ctx.false_();
         let true_ = ctx.true_();
@@ -1879,7 +1888,8 @@ fn eval_heap_inst(
                 .as_ref()
                 .map(|c| c.guard.clone())
                 .unwrap_or_else(|| std::rc::Rc::from(Vec::new()));
-            // SIDECOND: prove `not(perm < 1)` (full/write permission) under pc —
+            // SIDECOND: prove `not(perm < cap)` (full/write permission, `cap` =
+            // the location's own permission bound, `1/1` for a field) under pc —
             // per leaf, so a branch-structured held perm never materializes. Under
             // the guarded-merge path the write obligation is proven against the
             // guard-gated perm (write required only where the chunk is present).
@@ -1893,7 +1903,7 @@ fn eval_heap_inst(
             } else {
                 perm.clone()
             };
-            if !prove_perm_write(ctx, &proof_perm, &pc_lits) {
+            if !prove_perm_write(ctx, &proof_perm, &kind.bound, &pc_lits) {
                 return Err(VerifyError::InsufficientPermission);
             }
             // Permission (and its presence guard) unchanged by the write; keep it
