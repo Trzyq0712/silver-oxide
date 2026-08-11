@@ -40,8 +40,9 @@ pub(crate) struct FunctionDefinition {
     /// value is never read (see [`RecipeBuilder::token_steps`]). Rebuilding a step
     /// only *adds* the node, which makes `g` materializable here; the unfold rule
     /// additionally releases each of these under the enclosing `f%pre` truth, so a
-    /// nested callee's axioms activate exactly when this body's own do.
-    pub(crate) token_steps: Vec<Val>,
+    /// nested callee's axioms activate exactly when this body's own do, and only
+    /// under the body-internal condition guarding the nested call.
+    pub(crate) token_steps: Vec<TokenStep>,
     /// Guarded facts this function's verification established, replayed at
     /// every occurrence of `f(args)` (Silicon's `bodyProp`/`post` axioms).
     /// Derived from the body's `Assert` insts — each was *proven* under
@@ -66,6 +67,27 @@ pub(crate) struct Fact {
     /// NOT be — replaying them on `f'` would re-mention `f'` at smaller args,
     /// an unbounded matching loop.
     pub(crate) post: bool,
+}
+
+/// One propagated precondition token: a nested callee's `g%pre(gargs)` step plus
+/// the **callee-internal** path condition guarding the call that produced it.
+/// Released as `guards ==> token` (and, in a function definition, additionally
+/// under the enclosing `f%pre` — see `FunctionUnfoldApplier`), giving
+/// `f_pre(a) ==> (b[x:=a] ==> g_pre(gargs[x:=a]))` for a body
+/// `f(x) { b ? g(x) : .. }`. Without the guards the release is too eager: `g`'s
+/// own axioms would fire at args where this body never calls it.
+///
+/// Deliberately not a [`Fact`]: `post` is meaningless here, and
+/// [`RecipeBuilder::export_fact`] prepends the `#requires` application as a
+/// fact's outermost guard, which a token must not inherit (its outer gate is the
+/// call-site token, applied at release time).
+///
+/// `guards` is outermost-first, like [`Fact::guards`], and folded innermost-first
+/// at release.
+#[derive(Clone)]
+pub(crate) struct TokenStep {
+    pub(crate) token: Val,
+    pub(crate) guards: Vec<(Val, Polarity)>,
 }
 
 /// One seed slot of a [`BodyRecipe`]: resolved at graft time to an actual arg or
@@ -96,8 +118,9 @@ pub(crate) struct BodyRecipe {
     /// what lets a contract-introduced function application unfold at a client.
     /// Released **unguarded**: a resource graft has no enclosing `f%pre` to inherit,
     /// and it is function *facts*, not resource footprints, that the call-site pc
-    /// gating exists to confine.
-    pub(crate) token_steps: Vec<Val>,
+    /// gating exists to confine. Each token's own body-internal guards still apply
+    /// (see [`TokenStep`]).
+    pub(crate) token_steps: Vec<TokenStep>,
 }
 
 impl BodyRecipe {
@@ -232,8 +255,9 @@ pub(crate) struct RecipeBuilder {
     /// -- and then a resource recipe replayed at a client mints the callee
     /// application without its token, leaving the callee's body permanently
     /// un-unfolded at that occurrence (function bodies are unaffected: they keep
-    /// every step via `into_function_parts`).
-    token_steps: Vec<Val>,
+    /// every step via `into_function_parts`). Each carries the callee-internal pc
+    /// of the call it accompanies (see [`TokenStep`]).
+    token_steps: Vec<TokenStep>,
 }
 
 impl RecipeBuilder {
@@ -261,9 +285,11 @@ impl RecipeBuilder {
     /// Mark this recipe as a spec (contract-function) body — suppresses
     /// precondition-propagation token emission (see [`Self::spec`]).
     /// Record an orphan `g%pre` token step so [`Self::slice`] keeps it (see
-    /// [`Self::token_steps`]).
-    pub(crate) fn record_token_step(&mut self, v: Val) {
-        self.token_steps.push(v);
+    /// [`Self::token_steps`]), together with the callee-internal path condition of
+    /// the call it accompanies — empty when the walk has no recipe-space pc to
+    /// offer, which reproduces the pre-guard behavior (see [`TokenStep`]).
+    pub(crate) fn record_token_step(&mut self, token: Val, guards: Vec<(Val, Polarity)>) {
+        self.token_steps.push(TokenStep { token, guards });
     }
 
     pub(crate) fn mark_spec(&mut self) {
@@ -381,7 +407,7 @@ impl RecipeBuilder {
     /// 1:1 — facts and `token_steps` index into the same shared stream, as before.
     pub(crate) fn into_function_parts(
         self,
-    ) -> Result<(Vec<AxiomInst>, Vec<Fact>, Vec<Val>), VerifyError> {
+    ) -> Result<(Vec<AxiomInst>, Vec<Fact>, Vec<TokenStep>), VerifyError> {
         let steps = self
             .steps
             .into_iter()
@@ -425,10 +451,18 @@ impl RecipeBuilder {
         let mut reach = vec![false; n];
         let mut stack = vec![*root];
         if keep_tokens {
-            // Token steps are roots in their own right (see `token_steps`).
+            // Token steps are roots in their own right (see `token_steps`), and so
+            // is each token's guard: a guard's *defining* steps are not reachable
+            // from the result either, so without seeding them the backward closure
+            // prunes them and the remap below finds no translation.
             for t in &self.token_steps {
-                if let Val::Temp(i) = t {
-                    stack.push(*i);
+                if let Val::Temp(i) = t.token {
+                    stack.push(i);
+                }
+                for (g, _) in &t.guards {
+                    if let Val::Temp(i) = g {
+                        stack.push(*i);
+                    }
                 }
             }
         }
@@ -488,14 +522,31 @@ impl RecipeBuilder {
         let res = new_val[*root].clone().expect("root is reached");
         // Token steps are reached only when `keep_tokens`; remap them into the
         // sliced temp space so `BodyRecipe::build` can release each one's truth.
-        let token_steps = self
-            .token_steps
-            .iter()
-            .filter_map(|t| match t {
-                Val::Temp(i) => new_val[*i].clone(),
-                Val::Literal(_) => None,
-            })
-            .collect();
+        // A token that does not remap is dropped (it was never reached, so nothing
+        // will mint it); a *guard* that does not remap must never be dropped — that
+        // would strengthen the release, which is the unsound direction — so it is an
+        // error instead, since the root seeding above is what makes it impossible.
+        let mut token_steps: Vec<TokenStep> = Vec::new();
+        for t in &self.token_steps {
+            let Val::Temp(i) = t.token else { continue };
+            let Some(token) = new_val[i].clone() else {
+                continue;
+            };
+            let guards = t
+                .guards
+                .iter()
+                .map(|(g, pol)| match g {
+                    Val::Temp(j) => new_val[*j]
+                        .clone()
+                        .map(|v| (v, *pol))
+                        .ok_or(VerifyError::Unimplemented(
+                            "purify: token guard pruned by slice",
+                        )),
+                    Val::Literal(l) => Ok((Val::Literal(l.clone()), *pol)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            token_steps.push(TokenStep { token, guards });
+        }
         Ok(BodyRecipe {
             seed_refs,
             steps,
@@ -525,7 +576,11 @@ fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
         },
         AxiomInst::Forall { caps, .. } => caps.iter().for_each(f),
         AxiomInst::Assume(v) => f(v),
-        AxiomInst::Token { args, .. } => args.iter().for_each(f),
+        AxiomInst::Token { args, guards, .. } => {
+            for v in args.iter().chain(guards.iter().map(|(g, _)| g)) {
+                f(v);
+            }
+        }
     }
 }
 
@@ -552,9 +607,14 @@ pub(crate) fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomI
             caps: caps.iter().map(&tr).collect(),
         },
         AxiomInst::Assume(v) => AxiomInst::Assume(tr(v)),
-        AxiomInst::Token { func, args } => AxiomInst::Token {
+        AxiomInst::Token {
+            func,
+            args,
+            guards,
+        } => AxiomInst::Token {
             func: *func,
             args: args.iter().map(&tr).collect(),
+            guards: guards.iter().map(|(g, pol)| (tr(g), *pol)).collect(),
         },
     }
 }

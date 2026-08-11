@@ -222,3 +222,169 @@ method client(v: Int)
         "an uncalled function's post must not be instantiated"
     );
 }
+
+// ---- callee-internal pc on a propagated token ------------------------------
+//
+// A body that calls `g` under a condition propagates `g%pre(gargs)` so `g` can
+// unfold at a client. That token's release carries two guards: the enclosing
+// gate (the call's own `f%pre`, or the quantifier's e-class) and the
+// body-internal condition guarding the nested call —
+// `f_pre(a) ==> (b[x:=a] ==> g_pre(..))`. Without the inner guard, `g`'s own
+// axioms fire at args the body never calls it at.
+
+#[test]
+fn conditional_nested_call_does_not_release_callee_off_its_branch() {
+    // `f(-1)` takes the else arm, so `g` is never called; its `ensures false`
+    // must not arrive. The call to `f` is unconditional, so the outer gate is
+    // true and the body-internal `x > 0` is the only thing that can confine it.
+    let input = r#"
+function g(a: Int): Int
+  ensures false
+
+function f(x: Int): Int
+{ x > 0 ? g(x) : 0 }
+
+method client()
+{
+    var r: Int := f(-1)
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_err(),
+        "a nested callee's post must not be released where the body does not call it"
+    );
+}
+
+#[test]
+fn conditional_nested_call_releases_callee_on_its_branch() {
+    // Non-vacuity for the test above: at `f(1)` the body really does call `g`,
+    // so `ensures false` must still arrive and make the state inconsistent.
+    // Guarding must not cost the release where the guard holds.
+    let input = r#"
+function g(a: Int): Int
+  ensures false
+
+function f(x: Int): Int
+{ x > 0 ? g(x) : 0 }
+
+method client()
+{
+    var r: Int := f(1)
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_ok(),
+        "a nested callee's post must still be released where the body calls it"
+    );
+}
+
+#[test]
+fn quantifier_conditional_call_does_not_release_callee_off_its_branch() {
+    // The quantifier half: `prepare_body` emits the token for a call inside a
+    // forall body, and the release happens at *instantiation*. Instantiating at
+    // `i == -1` (via the ground trigger term `h(-1)`) must not fire `g`'s
+    // axioms, since the body only calls `g` under `i > 0`. The instantiated body
+    // is separately fine — `ite(-1 > 0, .., true)` folds to `true`.
+    let input = r#"
+function h(a: Int): Int
+
+function g(a: Int): Int
+  ensures false
+
+method client()
+{
+    inhale forall i: Int :: {h(i)} i > 0 ==> g(i) == 5
+    var t: Int := h(-1)
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_err(),
+        "instantiating at a sigma the body excludes must not release the callee"
+    );
+}
+
+#[test]
+fn quantifier_conditional_call_releases_callee_on_its_branch() {
+    // Non-vacuity for the test above, at a sigma the body does include.
+    let input = r#"
+function h(a: Int): Int
+
+function g(a: Int): Int
+  ensures false
+
+method client()
+{
+    inhale forall i: Int :: {h(i)} i > 0 ==> g(i) == 5
+    var t: Int := h(3)
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_ok(),
+        "instantiating at a sigma the body includes must still release the callee"
+    );
+}
+
+#[test]
+fn resource_body_conditional_call_does_not_release_callee_off_its_branch() {
+    // The third release path: a predicate body's boolean is grafted via
+    // `slice_with_tokens`, which releases the propagated token with no *outer*
+    // gate (a graft has no enclosing `f%pre`). The body-internal condition is
+    // therefore the only guard, and at `r.f == -1` the body does not call `g`.
+    let input = r#"
+field f: Int
+
+function g(a: Int): Int
+  ensures false
+
+predicate p(x: Ref)
+{ acc(x.f) && (0 < x.f ==> g(x.f) == 5) }
+
+method client(r: Ref)
+{
+    inhale acc(r.f) && r.f == -1
+    fold p(r)
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_err(),
+        "a resource body must not release its callee where its condition fails"
+    );
+}
+
+#[test]
+fn resource_body_conditional_call_releases_callee_on_its_branch() {
+    // Non-vacuity for the test above. Verified against a temporarily-disabled
+    // guard fold: without the guards the `-1` case above wrongly verifies, so
+    // this pair genuinely brackets the resource path.
+    let input = r#"
+field f: Int
+
+function g(a: Int): Int
+  ensures false
+
+predicate p(x: Ref)
+{ acc(x.f) && (0 < x.f ==> g(x.f) == 5) }
+
+method client(r: Ref)
+{
+    inhale acc(r.f) && r.f == 3
+    fold p(r)
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_ok(),
+        "a resource body must still release its callee where its condition holds"
+    );
+}

@@ -1334,9 +1334,16 @@ pub(crate) enum AxiomInst {
     /// adds both at a value-position call). Like [`Self::Assume`] it occupies **no**
     /// temp slot: its value is never read, so temp numbering stays the inst
     /// numbering of the body it was prepared from.
+    ///
+    /// `guards` is the **body-internal** path condition of the call that produced
+    /// the token (a `forall` body's `i > 0 ==> g(i) == ..` puts `i > 0` here), in
+    /// body-temp space, outermost-first. Released as `guards ==> token` inside the
+    /// enclosing gate, so instantiating the quantifier at a σ where the condition
+    /// fails does not fire the callee's own axioms.
     Token {
         func: FuncId,
         args: Vec<Val>,
+        guards: Vec<(Val, Polarity)>,
     },
 }
 
@@ -1421,15 +1428,17 @@ pub(crate) fn build_instance(
 /// merging it with `true` is what activates `g`'s own axioms, and is what lets a
 /// contract-introduced function application unfold at a client.
 ///
-/// Released unguarded — a resource graft has no enclosing `f%pre` truth to
+/// No *outer* gate here — a resource graft has no enclosing `f%pre` truth to
 /// inherit, and the call-site pc gating exists to confine a function's *facts*,
-/// not a resource footprint.
+/// not a resource footprint. Each token's own **body-internal** guards do apply
+/// though: a call under a condition inside the resource body must not release its
+/// callee's axioms where that condition fails.
 pub(crate) fn build_instance_releasing_tokens(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     res: &Val,
     vals_seed: &[Id],
-    token_steps: &[Val],
+    token_steps: &[crate::verify::cert::TokenStep],
     changed: &mut Vec<Id>,
 ) -> Id {
     // Most recipes propagate no callee token, and then this *is* `build_instance`.
@@ -1437,11 +1446,12 @@ pub(crate) fn build_instance_releasing_tokens(
         return build_instance(egraph, insts, res, vals_seed, changed);
     }
     let vals = build_instance_vals(egraph, insts, vals_seed, changed);
-    for tv in token_steps {
-        let tok = resolve_val(egraph, &vals, tv);
+    for ts in token_steps {
+        let tok = resolve_val(egraph, &vals, &ts.token);
+        let rel = fold_guards(egraph, &vals, &ts.guards, tok);
         let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-        if egraph.union(tok, true_) {
-            changed.push(egraph.find(tok));
+        if egraph.union(rel, true_) {
+            changed.push(egraph.find(rel));
         }
     }
     resolve_val(egraph, &vals, res)
@@ -1579,7 +1589,7 @@ fn build_instance_vals_impl(
                 let id = egraph.add(Symbolic::Forall(*recipe, caps));
                 vals.push(id);
             }
-            AxiomInst::Token { func, args } => {
+            AxiomInst::Token { func, args, guards } => {
                 // A nested callee's `g%pre(gargs)` (Silicon's
                 // `bodyPreconditionPropagation`). Adding the node is what lets `g`
                 // materialize when *this* body is unfolded; releasing its truth is
@@ -1589,20 +1599,15 @@ fn build_instance_vals_impl(
                 // absent or already true the guard is `None` and the nested token
                 // becomes true outright, which is the old presence⇒release
                 // behavior.
-                //
-                // TODO(pre-prop-pc): the propagated token carries no *callee-
-                // internal* pc — `prepare_body` ignores `inst.pc` and a recipe
-                // token step stores only a `Val`. So a leak one level in
-                // (`function f(x) { b ? g(x) : 0 }`, with `g` exporting facts) is
-                // not closed by the call-site gating, though it is not made worse
-                // either. Closing it means per-token pc guards in the recipe,
-                // naturally shaped like `Fact`.
                 let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
                 let tok = egraph.add(Symbolic::FuncApp(*func, Box::new([]), args));
+                // Body-internal guards inside the enclosing gate, matching the
+                // function case's `outer ==> (b ==> g%pre(..))`.
+                let guarded = fold_guards(egraph, &vals, guards, tok);
                 let t = true_of(egraph);
                 let rel = match token_guard {
-                    Some(g) => egraph.add(Symbolic::Ite([g, tok, t])),
-                    None => tok,
+                    Some(g) => egraph.add(Symbolic::Ite([g, guarded, t])),
+                    None => guarded,
                 };
                 if egraph.union(rel, t) {
                     changed.push(egraph.find(rel));
@@ -1971,6 +1976,31 @@ struct FunctionUnfoldApplier {
 /// callee-internal pc). Nesting order is logically free — `a ⟹ b ⟹ c` is
 /// `b ⟹ a ⟹ c` — and collapse is order-insensitive too, since `ite-reduce`
 /// rewrites an `ite(g, x, true)` with `g` true at whatever depth it sits.
+/// Wrap `inner` in a recipe-space guard chain: `guards ==> inner`, as nested
+/// `Ite`s with `true` on the dead side. `guards` is outermost-first (matching
+/// [`Fact::guards`] and [`TokenStep::guards`]) and is folded innermost-first, the
+/// same shape `VerifyContext::implication` builds. Empty `guards` returns `inner`.
+fn fold_guards(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    vals: &[Id],
+    guards: &[(Val, Polarity)],
+    inner: Id,
+) -> Id {
+    if guards.is_empty() {
+        return inner;
+    }
+    let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+    let mut imp = inner;
+    for (g, pol) in guards.iter().rev() {
+        let g = resolve_val(egraph, vals, g);
+        imp = match pol {
+            Polarity::Positive => egraph.add(Symbolic::Ite([g, imp, true_])),
+            Polarity::Negative => egraph.add(Symbolic::Ite([g, true_, imp])),
+        };
+    }
+    imp
+}
+
 fn replay_facts(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     def: &FunctionDefinition,
@@ -1984,14 +2014,8 @@ fn replay_facts(
         if only_post && !fact.post {
             continue;
         }
-        let mut imp = resolve_val(egraph, vals, &fact.cond);
-        for (g, pol) in fact.guards.iter().rev() {
-            let g = resolve_val(egraph, vals, g);
-            imp = match pol {
-                Polarity::Positive => egraph.add(Symbolic::Ite([g, imp, true_])),
-                Polarity::Negative => egraph.add(Symbolic::Ite([g, true_, imp])),
-            };
-        }
+        let cond = resolve_val(egraph, vals, &fact.cond);
+        let mut imp = fold_guards(egraph, vals, &fact.guards, cond);
         if let Some(tok) = token {
             imp = egraph.add(Symbolic::Ite([tok, imp, true_]));
         }
@@ -2114,12 +2138,16 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             // release it accompanies, so it cannot lose a proof: if `tok` is not
             // true, this body's equality is not released either.
             if do_union_now || first_build {
-                for tv in &self.def.token_steps {
-                    let tok_node = resolve_val(egraph, &vals, tv);
+                for ts in &self.def.token_steps {
+                    let tok_node = resolve_val(egraph, &vals, &ts.token);
+                    // `guards` is the body-internal condition guarding the nested
+                    // call; `tok_id` is this call's own token. Folding the former
+                    // inside the latter gives `f%pre(a) ==> (b[x:=a] ==> g%pre(..))`.
+                    let guarded = fold_guards(egraph, &vals, &ts.guards, tok_node);
                     let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
                     let rel = match tok_id {
-                        Some(tok) => egraph.add(Symbolic::Ite([tok, tok_node, true_])),
-                        None => tok_node,
+                        Some(tok) => egraph.add(Symbolic::Ite([tok, guarded, true_])),
+                        None => guarded,
                     };
                     if egraph.union(rel, true_) {
                         changed.push(egraph.find(rel));

@@ -226,12 +226,22 @@ const OPERAND_RECIPE: &str = "purify: operand without a recipe";
 /// `y.f` where `x == y` holds on this path); a `FunctionCall` assumes the
 /// callee's `f%pre` token under it (the token's truth is what releases the
 /// callee's body equality and exported facts). Every other variant ignores it.
+///
+/// `recipe_pc` is the *same* path condition before lowering, needed only when a
+/// recipe is being built: a propagated `g%pre` token records it in recipe space
+/// (via [`EvalState::recipe_pc`]) so the token is released only under the
+/// body-internal condition guarding its call. `None` where no recipe-space pc can
+/// be recovered — a trusted axiom body, or a `forall` WD check whose pc is the
+/// concatenation `host_pc ++ inst.pc` with the host half already lowered to ids.
+/// `None` records empty guards, i.e. exactly the pre-guard behavior: it can only
+/// release a token too eagerly, never too late, so it cannot mask a real failure.
 fn eval_pure_inst(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     ty: &Type,
     pi: &PureInst,
     pc_lits: &[(egg::Id, Polarity)],
+    recipe_pc: Option<&PathConds>,
 ) -> Result<(egg::Id, Option<Val>), VerifyError> {
     use crate::verify::rewrite::AxiomPure;
     Ok(match pi {
@@ -396,10 +406,18 @@ fn eval_pure_inst(
                         type_args: Vec::new(),
                         args,
                     });
+                    // The callee-internal pc of *this* call, in recipe space: the
+                    // release becomes `f%pre(a) ==> (pc[x:=a] ==> g%pre(gargs))`, so
+                    // a conditionally-called callee's axioms do not fire at args the
+                    // body never calls it at.
+                    let guards = match recipe_pc {
+                        Some(pc) => state.recipe_pc(pc)?,
+                        None => Vec::new(),
+                    };
                     // The token's value is never consumed, so `RecipeBuilder::slice`
                     // would prune it as unreachable from the result. Register it as
                     // a slice root.
-                    rb.record_token_step(tok);
+                    rb.record_token_step(tok, guards);
                 }
                 Some(call)
             } else {
@@ -2043,7 +2061,7 @@ fn eval_resource_body_inst(
         }
         InstKind::Pure(ty, pi) => {
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-            let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits)?;
+            let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits, Some(&inst.pc))?;
             state.push_val(id, ty.clone(), recipe);
         }
         // `unfold` inside a resource body verifies identically to a method
@@ -2085,7 +2103,7 @@ fn eval_method_inst(
         }
         InstKind::Pure(ty, pi) => {
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-            let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits)?;
+            let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits, Some(&inst.pc))?;
             state.push_val(id, ty.clone(), recipe);
         }
         // `base inhale <resource>(args) perm`: produce the resource's footprint
@@ -2878,7 +2896,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 InstKind::Pure(ty, pi) => {
                     // Axiom bodies are heap-free and trusted — no `Deref`, so the
                     // path condition is irrelevant here.
-                    let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &[])?;
+                    let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &[], None)?;
                     state.push_val(id, ty.clone(), None);
                 }
                 InstKind::Assume(val) => {
@@ -3020,9 +3038,15 @@ pub(crate) fn prepare_body(
                 type_args: fc.type_args.clone(),
                 args: args.clone(),
             }));
+            // The token's truth is released under this inst's own path condition —
+            // a call under `i > 0 ==> ..` inside the body must not fire the
+            // callee's axioms at a σ where `i > 0` fails. No `recipe_pc` needed:
+            // a prepared body's `Val`s *are* the host body's temps, used
+            // identity-wise, so `inst.pc`'s literals transfer directly.
             out.push(AxiomInst::Token {
                 func: alloc.fn_pre_token(fc.function, &names(fc.function)),
                 args,
+                guards: inst.pc.conds.clone(),
             });
             continue;
         }
@@ -3147,11 +3171,11 @@ fn check_forall_wd_in_scratch(
             // build its node like any other step.
             InstKind::Pure(ty, pi @ PureInst::Forall(inner)) => {
                 check_forall_wd(ctx, inner, &state, &pc_lits)?;
-                let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits)?;
+                let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits, None)?;
                 state.push_val(id, ty.clone(), None);
             }
             InstKind::Pure(ty, pi) => {
-                let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits)?;
+                let (id, _) = eval_pure_inst(ctx, &state, ty, pi, &pc_lits, None)?;
                 state.push_val(id, ty.clone(), None);
             }
             // A callee's postcondition, stitched at the call: assume it under the
