@@ -1,0 +1,60 @@
+// design/fold-unfold [60] R1 -- the adversarial test for "a bind lands in the
+// wrong e-class".
+//
+// A predicate with TWO SAME-TYPED slots. A transposed bind (slot 0's value
+// handed to slot 1) is invisible to typing and survives every structural check:
+// the snapshot has the right arity, the right field types, and the round-trip
+// still produces a well-formed heap. It is detectable ONLY by value, and only
+// when the two slots hold *different* values -- which is why 1 and 2 here, and
+// why an `x.a == x.b` style assertion would not do.
+//
+// R1 is the top risk of the bind-point refactor precisely because it is silent:
+// it makes the verifier accept more, which looks like progress.
+
+field a: Int
+field b: Int
+
+predicate P(x: Ref) {
+    acc(x.a) && acc(x.b)
+}
+
+// Forward: fold packs the two slots, unfold recovers them. Order must survive.
+method roundtrip_preserves_slot_order(x: Ref)
+    requires acc(x.a) && acc(x.b)
+{
+    x.a := 1
+    x.b := 2
+    fold P(x)
+    unfold P(x)
+    assert x.a == 1
+    assert x.b == 2
+}
+
+// The values swapped, so a transposition that happened to be self-cancelling
+// across a single round-trip still gets caught by one of the two directions.
+method roundtrip_preserves_slot_order_swapped(x: Ref)
+    requires acc(x.a) && acc(x.b)
+{
+    x.a := 2
+    x.b := 1
+    fold P(x)
+    unfold P(x)
+    assert x.a == 2
+    assert x.b == 1
+}
+
+// Two round-trips: a transposition that is invisible after an even number of
+// swaps is caught here by the intermediate assertion.
+method two_roundtrips_preserve_slot_order(x: Ref)
+    requires acc(x.a) && acc(x.b)
+{
+    x.a := 1
+    x.b := 2
+    fold P(x)
+    unfold P(x)
+    assert x.a == 1
+    fold P(x)
+    unfold P(x)
+    assert x.a == 1
+    assert x.b == 2
+}

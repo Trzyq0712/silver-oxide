@@ -1,0 +1,27 @@
+// design/fold-unfold [60] R1 -- the negative half.
+//
+// A fold/unfold round-trip must not make the state inconsistent. This is the
+// cheapest possible guard against a bind landing somewhere it should not, and
+// it is what caught the two most recent soundness bugs in this codebase: if the
+// round-trip ever fuses values it should not (a shared `unwrap(None)` class, a
+// stale snapshot, a transposed slot unioned with its neighbour), `false`
+// becomes provable and every assertion after it verifies vacuously.
+//
+// Must be REJECTED.
+
+field a: Int
+field b: Int
+
+predicate P(x: Ref) {
+    acc(x.a) && acc(x.b)
+}
+
+method roundtrip_does_not_prove_false(x: Ref)
+    requires acc(x.a) && acc(x.b)
+{
+    x.a := 1
+    x.b := 2
+    fold P(x)
+    unfold P(x)
+    assert false
+}
