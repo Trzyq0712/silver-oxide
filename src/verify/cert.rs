@@ -226,12 +226,6 @@ pub(crate) struct RecipeBuilder {
     pub(crate) facts: Vec<Fact>,
     /// Body-temp index of each `FunctionCall` → callee (post-assert detection).
     callee_of: std::collections::HashMap<usize, MemberId>,
-    /// This function's pre-token application (`f#requires(params)` /
-    /// `R#pre(params, s)`), args over the params (recipe identity). `None` for
-    /// a function without a precondition (facts unguarded) and for resources.
-    guard_app: Option<(FuncId, Vec<Val>)>,
-    /// The memoized pre-token step, emitted on first use.
-    pre_guard: Option<Val>,
     /// In-SCC callees (a recursion cycle's members), lowered to their limited
     /// twin so a downstream unfold halts after one level.
     recursive_scc: Option<std::collections::HashSet<MemberId>>,
@@ -263,7 +257,6 @@ pub(crate) struct RecipeBuilder {
 impl RecipeBuilder {
     pub(crate) fn new(
         n_params: usize,
-        guard_app: Option<(FuncId, Vec<Val>)>,
         recursive_scc: Option<std::collections::HashSet<MemberId>>,
         post_meta: Option<PostMeta>,
     ) -> Self {
@@ -272,8 +265,6 @@ impl RecipeBuilder {
             steps: Vec::new(),
             facts: Vec::new(),
             callee_of: std::collections::HashMap::new(),
-            guard_app,
-            pre_guard: None,
             recursive_scc,
             post_meta,
             pending_slots: Vec::new(),
@@ -340,30 +331,17 @@ impl RecipeBuilder {
         self.recursive_scc.as_ref().is_some_and(|s| s.contains(&m))
     }
 
-    /// This function's pre-token as a recipe step, emitted once on first use.
-    /// Its args are over the params (recipe identity), so no translation.
-    pub(crate) fn guard(&mut self) -> Option<Val> {
-        let (func, args) = self.guard_app.as_ref()?;
-        if self.pre_guard.is_none() {
-            let (func, args) = (*func, args.clone());
-            self.pre_guard = Some(self.emit(AxiomPure::App {
-                func,
-                type_args: Vec::new(),
-                args,
-            }));
-        }
-        self.pre_guard.clone()
-    }
-
-    /// Export a guarded fact: the pre-token first (emitted on demand), then the
-    /// caller-supplied (already recipe-translated) path-condition guards.
+    /// Export a guarded fact under the caller-supplied (already
+    /// recipe-translated) path-condition guards.
+    ///
+    /// A fact carries **no precondition guard of its own**. Its release is gated
+    /// by the function's `f%pre` token, which is minted and released only at a
+    /// value-position call — and `lower_func_app` emits that call's precondition
+    /// check at the same point, over the same args, unconditionally. So "the
+    /// token is true here" already means "the precondition was established
+    /// here", and a second conjunct restating it added nothing.
     pub(crate) fn export_fact(&mut self, pc: Vec<(Val, Polarity)>, cond: Val, post: bool) {
-        let mut guards: Vec<(Val, Polarity)> = Vec::new();
-        if let Some(g) = self.guard() {
-            guards.push((g, Polarity::Positive));
-        }
-        guards.extend(pc);
-        self.facts.push(Fact { guards, cond, post });
+        self.facts.push(Fact { guards: pc, cond, post });
     }
 
     /// Whether an `Assert`ed value is the exit `assert f#ensures(..)` — a body

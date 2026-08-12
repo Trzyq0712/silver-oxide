@@ -45,15 +45,12 @@ pub struct FuncRegistry {
     /// [`FuncRegistry::limited`]): an uninterpreted `f'` with no unfold rule,
     /// used to break recursive unfolding.
     limited: HashMap<MemberId, FuncId>,
-    /// Precondition-token id per heap-dependent function's `#requires` Resource
-    /// (see [`FuncRegistry::pre_token`]).
-    pre_token: HashMap<MemberId, FuncId>,
-    /// Uniform precondition-token id keyed on the **function member** itself
-    /// (see [`FuncRegistry::fn_pre_token`]). Unlike [`Self::pre_token`] (keyed on
-    /// the heap-dep `#requires` Resource, over the resource's args) this one is
-    /// over the *function's own args* `fargs` and is minted for every function
-    /// flavour identically — it is the `forall`-style presence trigger that gates
-    /// the definitional body-unfold (`rewrite::function_rule`).
+    /// Precondition-token id keyed on the **function member**, over the
+    /// function's own args `fargs`. Minted for every function flavour
+    /// identically: it is the `forall`-style presence trigger that gates the
+    /// definitional body-unfold (`rewrite::function_rule`), and its *truth*,
+    /// released at the call under that call's pc, is what lets the function's
+    /// facts fire. The one and only precondition token.
     fn_pre_token: HashMap<MemberId, FuncId>,
     /// Display names for minted ids (which are outside the interner).
     names: HashMap<FuncId, String>,
@@ -156,7 +153,6 @@ impl FuncRegistry {
             proj: HashMap::new(),
             tag: HashMap::new(),
             limited: HashMap::new(),
-            pre_token: HashMap::new(),
             fn_pre_token: HashMap::new(),
             names,
             rules,
@@ -213,7 +209,6 @@ impl FuncRegistry {
             proj: HashMap::new(),
             tag: HashMap::new(),
             limited: HashMap::new(),
-            pre_token: HashMap::new(),
             fn_pre_token: HashMap::new(),
             names,
             rules,
@@ -269,25 +264,6 @@ impl FuncRegistry {
         id
     }
 
-    /// The **precondition token** of a heap-dependent function: an uninterpreted
-    /// boolean `R#pre(args ++ [s])` over its `#requires` Resource `R`'s params
-    /// and the snapshot (minted on first use, keyed on the resource — each
-    /// heap-dependent function has exactly one).
-    ///
-    /// Uninterpreted on purpose (Silicon's `f%precondition`): "the precondition
-    /// holds here" is not a function of `(args, s)` — it also demands the footprint,
-    /// which the snapshot's values do not record. The token is *stamped* where a
-    /// `Snap`'s implicit check passed (`declaration::eval_snap` assumes it) and
-    /// guards every fact exported from the function's body. No rule is ever
-    /// registered for it.
-    pub fn pre_token(&mut self, resource: MemberId, name: &str) -> FuncId {
-        if let Some(&id) = self.pre_token.get(&resource) {
-            return id;
-        }
-        let id = self.mint(format!("{name}#pre"));
-        self.pre_token.insert(resource, id);
-        id
-    }
 
     /// The uniform **function** precondition token `f%pre` (minting it on first
     /// use), keyed on the function member and applied to the function's own args

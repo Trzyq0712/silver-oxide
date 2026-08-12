@@ -2791,23 +2791,14 @@ fn eval_snap(
 
     // A certificate walk mirrors the snapshot as `cons(Some(v_i))` over the read
     // values' recipes (a self-framed footprint is fully held, so each slot is
-    // `Some`), and exports the nested callee's pre-token as a fact: the check lives
-    // in this inst, not in an `Assert`, so fact derivation would otherwise miss it.
-    // A caller who rebuilds this recipe can then discharge the guard on `g`'s post
-    // fact without re-running the check — Silicon's
-    // `bodyPreconditionPropagationAxiom`.
+    // `Some`). It exports no pre-token fact: a function's facts are gated by its
+    // `f%pre` token, released at the call, so there is no separate precondition
+    // guard for a caller to discharge.
     let recipe = if ctx.recipe.is_some() {
         let def = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
         let elems: Vec<Type> = def.footprint.iter().map(|sl| sl.elem.clone()).collect();
-        let args_r: Vec<Val> = args
-            .iter()
-            .map(|a| state.require_recipe(a, OPERAND_RECIPE))
-            .collect::<Result<_, _>>()?;
-        let pc_r = state.recipe_pc(&inst.pc)?;
         let some_id = ctx.alloc.option_some();
         let cons_id = ctx.alloc.cons(*resource, 0);
-        let name = program.name(*resource).to_string();
-        let tok_id = ctx.alloc.pre_token(*resource, &name);
         let rb = ctx.recipe.as_mut().unwrap();
         let mut members_r = Vec::with_capacity(slot_recipes.len());
         for (i, r) in slot_recipes.iter().enumerate() {
@@ -2825,33 +2816,17 @@ fn eval_snap(
             type_args: Vec::new(),
             args: members_r,
         });
-        let mut tok_args = args_r;
-        tok_args.push(s_r.clone());
-        let cond = rb.emit(AxiomPure::App {
-            func: tok_id,
-            type_args: Vec::new(),
-            args: tok_args,
-        });
-        rb.export_fact(pc_r, cond, false);
         Some(s_r)
     } else {
         None
     };
 
-    // The precondition held here — `walk_footprint` proved footprint
-    // sufficiency and the resource's bool. **Release the pre-token**: assume
-    // `R#pre(args, s)`, the uninterpreted stamp guarding every fact the callee
-    // exported (`pre_token`). Silicon does exactly this after consuming a
-    // function's precondition at a call site (`Evaluator.scala:652`). The token
-    // is never defined, so it can only ever become true here — which is what
-    // makes the guarded facts sound.
-    let name = program.name(*resource).to_string();
-    let tok = ctx.alloc.pre_token(*resource, &name);
-    let mut tok_args = arg_ids;
-    tok_args.push(s);
-    let tok = ctx.add_func_app_id(tok, Box::new([]), Type::Bool, tok_args.into());
-    ctx.assume_guarded(tok, pc_lits.iter().rev().copied());
-
+    // No pre-token is stamped here. `R#pre` used to be released at this point --
+    // the precondition *check* -- to guard the callee's exported facts. Those
+    // facts are now gated solely by the callee's `f%pre` token, which is released
+    // at the **call**, which is where it belongs: reaching a call means its check
+    // passed, so the two were saying the same thing at two different program
+    // points. See design/pre-tokens/AUDIT.md.
     ctx.reduce();
     Ok((s, recipe))
 }
@@ -3491,7 +3466,6 @@ pub(crate) fn verify_resource(
         resource.params.len(),
         None,
         None,
-        None,
     ));
     let params: Vec<egg::Id> = resource
         .params
@@ -3598,9 +3572,9 @@ pub(crate) fn verify_function(
     ctx.fn_certs = Some(fn_certs);
     assume_axioms(&mut ctx, program)?;
     // The certificate recipe is built by the walk itself (single pass): the
-    // pre-token guard, the limited-twin substitution set, and the exit-post
-    // shape are fixed up front.
-    let guard_app = pre_token(ctx.alloc, program, function);
+    // limited-twin substitution set and the exit-post shape are fixed up front.
+    // No precondition guard is prepared -- a function's facts are gated by its
+    // `f%pre` token, released at the call.
     let post_meta = function.ensures.as_ref().map(|en| {
         let self_func = if recursive_scc.is_some() {
             let name = ctx.member_name(self_id);
@@ -3617,7 +3591,6 @@ pub(crate) fn verify_function(
     });
     let mut recipe = crate::verify::cert::RecipeBuilder::new(
         function.params.len(),
-        guard_app,
         recursive_scc.cloned(),
         post_meta,
     );
@@ -3722,41 +3695,6 @@ fn contract_members(program: &vmir::Program) -> std::collections::HashSet<Member
     set
 }
 
-/// The **pre-token** guarding every fact a function's body exports: the
-/// application `(func, args)` that must hold for the facts to fire, over the
-/// function's own param space (`Val::Temp(0..n_params)`, i.e. recipe space).
-///
-/// - **heap-free**: `f#requires(params)`, a **defined** boolean function, made
-///   true at a call site by its `Assert f#requires(args)` passing.
-/// - **heap-dependent**: `R#pre(args, s)`, an **uninterpreted** token over the
-///   `#requires` Resource (see [`FuncRegistry::pre_token`]) — the precondition
-///   also demands the footprint, so it is not definable from `(args, s)` and the
-///   token is stamped by [`eval_snap`] where the check passed.
-///
-/// `None` for a function without a precondition (its facts are unguarded).
-fn pre_token(
-    alloc: &mut crate::verify::func_registry::FuncRegistry,
-    program: &vmir::Program,
-    function: &Function,
-) -> Option<(crate::verify::lang::FuncId, Vec<Val>)> {
-    match function.requires.as_ref()? {
-        vmir::Requires::Pure(rq) => Some((
-            crate::verify::func_registry::func_id_for_member(rq.member),
-            rq.args.clone(),
-        )),
-        vmir::Requires::Framed {
-            resource,
-            args,
-            snap,
-        } => {
-            let name = program.name(*resource).to_string();
-            let mut args = args.clone();
-            args.push(snap.clone());
-            Some((alloc.pre_token(*resource, &name), args))
-        }
-    }
-}
-
 /// Synthesize an **abstract** function's definition: no body, nothing to
 /// verify — just the guarded post axiom `pre-token ⟹ f#ensures(params,
 /// f(params))` built from the contract links. (Silicon's phase 1 emits
@@ -3793,18 +3731,9 @@ fn contract_post_definition(
     };
     // Link args are over the params (`Temp(0..n_params)`) — identity in recipe
     // space, so they can be used verbatim.
-    let mut guards = Vec::new();
-    if let Some((func, args)) = pre_token(alloc, program, function) {
-        let tok = emit(
-            &mut steps,
-            AxiomPure::App {
-                func,
-                type_args: Vec::new(),
-                args,
-            },
-        );
-        guards.push((tok, vmir::Polarity::Positive));
-    }
+    // No precondition guard: like every other function, an abstract function's
+    // fact is gated by its `f%pre` token, released at the call.
+    let guards = Vec::new();
     let self_app = emit(
         &mut steps,
         AxiomPure::App {
