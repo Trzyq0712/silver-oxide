@@ -12,7 +12,7 @@ use crate::{
     },
     vmir::{
         self, Assign, BinOp, Bound, Declaration, Function, HeapInst, HeapVal, Inst, InstKind,
-        Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, Sign, Type, Val,
+        Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, Type, Val,
     },
 };
 
@@ -176,7 +176,8 @@ fn heapval_dead(state: &EvalState, hv: &HeapVal) -> bool {
 fn display_heaps(state: &EvalState, kind: &InstKind, heaps_before: usize) -> Vec<(String, Heap)> {
     match kind {
         InstKind::Heap(
-            HeapInst::Combine { base, .. }
+            HeapInst::Add { base, .. }
+            | HeapInst::Sub { base, .. }
             | HeapInst::Inhale { base, .. }
             | HeapInst::Exhale { base, .. },
         ) => {
@@ -1934,12 +1935,8 @@ fn eval_heap_inst(
         }
         // `base ± acc loc perm`: build the single chunk, then union (Add) or
         // subtract (Sub) it.
-        HeapInst::Combine {
-            base,
-            sign,
-            loc,
-            perm,
-        } => {
+        HeapInst::Add { base, loc, perm } | HeapInst::Sub { base, loc, perm } => {
+            let is_add = matches!(inst, HeapInst::Add { .. });
             let base_h = get_heap(state, base);
             let perm_id = eval_perm(ctx, state, perm);
             let chunk = heap_acc(ctx, loc, perm_id, state);
@@ -1950,8 +1947,8 @@ fn eval_heap_inst(
                 .collect();
             let (kind, ch) = chunk.entries().next().unwrap();
             let (kind, mut ch) = (kind.clone(), ch.clone());
-            match sign {
-                Sign::Add => {
+            if is_add {
+                {
                     // A resource body's `acc` records a footprint slot in the
                     // certificate under construction: its value is the seed
                     // placeholder `SlotValue(i)` (supplied at graft time), its
@@ -1971,14 +1968,13 @@ fn eval_heap_inst(
                     }
                     Ok(heap_union(ctx, &base_h, &kind, ch, &pc_lits))
                 }
-                Sign::Sub => {
-                    if ctx.recipe.is_some() {
-                        return Err(VerifyError::Unimplemented(
-                            "purify: unsupported heap inst in a resource body",
-                        ));
-                    }
-                    heap_subtract(ctx, &base_h, &kind, ch, &pc_lits)
+            } else {
+                if ctx.recipe.is_some() {
+                    return Err(VerifyError::Unimplemented(
+                        "purify: unsupported heap inst in a resource body",
+                    ));
                 }
+                heap_subtract(ctx, &base_h, &kind, ch, &pc_lits)
             }
         }
         // Resource inhale/exhale need the program + certificates; method-only.
@@ -2328,9 +2324,10 @@ enum Direction {
 }
 
 /// The result of a footprint walk: the accumulator heap after all slot effects,
-/// the snapshot members `present ? Some(v) : None` per slot (for a `Consume`
-/// walk; empty for `Produce`), and — during a certificate walk — each slot
-/// value's recipe term.
+/// the snapshot members `present ? Some(v) : None` per slot, and — during a
+/// certificate walk — each slot value's recipe term. Members are filled for
+/// **both** directions: the `members.push` in the slot loop is unconditional, so
+/// a `Produce` walk conses a snapshot exactly as a `Consume` walk does.
 struct FootprintResult {
     heap: Heap,
     members: Vec<egg::Id>,
@@ -3235,7 +3232,7 @@ fn walk_body(
 ) -> Result<(), VerifyError> {
     for (inst_idx, inst) in insts.iter().enumerate() {
         assert_statement_pc_is_block_cube(ctx, state, inst);
-        if let (Some(ops), InstKind::Heap(HeapInst::Combine { loc, perm, .. })) =
+        if let (Some(ops), InstKind::Heap(HeapInst::Add { loc, perm, .. } | HeapInst::Sub { loc, perm, .. })) =
             (&mut footprint_ops, &inst.kind)
         {
             ops.push((loc.clone(), perm.clone()));
@@ -3867,14 +3864,16 @@ fn inst_obligations(
         // likewise skips the assertion for a constrainable ARP, so a
         // wildcard-bearing permission carries no `perm ≥ 0` obligation.
         InstKind::Heap(
-            HeapInst::Combine { perm, .. }
+            HeapInst::Add { perm, .. }
+            | HeapInst::Sub { perm, .. }
             | HeapInst::Inhale { perm, .. }
             | HeapInst::Exhale { perm, .. }
             | HeapInst::Fold { perm, .. }
             | HeapInst::Unfold { perm, .. },
         ) if perm.has_wildcard() => vec![],
         InstKind::Heap(
-            HeapInst::Combine { perm, .. }
+            HeapInst::Add { perm, .. }
+            | HeapInst::Sub { perm, .. }
             | HeapInst::Inhale { perm, .. }
             | HeapInst::Exhale { perm, .. }
             | HeapInst::Fold { perm, .. }

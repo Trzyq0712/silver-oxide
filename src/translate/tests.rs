@@ -134,7 +134,9 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             ) if *group == number_group && fc.function == pred_id => {
                 saw_addr_call = true;
             }
-            vmir::InstKind::Heap(vmir::HeapInst::Combine { .. }) => saw_acc = true,
+            vmir::InstKind::Heap(vmir::HeapInst::Add { .. } | vmir::HeapInst::Sub { .. }) => {
+                saw_acc = true
+            }
             _ => {}
         }
     }

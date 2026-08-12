@@ -92,7 +92,7 @@ pub(crate) fn field_addr(
 
 /// Lower `acc(base.fname, perm)` to its `(loc, perm)`: the field's `@addr`
 /// function applied to `base`, paired with the permission amount. The caller
-/// emits the `HeapInst::Combine`. Shared by `new(...)` lowering.
+/// emits the `HeapInst::Add`. Shared by `new(...)` lowering.
 pub(crate) fn field_acc(
     b: &TranslationContext<'_>,
     sink: &mut Sink,

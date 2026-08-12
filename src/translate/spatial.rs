@@ -11,7 +11,7 @@ use crate::translate::sink::{PcKind, Sink};
 use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, HeapInst, HeapVal, Perm, Polarity, PureInst, Sign, TRUE, Type, Val,
+    self, FALSE, HeapInst, HeapVal, Perm, Polarity, PureInst, TRUE, Type, Val,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -195,15 +195,17 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
             let (loc, perm) = lower_acc(b, env, sink, hctx, res, perm)?;
             // Inhale adds the chunk; exhale subtracts it (so a later `perm`
             // observes the reduced heap).
-            let sign = match mode {
-                SpatialMode::Inhale => Sign::Add,
-                SpatialMode::Exhale { .. } => Sign::Sub,
-            };
-            let inst = HeapInst::Combine {
-                base: acc_heap,
-                sign,
-                loc,
-                perm,
+            let inst = match mode {
+                SpatialMode::Inhale => HeapInst::Add {
+                    base: acc_heap,
+                    loc,
+                    perm,
+                },
+                SpatialMode::Exhale { .. } => HeapInst::Sub {
+                    base: acc_heap,
+                    loc,
+                    perm,
+                },
             };
             // Always carry the path condition: an `acc` has a permission ≥ 0
             // side condition that must be discharged under the conditions
@@ -286,7 +288,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
 }
 
 /// Lower `acc(res, perm)` to its location and (pc-gated) permission. The caller
-/// emits the `HeapInst::Combine` that adds/subtracts the chunk. A source-level
+/// emits the `HeapInst::Add`/`HeapInst::Sub` that adds/subtracts the chunk. A source-level
 /// `wildcard` maps directly to [`Perm::Wildcard`]; otherwise the amount is
 /// lowered and passed through the read-only policy (see [`Sink::perm_amount`]).
 fn lower_acc<Ext: PureExt>(

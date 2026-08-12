@@ -206,7 +206,8 @@ fn decls_have_wildcard(decls: &TiVec<MemberId, Declaration>) -> bool {
     fn insts_wild(insts: &[Inst]) -> bool {
         insts.iter().any(|i| match &i.kind {
             InstKind::Heap(
-                HeapInst::Combine { perm, .. }
+                HeapInst::Add { perm, .. }
+                | HeapInst::Sub { perm, .. }
                 | HeapInst::Inhale { perm, .. }
                 | HeapInst::Exhale { perm, .. }
                 | HeapInst::Fold { perm, .. }

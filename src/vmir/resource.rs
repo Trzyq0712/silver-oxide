@@ -72,8 +72,10 @@ impl Resource {
     /// Slot types come from the body: only `Pure` insts produce a `Val`, and
     /// params occupy `Val::Temp(0..n)`, so a `Val -> Type` map is just the params
     /// followed by each `Pure`'s result type. Every footprint slot is a
-    /// `HeapInst::Combine` whose `loc` is an address of type `Addr<T>`; the slot
-    /// type is `Option[T]`.
+    /// `HeapInst::Add` whose `loc` is an address of type `Addr<T>`; the slot
+    /// type is `Option[T]`. Naming `Add` (rather than the old sign-less
+    /// `Combine`) is load-bearing: a `Sub` in a body — which a desugared
+    /// `unfolding` will emit — must never be counted as a footprint slot.
     pub fn derive_snapshot(&self) -> Option<Snapshot> {
         if !self.is_self_framed() {
             return None;
@@ -86,7 +88,7 @@ impl Resource {
         for inst in &body.insts {
             match &inst.kind {
                 InstKind::Pure(ty, _) => val_types.push(ty.clone()),
-                InstKind::Heap(HeapInst::Combine { loc, .. }) => {
+                InstKind::Heap(HeapInst::Add { loc, .. }) => {
                     let ty = match loc {
                         Val::Temp(n) => val_types.get(*n),
                         Val::Literal(_) => None,

@@ -62,12 +62,19 @@ impl Display for VmirDisplay<'_, &Perm> {
 /// Heap instructions. All heap instructions produce new heaps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HeapInst {
-    /// `h := base <sign> acc <loc> <perm>`. Adds (or subtracts) the single
-    /// location chunk at `loc` with permission `perm` to/from `base`. Pure heap
-    /// accounting — no boolean is assumed or asserted (cf. `Inhale`/`Exhale`).
-    Combine {
+    /// `h := base + acc <loc> <perm>`. Adds the single location chunk at `loc`
+    /// with permission `perm` to `base`. Pure heap accounting — no boolean is
+    /// assumed or asserted (cf. `Inhale`/`Exhale`).
+    Add {
         base: HeapVal,
-        sign: Sign,
+        loc: Val,
+        perm: Perm,
+    },
+    /// `h := base - acc <loc> <perm>`. Subtracts the single location chunk at
+    /// `loc` with permission `perm` from `base`. Pure heap accounting — no
+    /// boolean is assumed or asserted (cf. `Inhale`/`Exhale`).
+    Sub {
+        base: HeapVal,
         loc: Val,
         perm: Perm,
     },
@@ -169,13 +176,6 @@ impl HeapInst {
     }
 }
 
-/// Whether a [`HeapInst::Combine`] adds or subtracts its operand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Sign {
-    Add,
-    Sub,
-}
-
 /// Assign a value to a heap location.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Assign {
@@ -192,15 +192,6 @@ impl Display for HeapVal {
         match self {
             HeapVal::Empty => write!(f, "empty"),
             HeapVal::Temp(i) => write!(f, "h{i}"),
-        }
-    }
-}
-
-impl Display for Sign {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Sign::Add => write!(f, "+"),
-            Sign::Sub => write!(f, "-"),
         }
     }
 }
@@ -226,12 +217,12 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 write!(f, " {}", self.with(perm))
             };
         match self.item {
-            HeapInst::Combine {
-                base,
-                sign,
-                loc,
-                perm,
-            } => write!(f, "{base} {sign} acc {loc} {}", self.with(perm)),
+            HeapInst::Add { base, loc, perm } => {
+                write!(f, "{base} + acc {loc} {}", self.with(perm))
+            }
+            HeapInst::Sub { base, loc, perm } => {
+                write!(f, "{base} - acc {loc} {}", self.with(perm))
+            }
             HeapInst::Inhale { base, call, perm } => {
                 resource_combine(f, base, "inhale", call, perm)
             }

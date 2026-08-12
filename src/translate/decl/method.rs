@@ -272,9 +272,8 @@ pub(crate) fn lower_method(
     let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(m.name.0) {
         // `#requires` is always self-framed, so it always yields its snapshot.
-        let (h, s) = emit_resource_combine(
+        let (h, s) = emit_resource_inhale(
             &mut sink,
-            vmir::Sign::Add,
             req_id,
             current_heap,
             param_vals.clone(),
@@ -622,9 +621,8 @@ pub(crate) fn lower_method(
                         }
                         // `base` is the exit heap (delta subtracted from it). A
                         // self-framed callee (`!is_ctx`) yields its snapshot.
-                        (heap, _) = emit_resource_combine(
+                        (heap, _) = emit_resource_exhale(
                             sink,
-                            vmir::Sign::Sub,
                             ens_id,
                             heap,
                             ens_args,
@@ -1047,9 +1045,8 @@ fn lower_new(
             for f in fields {
                 let (loc, perm) = resource::field_acc(b, sink, v.clone(), f.0, vmir::write())?;
                 let perm = sink.gate_perm(vmir::Perm::Amount(perm));
-                heap = sink.emit_heap(HeapInst::Combine {
+                heap = sink.emit_heap(HeapInst::Add {
                     base: heap,
-                    sign: vmir::Sign::Add,
                     loc,
                     perm,
                 });
@@ -1125,7 +1122,7 @@ fn lower_method_call(
     let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(call.name.0) {
         // `#requires` is always self-framed, so it always yields its snapshot.
-        let (h, s) = emit_resource_combine(sink, vmir::Sign::Sub, req_id, heap, args.clone(), true);
+        let (h, s) = emit_resource_exhale(sink, req_id, heap, args.clone(), true);
         heap = h;
         req_snap = s;
     }
@@ -1154,7 +1151,7 @@ fn lower_method_call(
                 .expect("two-state ensures implies an exhaled requires");
             ens_args.push(s);
         }
-        (heap, _) = emit_resource_combine(sink, vmir::Sign::Add, ens_id, heap, ens_args, !is_ctx);
+        (heap, _) = emit_resource_inhale(sink, ens_id, heap, ens_args, !is_ctx);
     }
 
     Ok(heap)
@@ -1169,23 +1166,32 @@ fn lower_method_call(
 /// yields no snapshot. `yields_snap` is the caller's `!is_ctx` for `resource` —
 /// always `true` for a `#requires` id (always self-framed), and
 /// `method_requires(owner).is_none()` for a `#ensures` id.
-fn emit_resource_combine(
+fn emit_resource_inhale(
     sink: &mut Sink,
-    sign: vmir::Sign,
     resource: vmir::MemberId,
     base: HeapVal,
     args: Vec<Val>,
     yields_snap: bool,
 ) -> (HeapVal, Option<Val>) {
-    // Gate the permission by the current branch path condition so a contract
-    // inhaled/exhaled inside an `if` arm contributes nothing on the other path
-    // (the empty top-level pc leaves `write` unchanged).
-    let perm = sink.gate_perm(vmir::Perm::write());
-    sink.emit_resource_combine(
-        base,
-        sign,
-        ResourceCall { resource, args },
-        perm,
-        yields_snap,
-    )
+    let perm = contract_perm(sink);
+    sink.emit_resource_inhale(base, ResourceCall { resource, args }, perm, yields_snap)
+}
+
+/// The consume counterpart of [`emit_resource_inhale`].
+fn emit_resource_exhale(
+    sink: &mut Sink,
+    resource: vmir::MemberId,
+    base: HeapVal,
+    args: Vec<Val>,
+    yields_snap: bool,
+) -> (HeapVal, Option<Val>) {
+    let perm = contract_perm(sink);
+    sink.emit_resource_exhale(base, ResourceCall { resource, args }, perm, yields_snap)
+}
+
+/// Gate the permission by the current branch path condition so a contract
+/// inhaled/exhaled inside an `if` arm contributes nothing on the other path
+/// (the empty top-level pc leaves `write` unchanged).
+fn contract_perm(sink: &mut Sink) -> vmir::Perm {
+    sink.gate_perm(vmir::Perm::write())
 }

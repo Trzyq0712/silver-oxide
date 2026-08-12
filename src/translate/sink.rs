@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::vmir::{
     self, BinOp, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Perm, Polarity, PureInst,
-    ResourceCall, Sign, Type, Val, none,
+    ResourceCall, Type, Val, none,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -392,22 +392,31 @@ impl Sink {
     /// When `yields_snap` (the callee is self-framed) the inst additionally
     /// produces a pure `Val` — the snapshot of the in/ex-haled resource — so the
     /// `Val` counter bumps alongside the heap counter.
-    pub fn emit_resource_combine(
+    /// Fork model: the branch no longer rides in the perm scale, so the inhale
+    /// carries the block cube as its pc — the verifier guards the inhaled bool by
+    /// it (else a conditional inhale leaks its fact past the branch). An empty pc
+    /// (unconditional inhale) guards by nothing.
+    pub fn emit_resource_inhale(
         &mut self,
         base: HeapVal,
-        sign: Sign,
         call: ResourceCall,
         perm: Perm,
         yields_snap: bool,
     ) -> (HeapVal, Option<Val>) {
-        let h = match sign {
-            // Fork model: the branch no longer rides in the perm scale, so the
-            // inhale carries the block cube as its pc — the verifier guards the
-            // inhaled bool by it (else a conditional inhale leaks its fact past
-            // the branch). An empty pc (unconditional inhale) guards by nothing.
-            Sign::Add => self.emit_heap_guarded(HeapInst::Inhale { base, call, perm }),
-            Sign::Sub => self.emit_heap_guarded(HeapInst::Exhale { base, call, perm }),
-        };
+        let h = self.emit_heap_guarded(HeapInst::Inhale { base, call, perm });
+        let snap = yields_snap.then(|| self.next_val_temp());
+        (h, snap)
+    }
+
+    /// The consume counterpart of [`Sink::emit_resource_inhale`].
+    pub fn emit_resource_exhale(
+        &mut self,
+        base: HeapVal,
+        call: ResourceCall,
+        perm: Perm,
+        yields_snap: bool,
+    ) -> (HeapVal, Option<Val>) {
+        let h = self.emit_heap_guarded(HeapInst::Exhale { base, call, perm });
         let snap = yields_snap.then(|| self.next_val_temp());
         (h, snap)
     }
