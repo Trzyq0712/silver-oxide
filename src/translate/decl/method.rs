@@ -174,7 +174,7 @@ impl MethodTranslator<'_, Metaed> {
                 .unwrap_or(vmir::Precond::SelfFramed);
             // A two-state (`Ctx`) ensures receives the pre-state as a trailing
             // snapshot parameter `s : Snap(req)`; its body opens with a
-            // `FromSnap` reconstructing the pre-state heap `old(...)` reads.
+            // a bound `inhale` reconstructing the pre-state heap `old(...)` reads.
             let snap_entry = match &precond {
                 vmir::Precond::Ctx(req_id, req_args) => {
                     let snap = vmir::Val::Temp(params.len());

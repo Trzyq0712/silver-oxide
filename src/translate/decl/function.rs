@@ -131,9 +131,9 @@ impl FunctionTranslator<'_, Metaed> {
     ///   boolean requires-function.
     /// - `#ensures` → a boolean [`vmir::Function`]
     ///   `(params ++ [result, s: Snap(req)]) -> Bool` whose body reconstructs
-    ///   the precondition heap from `s` (`FromSnap`) and reads it.
+    ///   the precondition heap from `s` (a bound `inhale`) and reads it.
     /// - the main function → `(params ++ [s: Snap(req)]) -> ret`; its body
-    ///   opens with the same `FromSnap` (which implicitly assumes the
+    ///   opens with the same bound `inhale` (which implicitly assumes the
     ///   resource bool — no entry `assume`) and asserts
     ///   `#ensures(params, result, s)` at exit. Call sites build `s` with
     ///   `PureInst::Snap` (which implicitly asserts the precondition) — see
@@ -266,7 +266,7 @@ impl FunctionTranslator<'_, Metaed> {
             // WF context (heap-free): the postcondition's side conditions may
             // rely on the precondition (`requires y != 0 ensures result == x/y`),
             // so its body opens with `assume #requires(params)` — mirroring what
-            // the heap-dependent `FromSnap` entry assumes implicitly.
+            // the heap-dependent a bound `inhale` entry assumes implicitly.
             let wf_contract = (!heap_dep).then(|| pure_exp::FnContract {
                 requires: meta_requires,
                 ensures: None,
@@ -300,7 +300,7 @@ impl FunctionTranslator<'_, Metaed> {
         // The main function: pure and heap-free at the call boundary. Its body
         // (when present) assumes the precondition at entry — as a pure
         // `assume #requires(params)` when heap-free, or implicitly via the
-        // `FromSnap` heap reconstruction when heap-dependent — and asserts
+        // a bound `inhale` heap reconstruction when heap-dependent — and asserts
         // `#ensures(params, result[, s])` at exit.
         let mut fn_params = params;
         let mut val_base = n_params;
@@ -321,7 +321,7 @@ impl FunctionTranslator<'_, Metaed> {
             val_base += 1;
         }
         let contract = pure_exp::FnContract {
-            // Heap-dependent: the precondition is assumed by `FromSnap`, not
+            // Heap-dependent: the precondition is assumed by a bound `inhale`, not
             // by a boolean entry stitch.
             requires: if heap_dep { None } else { meta_requires },
             // The exit `assert #ensures(params, result[, s])` — the snapshot

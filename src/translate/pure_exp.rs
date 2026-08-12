@@ -762,7 +762,7 @@ impl PureExt for typed::MethodEnsuresExt {
         match ext {
             typed::MethodEnsuresExt::Heap(node) => lower_heap_node(b, env, sink, hctx, ty, node),
             // old(e): re-read `e` against the method pre-state. For a two-state
-            // ensures that heap is the one its entry `FromSnap` reconstructs
+            // ensures that heap is the one its entry bound `inhale` reconstructs
             // from the trailing snapshot parameter, supplied as the `old`
             // baseline by `lower_spatial_ensures`. Ensures-`old` is always
             // unlabeled (`old[L]` is a type error). A self-framed ensures has no
@@ -867,7 +867,7 @@ impl PureExt for typed::FuncEnsuresExt {
 /// requires(params)` at entry, `assert ensures(params, result)` at exit.
 /// `requires`/`ensures` are `None` when the function omits that clause; for a
 /// heap-dependent function `requires` is `None` (the precondition is assumed
-/// implicitly by the entry `FromSnap`) and `ensures` is `None` too (the
+/// implicitly by the entry bound `inhale`) and `ensures` is `None` too (the
 /// snapshot-taking exit check is deferred). `params` are the function's
 /// parameter `Val`s (`Temp(0..n_params)`).
 ///
@@ -883,7 +883,7 @@ pub(crate) struct FnContract {
     pub snap: Option<Val>,
 }
 
-/// The entry `FromSnap` of a heap-dependent function (or ensures-function)
+/// The entry bound `inhale` of a heap-dependent function (or ensures-function)
 /// body: reconstruct the precondition heap from the snapshot parameter `snap`
 /// of `resource(args)`. The produced heap becomes the body's value/perm heap.
 pub(crate) struct SnapEntry {
@@ -910,7 +910,7 @@ fn call_contract(sink: &mut Sink, func: vmir::MemberId, args: Vec<Val>) -> Val {
 /// heap-dependent function, occupy the lower temps); `heap` is the context heap
 /// the body reads from (`HeapVal::Empty` for a heap-free body); `result` is
 /// `Some` only for a postcondition function. When `snap_entry` is `Some`, the
-/// body opens with its `FromSnap` — reconstructing the precondition heap from
+/// body opens with its bound `inhale` — reconstructing the precondition heap from
 /// the snapshot parameter (implicitly assuming the resource bool) — and that
 /// heap replaces `heap` as the body's value/perm heap. When `contract` is
 /// `Some`, the body **assumes** `requires(params)` at entry and **asserts**
@@ -937,11 +937,16 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
             resource,
             args,
             snap,
-        }) => sink.emit_heap(HeapInst::FromSnap {
-            resource,
-            args,
-            snap,
-        }),
+        }) => sink.emit_heap(HeapInst::Inhale {
+                base: HeapVal::Empty,
+                bind: vmir::Bind::Bound(snap),
+                call: vmir::ResourceCall { resource, args },
+                // `1/1`, NOT `wildcard`: the scale multiplies each footprint
+                // slot's own permission, so `1/1` reproduces the amounts the
+                // dedicated instruction used (`1 * p` folds away). A wildcard
+                // scale would silently rewrite every slot to `w * p`.
+                perm: vmir::Perm::write(),
+            }),
         None => heap,
     };
     let hctx = HeapCtx {
@@ -952,7 +957,7 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
         in_quantifier: false,
     };
     // Entry: assume the precondition. (Heap-dependent bodies skip this — the
-    // `FromSnap` above assumes the requires resource's bool implicitly.)
+    // the bound `inhale` above assumes the requires resource's bool implicitly.)
     if let Some(FnContract {
         requires: Some(req),
         params,

@@ -4,6 +4,6 @@ sat_iterations=4
 egraph_nodes_peak=17
 egraph_classes_peak=14
 rule_applications=1
-prove_calls=5
+prove_calls=6
 prove_tier3=0
 rule.ite-reduce=1

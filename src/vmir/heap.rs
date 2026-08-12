@@ -127,18 +127,6 @@ pub enum HeapInst {
         perm: Perm,
     },
     /// `h := heap_of R(args), snap` — widen a snapshot value back into a heap:
-    /// one chunk per footprint slot of the self-framed resource `R(args)`, at
-    /// `addr_k` with permission `perm_k` (presence-gated) and value
-    /// `unwrap(proj_k(snap))`; the resource's boolean condition is **assumed**
-    /// implicitly. Inverse of [`PureInst::Snap`](crate::vmir::PureInst::Snap);
-    /// value-preserving like `Unfold` (values come from the snapshot), not
-    /// opaque like `Inhale`. Used at the entry of a heap-dependent function
-    /// body to reconstruct the precondition heap from the snapshot parameter.
-    FromSnap {
-        resource: MemberId,
-        args: Vec<Val>,
-        snap: Val,
-    },
     /// `h := merge <cond> ? <then_h> : <els_h>` — the block-IR heap join: select
     /// between two predecessor exit heaps under a binary join condition. The
     /// *structural* per-chunk merge (`design/block-vmir/30`) that collapses the
@@ -324,20 +312,6 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 write!(f, "{base} unfold ")?;
                 call_head(f, call)?;
                 write!(f, " {}", self.with(perm))
-            }
-            HeapInst::FromSnap {
-                resource,
-                args,
-                snap,
-            } => {
-                write!(f, "heap_of {}(", self.member(*resource))?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                write!(f, "), {snap}")
             }
             HeapInst::Merge {
                 cond,

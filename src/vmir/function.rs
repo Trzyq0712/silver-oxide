@@ -14,7 +14,7 @@ use std::fmt::{self, Display, Formatter};
 /// and the function takes that resource's snapshot as an ordinary trailing
 /// parameter (`Type::Snap(req_id)`). Call sites build the snapshot with
 /// `PureInst::Snap`; the body reconstructs its precondition heap with
-/// `HeapInst::FromSnap` and reads it via `Deref`.
+/// `HeapInst::a bound inhale` and reads it via `Deref`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Function {
     pub name: Spur,
@@ -54,7 +54,7 @@ pub enum Requires {
     Pure(ContractCall<Val>),
     /// Heap-dependent: a self-framed `Resource` (footprint + bool) applied to
     /// `args`, plus `snap` — the trailing snapshot parameter that call sites
-    /// build with `PureInst::Snap` and the body opens with `HeapInst::FromSnap`.
+    /// build with `PureInst::Snap` and the body opens with `HeapInst::a bound inhale`.
     /// There is no boolean requires-function, so the verifier guards this
     /// function's facts with an uninterpreted pre-token over `args ++ [snap]`,
     /// released where a `Snap`'s implicit precondition check passes.

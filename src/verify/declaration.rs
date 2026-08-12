@@ -2021,11 +2021,6 @@ fn eval_heap_inst(
         HeapInst::Fold { .. } | HeapInst::Unfold { .. } => Err(VerifyError::Unimplemented(
             "fold/unfold outside method body",
         )),
-        // Snapshot → heap reconstruction needs the program + certificates;
-        // handled in `eval_method_inst` (function bodies are walked there).
-        HeapInst::FromSnap { .. } => Err(VerifyError::Unimplemented(
-            "FromSnap outside a function/method body",
-        )),
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).
         HeapInst::Assign(heap, Assign { loc, val }) => {
@@ -2098,10 +2093,14 @@ fn eval_resource_body_inst(
         // `unfold` inside a resource body verifies identically to a method
         // body (shared `eval_unfold`); only `Unfold` is emitted here.
         InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
-        // The entry `heap_of req(args), s` of a two-state resource body:
-        // reconstruct the pre-state heap from the snapshot parameter (implicitly
-        // assuming the precondition resource's boolean).
-        InstKind::Heap(HeapInst::FromSnap { .. }) => {
+        // The entry of a two-state resource body: reconstruct the pre-state
+        // heap from the snapshot parameter (implicitly assuming the precondition
+        // resource's boolean). A *bound* inhale, so it reconstructs rather than
+        // havocs.
+        InstKind::Heap(HeapInst::Inhale {
+            bind: Bind::Bound(_),
+            ..
+        }) => {
             let heap = eval_from_snap(ctx, program, state, inst, certs)?;
             state.push_heap(heap);
         }
@@ -2268,12 +2267,6 @@ fn eval_method_inst(
         // footprint (fields recovered by projecting the snapshot), assume the
         // body's pure facts.
         InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
-        // `heap_of R(args), s`: reconstruct a heap from a snapshot (the entry of
-        // a heap-dependent function body), assuming the resource bool.
-        InstKind::Heap(HeapInst::FromSnap { .. }) => {
-            let heap = eval_from_snap(ctx, program, state, inst, certs)?;
-            state.push_heap(heap);
-        }
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -2863,7 +2856,7 @@ fn eval_snap(
     Ok((s, recipe))
 }
 
-/// Evaluate a `FromSnap`: widen a snapshot value back into a heap — the entry
+/// Evaluate a a bound `inhale`: widen a snapshot value back into a heap — the entry
 /// of a heap-dependent function body reconstructing its precondition heap from
 /// the snapshot parameter. Inverse of [`eval_snap`], inhale-shaped: one chunk
 /// per footprint slot at the grafted address with the footprint permission and
@@ -2876,14 +2869,15 @@ fn eval_from_snap(
     inst: &Inst,
     certs: &HashMap<MemberId, ResourceDefinition>,
 ) -> Result<Heap, VerifyError> {
-    let InstKind::Heap(HeapInst::FromSnap {
-        resource,
-        args,
-        snap,
+    let InstKind::Heap(HeapInst::Inhale {
+        bind: Bind::Bound(snap),
+        call,
+        ..
     }) = &inst.kind
     else {
-        unreachable!("eval_from_snap called on a non-FromSnap instruction");
+        unreachable!("eval_from_snap called on a non-bound-inhale instruction");
     };
+    let (resource, args) = (&call.resource, &call.args);
     let arg_ids: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
     let s = state.get_val(ctx, snap);
     // The snapshot parameter's recipe — each reconstructed slot's provenance
@@ -2897,7 +2891,7 @@ fn eval_from_snap(
 
     // Reconstruct the precondition heap: produce one chunk per footprint slot
     // valued `unwrap(proj_i(s))` into the empty heap, assuming the resource body
-    // (guarded by the path condition — a `FromSnap` may sit under a branch).
+    // (guarded by the path condition — a a bound `inhale` may sit under a branch).
     let FootprintResult { heap: out, .. } = walk_footprint(
         ctx,
         program,
@@ -3506,7 +3500,7 @@ pub(crate) fn verify_resource(
         .collect();
     // A two-state (`Ctx`) resource needs no special seeding: its pre-state
     // arrives as the trailing snapshot parameter (a fresh symbolic like any
-    // other param) and its body's entry `FromSnap` reconstructs the pre-state
+    // other param) and its body's entry bound `inhale` reconstructs the pre-state
     // heap, implicitly assuming the precondition resource's boolean.
     let mut state = EvalState::with_args(params, resource.params.clone());
 
@@ -3559,7 +3553,7 @@ pub(crate) fn verify_resource(
 /// sites (`rewrite::function_rule`). Abstract functions (no body) have nothing
 /// to verify.
 ///
-/// The walk runs the ordinary live eval (obligations, `FromSnap`/`Unfold` heap
+/// The walk runs the ordinary live eval (obligations, a bound `inhale`/`Unfold` heap
 /// reconstruction, `Deref` values), logging each heap-reconstruction event into
 /// `ctx.heap_events`. Then [`purify_function`] re-walks the body once, turning it
 /// into an add-only recipe over the params (and the snapshot param, for
@@ -3666,7 +3660,7 @@ pub(crate) fn verify_function(
     let mut snap = Snapshotter::from_env(function_name);
     snap.snapshot(&ctx, &[], "init", None);
     // The method-body eval path handles every inst a function body can contain
-    // (pure ops, the entry `assume`, `Snap`/`FromSnap`/`Unfold` for heap-dependent
+    // (pure ops, the entry `assume`, `Snap`/a bound `inhale`/`Unfold` for heap-dependent
     // functions).
     walk_body(
         &mut ctx,
@@ -3866,7 +3860,7 @@ fn inst_obligations(
 ) -> Vec<(egg::Id, VerifyError)> {
     match kind {
         // `0 < perm(heap, loc)` — the location must be framed by the heap being
-        // read. In a function body that heap is the one the entry `FromSnap`
+        // read. In a function body that heap is the one the entry bound `inhale`
         // reconstructs from the snapshot parameter, so this failing means a read
         // outside the declared precondition. `chunk_under_pc` lets an address
         // that only aliases a held chunk under this instruction's branch (e.g.

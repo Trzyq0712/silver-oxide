@@ -323,7 +323,7 @@ method m(x: Ref)
 #[test]
 fn old_over_heap_dependent_function_binds_pre_state() {
     // `old(get(this))` applies a heap-dependent function under `old`: the
-    // ensures body reads the pre-state via `Snap` on the `FromSnap`-widened
+    // ensures body reads the pre-state via `Snap` on the a bound `inhale`-widened
     // snapshot parameter, which must congruence-collapse to the caller's real
     // pre-state values at the exhale graft.
     let unchanged = r#"
@@ -517,7 +517,7 @@ method m(x: Int)
 /// Jointly build resource and function certificates to a fixpoint (test
 /// helper) — the stand-in for the driver's topological order when the two
 /// kinds depend on each other: a heap-dependent function's body needs its
-/// `f#requires` **Resource** cert (`FromSnap`), while a resource body may call
+/// `f#requires` **Resource** cert (a bound `inhale`), while a resource body may call
 /// functions. Failures are tolerated (retried until no progress) so a
 /// deliberately-failing member simply ends up without a cert.
 #[allow(clippy::type_complexity)]
@@ -3226,7 +3226,7 @@ method m() { assert f(2) == 3 }
 
 #[test]
 fn heap_dependent_function_purifies_to_snapshot_projection() {
-    // A heap-dependent body (`FromSnap`; `Deref`) purifies to `unwrap(proj_0(s))`.
+    // A heap-dependent body (a bound `inhale`; `Deref`) purifies to `unwrap(proj_0(s))`.
     // The function verifies (frames its precondition footprint) end to end.
     let input = r#"
 field f: Int
@@ -3303,7 +3303,7 @@ fn postcondition_wd_under_precondition() {
     // Post WD depends on pre truth: the divisor obligation inside
     // `safediv#ensures`'s body is only provable under the entry
     // `assume safediv#requires(x, y)` (mirroring the heap-dependent
-    // `FromSnap` entry).
+    // a bound `inhale` entry).
     let input = r#"
 function safediv(x: Int, y: Int): Int
     requires y != 0

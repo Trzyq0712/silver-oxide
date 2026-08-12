@@ -27,8 +27,8 @@ pub struct Resource {
 /// - `Ctx(req, args)`: two-state — the body additionally reads the pre-state of
 ///   the precondition resource `req` applied to `args`, received as a trailing
 ///   snapshot parameter `s : Snap(req)` and widened back into a heap by the
-///   body's entry `HeapInst::FromSnap`. `#ensures`. Opaque-only; never
-///   snapshotted or folded. (The payload is metadata — the entry `FromSnap`
+///   body's entry `HeapInst::a bound inhale`. `#ensures`. Opaque-only; never
+///   snapshotted or folded. (The payload is metadata — the entry bound `inhale`
 ///   carries the same information explicitly.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Precond {
@@ -168,7 +168,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
             None => Ok(()),
             Some(body) => {
                 // Body heaps always count from `h0` (a two-state resource's
-                // pre-state is reconstructed by its explicit entry `FromSnap`,
+                // pre-state is reconstructed by its explicit entry bound `inhale`,
                 // which is `h0` itself — no reserved slot).
                 writeln!(f, " {{")?;
                 write!(

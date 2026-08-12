@@ -690,10 +690,10 @@ fn heap_dependent_function_lowers_to_snapshot_passing() {
     // A function whose precondition grants permission (`acc`) is heap-dependent:
     // - `get#requires` is a self-framed Resource (footprint + bool);
     // - `get` gains a trailing snapshot parameter `Snap(get#requires)`; its body
-    //   opens with `FromSnap` (no boolean entry assume — the resource bool is
+    //   opens with a bound `inhale` (no boolean entry assume — the resource bool is
     //   assumed implicitly) and closes with `assert get#ensures(x, result, s)`;
     // - `get#ensures` is a boolean Function over (params ++ [result, snap]) whose
-    //   body also opens with `FromSnap`, so it can read the precondition heap.
+    //   body also opens with a bound `inhale`, so it can read the precondition heap.
     let input = r#"
 field f: Int
 function get(x: Ref): Int
@@ -726,18 +726,20 @@ function get(x: Ref): Int
         "heap-dep function takes its precondition snapshot as trailing param"
     );
     let body = get.body.as_ref().expect("body must be lowered");
-    // Entry: FromSnap reconstructing the precondition heap from the snap param.
+    // Entry: a *bound* inhale reconstructing the precondition heap from the
+    // snap param. The bind is what makes this a reconstruction rather than a
+    // havoc, so assert it names the snapshot parameter specifically.
     assert!(
         matches!(
             &body.insts[0].kind,
-            vmir::InstKind::Heap(vmir::HeapInst::FromSnap { resource, args, snap })
-                if *resource == req_id
-                    && args == &vec![vmir::Val::Temp(0)]
-                    && *snap == vmir::Val::Temp(1)
+            vmir::InstKind::Heap(vmir::HeapInst::Inhale { bind, call, .. })
+                if *bind == vmir::Bind::Bound(vmir::Val::Temp(1))
+                    && call.resource == req_id
+                    && call.args == vec![vmir::Val::Temp(0)]
         ),
-        "body must open with FromSnap of get#requires"
+        "body must open with a bound inhale of get#requires"
     );
-    // No boolean entry assume — FromSnap assumes the resource bool implicitly.
+    // No boolean entry assume — the inhale assumes the resource bool implicitly.
     assert!(
         !body
             .insts
@@ -765,7 +767,7 @@ function get(x: Ref): Int
     );
 
     // #ensures: boolean Function over (params ++ [result, snap]), body opens
-    // with the same FromSnap.
+    // with the same a bound inhale.
     let vmir::Declaration::Function(ens) = &p.decls[ens_id] else {
         panic!("get#ensures must be a Function");
     };
@@ -779,10 +781,11 @@ function get(x: Ref): Int
     assert!(
         matches!(
             &ens_body.insts[0].kind,
-            vmir::InstKind::Heap(vmir::HeapInst::FromSnap { resource, snap, .. })
-                if *resource == req_id && *snap == vmir::Val::Temp(2)
+            vmir::InstKind::Heap(vmir::HeapInst::Inhale { bind, call, .. })
+                if call.resource == req_id
+                    && *bind == vmir::Bind::Bound(vmir::Val::Temp(2))
         ),
-        "ensures body must open with FromSnap (snap after result)"
+        "ensures body must open with a bound inhale (snap after result)"
     );
 }
 

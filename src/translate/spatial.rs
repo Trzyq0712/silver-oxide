@@ -130,7 +130,7 @@ pub(crate) fn lower_spatial_ensures(
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
     sink.in_resource_body = true;
-    // A two-state ensures opens with `heap_of req(args), s` (`FromSnap`):
+    // A two-state ensures opens with a bound `inhale` of `req(args)`:
     // reconstruct the method pre-state from the trailing snapshot parameter.
     // That heap is the (unlabeled) `old` baseline `old(e)` reads. A self-framed
     // ensures has no pre-state, so `old` is rejected at lowering (see
@@ -141,10 +141,15 @@ pub(crate) fn lower_spatial_ensures(
              args,
              snap,
          }| {
-            sink.emit_heap(HeapInst::FromSnap {
-                resource,
-                args,
-                snap,
+sink.emit_heap(HeapInst::Inhale {
+                base: HeapVal::Empty,
+                bind: vmir::Bind::Bound(snap),
+                call: vmir::ResourceCall { resource, args },
+                // `1/1`, NOT `wildcard`: the scale multiplies each footprint
+                // slot's own permission, so `1/1` reproduces the amounts the
+                // dedicated instruction used (`1 * p` folds away). A wildcard
+                // scale would silently rewrite every slot to `w * p`.
+                perm: vmir::Perm::write(),
             })
         },
     );
