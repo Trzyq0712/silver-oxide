@@ -14,7 +14,7 @@ pub mod display;
 
 pub use ty::Type;
 
-pub use heap::{Assign, HeapInst, HeapVal, Perm};
+pub use heap::{Assign, Bind, HeapInst, HeapVal, Perm};
 pub use pure::{BinOp, FALSE, Literal, NULL, PureInst, TRUE, Val, none, write};
 
 pub use adt::TyParams;

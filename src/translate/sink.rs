@@ -67,6 +67,15 @@ pub(crate) struct Sink {
     /// precondition resources; `false` for methods and predicate bodies. See
     /// [`Sink::perm_amount`].
     pub(crate) read_only: bool,
+    /// Whether this sink is lowering a **resource body** (a predicate, or a
+    /// method/function contract) rather than a method body. Decides the `Bind`
+    /// on a footprint `acc`: `SelfSlot` inside a resource, `Fresh` in a method.
+    ///
+    /// Carried here rather than threaded because the two are already distinct
+    /// entry points — `lower_spatial_never` / `lower_spatial_ensures` mint their
+    /// own `Sink` and return a `ResourceBody`, while a method body's statements
+    /// share the method's sink. Same shape as `read_only` above.
+    pub(crate) in_resource_body: bool,
 }
 
 impl Sink {
@@ -80,6 +89,7 @@ impl Sink {
             heap: None,
             memo: HashMap::new(),
             read_only: false,
+            in_resource_body: false,
         }
     }
 
@@ -191,6 +201,18 @@ impl Sink {
     }
 
     /// Map a lowered permission *value* to a [`Perm`], applying the read-only
+    /// The [`Bind`] for a footprint `acc` emitted by this sink: the enclosing
+    /// resource's next own slot inside a resource body, an unconstrained fresh
+    /// value in a method body. There is no third case — a bind to a named term
+    /// comes from a desugaring that builds the instruction itself.
+    pub(crate) fn acc_bind(&self) -> crate::vmir::Bind {
+        if self.in_resource_body {
+            crate::vmir::Bind::SelfSlot
+        } else {
+            crate::vmir::Bind::Fresh
+        }
+    }
+
     /// (function) policy when [`Sink::read_only`] is set: a constant `0` stays
     /// `0`; a constant nonzero amount becomes `wildcard`; any other (symbolic)
     /// amount `p` becomes `p > 0 ? wildcard : 0`. Outside read-only context the

@@ -1049,6 +1049,9 @@ fn lower_new(
                     base: heap,
                     loc,
                     perm,
+                    // `new(...)` genuinely mints values: the canonical
+                    // legitimate `with fresh`.
+                    bind: vmir::Bind::Fresh,
                 });
             }
             Ok(heap)

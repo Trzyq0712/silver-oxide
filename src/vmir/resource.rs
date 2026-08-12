@@ -1,7 +1,7 @@
 use crate::vmir::display::VmirDisplay;
 use crate::vmir::{
-    Adt, AdtVariant, Bound, Domain, Function, HeapInst, HeapVal, Inst, InstKind, MemberId, Type,
-    Val,
+    Adt, AdtVariant, Bind, Bound, Domain, Function, HeapInst, HeapVal, Inst, InstKind, MemberId,
+    Type, Val,
 };
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
@@ -73,9 +73,14 @@ impl Resource {
     /// params occupy `Val::Temp(0..n)`, so a `Val -> Type` map is just the params
     /// followed by each `Pure`'s result type. Every footprint slot is a
     /// `HeapInst::Add` whose `loc` is an address of type `Addr<T>`; the slot
-    /// type is `Option[T]`. Naming `Add` (rather than the old sign-less
-    /// `Combine`) is load-bearing: a `Sub` in a body — which a desugared
-    /// `unfolding` will emit — must never be counted as a footprint slot.
+    /// type is `Option[T]`.
+    ///
+    /// The layout is **defined by the body's `with self` binds**, not inferred
+    /// from the shape of its instructions. That distinction is load-bearing: a
+    /// body may legitimately contain heap operations that are *not* footprint
+    /// slots — a scoped `unfolding` region produces and consumes chunks of
+    /// another predicate — and those carry `Bind::Bound`/no bind, so they are
+    /// skipped here rather than silently becoming phantom slots.
     pub fn derive_snapshot(&self) -> Option<Snapshot> {
         if !self.is_self_framed() {
             return None;
@@ -88,7 +93,12 @@ impl Resource {
         for inst in &body.insts {
             match &inst.kind {
                 InstKind::Pure(ty, _) => val_types.push(ty.clone()),
-                InstKind::Heap(HeapInst::Add { loc, .. }) => {
+                // Only a `with self` add declares a footprint slot.
+                InstKind::Heap(HeapInst::Add {
+                    loc,
+                    bind: Bind::SelfSlot,
+                    ..
+                }) => {
                     let ty = match loc {
                         Val::Temp(n) => val_types.get(*n),
                         Val::Literal(_) => None,

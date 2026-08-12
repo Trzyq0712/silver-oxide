@@ -72,6 +72,7 @@ pub(crate) fn lower_spatial_never(
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, heap_base);
     sink.read_only = read_only;
+    sink.in_resource_body = true;
     let (h, bv) = lower_spatial(
         b,
         env,
@@ -128,6 +129,7 @@ pub(crate) fn lower_spatial_ensures(
     snap_entry: Option<pure_exp::SnapEntry>,
 ) -> Result<vmir::ResourceBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
+    sink.in_resource_body = true;
     // A two-state ensures opens with `heap_of req(args), s` (`FromSnap`):
     // reconstruct the method pre-state from the trailing snapshot parameter.
     // That heap is the (unlabeled) `old` baseline `old(e)` reads. A self-framed
@@ -200,6 +202,10 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
                     base: acc_heap,
                     loc,
                     perm,
+                    // A footprint `acc` in a resource body declares that
+                    // resource's next own slot; in a method body it produces an
+                    // unconstrained value.
+                    bind: sink.acc_bind(),
                 },
                 SpatialMode::Exhale { .. } => HeapInst::Sub {
                     base: acc_heap,

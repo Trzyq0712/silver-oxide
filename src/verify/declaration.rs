@@ -12,7 +12,7 @@ use crate::{
     },
     vmir::{
         self, Assign, BinOp, Bound, Declaration, Function, HeapInst, HeapVal, Inst, InstKind,
-        Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, Type, Val,
+        Bind, Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, Type, Val,
     },
 };
 
@@ -1935,8 +1935,15 @@ fn eval_heap_inst(
         }
         // `base ± acc loc perm`: build the single chunk, then union (Add) or
         // subtract (Sub) it.
-        HeapInst::Add { base, loc, perm } | HeapInst::Sub { base, loc, perm } => {
-            let is_add = matches!(inst, HeapInst::Add { .. });
+        HeapInst::Add {
+            base, loc, perm, ..
+        }
+        | HeapInst::Sub { base, loc, perm } => {
+            // `Add` carries a `Bind`; `Sub` is read-shaped and carries none.
+            let bind = match inst {
+                HeapInst::Add { bind, .. } => Some(bind),
+                _ => None,
+            };
             let base_h = get_heap(state, base);
             let perm_id = eval_perm(ctx, state, perm);
             let chunk = heap_acc(ctx, loc, perm_id, state);
@@ -1947,8 +1954,36 @@ fn eval_heap_inst(
                 .collect();
             let (kind, ch) = chunk.entries().next().unwrap();
             let (kind, mut ch) = (kind.clone(), ch.clone());
-            if is_add {
+            if let Some(bind) = bind {
                 {
+                    // The bind selects the value source. `Fresh` and `SelfSlot`
+                    // agree on the *value* today — `heap_acc` mints a fresh
+                    // symbolic either way — and differ only in provenance: a
+                    // resource body's slot records a `SlotValue(i)` seed that is
+                    // resolved at graft time by whatever the caller passed. So
+                    // this reads the bind rather than inferring the context, but
+                    // is behavior-preserving.
+                    match bind {
+                        // A resource body's footprint slot. Recorded below.
+                        Bind::SelfSlot => debug_assert!(
+                            ctx.recipe.is_some(),
+                            "`with self` outside a resource-body (certificate) walk"
+                        ),
+                        // A method-body produce: an unconstrained value, and no
+                        // certificate is under construction to record it in.
+                        Bind::Fresh => debug_assert!(
+                            ctx.recipe.is_none(),
+                            "`with fresh` inside a resource body — a body that \
+                             mints an observable value is not deterministic"
+                        ),
+                        // Wired in the stage that desugars fold/unfold; nothing
+                        // emits it yet.
+                        Bind::Bound(_) => {
+                            return Err(VerifyError::Unimplemented(
+                                "bound slot produce (`with <val>`)",
+                            ));
+                        }
+                    }
                     // A resource body's `acc` records a footprint slot in the
                     // certificate under construction: its value is the seed
                     // placeholder `SlotValue(i)` (supplied at graft time), its

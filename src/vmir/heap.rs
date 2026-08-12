@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{MemberId, ResourceCall, Val};
+use crate::vmir::{MemberId, ResourceCall, Type, Val};
 use std::fmt::{self, Display, Formatter};
 
 /// Heap-typed value.
@@ -62,13 +62,19 @@ impl Display for VmirDisplay<'_, &Perm> {
 /// Heap instructions. All heap instructions produce new heaps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HeapInst {
-    /// `h := base + acc <loc> <perm>`. Adds the single location chunk at `loc`
-    /// with permission `perm` to `base`. Pure heap accounting — no boolean is
-    /// assumed or asserted (cf. `Inhale`/`Exhale`).
+    /// `h := base + acc <loc> <perm> with <bind>`. Adds the single location
+    /// chunk at `loc` with permission `perm` to `base`. Pure heap accounting —
+    /// no boolean is assumed or asserted (cf. `Inhale`/`Exhale`).
+    ///
+    /// `bind` says where the chunk's **value** comes from. It is always written
+    /// and never defaulted: producing a value is the operation with soundness
+    /// consequences, so the dangerous case (`Fresh`) must not be the one a
+    /// reader skips.
     Add {
         base: HeapVal,
         loc: Val,
         perm: Perm,
+        bind: Bind,
     },
     /// `h := base - acc <loc> <perm>`. Subtracts the single location chunk at
     /// `loc` with permission `perm` from `base`. Pure heap accounting — no
@@ -158,6 +164,37 @@ impl HeapInst {
     /// **self-framed** resource produces `s : Snap(callee)` alongside the new
     /// heap. Two-state callees (and every other heap inst) yield none. Derived
     /// from the callee declaration — not stored on the inst.
+    /// The extra pure `Val` this instruction yields, and its type.
+    ///
+    ///  - `Inhale`/`Exhale` of a **self-framed** callee → `Snap(callee)`, plain.
+    ///  - `Sub` → `Option<T>`, where `T` is the held value type of `loc`: the
+    ///    instruction *discovers* whether the location held anything, and `None`
+    ///    reports that it did not. This is the one position where optionality
+    ///    belongs, because it is the one place presence is discovered rather than
+    ///    supplied — `Add`'s `bind` and both resource ops hand a value over.
+    ///  - everything else → none.
+    ///
+    /// Derived, never stored, like [`HeapInst::snap_yield`] which it generalizes.
+    /// `val_ty` resolves an operand's VMIR type; both callers already track it
+    /// (the translator in its `Sink`, the verifier in `EvalState::val_types`).
+    ///
+    /// NOTE: the `Sub` arm has no consumer yet — the `Option` is threaded when
+    /// `unfold` is desugared into a `Sub` + `Inhale` pair. Until then nothing
+    /// pushes this `Val`, so temp numbering is unchanged.
+    pub fn val_yield(
+        &self,
+        decls: &typed_index_collections::TiVec<MemberId, crate::vmir::Declaration>,
+        val_ty: impl Fn(&Val) -> Option<Type>,
+    ) -> Option<Type> {
+        match self {
+            HeapInst::Sub { loc, .. } => {
+                let held = val_ty(loc)?.addr_value()?.clone();
+                Some(Type::Option(Box::new(held)))
+            }
+            _ => self.snap_yield(decls).map(Type::Snap),
+        }
+    }
+
     pub fn snap_yield(
         &self,
         decls: &typed_index_collections::TiVec<MemberId, crate::vmir::Declaration>,
@@ -172,6 +209,35 @@ impl HeapInst {
                 }
             }
             _ => None,
+        }
+    }
+}
+
+/// Where a produced chunk's value comes from — the IR half of the verifier's
+/// `ValueSource`. Deliberately *not* the same type: `ValueSource` names e-class
+/// ids and recipe terms, which the IR does not have.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Bind {
+    /// Havoc — surface `with fresh`. An unconstrained fresh value per slot.
+    /// Legal only at an instruction in a **method** body: a resource body that
+    /// minted a fresh observable value would not be deterministic.
+    Fresh,
+    /// Bound to an in-scope term — surface `with <val>`.
+    Bound(Val),
+    /// The **next** slot of the enclosing resource's own footprint — surface
+    /// `with self`. Deliberately **unnumbered**: writing `self.2` would
+    /// presuppose the slot layout, and the layout is *derived* from the body, so
+    /// the body would reference its own derived structure. Unnumbered, the
+    /// ordinal is a consequence of position and the circularity is gone.
+    SelfSlot,
+}
+
+impl Display for Bind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Bind::Fresh => write!(f, "fresh"),
+            Bind::Bound(v) => write!(f, "{v}"),
+            Bind::SelfSlot => write!(f, "self"),
         }
     }
 }
@@ -217,9 +283,12 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 write!(f, " {}", self.with(perm))
             };
         match self.item {
-            HeapInst::Add { base, loc, perm } => {
-                write!(f, "{base} + acc {loc} {}", self.with(perm))
-            }
+            HeapInst::Add {
+                base,
+                loc,
+                perm,
+                bind,
+            } => write!(f, "{base} + acc {loc} {} with {bind}", self.with(perm)),
             HeapInst::Sub { base, loc, perm } => {
                 write!(f, "{base} - acc {loc} {}", self.with(perm))
             }
@@ -263,5 +332,73 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             } => write!(f, "merge {cond} ? {then_h} : {els_h}"),
             HeapInst::Union { a, b } => write!(f, "union {a} {b}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vmir::{Bound, Perm};
+    use lasso::Rodeo;
+    use typed_index_collections::TiVec;
+
+    fn addr_ty(value: Type) -> Type {
+        let mut groups: Rodeo<lasso::Spur> = Rodeo::new();
+        Type::Addr {
+            group: groups.get_or_intern("f"),
+            value: Box::new(value),
+            bound: Bound::Bounded(num::BigRational::from(num::BigInt::from(1))),
+        }
+    }
+
+    /// `Sub` yields `Option<T>` for the *held value* type of its location — the
+    /// one place presence is discovered rather than supplied.
+    #[test]
+    fn sub_yields_option_of_the_held_value_type() {
+        let decls: TiVec<MemberId, crate::vmir::Declaration> = TiVec::new();
+        let inst = HeapInst::Sub {
+            base: HeapVal::Empty,
+            loc: Val::Temp(0),
+            perm: Perm::write(),
+        };
+        let got = inst.val_yield(&decls, |_| Some(addr_ty(Type::Int)));
+        assert_eq!(got, Some(Type::Option(Box::new(Type::Int))));
+    }
+
+    /// A predicate location yields `Option<Snap(P)>`, which is what makes the
+    /// desugared `unfold` able to hand the snapshot to its paired `inhale`.
+    #[test]
+    fn sub_on_a_predicate_location_yields_option_of_its_snapshot() {
+        let decls: TiVec<MemberId, crate::vmir::Declaration> = TiVec::new();
+        let pred = MemberId(7);
+        let inst = HeapInst::Sub {
+            base: HeapVal::Empty,
+            loc: Val::Temp(0),
+            perm: Perm::write(),
+        };
+        let got = inst.val_yield(&decls, |_| Some(addr_ty(Type::Snap(pred))));
+        assert_eq!(got, Some(Type::Option(Box::new(Type::Snap(pred)))));
+    }
+
+    /// `Add` supplies its value through `bind`, so it discovers nothing and
+    /// yields nothing.
+    #[test]
+    fn add_yields_nothing() {
+        let decls: TiVec<MemberId, crate::vmir::Declaration> = TiVec::new();
+        let inst = HeapInst::Add {
+            base: HeapVal::Empty,
+            loc: Val::Temp(0),
+            perm: Perm::write(),
+            bind: Bind::Fresh,
+        };
+        assert_eq!(inst.val_yield(&decls, |_| Some(addr_ty(Type::Int))), None);
+    }
+
+    /// A bind renders as `with <source>`, and the `Fresh` case is never silent.
+    #[test]
+    fn bind_display_is_explicit() {
+        assert_eq!(Bind::Fresh.to_string(), "fresh");
+        assert_eq!(Bind::SelfSlot.to_string(), "self");
+        assert_eq!(Bind::Bound(Val::Temp(4)).to_string(), "e4");
     }
 }
