@@ -1,0 +1,25 @@
+// The positive control for `failing/functions/callee_facts_do_not_escape_their_guard.vpr`.
+//
+// The guard must not be so strong that a legitimate unconditional call fails to
+// deliver the callee's postcondition. Without this, the negative cases could be
+// satisfied by a guard that never releases anything at all.
+
+function restates(x: Int): Int
+    requires x > 0
+    ensures result == x && x > 0
+{ x }
+
+method unconditional_call_releases_the_postcondition(x: Int)
+    requires x > 0
+{
+    var v: Int := restates(x)
+    assert v == x
+}
+
+// Released under a branch, and used INSIDE that branch, where it is legitimate.
+method call_fact_is_usable_inside_its_own_branch(x: Int) {
+    if (x > 0) {
+        var v: Int := restates(x)
+        assert v == x
+    }
+}

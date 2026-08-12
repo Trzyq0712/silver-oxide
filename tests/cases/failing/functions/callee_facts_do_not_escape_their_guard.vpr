@@ -1,0 +1,35 @@
+// A callee's postcondition must not escape the path condition of the call that
+// released it. This is the shape of the `ensures false` leak across ternary
+// siblings that motivated putting the pc on the `f%pre` token.
+//
+// The trick that makes leakage OBSERVABLE: `restates` re-asserts its own
+// precondition in its postcondition, so the escaping fact is about the
+// *argument* (`x > 0`) rather than the result. A fact about the result would be
+// unobservable on a sibling path, where the result is not the call's value.
+//
+// Both methods must be REJECTED.
+//
+// Verified to have teeth by a 2x2 probe (design/pre-tokens/AUDIT.md): with BOTH
+// the token's pc guard and the `guard_app` fact guard disabled, both methods
+// verify -- i.e. the leak is real and these cases catch it. With EITHER guard
+// alone they are correctly rejected, which is why they pass today and why they
+// become the sole guard once `guard_app` is deleted.
+
+function restates(x: Int): Int
+    requires x > 0
+    ensures result == x && x > 0
+{ x }
+
+// The ternary's condition establishes the precondition, so the call's own check
+// passes and the method fails only if the postcondition escapes the arm.
+method ternary_sibling(x: Int) {
+    var v: Int := (x > 0) ? restates(x) : 0
+    assert x > 0
+}
+
+// The same, under an if-statement rather than a ternary.
+method branch_sibling(x: Int) {
+    var v: Int := 0
+    if (x > 0) { v := restates(x) }
+    assert x > 0
+}
