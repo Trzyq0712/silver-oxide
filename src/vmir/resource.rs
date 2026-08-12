@@ -93,6 +93,15 @@ impl Resource {
         for inst in &body.insts {
             match &inst.kind {
                 InstKind::Pure(ty, _) => val_types.push(ty.clone()),
+                // A frame-only exhale yields the callee's snapshot, so it
+                // occupies a `Val` slot even though it is a *heap* instruction.
+                // The table is positional, so skipping it would shift every
+                // later `loc` lookup and miscount the footprint. Its type is
+                // never an `Addr`, so a placeholder keeps the alignment without
+                // needing the declarations to resolve the real snapshot type.
+                InstKind::Heap(HeapInst::Exhale {
+                    frame_only: true, ..
+                }) => val_types.push(Type::Bool),
                 // Only a `with self` add declares a footprint slot.
                 InstKind::Heap(HeapInst::Add {
                     loc,

@@ -436,6 +436,31 @@ impl Sink {
         })
     }
 
+    /// A **frame-only** exhale: prove the callee's footprint is held and assert
+    /// its boolean, producing the snapshot but **no heap** (`_, e := ..`). This is
+    /// the implicit precondition check at a heap-dependent function call --
+    /// functions frame, they don't consume -- so it bumps the `Val` counter only.
+    pub fn emit_resource_frame_exhale(
+        &mut self,
+        base: HeapVal,
+        call: ResourceCall,
+        perm: Perm,
+    ) -> Val {
+        // NOT `emit_heap_guarded`: that mints a heap temp, and this instruction
+        // produces no heap. Only the `Val` counter advances.
+        let pc = self.guard();
+        self.insts.push(Inst::new(
+            pc,
+            InstKind::Heap(HeapInst::Exhale {
+                frame_only: true,
+                base,
+                call,
+                perm,
+            }),
+        ));
+        self.next_val_temp()
+    }
+
     /// The consume counterpart of [`Sink::emit_resource_inhale`].
     pub fn emit_resource_exhale(
         &mut self,
@@ -444,7 +469,12 @@ impl Sink {
         perm: Perm,
         yields_snap: bool,
     ) -> (HeapVal, Option<Val>) {
-        let h = self.emit_heap_guarded(HeapInst::Exhale { base, call, perm });
+        let h = self.emit_heap_guarded(HeapInst::Exhale {
+            frame_only: false,
+            base,
+            call,
+            perm,
+        });
         let snap = yields_snap.then(|| self.next_val_temp());
         (h, snap)
     }

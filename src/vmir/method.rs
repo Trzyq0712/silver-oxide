@@ -99,7 +99,9 @@ fn count_temps(insts: &[Inst], decls: &TiVec<MemberId, Declaration>) -> (usize, 
         match &inst.kind {
             InstKind::Pure(..) => vals += 1,
             InstKind::Heap(hi) => {
-                heaps += 1;
+                if hi.produces_heap() {
+                    heaps += 1;
+                }
                 if hi.snap_yield(decls).is_some() {
                     vals += 1;
                 }

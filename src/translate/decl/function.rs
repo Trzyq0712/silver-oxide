@@ -136,7 +136,7 @@ impl FunctionTranslator<'_, Metaed> {
     ///   opens with the same bound `inhale` (which implicitly assumes the
     ///   resource bool — no entry `assume`) and asserts
     ///   `#ensures(params, result, s)` at exit. Call sites build `s` with
-    ///   `PureInst::Snap` (which implicitly asserts the precondition) — see
+    ///   a frame-only `exhale` of its `#requires` (which implicitly asserts the precondition) — see
     ///   `pure_exp::lower_func_app`.
     pub(crate) fn define(
         self,

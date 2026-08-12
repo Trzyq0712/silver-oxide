@@ -9,7 +9,7 @@ pub enum TranslationError {
     /// Silver has no syntax to write one.
     GenericDomainUnsupported(String),
     /// A heap-dependent function called inside a `forall` body. Its snapshot
-    /// (`PureInst::Snap`) would have to be taken *per instance*, over a footprint
+    /// (a frame-only `exhale`) would have to be taken *per instance*, over a footprint
     /// that may mention the binders — quantified permissions, which are not
     /// supported. Even a binder-independent footprint is rejected for now: the
     /// quantifier's compiled body must stay pure and heap-free, since the

@@ -128,11 +128,17 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                 }
                 InstKind::Heap(hi) => {
                     // A snapshot-yielding inhale/exhale also produces a pure
-                    // temp: `h1, e5 := h0 inhale R(...) 1/1`.
+                    // temp: `h1, e5 := h0 inhale R(...) 1/1`. A frame-only exhale
+                    // produces the temp but no heap: `_, e5 := h0 exhale R(..)`.
                     if hi.snap_yield(self.decls).is_some() {
+                        let heap_binder = if hi.produces_heap() {
+                            format!("h{h_idx}")
+                        } else {
+                            "_".to_string()
+                        };
                         writeln!(
                             f,
-                            "{indent}h{h_idx}, e{e_idx} := {}{}",
+                            "{indent}{heap_binder}, e{e_idx} := {}{}",
                             PcPrefix(&inst.pc),
                             self.with(hi)
                         )?;
@@ -145,7 +151,9 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                             self.with(hi)
                         )?;
                     }
-                    h_idx += 1;
+                    if hi.produces_heap() {
+                        h_idx += 1;
+                    }
                 }
                 InstKind::Assume(v) => writeln!(f, "{indent}{}assume {v}", PcPrefix(&inst.pc))?,
                 InstKind::Assert(v) => {

@@ -239,9 +239,6 @@ fn inst_deps(insts: &[Inst], out: &mut Vec<MemberId>) {
             InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
                 out.push(call.resource)
             }
-            // Snapshot narrowing/widening needs the resource's certificate
-            // (footprint layout), so the resource must be verified first.
-            InstKind::Pure(_, PureInst::Snap { resource, .. }) => out.push(*resource),
             // An inline `forall` depends on whatever its body calls and its
             // triggers match on — the body is an ordinary inst stream one scope
             // down, so recurse (nested `forall`s included).

@@ -396,7 +396,7 @@ pub(crate) fn lower_literal(lit: &typed::Literal) -> Result<Literal, Translation
 /// Lower a Silver `function` application to a VMIR `FunctionCall` (monomorphic,
 /// no `type_args`). Calls are always pure: a **heap-dependent** callee (one
 /// whose `requires` grants permission) receives the snapshot of its `#requires`
-/// resource — built here from the current value heap by `PureInst::Snap`, which
+/// resource — built here by a frame-only `exhale` of its `#requires`, which
 /// implicitly checks the precondition (footprint sufficiency + resource bool) —
 /// as an extra trailing argument. A **heap-free** callee's precondition is
 /// instead asserted as a boolean contract call.
@@ -453,13 +453,17 @@ fn lower_func_app<Ext: PureExt>(
                 b.interner.resolve(&call.name.0).to_string(),
             ));
         }
-        let s = sink.emit_pure_guarded(
-            vmir::Type::Snap(req_id),
-            PureInst::Snap {
+        // The implicit precondition check: a frame-only exhale of the callee's
+        // `#requires` resource, yielding its snapshot but no heap. `1/1`, not
+        // `wildcard`: the scale multiplies each footprint slot's own permission,
+        // so `1 * p` reproduces the amounts the dedicated `Snap` instruction used.
+        let s = sink.emit_resource_frame_exhale(
+            hctx.value,
+            vmir::ResourceCall {
                 resource: req_id,
                 args: args.clone(),
-                heap: hctx.value,
             },
+            vmir::Perm::write(),
         );
         call_args.push(s);
     } else if let Some(req_id) = requires {

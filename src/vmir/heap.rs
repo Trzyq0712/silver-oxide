@@ -103,6 +103,16 @@ pub enum HeapInst {
     /// `perm`) from `base` **and assert** its boolean condition. Yields a snapshot
     /// `Val` exactly like `Inhale` (values = the consumed caller chunk values).
     Exhale {
+        /// When `true` this exhale is a **frame check**: it proves the callee's
+        /// footprint is held and asserts its boolean, but produces **no heap** --
+        /// the binder is written `_`. Functions frame, they don't consume.
+        ///
+        /// This is an output-arity property, not a mode flag: the instruction
+        /// declares which of its results are wanted, and the evaluator reads that
+        /// rather than being told by a side channel. It must never be *derived*
+        /// (by liveness, say) and no pass may introduce it -- blanking a merely
+        /// unused heap binder would silently turn a consume into a frame check.
+        frame_only: bool,
         base: HeapVal,
         call: ResourceCall,
         perm: Perm,
@@ -157,6 +167,15 @@ impl HeapInst {
     /// **self-framed** resource produces `s : Snap(callee)` alongside the new
     /// heap. Two-state callees (and every other heap inst) yield none. Derived
     /// from the callee declaration — not stored on the inst.
+    /// Whether this instruction produces a heap. Everything does except a
+    /// **frame-only** exhale, whose binder is `_` (see
+    /// [`HeapInst::Exhale::frame_only`]). Output arity is part of an
+    /// instruction's shape, so this drives both the display and the temp
+    /// numbering rather than being stored alongside them.
+    pub fn produces_heap(&self) -> bool {
+        !matches!(self, HeapInst::Exhale { frame_only: true, .. })
+    }
+
     /// The extra pure `Val` this instruction yields, and its type.
     ///
     ///  - `Inhale`/`Exhale` of a **self-framed** callee → `Snap(callee)`, plain.
@@ -297,9 +316,9 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 resource_combine(f, base, "inhale", call, perm)?;
                 write!(f, " with {bind}")
             }
-            HeapInst::Exhale { base, call, perm } => {
-                resource_combine(f, base, "exhale", call, perm)
-            }
+            HeapInst::Exhale {
+                base, call, perm, ..
+            } => resource_combine(f, base, "exhale", call, perm),
             HeapInst::Assign(base, Assign { loc, val }) => {
                 write!(f, "{base} assign {loc} {val}")
             }

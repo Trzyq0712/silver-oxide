@@ -815,14 +815,20 @@ method m(y: Ref)
         panic!("m must be a Method");
     };
     let insts = m.flatten();
+    // The call site's implicit precondition check is a **frame-only** exhale of
+    // `get#requires`: it proves the footprint is held and yields the snapshot,
+    // but produces no heap (functions frame, they don't consume).
     let snap_at = insts.iter().position(|i| {
         matches!(
             &i.kind,
-            vmir::InstKind::Pure(vmir::Type::Snap(r), vmir::PureInst::Snap { resource, .. })
-                if *r == req_id && *resource == req_id
+            vmir::InstKind::Heap(vmir::HeapInst::Exhale {
+                frame_only: true,
+                call,
+                ..
+            }) if call.resource == req_id
         )
     });
-    let snap_at = snap_at.expect("call site must emit a Snap of get#requires");
+    let snap_at = snap_at.expect("call site must emit a frame exhale of get#requires");
     // The following FunctionCall must carry the snapshot as its last argument.
     let call = insts[snap_at..].iter().find_map(|i| match &i.kind {
         vmir::InstKind::Pure(_, vmir::PureInst::FunctionCall(fc)) if fc.function == get_id => {
@@ -833,7 +839,8 @@ method m(y: Ref)
     let call = call.expect("call to get after the Snap");
     let args: Vec<_> = call.args.iter().cloned().collect();
     assert_eq!(args.len(), 2, "call args are (y, snap)");
-    // No boolean requires-assert for a heap-dep callee (Snap checks implicitly);
+    // No boolean requires-assert for a heap-dep callee (the frame exhale checks
+    // it implicitly);
     // `m` has no other assert-producing constructs before the call.
     assert!(
         !insts[..snap_at]

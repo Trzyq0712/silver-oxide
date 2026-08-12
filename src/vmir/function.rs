@@ -13,7 +13,7 @@ use std::fmt::{self, Display, Formatter};
 /// still this same declaration: its `f#requires` is a self-framed `Resource`,
 /// and the function takes that resource's snapshot as an ordinary trailing
 /// parameter (`Type::Snap(req_id)`). Call sites build the snapshot with
-/// `PureInst::Snap`; the body reconstructs its precondition heap with
+/// a frame-only `exhale` of its `#requires`; the body reconstructs its precondition heap with
 /// `HeapInst::a bound inhale` and reads it via `Deref`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Function {
@@ -54,7 +54,7 @@ pub enum Requires {
     Pure(ContractCall<Val>),
     /// Heap-dependent: a self-framed `Resource` (footprint + bool) applied to
     /// `args`, plus `snap` — the trailing snapshot parameter that call sites
-    /// build with `PureInst::Snap` and the body opens with `HeapInst::a bound inhale`.
+    /// build with a frame-only `exhale`, and the body opens with a bound `inhale`.
     /// There is no boolean requires-function, so the verifier guards this
     /// function's facts with an uninterpreted pre-token over `args ++ [snap]`,
     /// released where a `Snap`'s implicit precondition check passes.
@@ -133,7 +133,7 @@ impl Params {
 /// A (possibly generic) function application. `type_args` records the result-type
 /// instantiation for the verifier's `FuncApp` payload (empty for a fully-concrete
 /// result). Always pure and heap-free: a heap-dependent function receives its
-/// precondition snapshot (built by `PureInst::Snap` at the call site) as an
+/// precondition snapshot (yielded by the frame-only `exhale` at the call site) as an
 /// ordinary trailing argument.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionCall {

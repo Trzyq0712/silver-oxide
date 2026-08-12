@@ -456,11 +456,6 @@ fn eval_pure_inst(
             };
             (id, recipe)
         }
-        // `Snap` needs the program + certificates; every inst walker intercepts
-        // it and dispatches to `eval_snap` before reaching this function.
-        PureInst::Snap { .. } => {
-            unreachable!("Snap is handled by eval_snap in the inst walkers")
-        }
         // perm(loc): permission amount held at `loc` in the given heap. Has no
         // pure recipe — a certificate walk rejects it.
         PureInst::Perm(hv, loc) => {
@@ -2079,12 +2074,6 @@ fn eval_resource_body_inst(
     certs: &HashMap<MemberId, ResourceDefinition>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
-        // A heap-dependent function call inside a resource body narrows the
-        // body's footprint heap with `Snap` — shared with method bodies.
-        InstKind::Pure(ty, PureInst::Snap { .. }) => {
-            let (id, recipe) = eval_snap(ctx, program, state, inst, certs)?;
-            state.push_val(id, ty.clone(), recipe);
-        }
         InstKind::Pure(ty, pi) => {
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
             let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits, Some(&inst.pc))?;
@@ -2093,6 +2082,14 @@ fn eval_resource_body_inst(
         // `unfold` inside a resource body verifies identically to a method
         // body (shared `eval_unfold`); only `Unfold` is emitted here.
         InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
+        // A heap-dependent function call's implicit precondition check, which
+        // may appear in a contract body. Non-consuming, so it is legal here where
+        // a consuming resource op is not.
+        InstKind::Heap(HeapInst::Exhale {
+            frame_only: true, ..
+        }) => {
+            eval_resource_op(ctx, program, state, inst, certs)?;
+        }
         // The entry of a two-state resource body: reconstruct the pre-state
         // heap from the snapshot parameter (implicitly assuming the precondition
         // resource's boolean). A *bound* inhale, so it reconstructs rather than
@@ -2125,12 +2122,6 @@ fn eval_method_inst(
     certs: &HashMap<MemberId, ResourceDefinition>,
 ) -> Result<(), VerifyError> {
     match &inst.kind {
-        // `Snap` needs the program + certificates (footprint graft), so it is
-        // handled here rather than in `eval_pure_inst`.
-        InstKind::Pure(ty, PureInst::Snap { .. }) => {
-            let (id, recipe) = eval_snap(ctx, program, state, inst, certs)?;
-            state.push_val(id, ty.clone(), recipe);
-        }
         InstKind::Pure(ty, pi) => {
             let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
             let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits, Some(&inst.pc))?;
@@ -2142,79 +2133,8 @@ fn eval_method_inst(
         // **asserts** it. A self-framed callee additionally yields the snapshot
         // of its footprint as a pure `Val` (the pre-state handle a two-state call
         // receives). Both route through `walk_footprint`.
-        InstKind::Heap(
-            hi @ (HeapInst::Inhale {
-                base, call, perm, ..
-            }
-            | HeapInst::Exhale { base, call, perm }),
-        ) => {
-            let is_inhale = matches!(hi, HeapInst::Inhale { .. });
-            let base_h = get_heap(state, base);
-            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            let scale = eval_perm(ctx, state, perm);
-            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-            // Inhale: produce fresh chunks, assume the bool guarded by `0 < scale`
-            // (it carries no path condition — the branch lives in the perm scale).
-            // Exhale: consume the held chunks, assert the bool under `pc`.
-            let (source, direction, bool_guard) = if is_inhale {
-                // The bind is the value source: `Fresh` havocs each slot, while
-                // `Bound(s)` recovers it as `unwrap(proj_i(s))` so this heap and
-                // any other reconstruction from `s` name the *same* terms.
-                let source = match hi {
-                    HeapInst::Inhale {
-                        bind: Bind::Bound(v),
-                        ..
-                    } => {
-                        let sv = state.get_val(ctx, v);
-                        ValueSource::ProjectSnap(sv, state.recipe_of(v))
-                    }
-                    HeapInst::Inhale {
-                        bind: Bind::SelfSlot,
-                        ..
-                    } => {
-                        return Err(VerifyError::Unimplemented(
-                            "`with self` on a resource inhale",
-                        ));
-                    }
-                    _ => ValueSource::Fresh,
-                };
-                let pos = ctx.perm_positive(scale);
-                let mut guard = vec![(pos, Polarity::Positive)];
-                // Fork model: arms run unguarded (the branch no longer rides in
-                // the perm scale), so the block cube must guard the inhaled bool
-                // — otherwise a conditional `inhale` on one arm leaks its fact
-                // past the branch.
-                guard.extend_from_slice(&pc_lits);
-                (source, Direction::Produce, guard)
-            } else {
-                (
-                    ValueSource::ReadHeap(base_h.clone()),
-                    Direction::Consume,
-                    pc_lits.clone(),
-                )
-            };
-            let FootprintResult {
-                heap: out, members, ..
-            } = walk_footprint(
-                ctx,
-                program,
-                certs,
-                call.resource,
-                &args,
-                base_h,
-                source,
-                direction,
-                Some(scale),
-                &pc_lits,
-                &bool_guard,
-                false,
-            )?;
-            state.push_heap(out);
-            if let Some(res_id) = hi.snap_yield(&program.decls) {
-                let s = build_snapshot(ctx, res_id, members);
-                // Inhale/exhale are method-only, so no recipe is in flight.
-                state.push_val(s, Type::Snap(res_id), None);
-            }
+        InstKind::Heap(HeapInst::Inhale { .. } | HeapInst::Exhale { .. }) => {
+            eval_resource_op(ctx, program, state, inst, certs)?;
         }
         // `fold`: consume the predicate footprint (scaled by `perm`), assert the
         // body's pure facts, and produce a predicate chunk holding the snapshot
@@ -2733,102 +2653,156 @@ fn eval_unfold(
     Ok(())
 }
 
-/// Evaluate a `Snap`: narrow `heap` to the snapshot of the self-framed
-/// resource `resource(args)` — the implicit precondition check of a
-/// heap-dependent function call. Exhale-shaped but **non-consuming**: footprint
-/// sufficiency is proven on a scratch subtraction chain (so aliased slots
-/// require their sum) whose result is discarded — functions frame, they don't
-/// consume. The resource's boolean is **asserted** over the values read from
-/// `heap`, and the snapshot is the `cons` of those values
-/// (`present ? Some(v) : None` per slot, as in `fold`). Returns the snapshot
-/// e-class; the caller pushes it as the inst's `Val`.
-fn eval_snap(
+
+/// Evaluate a resource `inhale` / `exhale`. `base inhale R(args) p` produces the
+/// resource's footprint into `base` and **assumes** its boolean; `base exhale ..`
+/// consumes it and **asserts** it. A self-framed callee additionally yields the
+/// snapshot of its footprint as a pure `Val`.
+///
+/// Shared by the method walk and the resource/function-body walks: a
+/// **frame-only** exhale (a heap-dependent function call's implicit precondition
+/// check) occurs inside contract and function bodies, where a *consuming*
+/// resource op would rightly be rejected.
+fn eval_resource_op(
     ctx: &mut VerifyContext<'_>,
     program: &vmir::Program,
-    state: &EvalState,
+    state: &mut EvalState,
     inst: &Inst,
     certs: &HashMap<MemberId, ResourceDefinition>,
-) -> Result<(egg::Id, Option<Val>), VerifyError> {
-    use crate::verify::rewrite::AxiomPure;
-    let InstKind::Pure(
-        _,
-        PureInst::Snap {
-            resource,
-            args,
-            heap,
-        },
+) -> Result<(), VerifyError> {
+    let InstKind::Heap(
+        hi @ (HeapInst::Inhale {
+            base, call, perm, ..
+        }
+        | HeapInst::Exhale {
+            base, call, perm, ..
+        }),
     ) = &inst.kind
     else {
-        unreachable!("eval_snap called on a non-Snap instruction");
+        unreachable!("eval_resource_op called on a non-resource-op instruction");
     };
-    let h = get_heap(state, heap);
-    let arg_ids: Vec<egg::Id> = args.iter().map(|v| state.get_val(ctx, v)).collect();
-    let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
 
-    // Non-consuming: the sufficiency subtraction runs on a scratch clone of `h`
-    // (so aliased slots require their sum) whose resulting heap is discarded —
-    // functions frame, they don't consume. Values are read from `h`; the body
-    // boolean is asserted. The snapshot is the `cons` of the per-slot members.
-    let FootprintResult {
-        members,
-        slot_recipes,
-        ..
-    } = walk_footprint(
-        ctx,
-        program,
-        certs,
-        *resource,
-        &arg_ids,
-        h.clone(),
-        ValueSource::ReadHeap(h),
-        Direction::Consume,
-        None,
-        &pc_lits,
-        &pc_lits,
-        true,
-    )?;
-    let s = build_snapshot(ctx, *resource, members);
-
-    // A certificate walk mirrors the snapshot as `cons(Some(v_i))` over the read
-    // values' recipes (a self-framed footprint is fully held, so each slot is
-    // `Some`). It exports no pre-token fact: a function's facts are gated by its
-    // `f%pre` token, released at the call, so there is no separate precondition
-    // guard for a caller to discharge.
-    let recipe = if ctx.recipe.is_some() {
-        let def = certs.get(resource).ok_or(VerifyError::DependencyFailed)?;
-        let elems: Vec<Type> = def.footprint.iter().map(|sl| sl.elem.clone()).collect();
-        let some_id = ctx.alloc.option_some();
-        let cons_id = ctx.alloc.cons(*resource, 0);
-        let rb = ctx.recipe.as_mut().unwrap();
-        let mut members_r = Vec::with_capacity(slot_recipes.len());
-        for (i, r) in slot_recipes.iter().enumerate() {
-            let v = r.clone().ok_or(VerifyError::Unimplemented(
-                "purify: snap value outside footprint",
-            ))?;
-            members_r.push(rb.emit(AxiomPure::App {
-                func: some_id,
-                type_args: vec![elems[i].clone()],
-                args: vec![v],
-            }));
+        let is_inhale = matches!(hi, HeapInst::Inhale { .. });
+        // A frame-only exhale is the implicit precondition check of a
+        // heap-dependent function call: sufficiency is proven on a scratch
+        // subtraction chain (so aliased slots require their sum) whose result
+        // is discarded, and a bare-wildcard slot takes the presence path
+        // rather than materializing a wildcard permission.
+        let frame_only = matches!(hi, HeapInst::Exhale { frame_only: true, .. });
+        let base_h = get_heap(state, base);
+        let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
+        let scale = eval_perm(ctx, state, perm);
+        let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+        // Inhale: produce fresh chunks, assume the bool guarded by `0 < scale`
+        // (it carries no path condition — the branch lives in the perm scale).
+        // Exhale: consume the held chunks, assert the bool under `pc`.
+        let (source, direction, bool_guard) = if is_inhale {
+            // The bind is the value source: `Fresh` havocs each slot, while
+            // `Bound(s)` recovers it as `unwrap(proj_i(s))` so this heap and
+            // any other reconstruction from `s` name the *same* terms.
+            let source = match hi {
+                HeapInst::Inhale {
+                    bind: Bind::Bound(v),
+                    ..
+                } => {
+                    let sv = state.get_val(ctx, v);
+                    ValueSource::ProjectSnap(sv, state.recipe_of(v))
+                }
+                HeapInst::Inhale {
+                    bind: Bind::SelfSlot,
+                    ..
+                } => {
+                    return Err(VerifyError::Unimplemented(
+                        "`with self` on a resource inhale",
+                    ));
+                }
+                _ => ValueSource::Fresh,
+            };
+            let pos = ctx.perm_positive(scale);
+            let mut guard = vec![(pos, Polarity::Positive)];
+            // Fork model: arms run unguarded (the branch no longer rides in
+            // the perm scale), so the block cube must guard the inhaled bool
+            // — otherwise a conditional `inhale` on one arm leaks its fact
+            // past the branch.
+            guard.extend_from_slice(&pc_lits);
+            (source, Direction::Produce, guard)
+        } else {
+            (
+                ValueSource::ReadHeap(base_h.clone()),
+                Direction::Consume,
+                pc_lits.clone(),
+            )
+        };
+        let FootprintResult {
+            heap: out,
+            members,
+            slot_recipes,
+        } = walk_footprint(
+            ctx,
+            program,
+            certs,
+            call.resource,
+            &args,
+            base_h,
+            source,
+            direction,
+            // A frame check does not scale: it reads the footprint at the
+            // callee's own slot permissions, exactly as the dedicated `Snap`
+            // did. Scaling by the (unused) `1/1` operand would rebuild every
+            // slot permission as `1 * p`, which is equal but not identical,
+            // and identity is what the `old(f(x)) == f(x)` congruence needs.
+            if frame_only { None } else { Some(scale) },
+            &pc_lits,
+            &bool_guard,
+            frame_only,
+        )?;
+        if hi.produces_heap() {
+            state.push_heap(out);
         }
-        let s_r = rb.emit(AxiomPure::App {
-            func: cons_id,
-            type_args: Vec::new(),
-            args: members_r,
-        });
-        Some(s_r)
-    } else {
-        None
-    };
-
-    // No pre-token is stamped here. `R#pre` used to be released at this point --
-    // the precondition *check* -- to guard the callee's exported facts. Those
-    // facts are now gated solely by the callee's `f%pre` token, which is released
-    // at the **call**, which is where it belongs: reaching a call means its check
-    // passed, so the two were saying the same thing at two different program
-    // points. See design/pre-tokens/AUDIT.md.
-    ctx.reduce();
-    Ok((s, recipe))
+        if let Some(res_id) = hi.snap_yield(&program.decls) {
+            let s = build_snapshot(ctx, res_id, members);
+            // A certificate walk mirrors the snapshot as `cons(Some(v_i))`
+            // over the read values' recipes -- a self-framed footprint is
+            // fully held, so every slot is `Some`. Only a frame-only exhale
+            // (a function's precondition check) is ever reached during a
+            // recipe walk; a consuming inhale/exhale is method-only, where no
+            // recipe is in flight and this yields `None` as before.
+            let recipe = if ctx.recipe.is_some() {
+                let def = certs.get(&res_id).ok_or(VerifyError::DependencyFailed)?;
+                let elems: Vec<Type> =
+                    def.footprint.iter().map(|sl| sl.elem.clone()).collect();
+                let some_id = ctx.alloc.option_some();
+                let cons_id = ctx.alloc.cons(res_id, 0);
+                let rb = ctx.recipe.as_mut().unwrap();
+                let mut members_r = Vec::with_capacity(slot_recipes.len());
+                for (i, r) in slot_recipes.iter().enumerate() {
+                    let v = r.clone().ok_or(VerifyError::Unimplemented(
+                        "purify: snap value outside footprint",
+                    ))?;
+                    members_r.push(rb.emit(crate::verify::rewrite::AxiomPure::App {
+                        func: some_id,
+                        type_args: vec![elems[i].clone()],
+                        args: vec![v],
+                    }));
+                }
+                Some(rb.emit(crate::verify::rewrite::AxiomPure::App {
+                    func: cons_id,
+                    type_args: Vec::new(),
+                    args: members_r,
+                }))
+            } else {
+                None
+            };
+            state.push_val(s, Type::Snap(res_id), recipe);
+        }
+        if frame_only {
+            // As the dedicated `Snap` instruction did: the two snapshots of
+            // one untouched footprint (say `old(f(x))` and `f(x)`) only land
+            // in the same e-class once the `1 * p` scale and the `proj`/`cons`
+            // round-trips have reduced.
+            ctx.reduce();
+        }
+    Ok(())
 }
 
 /// Evaluate a a bound `inhale`: widen a snapshot value back into a heap — the entry
@@ -3114,7 +3088,6 @@ pub(crate) fn prepare_body(
                 PureInst::Fresh
                 | PureInst::Deref(..)
                 | PureInst::Perm(..)
-                | PureInst::Snap { .. }
                 | PureInst::Forall(_) => {
                     return Err(VerifyError::Unimplemented("impure inst in axiom body"));
                 }
