@@ -91,6 +91,11 @@ pub enum HeapInst {
     /// passed on as the trailing snapshot argument of a two-state resource call.
     Inhale {
         base: HeapVal,
+        /// Where the produced footprint's values come from. `Fresh` havocs each
+        /// slot (a call's post-state); `Bound(s)` recovers them from an in-scope
+        /// snapshot as `unwrap(proj_i(s))`, which is what makes a method's entry
+        /// heap and the pre-state its `#ensures` reconstructs the *same* terms.
+        bind: Bind,
         call: ResourceCall,
         perm: Perm,
     },
@@ -200,7 +205,10 @@ impl HeapInst {
         decls: &typed_index_collections::TiVec<MemberId, crate::vmir::Declaration>,
     ) -> Option<MemberId> {
         match self {
-            HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. } => {
+            // `Inhale` yields nothing: its value source arrives through `bind`,
+            // so there is no snapshot left for it to hand back. A caller that
+            // needs the handle mints one and binds the inhale to it.
+            HeapInst::Exhale { call, .. } => {
                 match &decls[call.resource] {
                     crate::vmir::Declaration::Resource(r) if r.is_self_framed() => {
                         Some(call.resource)
@@ -292,8 +300,14 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             HeapInst::Sub { base, loc, perm } => {
                 write!(f, "{base} - acc {loc} {}", self.with(perm))
             }
-            HeapInst::Inhale { base, call, perm } => {
-                resource_combine(f, base, "inhale", call, perm)
+            HeapInst::Inhale {
+                base,
+                bind,
+                call,
+                perm,
+            } => {
+                resource_combine(f, base, "inhale", call, perm)?;
+                write!(f, " with {bind}")
             }
             HeapInst::Exhale { base, call, perm } => {
                 resource_combine(f, base, "exhale", call, perm)

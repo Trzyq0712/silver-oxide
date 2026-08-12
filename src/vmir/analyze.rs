@@ -329,6 +329,7 @@ mod tests {
             pc: PathConds::default(),
             heap: None,
             kind: InstKind::Heap(HeapInst::Inhale {
+                bind: crate::vmir::Bind::Fresh,
                 base: HeapVal::Empty,
                 call,
                 perm: crate::vmir::Perm::write(),

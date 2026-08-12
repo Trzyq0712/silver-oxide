@@ -265,22 +265,28 @@ pub(crate) fn lower_method(
     collect_var_types(&b.name_map, &body.0, &mut var_types);
 
     // Inhale this method's own precondition into the linear heap that every
-    // block threads: `h, s := current + acc self#requires`. The yielded
-    // snapshot is the method's pre-state handle, passed to the `#ensures`
-    // exhale at every exit.
+    // block threads. The pre-state handle is **minted here** and bound into the
+    // inhale, rather than being read back off it: an inhale takes its values in
+    // through `bind` and yields nothing. Binding to `s` is what makes this heap
+    // and the pre-state the `#ensures` reconstructs from `s` name the *same*
+    // terms (`unwrap(proj_i(s))`), which is how `old(...)` connects.
+    //
+    // `s` is opaque (`fresh`) because a method's caller decides the pre-state:
+    // it is deterministic — two reconstructions from the same `s` agree — but
+    // otherwise unconstrained, which per-slot `Fresh` could not express, since
+    // there would be no handle to thread to the `#ensures` exhale.
     let mut current_heap: HeapVal = HeapVal::Empty;
     let mut req_snap: Option<Val> = None;
     if let Some(req_id) = b.method_requires(m.name.0) {
-        // `#requires` is always self-framed, so it always yields its snapshot.
-        let (h, s) = emit_resource_inhale(
+        let s = sink.emit_pure(vmir::Type::Snap(req_id), PureInst::Fresh);
+        current_heap = emit_resource_inhale(
             &mut sink,
             req_id,
             current_heap,
             param_vals.clone(),
-            true,
+            vmir::Bind::Bound(s.clone()),
         );
-        current_heap = h;
-        req_snap = s;
+        req_snap = Some(s);
     }
     // Baseline for unlabeled `old`: the post-requires-inhale heap.
     let baseline = current_heap;
@@ -1154,7 +1160,8 @@ fn lower_method_call(
                 .expect("two-state ensures implies an exhaled requires");
             ens_args.push(s);
         }
-        (heap, _) = emit_resource_inhale(sink, ens_id, heap, ens_args, !is_ctx);
+        // A call's post-state values are unknown to the caller.
+        heap = emit_resource_inhale(sink, ens_id, heap, ens_args, vmir::Bind::Fresh);
     }
 
     Ok(heap)
@@ -1174,10 +1181,10 @@ fn emit_resource_inhale(
     resource: vmir::MemberId,
     base: HeapVal,
     args: Vec<Val>,
-    yields_snap: bool,
-) -> (HeapVal, Option<Val>) {
+    bind: vmir::Bind,
+) -> HeapVal {
     let perm = contract_perm(sink);
-    sink.emit_resource_inhale(base, ResourceCall { resource, args }, perm, yields_snap)
+    sink.emit_resource_inhale(base, ResourceCall { resource, args }, perm, bind)
 }
 
 /// The consume counterpart of [`emit_resource_inhale`].

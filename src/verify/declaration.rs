@@ -2144,7 +2144,10 @@ fn eval_method_inst(
         // of its footprint as a pure `Val` (the pre-state handle a two-state call
         // receives). Both route through `walk_footprint`.
         InstKind::Heap(
-            hi @ (HeapInst::Inhale { base, call, perm } | HeapInst::Exhale { base, call, perm }),
+            hi @ (HeapInst::Inhale {
+                base, call, perm, ..
+            }
+            | HeapInst::Exhale { base, call, perm }),
         ) => {
             let is_inhale = matches!(hi, HeapInst::Inhale { .. });
             let base_h = get_heap(state, base);
@@ -2155,6 +2158,27 @@ fn eval_method_inst(
             // (it carries no path condition — the branch lives in the perm scale).
             // Exhale: consume the held chunks, assert the bool under `pc`.
             let (source, direction, bool_guard) = if is_inhale {
+                // The bind is the value source: `Fresh` havocs each slot, while
+                // `Bound(s)` recovers it as `unwrap(proj_i(s))` so this heap and
+                // any other reconstruction from `s` name the *same* terms.
+                let source = match hi {
+                    HeapInst::Inhale {
+                        bind: Bind::Bound(v),
+                        ..
+                    } => {
+                        let sv = state.get_val(ctx, v);
+                        ValueSource::ProjectSnap(sv, state.recipe_of(v))
+                    }
+                    HeapInst::Inhale {
+                        bind: Bind::SelfSlot,
+                        ..
+                    } => {
+                        return Err(VerifyError::Unimplemented(
+                            "`with self` on a resource inhale",
+                        ));
+                    }
+                    _ => ValueSource::Fresh,
+                };
                 let pos = ctx.perm_positive(scale);
                 let mut guard = vec![(pos, Polarity::Positive)];
                 // Fork model: arms run unguarded (the branch no longer rides in
@@ -2162,7 +2186,7 @@ fn eval_method_inst(
                 // — otherwise a conditional `inhale` on one arm leaks its fact
                 // past the branch.
                 guard.extend_from_slice(&pc_lits);
-                (ValueSource::Fresh, Direction::Produce, guard)
+                (source, Direction::Produce, guard)
             } else {
                 (
                     ValueSource::ReadHeap(base_h.clone()),
@@ -3906,11 +3930,27 @@ fn inst_obligations(
             | HeapInst::Fold { perm, .. }
             | HeapInst::Unfold { perm, .. },
         ) if perm.has_wildcard() => vec![],
+        // A resource op carries the resource's **boolean**, so at zero permission
+        // it would assume or assert facts about a footprint it transferred no
+        // share of — a vacuous operation. Viper rejects `fold`/`unfold` at a
+        // possibly-zero amount too, so this mirrors it rather than diverging.
+        // Free today: every resource op carries a literal `1/1`, and `0 < 1/1`
+        // const-folds.
+        InstKind::Heap(HeapInst::Inhale { perm, .. } | HeapInst::Exhale { perm, .. }) => {
+            let perm = eval_perm(ctx, state, perm);
+            let goal = ctx.perm_positive(perm);
+            vec![(
+                goal,
+                VerifyError::SideCondition("permission must be positive"),
+            )]
+        }
+        // Slot ops carry no boolean, so moving zero permission says nothing and
+        // is legal — and they carry every gated amount (`b ? 1/1 : 0` is exactly
+        // `0` on the `!b` path), so a strict rule here would reject every
+        // conditional `acc`.
         InstKind::Heap(
             HeapInst::Add { perm, .. }
             | HeapInst::Sub { perm, .. }
-            | HeapInst::Inhale { perm, .. }
-            | HeapInst::Exhale { perm, .. }
             | HeapInst::Fold { perm, .. }
             | HeapInst::Unfold { perm, .. },
         ) => {

@@ -418,16 +418,22 @@ impl Sink {
     /// carries the block cube as its pc — the verifier guards the inhaled bool by
     /// it (else a conditional inhale leaks its fact past the branch). An empty pc
     /// (unconditional inhale) guards by nothing.
+    /// An inhale takes its values in through `bind`, so it yields **nothing** —
+    /// unlike [`Sink::emit_resource_exhale`], there is no snapshot left to hand
+    /// back. A caller needing the handle mints one and binds it in.
     pub fn emit_resource_inhale(
         &mut self,
         base: HeapVal,
         call: ResourceCall,
         perm: Perm,
-        yields_snap: bool,
-    ) -> (HeapVal, Option<Val>) {
-        let h = self.emit_heap_guarded(HeapInst::Inhale { base, call, perm });
-        let snap = yields_snap.then(|| self.next_val_temp());
-        (h, snap)
+        bind: crate::vmir::Bind,
+    ) -> HeapVal {
+        self.emit_heap_guarded(HeapInst::Inhale {
+            base,
+            bind,
+            call,
+            perm,
+        })
     }
 
     /// The consume counterpart of [`Sink::emit_resource_inhale`].
