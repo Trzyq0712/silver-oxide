@@ -25,7 +25,7 @@ fn var(name: &str) -> Var {
 //
 // - **Live** runs write to a **base** set that survives across runs: the live
 //   e-graph of a unit only grows, so an entry stays valid for the whole unit.
-// - **Scratch** runs (tier-3 probes, forall-WD checks) saturate a throwaway
+// - **Scratch** runs (`probe`-tier probes, forall-WD checks) saturate a throwaway
 //   clone and write to an **overlay** instead. A leaked scratch entry would be a
 //   completeness bug: the clone's ids can collide with ids the live graph mints
 //   later. Reading the base from a scratch run is fine.
@@ -72,7 +72,7 @@ pub(crate) struct ScratchScope;
 
 impl ScratchScope {
     /// A one-shot scope: its overlay dies with the returned guard. For throwaway
-    /// clones (tier-3 probes, WD checks).
+    /// clones (`probe`-tier probes, WD checks).
     pub(crate) fn enter() -> Self {
         Self::resume(new_scope_id())
     }
@@ -420,9 +420,9 @@ fn static_rules() -> Vec<Rule> {
         }),
         // `b == false` is `!b`, which lowers to `ite(b, false, true)`
         // (`translate/pure_exp.rs`, `UnOp::Not`). An equivalence, so no `Known`
-        // gate. Load-bearing for splitting: `split_candidates` only collects
-        // `Ite` conditions, so a goal left in the `== false` spelling (how Prusti
-        // emits MIR asserts) offers the splitter nothing.
+        // gate. It also normalizes goals into the `Ite` spelling that
+        // `Context::prove_by_ite_decomposition` decomposes — Prusti emits MIR asserts as `== false`,
+        // which that tier would otherwise not recognize.
         rw!("eq-false-is-not-r"; "(== ?b false)" => "(ite ?b false true)"),
         rw!("eq-false-is-not-l"; "(== false ?b)" => "(ite ?b false true)"),
         // `b == true` is `b` itself — a pure union, minting no node.
@@ -877,6 +877,28 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
                     unions.push((e, Target::False));
                 }
                 _ => {}
+            }
+            // The same decomposition at **any** literal sort, not just booleans:
+            // if the class folds to `L` and an arm folds to something other than
+            // `L`, that arm cannot be the one taken, so the condition is pinned to
+            // the other side. When *both* arms disagree with `L` the two unions
+            // pin `c` to both polarities, which is exactly the contradiction —
+            // `ite(c, 1, 2) ≡ 0` is refuted without ever splitting on `c`, and
+            // that is how a division guard survives a branch join (`d = c ? 1 : 2`
+            // then `d != 0`).
+            if let Some(self_val) = egraph[eclass].data.known() {
+                let arm_differs = |arm: Id| {
+                    egraph[arm]
+                        .data
+                        .known()
+                        .is_some_and(|lit| lit != self_val)
+                };
+                if arm_differs(t) {
+                    unions.push((c, Target::False));
+                }
+                if arm_differs(e) {
+                    unions.push((c, Target::True));
+                }
             }
             match known_bool(egraph, c) {
                 // ite(true, x, y) => x

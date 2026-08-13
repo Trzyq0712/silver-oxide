@@ -32,14 +32,14 @@ pub struct VerifyStats {
     /// `reduce()` calls (terminating reductions only).
     pub reduces: u64,
     /// Scratch full-rule-set (non-ground) saturations on a throwaway clone —
-    /// tier-3 goal probes and forall-WD checks (`run_probe`). Disjoint from
+    /// `probe`-tier goal probes and forall-WD checks (`run_probe`). Disjoint from
     /// `saturations` (which counts only live persistent-graph runs).
     pub probe_saturations: u64,
     /// egg `Runner` iterations spent inside `probe_saturations` (subset of
     /// `sat_iterations`).
     pub probe_iterations: u64,
     /// Per-block scratch e-graph: ground clones taken to build a block scratch (one per block that reaches
-    /// tier-3), full-rule-set saturations of that shared scratch, and the egg
+    /// the `probe` tier), full-rule-set saturations of that shared scratch, and the egg
     /// iterations they cost. `block_scratch_freehits` counts obligations
     /// discharged straight off the saturated scratch with no per-obligation
     /// clone (their pc was already implied by the block cube). All non-gated.
@@ -60,16 +60,22 @@ pub struct VerifyStats {
     /// total rule applications, and a per-rule breakdown.
     pub rule_applications: u64,
     pub per_rule: BTreeMap<String, u64>,
-    /// `prove_under_pc` calls, and how many reached the expensive Tier-3
+    /// `prove_under_pc` calls, and how many reached the expensive `probe`
     /// clone+saturate path (the clearest deterioration signal).
     pub prove_calls: u64,
-    /// Obligations closed by the two cheap ground tiers: `prove_tier1` = the memo /
-    /// `true`-class hit, `prove_tier2` = the post-`saturate()` re-check. Together with
-    /// `prove_tier3` they say how thin the tier-3 population really is — the premise
-    /// of the lazy-scratch design (see `design/block-vmir/82-*.md`). Non-gated.
-    pub prove_tier1: u64,
-    pub prove_tier2: u64,
-    pub prove_tier3: u64,
+    /// Obligations closed by each tier of `prove_under_pc`, named as that method
+    /// documents them and listed here in execution order. `prove_inconsistent` and
+    /// `prove_dead_block` are the vacuous verdicts (contradictory graph /
+    /// unreachable block); `prove_goal_true` and `prove_memo` are the two O(1)
+    /// e-graph hits; `prove_saturate` is the post-`saturate()` re-check. Together
+    /// they say how thin the `prove_probe` population really is — the premise of
+    /// the lazy-scratch design (see `design/block-vmir/82-*.md`). Non-gated.
+    pub prove_inconsistent: u64,
+    pub prove_dead_block: u64,
+    pub prove_goal_true: u64,
+    pub prove_memo: u64,
+    pub prove_saturate: u64,
+    pub prove_probe: u64,
     /// In-block obligations split by how their pc relates to the block cube
     /// (invariant 5 of the two-egraph block model): `cube_only` needs no extra
     /// assumption beyond what the block already establishes, `extra_pc` carries a
@@ -78,29 +84,24 @@ pub struct VerifyStats {
     pub prove_in_block_cube_only: u64,
     pub prove_in_block_extra_pc: u64,
     /// Gate G1 of `plans/…scratch-mode`: in-block obligations raised **after** their
-    /// block's first tier-3, i.e. the population a "sticky" scratch (keep proving in
+    /// block's first `probe` tier, i.e. the population a "sticky" scratch (keep proving in
     /// the scratch once it exists, stop saturating ground) would move off ground —
     /// and the ground saturations it would eliminate. Non-gated.
-    pub prove_in_block_after_first_tier3: u64,
-    pub ground_saturations_after_first_tier3: u64,
-    /// Gate G2: tier-3 sites classified by whether a *dominator* block with a strictly
+    pub prove_in_block_after_first_probe: u64,
+    pub ground_saturations_after_first_probe: u64,
+    /// Gate G2: `probe`-tier sites classified by whether a *dominator* block with a strictly
     /// smaller cube had itself built a scratch — i.e. whether there was anything to
     /// inherit. `dom_reuse_available` counts the sites where there was. Non-gated.
     pub dom_reuse_available: u64,
     pub dom_reuse_none: u64,
-    /// Tier-3 sites that have a strict-subset dominator **regardless** of whether it
+    /// `probe`-tier sites that have a strict-subset dominator **regardless** of whether it
     /// built a scratch. The gap against `dom_reuse_available` is the cost of laziness:
     /// the chain exists, but no ancestor materialized a graph to inherit — so
     /// inheritance would have to carry derived *facts* instead. Non-gated.
     pub dom_chain_available: u64,
-    /// Goals discharged by tier 3.5 — non-forking `ite`-goal decomposition
+    /// Goals discharged by the last tier — non-forking `ite`-goal decomposition
     /// (a constant branch reduces the goal to its other branch, no case split).
-    pub prove_tier35: u64,
-    /// Goals that reached the function case split, and how many were proven by
-    /// it. (Only branching pure functions reach it — method CFG joins are
-    /// discharged structurally.)
-    pub prove_tier4: u64,
-    pub prove_splits: u64,
+    pub prove_ite_decompose: u64,
     /// Non-deterministic timing (excluded from `Eq` / the gated snapshot).
     pub timing: TimingTrend,
     /// Per-e-graph wall clock (ground vs block scratch vs probes vs clones).
@@ -130,13 +131,13 @@ pub struct GraphTiming {
     pub ground: f64,
     /// `saturate_scratch()` + `reduce_scratch()` on the per-block scratch.
     pub scratch: f64,
-    /// `run_probe()` — throwaway clones (tier-3 goal probes, WD checks).
+    /// `run_probe()` — throwaway clones (`probe`-tier goal probes, WD checks).
     pub probe: f64,
     /// Building a block scratch: the ground clone plus the cube unions/rebuild.
     pub scratch_clone: f64,
-    /// The `ground` share spent after the current block's first tier-3 obligation —
+    /// The `ground` share spent after the current block's first `probe`-tier obligation —
     /// gate G1's denominator-side number (what sticky mode claims to remove).
-    pub ground_after_first_tier3: f64,
+    pub ground_after_first_probe: f64,
 }
 
 /// [`GraphTiming`] wrapper, `Eq`-transparent like [`TimingTrend`].
@@ -193,7 +194,7 @@ impl VerifyStats {
         ));
         s.push_str(&format!("rule_applications={}\n", self.rule_applications));
         s.push_str(&format!("prove_calls={}\n", self.prove_calls));
-        s.push_str(&format!("prove_tier3={}\n", self.prove_tier3));
+        s.push_str(&format!("prove_probe={}\n", self.prove_probe));
         // `per_rule` is a BTreeMap → already sorted, hence deterministic.
         for (rule, n) in &self.per_rule {
             s.push_str(&format!("rule.{rule}={n}\n"));

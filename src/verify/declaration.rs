@@ -32,7 +32,7 @@ struct EvalState {
     /// Heap temps produced on a **provably unreachable** path (a block whose
     /// cube is refuted in the ground graph — e.g. after `bb_unreach`'s `inhale
     /// false`). The Stage-4 join merge drops such an arm outright instead of
-    /// selecting a `0`-leaf against it (which would need a tier-4 exhaustiveness
+    /// selecting a `0`-leaf against it (which would need an exhaustiveness
     /// split). Keyed by `HeapVal::Temp` index.
     dead_heaps: std::collections::HashSet<usize>,
 }
@@ -489,7 +489,7 @@ fn eval_pure_inst(
             let id = match state.loc_kind(loc) {
                 Some(k) => {
                     let chunks = heap.chunks_of(&k).to_vec();
-                    perm_held_at(ctx, &chunks, addr)
+                    perm_held_at(ctx, &chunks, addr, pc_lits)
                 }
                 None => zero_real(ctx),
             };
@@ -725,7 +725,8 @@ fn merge_values(
 }
 
 /// A location chunk extracted from a heap for the location axioms: its
-/// permission, the location group tag, its canonical address, and its bound.
+/// permission, the location group tag, its canonical address, its bound, and the
+/// **presence guard** the first four are only meaningful under.
 struct LocationChunk {
     /// Kept **structural** — a bounded location's axiom is assumed per leaf, and
     /// non-aliasing only fires for bare (`Leaf`) perms, so a join `Select` never
@@ -736,6 +737,10 @@ struct LocationChunk {
     /// never over decomposed address arguments — see [`assume_location_axioms`].
     addr: egg::Id,
     bound: Bound,
+    /// [`Chunk::guard`] verbatim: the flat cube under which this chunk is present
+    /// at all. `perm` is the **ungated** amount, so every axiom stated about it
+    /// has to be gated by this cube — see [`assume_location_axioms`].
+    guard: crate::verify::heap::HeapPc,
 }
 
 
@@ -755,9 +760,69 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
             group: kind.group,
             bound: kind.bound.clone(),
             addr: ctx.egraph.find(chunk.addr),
+            guard: chunk.guard.clone(),
         });
     }
     out
+}
+
+/// The conjunction of two presence cubes, or `None` when they are **disjoint** —
+/// some literal occurs in both with opposite polarity, so the two chunks are
+/// never held in the same state and no joint fact about them may be stated.
+///
+/// Decided in Rust by e-class identity rather than left to saturation: the
+/// complementary pair (`[c+]` and `[c−]`, the two one-sided chunks of a single
+/// join) is exactly the case that must be dropped, and dropping it must not
+/// depend on an `ite`-idempotence rewrite firing.
+fn cube_meet(
+    ctx: &VerifyContext<'_>,
+    a: &[(egg::Id, Polarity)],
+    b: &[(egg::Id, Polarity)],
+) -> Option<Vec<(egg::Id, Polarity)>> {
+    let mut out: Vec<(egg::Id, Polarity)> = a.to_vec();
+    for (id, pol) in b {
+        let c = ctx.egraph.find(*id);
+        match out.iter().find(|(i, _)| ctx.egraph.find(*i) == c) {
+            Some((_, p)) if p == pol => {}
+            Some(_) => return None,
+            None => out.push((*id, *pol)),
+        }
+    }
+    Some(out)
+}
+
+/// Whether `cube` entails `sub`: every literal of `sub` already appears in `cube`
+/// with the same polarity, so `sub` holds wherever `cube` does. Syntactic on
+/// e-classes, like [`cube_eq`] — no prove, no saturation.
+fn cube_entails(
+    ctx: &VerifyContext<'_>,
+    cube: &[(egg::Id, Polarity)],
+    sub: &[(egg::Id, Polarity)],
+) -> bool {
+    sub.iter().all(|(id, pol)| {
+        let c = ctx.egraph.find(*id);
+        cube.iter()
+            .any(|(i, p)| p == pol && ctx.egraph.find(*i) == c)
+    })
+}
+
+/// `fact ∧ cube`, as a nested `ite` over `false` — the boolean twin of
+/// [`VerifyContext::gate_amount_by_pc`]. With an empty cube this is `fact`
+/// unchanged (no node).
+fn gate_bool_by_cube(
+    ctx: &mut VerifyContext<'_>,
+    fact: egg::Id,
+    cube: &[(egg::Id, Polarity)],
+) -> egg::Id {
+    let false_ = ctx.false_();
+    cube.iter().fold(fact, |acc, (lit, pol)| {
+        let arms = if matches!(pol, Polarity::Positive) {
+            [*lit, acc, false_]
+        } else {
+            [*lit, false_, acc]
+        };
+        ctx.add(Symbolic::Ite(arms))
+    })
 }
 
 /// Emit the location axioms over `h` after a consolidation. Both are e-graph
@@ -773,6 +838,33 @@ fn location_chunks(ctx: &VerifyContext<'_>, h: &Heap) -> Vec<LocationChunk> {
 ///   sets the whole conjunction false.
 ///
 /// Unbounded locations (predicates) never participate.
+///
+/// # Both axioms are stated under the chunks' presence guards
+///
+/// `Chunk.perm` is the **ungated** amount: since the guard-hoisted merge a
+/// conditionally-held chunk keeps a bare `Leaf` amount and carries its
+/// conditionality in [`Chunk::guard`], so reading `perm` raw reports a
+/// conditional footprint as fully held (the same hazard [`summarize_perm_at`]
+/// documents). Neither axiom is valid off-guard:
+/// - the bound would constrain an amount at a location that is not held there,
+///   and an off-guard residual folding above `b` makes the whole unit
+///   inconsistent — i.e. proves everything;
+/// - non-aliasing would derive `addrᵢ ≠ addrⱼ` for two chunks that are never
+///   held at once. Two complementary one-sided chunks of a single join
+///   (`[c+]`/`[c−]`, `1/1` each) sum above the bound on paper while the program
+///   holds at most one of them, so `if (b) { inhale acc(x.f) } else { inhale
+///   acc(y.f) }` proved `x != y` — unsound, and it verified from `b186cbb`
+///   (the guard hoist) until this gating, because the pre-hoist `?:0` encoding
+///   left such a chunk's perm a `Select`, which the `as_leaf()` filter below
+///   skipped for cost reasons. See `tests/cases/failing/guarded_nonaliasing.vpr`.
+///
+/// So the guard is folded into the fact rather than assumed around it: the bound
+/// becomes `guard ⇒ perm ≤ b` and non-aliasing fires on `gt ∧ guardᵢ ∧ guardⱼ`.
+/// Both stay valid on *every* path, so the unconditional `union` — and with it
+/// the collapse mechanics both axioms rely on — is unchanged, and no
+/// [`VerifyContext::assume_guarded`] (whose scratch half is unguarded, invariant
+/// 4) is involved. With empty guards this is byte-identical to the pre-gating
+/// encoding, so the unconditional hot path pays nothing.
 fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     let chunks = location_chunks(ctx, h);
     if chunks.is_empty() {
@@ -781,20 +873,34 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     let false_ = ctx.false_();
     let true_ = ctx.true_();
 
+    // The cube each chunk is actually present under: the block's control cube
+    // (this heap only exists on that path — `heap_union` runs per `inhale`, inside
+    // a block) meet the chunk's own residual merge guard. A contradiction means the
+    // chunk is unreachable here, so it states nothing.
+    let block: Vec<(egg::Id, Polarity)> = ctx.current_cube().to_vec();
+    let cubes: Vec<Option<Vec<(egg::Id, Polarity)>>> = chunks
+        .iter()
+        .map(|c| cube_meet(ctx, &block, &c.guard))
+        .collect();
+
     // Bound: perm ≤ b at each bounded location — assumed **per leaf** of the
     // (possibly branch-structured) perm, so a join `Select` never materializes.
     // A literal leaf (`1/1`, `0`) folds the axiom to a tautology (no node kept).
-    for c in &chunks {
+    for (c, cube) in chunks.iter().zip(&cubes) {
         let Bound::Bounded(b) = &c.bound else {
             continue;
         };
+        let Some(cube) = cube else { continue };
         let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
         let mut leaves = Vec::new();
         c.perm.for_each_leaf(&mut |l| leaves.push(l));
         for leaf in leaves {
             let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, leaf]));
             let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
-            ctx.union(le, true_);
+            // `cube ⇒ perm ≤ b`; with an empty cube `implication` returns `le`
+            // itself, so this is the old `union(le, true_)` untouched.
+            let fact = ctx.implication(le, cube.iter().rev().copied());
+            ctx.union(fact, true_);
         }
     }
 
@@ -818,7 +924,8 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     //
     // Only fires for bare (`Leaf`) perms — a branch-structured perm would need
     // the sum materialized; skipping only loses a disequality, and the merged heap
-    // holds one leaf-perm chunk per location.
+    // holds one leaf-perm chunk per location. Purely a cost filter: conditional
+    // presence is handled by the guard meet below, not by this skip.
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
             if chunks[i].group != chunks[j].group {
@@ -830,9 +937,23 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
             let (Some(pi), Some(pj)) = (chunks[i].perm.as_leaf(), chunks[j].perm.as_leaf()) else {
                 continue;
             };
+            // The two amounts are held simultaneously only where BOTH presence
+            // cubes hold. Disjoint cubes (the complementary one-sided chunks of one
+            // join) mean the pair never coexists, so their sum describes no
+            // reachable state and no disequality may be drawn from it at all.
+            let (Some(ci), Some(cj)) = (&cubes[i], &cubes[j]) else {
+                continue;
+            };
+            let Some(guard) = cube_meet(ctx, ci, cj) else {
+                continue;
+            };
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
             let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [pi, pj]));
             let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, sum]));
+            // Fold the joint guard into the trigger, preserving the
+            // `union(eq, ite(gt, false, eq))` collapse shape — the equation stays
+            // valid on every path, so the union may stay unconditional.
+            let gt = gate_bool_by_cube(ctx, gt, &guard);
             // Both operand orders — the `!=` goal's `Eq` order is source-dependent.
             for (x, y) in [
                 (chunks[i].addr, chunks[j].addr),
@@ -955,7 +1076,7 @@ fn heap_union(
 /// [`ChunkPerm`] **WITHOUT materializing the `Select` into the ground graph**.
 /// A `Select` pushes its condition into the pc and requires the predicate on
 /// both arms; a `Leaf` discharges it under the accumulated pc. This is the CFG
-/// case split done through the pc — no `ite` node, no `lt-ite`, no tier-4, and
+/// case split done through the pc — no `ite` node, no `lt-ite`, no goal-directed split, and
 /// (crucially) no perm-tower bloat in the live graph. The predicate is built
 /// from a leaf amount id by `mk`.
 fn prove_perm_leaves(
@@ -1061,6 +1182,45 @@ fn prove_perm_write(
     })
 }
 
+/// The structural **sum** of two permission trees, distributing `AddR` over
+/// `Select` so the branch structure survives into the result instead of being
+/// flattened into an `ite` in the graph.
+///
+/// That survival is the whole point: a summarized location's total is what
+/// [`prove_sufficient`] then discharges **per leaf**, with each branch literal
+/// pushed into the pc. Flattening first is what forced the old summarized path to
+/// prove one monolithic goal over a sum whose addends are live on different arms —
+/// a goal that needs a case split nothing was left to perform.
+///
+/// Descending into one side restricts the other to the same arm
+/// ([`ChunkPerm::restrict`], `ite`-idempotence), so two trees branching on one
+/// condition class yield a single `Select` layer rather than two. The result's
+/// conditions are exactly the union of the operands' — no condition is invented,
+/// so no split is either: the leaf count is fixed by how many distinct branch
+/// literals the participating chunks' guards mention, never by a search bound.
+fn perm_add(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> ChunkPerm {
+    match (a, b) {
+        (ChunkPerm::Leaf(x), ChunkPerm::Leaf(y)) => {
+            ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::AddR, [*x, *y])))
+        }
+        // Descend on `a` (this arm also covers `Select`/`Select`).
+        (ChunkPerm::Select { cond, then, els }, other) => {
+            let ot = ChunkPerm::restrict(ctx, *cond, other.clone(), true);
+            let oe = ChunkPerm::restrict(ctx, *cond, other.clone(), false);
+            let t = perm_add(ctx, then, &ot);
+            let e = perm_add(ctx, els, &oe);
+            ChunkPerm::select(ctx, *cond, t, e)
+        }
+        (other, ChunkPerm::Select { cond, then, els }) => {
+            let ot = ChunkPerm::restrict(ctx, *cond, other.clone(), true);
+            let oe = ChunkPerm::restrict(ctx, *cond, other.clone(), false);
+            let t = perm_add(ctx, &ot, then);
+            let e = perm_add(ctx, &oe, els);
+            ChunkPerm::select(ctx, *cond, t, e)
+        }
+    }
+}
+
 /// `held − needed`, kept structural (leaves get `SubR`, the tree stays a
 /// `Select` via the smart constructor so it never materializes as an `ite`).
 fn perm_sub(ctx: &mut VerifyContext<'_>, held: &ChunkPerm, needed: egg::Id) -> ChunkPerm {
@@ -1162,8 +1322,25 @@ fn heap_subtract_inner(
     // obligation transiently here — once, per consume — so sufficiency/remainder
     // are proven against the gated perm (present only where the guard holds),
     // preserving legacy semantics while merges stay flat.
+    //
+    // …**unless the pc already entails the guard**, i.e. the consume happens
+    // inside the very region the chunk is present in. There the gate is a no-op
+    // (`ite` arms the pc decides anyway) and folding it in is actively harmful:
+    // the remainder is stored as a bare amount, so the guard is *destroyed* by the
+    // first consume at the location and the chunk's conditionality survives only
+    // as `ite`s buried in its arithmetic. A later join-level consume then cannot
+    // see it as structure and has nothing to case-split on — which is precisely
+    // how the `&mut` reborrow shape lost its proof. Keeping the flat cube keeps
+    // the representation the whole guard-hoisted design depends on.
+    let keep_guard = existing
+        .as_ref()
+        .is_some_and(|c| !c.guard().is_empty() && cube_entails(ctx, pc_lits, c.guard()));
+    let kept: crate::verify::heap::HeapPc = match (&existing, keep_guard) {
+        (Some(c), true) => c.guard.clone(),
+        _ => std::rc::Rc::from(Vec::new()),
+    };
     let existing = existing.map(|c| {
-        if !c.guard().is_empty() {
+        if !c.guard().is_empty() && !keep_guard {
             let gated = gate_perm_by_guard(ctx, &c.perm, c.guard());
             Chunk::new_perm(c.addr, gated, c.value).with_recipe(c.recipe.clone())
         } else {
@@ -1215,7 +1392,7 @@ fn heap_subtract_inner(
         // Last-last resort: summarize the *whole* group under the symbolic address
         // gate. Nothing matched on ground and no pc-implied alias was found, but a
         // chunk may still sit here under an equality the pc does not mention.
-        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr);
+        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr, pc_lits);
         if !set.is_empty()
             && let Ok(h) = heap_subtract_summarized(
                 ctx,
@@ -1275,7 +1452,8 @@ fn heap_subtract_inner(
         out = out.with_chunk(
             kind,
             Chunk::new(existing.addr, remainder, existing.value)
-                .with_recipe(existing.recipe.clone()),
+                .with_recipe(existing.recipe.clone())
+                .with_guard(kept.clone()),
         );
         return Ok(out);
     }
@@ -1303,7 +1481,7 @@ fn heap_subtract_inner(
         // another chunk of the group may sit at this address under an equality the pc
         // does not mention. Fall back to the Σ-ite summary over the whole group —
         // strictly the last resort, so no consume that succeeds outright pays for it.
-        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr);
+        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr, pc_lits);
         if set.len() > 1
             && let Ok(h) = heap_subtract_summarized(
                 ctx,
@@ -1318,17 +1496,27 @@ fn heap_subtract_inner(
         {
             return Ok(h);
         }
-        if crate::verify::viz::dump_perm_enabled() {
-            let existing_perm = existing.perm.to_id(ctx);
-            eprintln!(
-                "[perm-dump] insufficient at subtract in group {:?}\n\
-                 held.perm:\n{}needed.perm:\n{}",
-                kind.group,
-                crate::verify::viz::dump_term(ctx, existing_perm, 64),
-                crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
-            );
+        // NOT retried under merge guards here, unlike `heap_subtract_summarized`
+        // and the `SlotPerm::Presence` framing check. This is the hot path — every
+        // `- acc` reaches it — and measurement says the retry buys nothing on it:
+        // where a single chunk's sufficiency is arm-dependent the deciding guard
+        // sits below the depth bound, in give-back residue, and a bound wide enough
+        // to reach it took `shape_area` from 1s to over ten minutes. The two
+        // members that need it are recorded in `expected_failures.txt`.
+        {
+            if crate::verify::viz::dump_perm_enabled() {
+                let existing_perm = existing.perm.to_id(ctx);
+                eprintln!(
+                    "[perm-dump] insufficient at subtract in group {:?}\n\
+                     held.perm:\n{}needed.perm:\n{}",
+                    kind.group,
+                    crate::verify::viz::dump_term(ctx, existing_perm, 64),
+                    crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
+                );
+            }
+            return Err(VerifyError::InsufficientPermission);
         }
-        return Err(VerifyError::InsufficientPermission);
+        // Sufficiency established per arm; fall through to the ordinary debit.
     }
 
     // Unconditional, unlike the guarded rule `union_heaps` and `merge_chunks` use.
@@ -1363,11 +1551,14 @@ fn heap_subtract_inner(
     if empty {
         out = out.without_chunk(kind, existing.addr);
     } else {
-        // The value (and so its recipe provenance) is unchanged by a subtract.
+        // The value (and so its recipe provenance) is unchanged by a subtract, and
+        // so is the presence guard when the pc entailed it: the chunk is still held
+        // exactly where it was, just for less.
         out = out.with_chunk(
             kind,
             Chunk::new_perm(existing.addr, remainder, existing.value)
-                .with_recipe(existing.recipe.clone()),
+                .with_recipe(existing.recipe.clone())
+                .with_guard(kept.clone()),
         );
     }
     Ok(out)
@@ -1387,7 +1578,7 @@ fn pc_alias_set(
     existing: Option<&Chunk>,
     partners: &[egg::Id],
     pc_lits: &[(egg::Id, Polarity)],
-) -> (Vec<(Chunk, crate::verify::heap::HeapPc)>, egg::Id) {
+) -> (Vec<(Chunk, crate::verify::heap::HeapPc)>, ChunkPerm) {
     let members: Vec<Chunk> = existing
         .cloned()
         .into_iter()
@@ -1399,17 +1590,22 @@ fn pc_alias_set(
                 .cloned()
         }))
         .collect();
-    let mut total: Option<egg::Id> = None;
+    // Structural, like the Σ-ite summary's: a member whose perm carries join
+    // structure keeps it, so sufficiency is decided per leaf rather than over a
+    // flattened `ite`.
+    let mut total: Option<ChunkPerm> = None;
     for c in &members {
-        let p = c.perm.to_id(ctx);
         total = Some(match total {
-            None => p,
-            Some(t) => ctx.add(Symbolic::Binary(BinOp::AddR, [t, p])),
+            None => c.perm.clone(),
+            Some(t) => perm_add(ctx, &t, &c.perm),
         });
     }
     let cube: crate::verify::heap::HeapPc = std::rc::Rc::from(pc_lits.to_vec());
     let set = members.into_iter().map(|c| (c, cube.clone())).collect();
-    (set, total.unwrap_or_else(|| zero_real(ctx)))
+    (
+        set,
+        total.unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx))),
+    )
 }
 
 /// Consume `chunk2` against a **summarized** location: a set of chunks that each sit
@@ -1424,7 +1620,15 @@ fn pc_alias_set(
 ///
 /// - **Sufficiency** is proven against `total`, the sum the caller summarized: at any
 ///   state where a member's cube holds it is the demanded location, so its fraction
-///   joins the sum (`1/2 + 1/2 ≥ 1/1`).
+///   joins the sum (`1/2 + 1/2 ≥ 1/1`). Proven **per leaf** of that sum
+///   ([`prove_sufficient`]), exactly as the unsummarized path proves a single
+///   chunk's: a member present on one arm only contributes a `Select` on its guard
+///   literal, and each leaf is discharged with that literal in the pc. Flattening
+///   into one goal instead was the whole of the `&mut`-reborrow incompleteness —
+///   the arms' contributions are live under complementary literals, so no single
+///   monolithic goal holds, while both leaves are trivial. The split set is the
+///   guards the chunks already carry, so it is finite and fixed by the CFG, never
+///   searched.
 /// - **The debit is guarded and _distributed_** across the set, greedily: each chunk
 ///   gives up `min(it holds, still needed)`, gated by `cube ? take : 0`, and the demand
 ///   is retired by that **gated** amount. No chunk is merged — where the cube fails the
@@ -1443,18 +1647,16 @@ fn heap_subtract_summarized(
     out: Heap,
     kind: &LocationKind,
     set: &[(Chunk, crate::verify::heap::HeapPc)],
-    total: egg::Id,
+    total: ChunkPerm,
     chunk2: Chunk,
     chunk2_perm: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Result<Heap, VerifyError> {
-    // `needed ≤ total`, i.e. `!(total < needed)`, under the pc.
-    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [total, chunk2_perm]));
-    let false_ = ctx.false_();
-    let true_ = ctx.true_();
-    let sufficient = ctx.add(Symbolic::Ite([lt, false_, true_]));
-    if !ctx.prove_under_pc(sufficient, pc_lits) {
+    // `needed ≤ total`, per leaf of `total`, each under the pc plus that leaf's
+    // branch literals.
+    if !prove_sufficient(ctx, &total, chunk2_perm, pc_lits) {
         if crate::verify::viz::dump_perm_enabled() {
+            let total = total.to_id(ctx);
             eprintln!(
                 "[perm-dump] insufficient in summarized subtract, group {:?}, {} chunk(s)\n\
                  total:\n{}needed:\n{}",
@@ -1498,10 +1700,18 @@ fn heap_subtract_summarized(
         if perm_all_zero(ctx, &rest) {
             out = out.without_chunk(kind, chunk.addr);
         } else {
+            // The member's own presence guard is carried through untouched: unlike
+            // the plain path, this one never folded it into the amount — `hold` is
+            // the raw perm and the debit is gated by the member's `cube` — so the
+            // remainder is still held exactly under that guard. Dropping it here
+            // was what destroyed the flat cube on the first consume at a location
+            // and left every later one with conditionality it could only see as
+            // `ite`s inside the arithmetic.
             out = out.with_chunk(
                 kind,
                 Chunk::new_perm(chunk.addr, rest, chunk.value)
-                    .with_recipe(chunk.recipe.clone()),
+                    .with_recipe(chunk.recipe.clone())
+                    .with_guard(chunk.guard.clone()),
             );
         }
     }
@@ -1739,20 +1949,43 @@ fn gate_perm_by_guard(
 /// - **provably distinct** — skipped outright, minting nothing. This prune is what
 ///   keeps the sum from growing the `ite` tower recorded in
 ///   `project_perm_collapse_root_cause`;
+/// - **equal under the chunk's own presence cube** — ungated too, see below;
 /// - **otherwise** — gated, and the cube it was gated by is returned alongside, so a
 ///   consume can gate its debit by the very same condition.
+///
+/// # The address gate is decided under the chunk's presence cube
+///
+/// A chunk's address means nothing where the chunk is not held, so the question is
+/// never "is `c.addr == addr` valid?" but "is it valid **wherever `c` exists**?" —
+/// i.e. under `pc ∧ c.guard`. Deciding it on ground instead is what left the `&mut`
+/// reborrow shape unprovable: the arm mints a fresh reference whose pointee equals
+/// the parameter's, so the two `p_C(..)` addresses coincide — but only through a
+/// chain released under the arm's own reach literal, which is exactly the literal
+/// the chunk's guard carries. Ground `find` cannot see it; a probe under the guard
+/// settles it immediately.
+///
+/// When the probe succeeds the address gate is dropped entirely and the returned
+/// cube is the chunk's **guard**: the contribution is conditional on presence, not
+/// on an equality, and `held` already encodes that condition. One `prove_under_pc`,
+/// paid only by a chunk that missed on ground and was not disproven — the same
+/// budget the disproof check above already spends.
+///
+/// The total is returned **structural** ([`perm_add`]), not flattened: a
+/// conditionally-present chunk contributes a `Select` on its guard literal, and
+/// [`prove_sufficient`] discharges the sum per leaf with that literal in the pc.
 fn summarize_perm_at(
     ctx: &mut VerifyContext<'_>,
     chunks: &[Chunk],
     addr: egg::Id,
-) -> (egg::Id, Vec<(Chunk, crate::verify::heap::HeapPc)>) {
+    pc_lits: &[(egg::Id, Polarity)],
+) -> (ChunkPerm, Vec<(Chunk, crate::verify::heap::HeapPc)>) {
     let canon = ctx.egraph.find(addr);
-    let mut total: Option<egg::Id> = None;
+    let mut total: Option<ChunkPerm> = None;
     let mut set: Vec<(Chunk, crate::verify::heap::HeapPc)> = Vec::new();
     for c in chunks {
-        let held = gate_perm_by_guard(ctx, &c.perm, c.guard()).to_id(ctx);
+        let held = gate_perm_by_guard(ctx, &c.perm, c.guard());
         // Ground match: no address gate at all (and no `Eq` node minted).
-        let (amount, cube): (egg::Id, crate::verify::heap::HeapPc) =
+        let (amount, cube): (ChunkPerm, crate::verify::heap::HeapPc) =
             if ctx.egraph.find(c.addr) == canon {
                 (held, std::rc::Rc::from(Vec::new()))
             } else {
@@ -1764,17 +1997,32 @@ fn summarize_perm_at(
                 ) {
                     continue;
                 }
-                let cube = vec![(eq, Polarity::Positive)];
-                let gated = ctx.gate_amount_by_pc(held, &cube);
-                (gated, std::rc::Rc::from(cube))
+                // Equal wherever this chunk is held: no address gate, and the
+                // condition on the contribution is the guard `held` already carries.
+                let presence = match cube_meet(ctx, pc_lits, c.guard()) {
+                    // Guard contradicts the pc — the chunk is unreachable here.
+                    None => continue,
+                    Some(cube) => cube,
+                };
+                if !c.guard().is_empty() && ctx.prove_under_pc(eq, &presence) {
+                    (held, c.guard.clone())
+                } else {
+                    let cube = vec![(eq, Polarity::Positive)];
+                    let held = held.to_id(ctx);
+                    let gated = ctx.gate_amount_by_pc(held, &cube);
+                    (ChunkPerm::Leaf(gated), std::rc::Rc::from(cube))
+                }
             };
         set.push((c.clone(), cube));
         total = Some(match total {
             None => amount,
-            Some(t) => ctx.add(Symbolic::Binary(BinOp::AddR, [t, amount])),
+            Some(t) => perm_add(ctx, &t, &amount),
         });
     }
-    (total.unwrap_or_else(|| zero_real(ctx)), set)
+    (
+        total.unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx))),
+        set,
+    )
 }
 
 /// The permission held at `addr`, as a term — what `perm(loc)` evaluates to.
@@ -1784,8 +2032,16 @@ fn summarize_perm_at(
 /// succeed. Heap operations reach for it only as a fallback
 /// ([`heap_subtract_inner`]), matching Silicon's split between greedy chunk matching
 /// and `--exhaleMode=1`.
-fn perm_held_at(ctx: &mut VerifyContext<'_>, chunks: &[Chunk], addr: egg::Id) -> egg::Id {
-    summarize_perm_at(ctx, chunks, addr).0
+fn perm_held_at(
+    ctx: &mut VerifyContext<'_>,
+    chunks: &[Chunk],
+    addr: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> egg::Id {
+    // `perm(loc)` is asked for as a *value*, so the branch structure has to be
+    // materialized here — the one place it is.
+    let total = summarize_perm_at(ctx, chunks, addr, pc_lits).0;
+    total.to_id(ctx)
 }
 
 /// The **sum** of two heaps held simultaneously (`HeapInst::Union`).
@@ -1927,7 +2183,7 @@ fn eval_heap_inst(
         } => {
             // An unreachable predecessor arm (its cube refuted, e.g. the enum
             // `bb_unreach` after `inhale false`) is dropped outright — selecting
-            // a `0`-leaf against it would need a tier-4 exhaustiveness split.
+            // a `0`-leaf against it would need an exhaustiveness case split.
             match (heapval_dead(state, then_h), heapval_dead(state, els_h)) {
                 (false, true) => return Ok(get_heap(state, then_h)),
                 (true, false) => return Ok(get_heap(state, els_h)),
@@ -2487,6 +2743,21 @@ fn walk_footprint(
                         let not_guard = ctx.add(Symbolic::Ite([guard, f, t]));
                         ctx.prove_under_pc(not_guard, pc_lits)
                     }
+                };
+                // Last resort, the framing twin of what `heap_subtract_inner` does
+                // on a miss: no chunk matched this address on ground (or the one
+                // that did could not be shown positive), but another chunk of the
+                // group may sit here — under an equality the pc does not mention,
+                // or under its own presence guard, which is the `&mut`-reborrow
+                // shape. Summarize the group at `addr` and ask for positivity per
+                // leaf. Reached only by a check that would otherwise fail, so no
+                // framing check that succeeds outright pays for it.
+                let suff = suff || {
+                    let chunks = heap.chunks_of(&slot.kind).to_vec();
+                    let (total, set) = summarize_perm_at(ctx, &chunks, addr, pc_lits);
+                    let mut pc = pc_lits.to_vec();
+                    pc.push((guard, Polarity::Positive));
+                    !set.is_empty() && prove_perm_positive(ctx, &total, &pc)
                 };
                 if !suff {
                     return Err(VerifyError::InsufficientPermission);

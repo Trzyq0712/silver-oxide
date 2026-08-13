@@ -1,0 +1,23 @@
+// KNOWN LIMITATION — should verify, currently rejected.
+//
+// The intra-block form of the same gap. `g`'s post is released under the call's
+// path condition `b` (the `f%pre` token's truth is assumed there, so the fact
+// cannot leak onto the `!b` sibling arm — that confinement is what
+// `e2e::branching::ternary_call_does_not_leak_callee_ensures` guards). Proving
+// the *unbranched* `r == 7` therefore needs a case split on the opaque `b`:
+// the `b` arm through the released post, the `!b` arm by folding the literal.
+//
+// Stated on its own branch — `assert b ==> r == 7` — it verifies through the
+// `ite_decompose` tier; that is the non-vacuity companion in
+// `e2e::branching::ternary_call_ensures_available_on_its_own_branch`.
+//
+// Root cause and rationale: see `goal_needs_case_split_heap_free.vpr`.
+
+function g(a: Int): Int
+  ensures result == 7
+
+method client(v: Int, b: Bool)
+{
+    var r: Int := b ? g(v) : 7
+    assert r == 7
+}

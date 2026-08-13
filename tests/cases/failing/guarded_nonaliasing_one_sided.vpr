@@ -1,0 +1,26 @@
+// The non-aliasing axiom must NOT fire between an unconditional chunk and a
+// chunk held on one arm only, once the join is past.
+//
+// `x.f` is held throughout; `y.f` leaves the join guarded by `[b+]`. Under `b`
+// the two are genuinely both held and `x != y` does follow — but only there, and
+// the assertion below sits after the join with no path condition.
+//
+// Two ways this was derived unconditionally before the fix: the merged chunk's
+// guard was ignored outright, and — the half the guard cube alone does not cover
+// — `heap_union` states the axioms once per `inhale`, from *inside* the arm,
+// where both chunks are unguarded and only the block's control cube separates
+// them. Both are covered by meeting `Chunk::guard` with `ctx.current_cube()`.
+//
+// See `tests/cases/failing/guarded_nonaliasing_two_arms.vpr` for the complementary
+// shape and the history.
+
+field f: Int
+
+method one_sided(x: Ref, y: Ref, b: Bool)
+    requires acc(x.f, write)
+{
+    if (b) {
+        inhale acc(y.f, write)
+    }
+    assert x != y
+}

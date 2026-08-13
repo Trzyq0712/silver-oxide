@@ -5,6 +5,6 @@ egraph_nodes_peak=21
 egraph_classes_peak=14
 rule_applications=3
 prove_calls=9
-prove_tier3=0
+prove_probe=0
 rule.eq-refl=1
 rule.ite-reduce=2

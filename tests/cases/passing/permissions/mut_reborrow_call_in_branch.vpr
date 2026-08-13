@@ -1,3 +1,33 @@
+// A call taking a `&mut` reborrow *inside a branch arm*, with the location used
+// again after the join.
+//
+// The arm mints a fresh reference whose snapshot is a deliberately
+// *uninterpreted* `p_Ref_mutable_arbitrary_value(..)` — the callee may have
+// mutated through the borrow, so `snap(arm_ref) == snap(param)` is false by
+// design. What survives is the pointee: that function's contract states
+// `ensures result.s_Ref_mutable_0 == r`, and the call passes the parameter's own
+// target ref. So the two chunk addresses `p_C(cons.0(snap))` ARE equal — through
+// a chain released only under the arm's own reach literal, which is exactly the
+// literal `merge_heaps` records in the one-sided chunk's `Chunk::guard`.
+//
+// Everything the three members need follows from taking that guard seriously:
+//   - `summarize_perm_at` decides the address gate under `pc ∧ chunk.guard`
+//     rather than on ground, so the chain is released and the gate disappears;
+//   - the summarized total stays a `ChunkPerm` tree, so `prove_sufficient` splits
+//     it per leaf with the guard literal in the pc — the split set is the guards
+//     the chunks already carry, not a searched one;
+//   - the guard survives a consume (`heap_subtract_inner` skips the gating
+//     entirely when the pc already entails it; `heap_subtract_summarized` carries
+//     it onto the remainder), so it is still there for the join-level consume;
+//   - the `SlotPerm::Presence` framing check falls back to the same summary,
+//     which is what `m_call_in_arm_then_read`'s `p_C_snap#requires` needs.
+//
+// `m_call_in_arm_then_read` and `m_call_in_arm_then_after` were rejected between
+// the retirement of the goal-directed case split ("tier 4") and that work; two
+// mechanisms measured and rejected in between — budgeted merge-guard splits at
+// the consume, and matching the two `p_C(..)` address classes directly at the
+// join under `¬cond` — are recorded in the tracking doc.
+//
 // Regression: a call taking a `&mut` reborrow *inside a branch arm*.
 //
 // Prusti encoding of:

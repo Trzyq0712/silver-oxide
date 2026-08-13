@@ -8,4 +8,20 @@
 #
 # Keep each entry's reason current. An entry with no live reason is a bug report.
 
-# (empty -- every member of the corpus verifies)
+# Permission conditional on an enum DISCRIMINANT, consumed inside a match arm.
+#
+# The location's amount is a frontend `c ==> acc` gate — Prusti encodes a
+# variant's footprint as `acc(p_Shape_k(s), discr == k ? write : none)` — so the
+# held perm is `ite(discr == 1, 1/1, 0)` while the demand is `1/1`. Discharging it
+# needs `discr == 1` on this path, and the arm's path condition does not entail
+# it: splitting the amount on its own gate (measured 2026-08-13) reaches the
+# `discr != 1` world and finds it consistent, so this is a missing link between a
+# match arm's reach literal and the discriminant, NOT a permission-arithmetic or
+# chunk-representation gap.
+#
+# These two were previously filed together with `mat3_mul` as one `&mut`-reborrow
+# shape. That was wrong: the reborrow shape was fixed by making `Chunk::guard`
+# load-bearing (guard-aware address gating, structural summarized totals, guards
+# surviving a consume) and these two did not move.
+shape_area m_shape_grow
+shape_area m_shape_translate

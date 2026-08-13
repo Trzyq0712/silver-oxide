@@ -1,0 +1,27 @@
+// The non-aliasing axiom must NOT fire across the two arms of one join.
+//
+// `x.f` and `y.f` are each held on one arm only, so `merge_heaps` files two
+// chunks with complementary guards (`[b+]` and `[b-]`) and bare `1/1` amounts.
+// Their amounts sum to `2/1 > 1/1`, but the program never holds both at once, so
+// nothing about `x` and `y` follows: `x != y` must be rejected.
+//
+// Regression for a real unsoundness. This verified from `b186cbb` (the
+// guard-hoisted merge, which left a conditionally-held chunk's perm a bare
+// `Leaf` where the older `?:0` encoding made it a `Select` that the axiom's
+// `as_leaf()` cost filter skipped) until `assume_location_axioms` learned to
+// meet the two chunks' presence cubes and drop disjoint pairs.
+//
+// Companion positive controls, which must keep verifying:
+// `tests/cases/passing/permissions/guarded_nonaliasing_still_fires.vpr`.
+
+field f: Int
+
+method two_arms(x: Ref, y: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, write)
+    } else {
+        inhale acc(y.f, write)
+    }
+    assert x != y
+}

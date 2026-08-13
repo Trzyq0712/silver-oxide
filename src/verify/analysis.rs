@@ -192,9 +192,22 @@ impl Analysis<Symbolic> for ConstFold {
     }
 
     fn modify(egraph: &mut EGraph<Symbolic, Self>, id: Id) {
-        if let Data::Known(lit) = egraph[id].data.clone() {
-            let lit_id = egraph.add(Symbolic::Lit(lit));
-            egraph.union(id, lit_id);
+        match egraph[id].data.clone() {
+            Data::Known(lit) => {
+                let lit_id = egraph.add(Symbolic::Lit(lit));
+                egraph.union(id, lit_id);
+            }
+            // One contradictory class makes the whole graph contradictory, so
+            // record that *in the graph* — `true == false` — and callers decide
+            // it with two `find`s instead of scanning every class. The merged
+            // class is itself `Inconsistent` (a same-typed `Bool` conflict), so
+            // this re-fires on it once and then unions an already-merged pair.
+            Data::Inconsistent => {
+                let t = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+                let f = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+                egraph.union(t, f);
+            }
+            Data::Unknown | Data::Ctor(..) => {}
         }
     }
 }

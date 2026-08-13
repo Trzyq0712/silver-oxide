@@ -1,0 +1,27 @@
+// KNOWN LIMITATION — should verify, currently rejected.
+//
+// Reasoning by cases over an opaque condition. `f`'s precondition `x != 0` is
+// provable only under `!(x == 0)`, so the call-site assert commits the guarded
+// fact `!(x == 0) ==> (x != 0)` and `f`'s post — guarded by that same formula —
+// does not fire unconditionally. Collapsing `ite(x == 0, 10, f(x)) ≡ 10` then
+// needs a case split on `x == 0`: the `x == 0` arm folds, the other arm goes
+// through the released guard. Neither arm is a *constant*, so the
+// `ite_decompose` tier (`Context::prove_by_ite_decomposition`) does not apply —
+// it only telescopes an `ite` with a `true`-constant arm, never forks.
+//
+// The forking goal-directed case split that used to close this ("tier 4") was
+// deleted deliberately: it fired zero times across the whole Prusti corpus
+// (benchmarks/rust, 2886 members) and the panic-freedom corpus, while costing
+// two full probe saturations per candidate condition on every goal that was
+// about to fail anyway. See the prove-tier ladder doc on
+// `Context::prove_under_pc`.
+//
+// Was `verify::declaration::e2e::heap_free_post_under_a_branch_via_case_split`.
+
+function f(x: Int): Int
+    requires x != 0
+    ensures result == 10
+
+function g(x: Int): Int
+    ensures result == 10
+{ x == 0 ? 10 : f(x) }

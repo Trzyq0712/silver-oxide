@@ -2285,11 +2285,12 @@ method m() {
 }
 
 #[test]
-fn quantifier_guarded_implication_by_case_split() {
-    // Proving `b() ==> foo(7)` needs a goal-directed case split on `b()` to
-    // collapse the guard `Ite(b(), Q, true)` and then `Ite(Q, foo(7), true)`.
-    // Neither guard collapses on its own (nothing concrete to fold); tier 4
-    // splits on `b()` and closes both arms.
+fn quantifier_guarded_implication_telescopes() {
+    // Proving `b() ==> foo(7)` means collapsing the guard `Ite(b(), Q, true)`
+    // and then `Ite(Q, foo(7), true)`. Neither collapses on its own (nothing
+    // concrete to fold), but both are `true`-constant-arm shapes, so the
+    // `ite_decompose` tier telescopes them one assumed condition at a time — no
+    // fork, and no case split needed.
     let input = r#"
 domain D {
     function foo(i: Int): Bool
@@ -2302,7 +2303,10 @@ method m() {
 "#;
     let program = lower(input);
     let result = verify_named_method(&program, "m");
-    assert!(result.is_ok(), "expected Ok via tier-4, got {result:?}");
+    assert!(
+        result.is_ok(),
+        "expected Ok via the ite_decompose tier, got {result:?}"
+    );
 }
 
 #[test]
@@ -3481,61 +3485,12 @@ function bad(x: Ref): Int
 }
 
 #[test]
-fn heap_free_post_under_a_branch_via_case_split() {
-    // Guarded fact replay does not cross a branch on its own: `f`'s
-    // precondition `x != 0` is provable only under `!e_c`, so the call-site
-    // assert commits `!e_c ⟹ (x != 0)` and `f`'s post fact — guarded by that
-    // same formula — does not fire unconditionally. Collapsing
-    // `ite(e_c, 10, f(x)) ≡ 10` needs a case split on `e_c`: tier 4 provides
-    // it, closing the `e_c` arm by folding and the `!e_c` arm through the
-    // now-released guard.
-    let input = r#"
-function f(x: Int): Int
-    requires x != 0
-    ensures result == 10
-
-function g(x: Int): Int
-    ensures result == 10
-{ x == 0 ? 10 : f(x) }
-"#;
-    let program = lower(input);
-    let result = verify_named_function(&program, "g");
-    assert!(result.is_ok(), "expected Ok via tier-4, got {result:?}");
-}
-
-#[test]
-fn heap_dep_post_under_a_branch_via_case_split() {
-    // A heap-dependent call whose `Snap` sits under a path condition delivers
-    // its postcondition through the opaque pre-token, which `eval_snap`
-    // releases only under the `Snap`'s pc `<!e2>`. The goal
-    // `ite(e2, V, e6) ≡ V` is unbranched, so chaining
-    // `!e2 ⟹ token ⟹ (e6 == V)` into it needs a case split on `e2` — the
-    // token is never *defined*, so unlike a heap-free guard it cannot be
-    // re-derived where the pc doesn't hold. Tier 4 splits on `e2`: the `e2` arm
-    // folds, the `!e2` arm releases the token. Also what unlocks *branching*
-    // recursive heap-dep functions.
-    let input = r#"
-field f: Int
-
-function peek(x: Ref): Int
-    requires acc(x.f)
-    ensures result == x.f
-
-function g(x: Ref, b: Bool): Int
-    requires acc(x.f)
-    ensures result == x.f
-{ b ? x.f : peek(x) }
-"#;
-    let program = lower(input);
-    let result = verify_named_function(&program, "g");
-    assert!(result.is_ok(), "expected Ok via tier-4, got {result:?}");
-}
-
-#[test]
 fn branchless_recursive_heap_dep_function_verifies_by_induction() {
     // Recursion over a snapshot works — it is the *branch*, not the recursion, that
-    // the pre-token cannot cross on its own (bridged by tier 4, see
-    // `heap_dep_post_under_a_branch_via_case_split`). With the recursive `Snap` at
+    // the pre-token cannot cross on its own (that branching case is the
+    // characterized incompleteness in
+    // `tests/cases/known_limitations/goal_needs_case_split_heap_dep.vpr`). With
+    // the recursive `Snap` at
     // empty pc the token is released unconditionally, so the in-batch post rule (the
     // induction hypothesis) gives `rf(x, next(n), s') == x.f`, discharging the exit
     // assert. The call site in `m` gets the post from the certificate's post fact.
@@ -4092,12 +4047,13 @@ method step(_1p: Ref, _2p: Ref, _3p: Ref)
 }
 
 #[test]
-fn branch_join_exhale_by_case_split() {
+fn branch_join_exhale() {
     // A CFG join leaves the ensured chunk's permission as a sum of
     // branch-scaled ites (`ite(c,1,0) + ite(c,0,ite(c2,1,0))`); the exit
     // exhale needs it under the disjunction of the branch flags, with the
     // third arm excluded by exhaustiveness. No single saturation proves the
-    // sufficiency — tier 4 splits on the branch conditions and each arm folds.
+    // sufficiency; the goal is discharged by the `ite_decompose` tier walking
+    // the branch flags, one assumption per iteration.
     let input = r#"
 domain s_Int_isize {
     function s_Int_isize_cons(arg0: Int): s_Int_isize

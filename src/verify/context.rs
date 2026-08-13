@@ -42,7 +42,7 @@ pub(crate) struct VerifyContext<'a> {
     /// ground axioms are pre-added to the graph instead) and one unfold rule
     /// per verified function body (one per `fn_certs` entry — see
     /// `rewrite::function_rule`).
-    /// Chained into full saturation (incl. the tier-3 probe) but not `reduce`.
+    /// Chained into full saturation (incl. the `probe` tier) but not `reduce`.
     pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
     /// Monotonic source of fresh-value ids (`Symbolic::Fresh(n)`). A plain counter
     /// now that nothing mints fresh values at saturation time — both certificate
@@ -95,7 +95,7 @@ pub(crate) struct VerifyContext<'a> {
     /// (productive: `eq-true-union`/congruence off a proven `Eq`).
     oob_memo: bool,
     /// Canonical class ids of implications already proven `true`, consulted at
-    /// tier 1 when `oob_memo` is on. Keyed by `egraph.find(imp)`: two distinct
+    /// the `memo` tier when `oob_memo` is on. Keyed by `egraph.find(imp)`: two distinct
     /// obligations only share a class via congruence — which means their goals
     /// and pcs are pairwise equal, i.e. the *same* obligation — so a hit is
     /// sound; a stale leader after an unrelated merge only causes a safe
@@ -109,15 +109,21 @@ pub(crate) struct VerifyContext<'a> {
     /// Whether we are inside a method block walk — gates the scratch on
     /// (functions/resources keep the per-obligation clone path).
     in_block: bool,
-    /// The live per-block scratch, built lazily on the block's first tier-3
+    /// The live per-block scratch, built lazily on the block's first `probe`-tier
     /// obligation and discarded at block exit. `None` when no obligation has
     /// needed it yet (or outside a method block).
     scratch: Option<BlockScratch>,
-    /// Whether the current block has already reached tier 3 — i.e. whether a scratch
+    /// Whether the current block has already reached the `probe` tier — i.e. whether a scratch
     /// exists *and* the block has proven it needs one. Everything after that point is
     /// what a "sticky" scratch mode would take over (gate G1); measurement only, no
     /// behaviour depends on it.
-    block_saw_tier3: bool,
+    block_saw_probe: bool,
+    /// Whether the current block's control cube is unsatisfiable — the block is
+    /// unreachable, so every obligation in it holds vacuously. Set when the
+    /// scratch is built (assuming the cube contradicts), cleared per block.
+    /// Unlike [`Self::is_inconsistent`] this is a fact about the *scratch*, so it
+    /// must never be consulted outside the block that established it.
+    block_dead: bool,
     /// Cube of every block walked so far, keyed by its index in walk order, plus
     /// whether that block built a scratch. Used to answer "did a dominator with a
     /// strictly smaller cube have a scratch to inherit?" (gate G2). Cleared per
@@ -135,8 +141,8 @@ struct BlockRecord {
     cube: Vec<(egg::Id, Polarity)>,
     /// Whether this block ever built a scratch (so a descendant could inherit it).
     built_scratch: bool,
-    /// Tier-3 obligations raised in this block, and total obligations.
-    tier3: u64,
+    /// `probe`-tier obligations raised in this block, and total obligations.
+    probes: u64,
     obligations: u64,
 }
 
@@ -264,7 +270,8 @@ impl<'a> VerifyContext<'a> {
             current_cube: Vec::new(),
             in_block: false,
             scratch: None,
-            block_saw_tier3: false,
+            block_saw_probe: false,
+            block_dead: false,
             block_cubes: Vec::new(),
             current_block: None,
         }
@@ -402,12 +409,16 @@ impl<'a> VerifyContext<'a> {
         sc.dirty_reduce = true;
     }
 
-    /// Whether the e-graph has reached a contradiction (some e-class merged
-    /// conflicting same-typed literals). Once inconsistent, every goal is
-    /// vacuously provable — used by [`Self::prove_under_pc`] as the implicit
-    /// channel through which an over-permissioned field location proves `false`.
+    /// Whether the e-graph has reached a contradiction. Once inconsistent, every
+    /// goal is vacuously provable — used by [`Self::prove_under_pc`] as the
+    /// implicit channel through which an over-permissioned field location proves
+    /// `false`.
+    ///
+    /// O(1): `ConstFold::modify` unions `true` with `false` the moment any class
+    /// becomes `Data::Inconsistent`, so the contradiction is a fact *in* the
+    /// graph rather than something to scan the classes for.
     pub(crate) fn is_inconsistent(&self) -> bool {
-        self.egraph.classes().any(|c| c.data.is_inconsistent())
+        graph_inconsistent(&self.egraph)
     }
 
     /// Display name for a member id. Registry-minted ids (outside the interner)
@@ -526,9 +537,9 @@ impl<'a> VerifyContext<'a> {
         }
         let secs = t.elapsed().as_secs_f64();
         self.alloc.stats.graph_timing.0.ground += secs;
-        if self.block_saw_tier3 {
-            self.alloc.stats.graph_timing.0.ground_after_first_tier3 += secs;
-            self.alloc.stats.ground_saturations_after_first_tier3 += 1;
+        if self.block_saw_probe {
+            self.alloc.stats.graph_timing.0.ground_after_first_probe += secs;
+            self.alloc.stats.ground_saturations_after_first_probe += 1;
         }
         self.alloc.stats.saturations += 1;
         self.clean = Some(self.clean_tag(CleanLevel::Full));
@@ -581,14 +592,14 @@ impl<'a> VerifyContext<'a> {
             .expect("true present")
     }
 
-    /// One `[tier3]` line per tier-3 obligation: ground size when tier 3 was
+    /// One `[probe]` line per `probe`-tier obligation: ground size when the tier was
     /// reached versus the scratch size the obligation reasons over, and how far the
     /// scratch had to be run (`reduce` = the cheap reductions sufficed).
-    fn trace_tier3(&self, g0: (usize, usize, usize), fresh: bool, ran: &str) {
+    fn trace_probe(&self, g0: (usize, usize, usize), fresh: bool, ran: &str) {
         let sc = self.scratch.as_ref().expect("scratch live");
         let st = sc.egraph.find(sc.true_id);
         eprintln!(
-            "[tier3] ground {}n/{}c true={} | scratch {}n/{}c true={} | ratio {:.2} | {} | {}",
+            "[probe] ground {}n/{}c true={} | scratch {}n/{}c true={} | ratio {:.2} | {} | {}",
             g0.0,
             g0.1,
             g0.2,
@@ -766,22 +777,36 @@ impl<'a> VerifyContext<'a> {
         self.egraph.rebuild();
     }
 
-    /// Prove `pc ⇒ goal` against the live e-graph, escalating through three
-    /// tiers (cheapest first) and **memoizing** the result:
-    /// 1. is the implication already known `true`? (O(1) — a prior identical
-    ///    obligation merged it, or it's trivial);
-    /// 2. else saturate the live graph (only **unconditional** facts live there)
-    ///    and re-check — proves any unconditionally-true goal, no clone;
-    /// 3. else clone, assume the path condition, saturate the clone, and check
-    ///    `goal == true` — the only tier that clones, for genuinely
-    ///    path-conditional goals.
+    /// Prove `pc ⇒ goal` against the live e-graph, escalating through named
+    /// tiers (cheapest first) and **memoizing** the result. In execution order,
+    /// each named by the stat it bumps:
+    ///
+    /// 1. `inconsistent` — the graph holds `true == false`, so everything is
+    ///    vacuously provable. Two `find`s, hence first: it is both the cheapest
+    ///    verdict and the one that makes all further work pointless.
+    /// 2. `dead_block` — the current block's control cube is unsatisfiable
+    ///    (`pc ⇒ false`), decided once when its scratch was built.
+    /// 3. `goal_true` — the goal is *unconditionally* true, so the implication
+    ///    holds whatever the pc is. Checked before the implication chain is
+    ///    built, because building it allocates nodes and const-folding
+    ///    obligations (`0 < 1/1`) are the bulk of the stream.
+    /// 4. `memo` — the implication itself is already `true` (a prior identical
+    ///    obligation merged it, or it is trivial), or sits in `proven_imps`.
+    /// 5. `saturate` — saturate the live graph (only **unconditional** facts
+    ///    live there) and re-check. No clone.
+    /// 6. `probe` — the only tier that clones: the block scratch, or a ground
+    ///    clone, with the path condition assumed and saturated.
+    /// 7. `ite_decompose` — non-forking `ite`-goal decomposition on that probe,
+    ///    see [`Self::prove_by_ite_decomposition`]. The last resort: there is
+    ///    **no case split**, so a goal needing genuine reasoning-by-cases over
+    ///    an opaque condition is reported unproven.
     ///
     /// On success the implication is merged with `true` in the live graph so the
-    /// next identical obligation hits tier 1. (Tiers 1/2 already have it merged.)
+    /// next identical obligation hits `memo`. (Tiers 1–5 already have it merged.)
     ///
     /// A PC literal that already folds to the opposite boolean means the path is
     /// unsatisfiable, so the goal holds vacuously and we short-circuit — which also
-    /// avoids `ConstFold`'s conflicting-value panic.
+    /// keeps the union below from making the whole graph contradictory.
     #[track_caller]
     pub(crate) fn prove_under_pc(
         &mut self,
@@ -805,50 +830,55 @@ impl<'a> VerifyContext<'a> {
             } else {
                 self.alloc.stats.prove_in_block_cube_only += 1;
             }
-            if self.block_saw_tier3 {
-                self.alloc.stats.prove_in_block_after_first_tier3 += 1;
+            if self.block_saw_probe {
+                self.alloc.stats.prove_in_block_after_first_probe += 1;
             }
             if let Some(me) = self.current_block {
                 self.block_cubes[me].obligations += 1;
             }
         }
+        // Inconsistent: the held facts are contradictory (e.g. a field location
+        // holds > 1/1 permission), so every goal is vacuously provable. Two
+        // `find`s — cheaper than building anything, hence first.
+        if self.is_inconsistent() {
+            self.alloc.stats.prove_inconsistent += 1;
+            return true;
+        }
+        // Dead block: the block's control cube is unsatisfiable, so nothing in it
+        // is reachable and all its obligations hold vacuously. Decided once, when
+        // the scratch was built, instead of rediscovered per obligation.
+        if self.block_dead {
+            self.alloc.stats.prove_dead_block += 1;
+            return true;
+        }
         let true_ = self.true_();
-        // Tier 0.5: the goal is *unconditionally* true, so the implication holds
-        // whatever the pc is -- and building that implication chain is itself node
-        // allocation. Const-folding obligations (`0 < 1/1`, a literal perm bound)
-        // are the bulk of the obligation stream, so this is checked before the
-        // chain is built rather than after.
+        // `goal_true`: unconditionally true, checked before the implication chain
+        // is built (see the tier list above).
         if self.egraph.find(goal) == self.egraph.find(true_) {
-            self.alloc.stats.prove_tier1 += 1;
+            self.alloc.stats.prove_goal_true += 1;
             return true;
         }
         let imp = self.implication(goal, pc_lits.iter().rev().copied());
 
-        // Tier 1: already true (memoized / trivial). O(1) — checked before the
-        // O(classes) inconsistency scan, which most calls never need. Under
-        // `oob_memo` a proven *conditional* obligation lives in `proven_imps`
-        // rather than the `true` class, so consult it too.
+        // `memo`: already true (memoized / trivial). Under `oob_memo` a proven
+        // *conditional* obligation lives in `proven_imps` rather than the `true`
+        // class, so consult it too.
         if self.egraph.find(imp) == self.egraph.find(true_)
             || (self.oob_memo && self.proven_imps.contains(&self.egraph.find(imp)))
         {
-            self.alloc.stats.prove_tier1 += 1;
+            self.alloc.stats.prove_memo += 1;
             return true;
         }
 
-        // Tier 0: the held facts are contradictory (e.g. a field location holds
-        // > 1/1 permission) — every goal is vacuously provable.
-        if self.is_inconsistent() {
-            return true;
-        }
-        // Tier 2: saturate the live graph and re-check (no clone). Saturation can
-        // also expose a contradiction, so re-check inconsistency too.
+        // `saturate`: saturate the live graph and re-check (no clone). Saturation
+        // can also expose a contradiction, so re-check inconsistency too.
         self.saturate();
         if self.is_inconsistent() || self.egraph.find(imp) == self.egraph.find(true_) {
-            self.alloc.stats.prove_tier2 += 1;
+            self.alloc.stats.prove_saturate += 1;
             return true;
         }
 
-        // Inside a method block, discharge tier-3 against the per-block scratch
+        // Inside a method block, discharge `probe`-tier proving against the per-block scratch
         // graph (reused across the block's obligations) instead of cloning ground
         // per obligation: it is warm, cube-assumed and kept in sync with ground, and
         // its `tr` imports any ground operand it is missing.
@@ -865,8 +895,8 @@ impl<'a> VerifyContext<'a> {
 
         // Tier 3 shortcut: if every PC literal already carries its required polarity
         // in the just-saturated live graph, assuming the PC adds nothing — skip
-        // straight to tier 3.5 / the function case split. Only functions/resources
-        // reach here, and their tier-2 always ran the full rule set, so the premise
+        // straight to the `ite_decompose` tier. Only functions/resources reach
+        // here, and their `saturate` tier always ran the full rule set, so the premise
         // (the live graph is fully saturated) holds.
         if pc_lits.iter().all(|(id, pol)| {
             matches!(
@@ -875,7 +905,7 @@ impl<'a> VerifyContext<'a> {
             )
         }) {
             let probe = self.egraph.clone();
-            let proven = self.tier35(&probe, goal) || self.split_prove(&probe, goal);
+            let proven = self.prove_by_ite_decomposition(&probe, goal);
             if proven {
                 self.record_proven(imp, true_, pc_lits.is_empty());
             }
@@ -902,23 +932,17 @@ impl<'a> VerifyContext<'a> {
                 }
             }
         }
-        self.alloc.stats.prove_tier3 += 1;
+        self.alloc.stats.prove_probe += 1;
         let proven = if unsat_pc {
             true
         } else {
             let probe = self.run_probe(probe);
-            if probe.find(goal) == probe.find(true_p) {
-                true
-            } else if self.tier35(&probe, goal) {
-                // Tier 3.5: non-forking ite-goal decomposition.
-                true
-            } else {
-                // Function case split on a goal-structural ite condition.
-                self.split_prove(&probe, goal)
-            }
+            // Last resort is the non-forking ite-goal decomposition; there is no
+            // case split beyond it.
+            probe.find(goal) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, goal)
         };
 
-        // Persist the result so future identical obligations hit tier 1.
+        // Persist the result so future identical obligations hit the `memo` tier.
         if proven {
             self.record_proven(imp, true_, pc_lits.is_empty());
         }
@@ -928,21 +952,22 @@ impl<'a> VerifyContext<'a> {
     /// Enter a method block: record its control cube (shared pc of all its
     /// insts) and drop any previous block's scratch (sibling cubes are mutually
     /// exclusive, so it cannot be reused). The scratch itself is built lazily, on
-    /// the block's first tier-3 obligation — most blocks never reach tier 3, and
+    /// the block's first `probe`-tier obligation — most blocks never reach the `probe` tier, and
     /// building at entry measured 1.8x slower on `structs_enums`.
     ///
     /// `idom` is the walk-order index of the block's immediate dominator (`None` for
     /// the entry block), used only by the dominator-reuse measurement below.
     pub(crate) fn begin_block(&mut self, cube: Vec<(egg::Id, Polarity)>, idom: Option<usize>) {
         self.scratch = None;
-        self.block_saw_tier3 = false;
+        self.block_saw_probe = false;
+        self.block_dead = false;
         let canon: Vec<(egg::Id, Polarity)> =
             cube.iter().map(|(id, p)| (self.egraph.find(*id), *p)).collect();
         self.block_cubes.push(BlockRecord {
             idom,
             cube: canon,
             built_scratch: false,
-            tier3: 0,
+            probes: 0,
             obligations: 0,
         });
         self.current_block = Some(self.block_cubes.len() - 1);
@@ -959,7 +984,8 @@ impl<'a> VerifyContext<'a> {
         self.current_cube.clear();
         self.in_block = false;
         self.scratch = None;
-        self.block_saw_tier3 = false;
+        self.block_saw_probe = false;
+        self.block_dead = false;
         self.current_block = None;
     }
 
@@ -1000,7 +1026,7 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// One `[block]` line per walked block (`SILVER_OXIDE_TRACE_BLOCKS`): cube size,
-    /// dominator relation, and how many of its obligations reached tier 3.
+    /// dominator relation, and how many of its obligations reached the `probe` tier.
     fn trace_block(&self) {
         let Some(me) = self.current_block else { return };
         let rec = &self.block_cubes[me];
@@ -1013,13 +1039,13 @@ impl<'a> VerifyContext<'a> {
         };
         eprintln!(
             "[block] idx={me} idom={:?} cube={} idom_cube={idom_cube} subset={} \
-             built_scratch={} reuse_src={:?} tier3={} obligations={}",
+             built_scratch={} reuse_src={:?} probes={} obligations={}",
             rec.idom,
             rec.cube.len(),
             if subset { "yes" } else { "no" },
             rec.built_scratch,
             self.dom_reuse_source(),
-            rec.tier3,
+            rec.probes,
             rec.obligations,
         );
     }
@@ -1054,6 +1080,13 @@ impl<'a> VerifyContext<'a> {
         }
         let t_rebuild = std::time::Instant::now();
         egraph.rebuild();
+        // `pc ⇒ false`, in its cheap *assume* form: the cube literals are already
+        // merged with their polarities, so a contradiction among them has surfaced
+        // as `true == false`. Recording it here decides the block's reachability
+        // once; every later obligation short-circuits at the top of
+        // `prove_under_pc`. (The implication form would be strictly weaker —
+        // const-fold does not collapse the `ite` chain of an unsatisfiable pc.)
+        self.block_dead = graph_inconsistent(&egraph);
         if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
             eprintln!(
                 "[scratch-build] ground {}n/{}c ids {} cube {} | clone+union {:?} rebuild {:?}",
@@ -1151,13 +1184,13 @@ impl<'a> VerifyContext<'a> {
         self.scratch = Some(sc);
     }
 
-    /// Tier-3 against the per-block scratch. The scratch already has the block
+    /// The `probe` tier against the per-block scratch. The scratch already has the block
     /// cube assumed and saturated, so an obligation whose pc is fully implied by
     /// the cube is discharged with no per-obligation clone (a "free hit").
     /// Obligations carrying extra pc literals (a perm-`Select` branch condition)
     /// clone the *warm* scratch and assume only those, then saturate.
     fn prove_via_scratch(&mut self, goal: egg::Id, pc_lits: &[(egg::Id, Polarity)]) -> bool {
-        // Ground size at the moment tier 3 is reached, before the scratch is built or
+        // Ground size at the moment the `probe` tier is reached, before the scratch is built or
         // touched — paired below with the scratch size the obligation actually
         // reasons over (`SILVER_OXIDE_TRACE_SCRATCH`).
         let trace = std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some();
@@ -1172,7 +1205,7 @@ impl<'a> VerifyContext<'a> {
             (0, 0, 0)
         };
         let fresh = self.scratch.is_none();
-        // Gate measurements: this is a tier-3 site. Classify whether a dominator's
+        // Gate measurements: this is a `probe`-tier site. Classify whether a dominator's
         // scratch was available to inherit *before* building ours (building marks the
         // current block, which must not count as its own source).
         if self.dom_reuse_source().is_some() {
@@ -1184,10 +1217,15 @@ impl<'a> VerifyContext<'a> {
             self.alloc.stats.dom_chain_available += 1;
         }
         if let Some(me) = self.current_block {
-            self.block_cubes[me].tier3 += 1;
+            self.block_cubes[me].probes += 1;
         }
-        self.block_saw_tier3 = true;
+        self.block_saw_probe = true;
         self.ensure_scratch();
+        // Building the scratch is what decides `pc ⇒ false`; if the cube is
+        // unsatisfiable there is nothing to translate or run.
+        if self.block_dead {
+            return true;
+        }
         // Translate goal + pc into scratch space first: `tr` may *import* ground
         // operands (a lazy/structural ground surfaces rule-canonical leaders),
         // which dirties the scratch — so import before the saturation below.
@@ -1203,25 +1241,32 @@ impl<'a> VerifyContext<'a> {
         self.reduce_scratch();
         {
             let sc = self.scratch.as_ref().expect("scratch live");
+            // A cube that only contradicts once reduced still kills the block, and
+            // latching it here spares every later obligation the same discovery.
+            if graph_inconsistent(&sc.egraph) {
+                self.block_dead = true;
+                return true;
+            }
             if sc.egraph.find(tg) == sc.egraph.find(sc.true_id) {
                 self.alloc.stats.block_scratch_freehits += 1;
                 if trace {
-                    self.trace_tier3(g0, fresh, "reduce");
+                    self.trace_probe(g0, fresh, "reduce");
                 }
                 return true;
             }
         }
         self.saturate_scratch();
         if trace {
-            self.trace_tier3(g0, fresh, "saturate");
+            self.trace_probe(g0, fresh, "saturate");
         }
 
-        let sc = self.scratch.as_ref().expect("scratch live");
         // A contradictory cube (or a mirrored union that conflicts under it)
-        // makes every goal vacuously provable.
-        if sc.egraph.classes().any(|c| c.data.is_inconsistent()) {
+        // makes every goal vacuously provable — and kills the rest of the block.
+        if graph_inconsistent(&self.scratch.as_ref().expect("scratch live").egraph) {
+            self.block_dead = true;
             return true;
         }
+        let sc = self.scratch.as_ref().expect("scratch live");
         if sc.egraph.find(tg) == sc.egraph.find(sc.true_id) {
             self.alloc.stats.block_scratch_freehits += 1;
             return true;
@@ -1235,10 +1280,10 @@ impl<'a> VerifyContext<'a> {
         let probe_base = sc.egraph.clone();
 
         // Free hit: the cube already implies the pc — no extra assumption needed,
-        // go straight to the goal-structural decompositions on the warm scratch.
+        // go straight to the goal-structural decomposition on the warm scratch.
         if all_sat {
             self.alloc.stats.block_scratch_freehits += 1;
-            return self.tier35(&probe_base, tg) || self.split_prove(&probe_base, tg);
+            return self.prove_by_ite_decomposition(&probe_base, tg);
         }
 
         // Extra literals: assume them on a clone of the warm scratch.
@@ -1257,16 +1302,10 @@ impl<'a> VerifyContext<'a> {
         }
         probe.rebuild();
         let probe = self.run_probe(probe);
-        if probe.find(tg) == probe.find(true_p) {
-            true
-        } else if self.tier35(&probe, tg) {
-            true
-        } else {
-            self.split_prove(&probe, tg)
-        }
+        probe.find(tg) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, tg)
     }
 
-    /// Persist a proven obligation so future identical ones hit tier 1.
+    /// Persist a proven obligation so future identical ones hit the `memo` tier.
     ///
     /// Default (and always for an **empty-pc** goal, where `imp == goal`): union
     /// `imp` with `true`. That path is *productive* — a proven `Eq`/discriminator
@@ -1298,17 +1337,23 @@ impl<'a> VerifyContext<'a> {
     ///   guarded fact / implication under a branch)
     ///
     /// This *assumes* the one condition and re-saturates the single surviving arm —
-    /// half of a tier-4 split, with the split variable read off the goal rather than
-    /// searched. It then loops on the surviving arm, so a nested guard chain
-    /// `c₁ ⟹ c₂ ⟹ … ⟹ φ` telescopes one assumption per iteration. The two
-    /// `false`-constant shapes are omitted: they need `¬c`/`c` to hold outright,
-    /// which `ite-reduce` + saturation already deliver.
+    /// half of a case split, with the condition read off the goal rather than
+    /// searched — and unlike a split it never forks, so one arm must already be
+    /// discharged. It then loops on the surviving arm, so a nested guard chain
+    /// `c₁ ⟹ c₂ ⟹ … ⟹ φ` telescopes one assumption per iteration.
+    ///
+    /// The `false`-constant shapes fall out of the same loop: `ite(c, false, true)`
+    /// leaves `false` as the surviving arm under `c`, which is discharged exactly
+    /// when assuming `c` **refutes itself** — checked here as the graph turning
+    /// inconsistent. That is weaker than asking saturation to derive `¬c` outright,
+    /// and it is how a negated goal (`!(x == 0)` under `0 < x`, the spelling Prusti
+    /// emits for MIR asserts) reaches its path-condition contradiction.
     ///
     /// Terminates without a depth cap: each iteration assumes one
     /// *previously-unknown* condition and the e-graph has finitely many, which the
-    /// `assumed` set makes explicit. `SILVER_OXIDE_NO_TIER35=1` disables it.
-    fn tier35(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
-        if std::env::var_os("SILVER_OXIDE_NO_TIER35").is_some() {
+    /// `assumed` set makes explicit. `SILVER_OXIDE_NO_ITE_DECOMPOSE=1` disables it.
+    fn prove_by_ite_decomposition(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
+        if std::env::var_os("SILVER_OXIDE_NO_ITE_DECOMPOSE").is_some() {
             return false;
         }
         // One working graph threaded across the chain, so its ids stay stable
@@ -1317,28 +1362,57 @@ impl<'a> VerifyContext<'a> {
         let mut goal = goal;
         let mut assumed: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
         loop {
+            // The assumptions accumulated along this chain are contradictory, so
+            // the surviving arm is unreachable and the goal holds vacuously. This
+            // is what closes the `ite(c, false, true)` shape — `¬c` need not be
+            // *derivable*, it is enough that assuming `c` refutes itself, which is
+            // strictly weaker than asking saturation to produce `¬c` outright.
+            if graph_inconsistent(&work) {
+                self.alloc.stats.prove_ite_decompose += 1;
+                return true;
+            }
             let g = work.find(goal);
             if Self::known_bool_class(&work, g, true) {
-                self.alloc.stats.prove_tier35 += 1;
+                self.alloc.stats.prove_ite_decompose += 1;
                 return true;
             }
             // Pick a `true`-constant-arm ite: the surviving arm is the *other*
             // branch, to be proven under the condition that reaches it.
+            //
+            // A class routinely holds several such nodes, and picking the wrong
+            // one dead-ends the chain — the class of `!(0 < d)` under a negated
+            // branch guard holds both `ite(c, true, self)`, whose surviving arm is
+            // the goal class itself, and the useful `ite(c', goal', true)`. So
+            // candidates that cannot make progress are skipped rather than taken
+            // and abandoned: a surviving arm equal to the current goal is a no-op,
+            // and a condition already fixed on this chain would re-saturate an
+            // identical graph. Within what is left, the positive implication
+            // `c ⟹ e` (the as-written direction) is preferred over its negated
+            // dual.
+            let usable = |work: &egg::EGraph<Symbolic, ConstFold>,
+                          assumed: &std::collections::HashSet<egg::Id>,
+                          cond: egg::Id,
+                          branch: egg::Id| {
+                work.find(branch) != g && !assumed.contains(&work.find(cond))
+            };
             let mut plan: Option<(egg::Id, bool, egg::Id)> = None;
             for node in &work[g].nodes {
                 let Symbolic::Ite([c, x, y]) = node else {
                     continue;
                 };
                 let (c, x, y) = (work.find(*c), work.find(*x), work.find(*y));
-                // Prefer the positive implication `c ⟹ e` (assume `c`, the
-                // as-written direction) over its negated dual `¬c ⟹ e`.
-                if Self::known_bool_class(&work, y, true) {
-                    plan = Some((c, true, x)); // ite(c, e, true) ⟸ e under c
+                // ite(c, e, true) ⟸ e under c
+                if Self::known_bool_class(&work, y, true) && usable(&work, &assumed, c, x) {
+                    plan = Some((c, true, x));
                     break;
                 }
-                if Self::known_bool_class(&work, x, true) {
-                    plan = Some((c, false, y)); // ite(c, true, e) ⟸ e under ¬c
-                    break;
+                // ite(c, true, e) ⟸ e under ¬c — the negated dual, taken only if
+                // no positive candidate in this class works out.
+                if Self::known_bool_class(&work, x, true)
+                    && usable(&work, &assumed, c, y)
+                    && plan.is_none()
+                {
+                    plan = Some((c, false, y));
                 }
             }
             let Some((cond, want, branch)) = plan else {
@@ -1347,7 +1421,7 @@ impl<'a> VerifyContext<'a> {
             // If the condition already can't take `want`, the constant-`true`
             // arm is the only reachable one — the goal holds outright.
             if Self::known_bool_class(&work, cond, !want) {
-                self.alloc.stats.prove_tier35 += 1;
+                self.alloc.stats.prove_ite_decompose += 1;
                 return true;
             }
             // Progress guard: assuming a condition already assumed on this chain
@@ -1366,87 +1440,6 @@ impl<'a> VerifyContext<'a> {
     /// Whether e-class `id` folds to the boolean literal `b` in `probe`.
     fn known_bool_class(probe: &egg::EGraph<Symbolic, ConstFold>, id: egg::Id, b: bool) -> bool {
         matches!(probe[probe.find(id)].data.known(), Some(Literal::Bool(v)) if *v == b)
-    }
-
-    /// Whether a saturated probe discharges `goal`: either the goal is merged
-    /// with `true`, or the probe's assumptions are contradictory so the goal
-    /// holds vacuously (this is what closes an unreachable case's branch).
-    fn probe_holds(probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
-        if probe.classes().any(|c| c.data.is_inconsistent()) {
-            return true;
-        }
-        let Some(true_p) = probe.lookup(Symbolic::Lit(Literal::Bool(true))) else {
-            return false;
-        };
-        probe.find(goal) == probe.find(true_p)
-    }
-
-    /// **Function-body case split.** The e-graph cannot reason by cases: an
-    /// `ite` whose condition is an unconstrained boolean stays opaque, so a
-    /// fact that holds in *both* branches is never concluded on its own.
-    ///
-    /// Method CFG joins are discharged structurally by the block walker, so the
-    /// obligations reaching here come from **branching pure functions**: a `?:` whose
-    /// arms establish `result` under different conditions (`x>=0 ? x : -x` with
-    /// `ensures result>=0`), or an arm calling a function whose precondition only
-    /// holds on that branch. Silicon forks the path per branch; we split the goal.
-    ///
-    /// Candidate conditions are read off **the goal term only**, and there is no
-    /// probe budget or iterative deepening — a function goal nests only a handful of
-    /// conditions. Depth-first, terminating via an `assumed` set.
-    fn split_prove(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
-        self.alloc.stats.prove_tier4 += 1;
-        if std::env::var_os("SILVER_OXIDE_TRACE_TIER4").is_some() {
-            eprintln!("[TIER4-ATTEMPT]");
-        }
-        let mut assumed: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
-        if self.split_goal(probe, goal, &mut assumed) {
-            self.alloc.stats.prove_splits += 1;
-            if std::env::var_os("SILVER_OXIDE_TRACE_TIER4").is_some() {
-                eprintln!("[TIER4-SUCCESS]");
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Prove `goal` by case analysis on an undecided condition drawn from the
-    /// goal's own `ite` structure: assume each polarity, re-saturate, and either
-    /// close the branch outright or recurse on a further condition. Both arms
-    /// must close. `assumed` blocks re-splitting a condition already fixed on
-    /// this path, which bounds the recursion.
-    fn split_goal(
-        &mut self,
-        probe: &egg::EGraph<Symbolic, ConstFold>,
-        goal: egg::Id,
-        assumed: &mut std::collections::HashSet<egg::Id>,
-    ) -> bool {
-        for cond in split_candidates(probe, &[goal]) {
-            if assumed.contains(&probe.find(cond)) {
-                continue;
-            }
-            let mut all_closed = true;
-            for want_true in [true, false] {
-                let mut branch = probe.clone();
-                let lit = branch.add(Symbolic::Lit(Literal::Bool(want_true)));
-                branch.union(cond, lit);
-                branch.rebuild();
-                let branch = self.run_probe(branch);
-                if !Self::probe_holds(&branch, goal) {
-                    assumed.insert(probe.find(cond));
-                    let closed = self.split_goal(&branch, goal, assumed);
-                    assumed.remove(&probe.find(cond));
-                    if !closed {
-                        all_closed = false;
-                        break;
-                    }
-                }
-            }
-            if all_closed {
-                return true;
-            }
-        }
-        false
     }
 
     /// Saturate a detached probe e-graph with the full rule set, inside a
@@ -1596,53 +1589,34 @@ impl<'a> VerifyContext<'a> {
     }
 }
 
-/// The `ite` conditions worth splitting on: those reachable from `roots` (the
-/// goal term) whose truth value is undecided — a `ConstFold`-known condition
-/// would make one branch vacuous. Breadth-first from the goal, so the
-/// conditions structurally nearest it — the ones that actually gate it — come
-/// first; no further ranking.
-fn split_candidates(probe: &egg::EGraph<Symbolic, ConstFold>, roots: &[egg::Id]) -> Vec<egg::Id> {
-    use egg::Language as _;
-    let mut visited: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
-    let mut seen: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    let mut queue: std::collections::VecDeque<egg::Id> =
-        roots.iter().map(|id| probe.find(*id)).collect();
-
-    while let Some(id) = queue.pop_front() {
-        if !visited.insert(id) {
-            continue;
-        }
-        // A class with a known constant value is opaque to the split search:
-        // its nodes are equalities/arithmetic *residue* (e.g. the `1/1` class
-        // accretes every cancelled borrow/give-back pair `(x−p)+p`), and no
-        // condition reachable only through it can change the goal — the value
-        // here is already decided. Descending it only floods the candidate list.
-        if probe[id].data.known().is_some() {
-            continue;
-        }
-        for node in &probe[id].nodes {
-            if let Symbolic::Ite([c, _, _]) = node {
-                let c = probe.find(*c);
-                if probe[c].data.known().is_none() && seen.insert(c) {
-                    out.push(c);
-                }
-            }
-            for child in node.children() {
-                queue.push_back(probe.find(*child));
-            }
-        }
-    }
-    out
-}
-
 /// One egg run over `rules`. Returns the graph and the iteration log — the
 /// caller records the log into the stats once the rule borrow is released.
+/// [`Context::is_inconsistent`] for a detached graph (a probe, or the block
+/// scratch). `false` when either boolean literal is absent: a graph that never
+/// mentioned one cannot have merged them.
+fn graph_inconsistent(egraph: &egg::EGraph<Symbolic, ConstFold>) -> bool {
+    let (Some(t), Some(f)) = (
+        egraph.lookup(Symbolic::Lit(Literal::Bool(true))),
+        egraph.lookup(Symbolic::Lit(Literal::Bool(false))),
+    ) else {
+        return false;
+    };
+    egraph.find(t) == egraph.find(f)
+}
+
 fn run_rules<'r>(
     egraph: egg::EGraph<Symbolic, ConstFold>,
     rules: impl IntoIterator<Item = &'r egg::Rewrite<Symbolic, ConstFold>>,
     iter_limit: Option<usize>,
 ) -> (egg::EGraph<Symbolic, ConstFold>, Vec<egg::Iteration<()>>) {
+    // A contradictory graph proves everything, so no rule can change any verdict
+    // it yields — stop running them. This is the single choke point for every
+    // graph (ground saturate/reduce, scratch saturate/reduce, every probe), and
+    // it is per-graph: a deliberately contradictory probe short-circuits without
+    // touching a consistent ground graph.
+    if graph_inconsistent(&egraph) {
+        return (egraph, Vec::new());
+    }
     // Explicit limits: egg's defaults (30 iterations, 10k nodes) are SILENT
     // truncation points — a run that hits one simply stops mid-saturation and
     // the caller sees an ordinary "not proven", which surfaced as a false

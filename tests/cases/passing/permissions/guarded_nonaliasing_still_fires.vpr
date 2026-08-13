@@ -1,0 +1,48 @@
+// Positive controls for the guard-aware location axioms: gating the axioms by
+// each chunk's presence cube must not cost any disequality that genuinely holds.
+//
+// Rejection side: `tests/cases/failing/guarded_nonaliasing_two_arms.vpr` and
+// `guarded_nonaliasing_one_sided.vpr`.
+
+field f: Int
+
+// Both chunks unconditional — the empty-cube path, byte-identical to the
+// pre-gating encoding.
+method unconditional(x: Ref, y: Ref)
+    requires acc(x.f, write)
+    requires acc(y.f, write)
+{
+    assert x != y
+}
+
+// One chunk inhaled inside the arm, asserted inside the same arm: both presence
+// cubes are the block's own control cube, so they meet and the axiom fires.
+method both_held_in_arm(x: Ref, y: Ref, b: Bool)
+    requires acc(x.f, write)
+{
+    if (b) {
+        inhale acc(y.f, write)
+        assert x != y
+    }
+}
+
+// The merged-guard version of the same: `y.f` leaves the join carrying `[b+]`,
+// and the assertion re-enters a block whose cube supplies that literal.
+method merged_guard_released_by_pc(x: Ref, y: Ref, b: Bool)
+    requires acc(x.f, write)
+{
+    if (b) {
+        inhale acc(y.f, write)
+    }
+    if (b) {
+        assert x != y
+    }
+}
+
+// The bound axiom still makes an over-full location inconsistent.
+method over_full_is_unreachable(x: Ref)
+    requires acc(x.f, write)
+    requires acc(x.f, write)
+{
+    assert false
+}

@@ -154,6 +154,19 @@ impl ChunkPerm {
         }
     }
 
+    /// This tree as seen from *inside* one arm of `cond`: every re-branch on the
+    /// same condition class is decided, so only the matching side survives. The
+    /// public face of [`Self::collapse_same_cond`], used by `perm_add` to restrict
+    /// one addend while descending into the other.
+    pub(crate) fn restrict(
+        ctx: &VerifyContext<'_>,
+        cond: egg::Id,
+        arm: ChunkPerm,
+        take_then: bool,
+    ) -> ChunkPerm {
+        Self::collapse_same_cond(ctx, ctx.egraph.find(cond), arm, take_then)
+    }
+
     /// The join-select smart constructor. `cond` is the then-edge reach value.
     /// Applies, in order: (0) `ite`-idempotence flattening of arms that branch on
     /// the same `cond`; (i) same-amount collapse (`then ≡ els ⇒ then`, the

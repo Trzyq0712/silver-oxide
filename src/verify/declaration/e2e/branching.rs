@@ -118,6 +118,11 @@ fn ternary_call_ensures_available_on_its_own_branch() {
     // Non-vacuity for the tests above: the guard must *collapse* where the call
     // does occur, which happens in the probe clone that assumes the goal's pc.
     // Without that, gating would trade a leak for lost completeness.
+    //
+    // The claim is stated *on* the branch (`b ==> …`), which is the shape the
+    // `ite_decompose` tier telescopes. Asserting the unbranched `r == 7` instead
+    // needs reasoning by cases over the opaque `b` — the case split we deleted;
+    // that form lives in `tests/cases/known_limitations/`.
     let input = r#"
 function g(a: Int): Int
   ensures result == 7
@@ -125,7 +130,7 @@ function g(a: Int): Int
 method client(v: Int, b: Bool)
 {
     var r: Int := b ? g(v) : 7
-    assert r == 7
+    assert b ==> r == 7
 }
 "#;
     let program = lower(input);

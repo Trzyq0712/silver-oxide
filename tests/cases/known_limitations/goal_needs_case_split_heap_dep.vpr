@@ -1,0 +1,29 @@
+// KNOWN LIMITATION — should verify, currently rejected.
+//
+// The heap-dependent twin of `goal_needs_case_split_heap_free.vpr`. A call whose
+// snapshot sits under a path condition delivers its postcondition through the
+// opaque `f%pre` token, which `eval_snap` releases only under that pc (`<!b>`
+// here). The goal `ite(b, x.f, peek(x)) ≡ x.f` is unbranched, so chaining
+// `!b ==> token ==> (peek(x) == x.f)` into it needs a case split on `b`. Unlike
+// a heap-free guard the token is never *defined*, so it cannot be re-derived
+// where the pc does not hold, and the `ite_decompose` tier does not apply
+// (neither arm is a constant).
+//
+// This is also what blocks *branching* recursive heap-dependent functions; the
+// branchless case still verifies by induction, see
+// `verify::declaration::e2e::branchless_recursive_heap_dep_function_verifies_by_induction`.
+//
+// Root cause and rationale: see `goal_needs_case_split_heap_free.vpr`.
+//
+// Was `verify::declaration::e2e::heap_dep_post_under_a_branch_via_case_split`.
+
+field f: Int
+
+function peek(x: Ref): Int
+    requires acc(x.f)
+    ensures result == x.f
+
+function g(x: Ref, b: Bool): Int
+    requires acc(x.f)
+    ensures result == x.f
+{ b ? x.f : peek(x) }
