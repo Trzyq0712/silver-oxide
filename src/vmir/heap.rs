@@ -197,9 +197,9 @@ impl HeapInst {
     /// `val_ty` resolves an operand's VMIR type; both callers already track it
     /// (the translator in its `Sink`, the verifier in `EvalState::val_types`).
     ///
-    /// NOTE: the `Sub` arm has no consumer yet — the `Option` is threaded when
-    /// `unfold` is desugared into a `Sub` + `Inhale` pair. Until then nothing
-    /// pushes this `Val`, so temp numbering is unchanged.
+    /// The `Sub` arm's consumer is the desugared `unfold` (`Sub` + `Inhale`),
+    /// which is the only site that sets `yields_value`. Every other `Sub` leaves
+    /// the binder `_` and pushes no `Val`, so temp numbering is unaffected.
     pub fn val_yield(
         &self,
         decls: &typed_index_collections::TiVec<MemberId, crate::vmir::Declaration>,

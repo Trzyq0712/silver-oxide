@@ -2336,12 +2336,17 @@ fn walk_footprint(
     // `Consume`, assumed for `Produce`). Usually `pc_lits`; an `inhale` passes
     // `[0 < scale]` since it carries no path condition.
     bool_guard: &[(egg::Id, Polarity)],
-    // A `Snap` (non-consuming precondition check): a bare-wildcard footprint slot
-    // skips building the wildcard perm and subtracting — sufficiency becomes a
-    // "holds a positive share" prove, presence is unconditional. Keeps the
-    // wildcard `ite` residue (which `ite-reduce` churns on) out of the persistent
-    // e-graph. `false` for the consuming/producing walks (fold/unfold/in/exhale).
-    is_snap: bool,
+    // A **frame-only** exhale (a heap-dependent function call's implicit
+    // precondition check): a bare-wildcard footprint slot skips building the
+    // wildcard perm and subtracting — sufficiency becomes a "holds a positive
+    // share" prove, presence is unconditional. Keeps the wildcard `ite` residue
+    // (which `ite-reduce` churns on) out of the persistent e-graph. `false` for
+    // the consuming/producing walks.
+    //
+    // This was `is_snap` while `PureInst::Snap` existed. Stage 3b turned that
+    // into a frame-only exhale and the flag became a second name for the same
+    // bit — its one `true` caller passes `frame_only` — so it is now that bit.
+    frame_only: bool,
 ) -> Result<FootprintResult, VerifyError> {
     use crate::verify::cert::SeedRef;
     let def = certs.get(&resource).ok_or(VerifyError::DependencyFailed)?;
@@ -2375,7 +2380,7 @@ fn walk_footprint(
         // indicator rather than the wildcard perm — the same recipe with the
         // wildcard leaf replaced by full permission `1`, so `ite(guard, 1, 0)`
         // whose `0 < …` folds to the gating guard.
-        let wc_slot = is_snap && recipe_has_wildcard(&slot.perm);
+        let wc_slot = frame_only && recipe_has_wildcard(&slot.perm);
         let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
         let bperm = if wc_slot {
