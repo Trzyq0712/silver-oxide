@@ -812,8 +812,17 @@ impl<'a> VerifyContext<'a> {
                 self.block_cubes[me].obligations += 1;
             }
         }
-        let imp = self.implication(goal, pc_lits.iter().rev().copied());
         let true_ = self.true_();
+        // Tier 0.5: the goal is *unconditionally* true, so the implication holds
+        // whatever the pc is -- and building that implication chain is itself node
+        // allocation. Const-folding obligations (`0 < 1/1`, a literal perm bound)
+        // are the bulk of the obligation stream, so this is checked before the
+        // chain is built rather than after.
+        if self.egraph.find(goal) == self.egraph.find(true_) {
+            self.alloc.stats.prove_tier1 += 1;
+            return true;
+        }
+        let imp = self.implication(goal, pc_lits.iter().rev().copied());
 
         // Tier 1: already true (memoized / trivial). O(1) — checked before the
         // O(classes) inconsistency scan, which most calls never need. Under
