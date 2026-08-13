@@ -446,6 +446,14 @@ fn static_rules() -> Vec<Rule> {
         )
         .expect("contra-congruence rule"),
     );
+    rules.push(
+        Rewrite::new(
+            "distinguishing-observation",
+            EqBucketSearcher,
+            DistinguishingObsApplier,
+        )
+        .expect("distinguishing-observation rule"),
+    );
     rules.extend(disequality_unit_prop_rules());
     rules
 }
@@ -717,6 +725,117 @@ impl Applier<Symbolic, ConstFold> for ContraCongruenceApplier {
             }
         }
         changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+/// Applier for `distinguishing-observation`: **congruence, contrapositive at the
+/// application**. Congruence gives `a ≡ b ⟹ f(a) ≡ f(b)`. Contrapositively, if
+/// some `f` has `f(a)` and `f(b)` sitting in classes whose [`Fingerprint`](crate::verify::analysis::Fingerprint)s
+/// differ, then `a ≡ b` is impossible — so an **undecided** `a == b` is `false`.
+///
+/// Sound for **any** `f`, injective or not: this is the contrapositive of
+/// congruence, not of injectivity. Injectivity is merely the usual *reason* an
+/// observation exists. Prusti encodes a primitive snapshot (`s_Int_isize`) as a
+/// **domain** with a `cons`/`value` retraction rather than an `adt`, so
+/// `s_Int_isize_cons(1)` and `s_Int_isize_cons(4)` carry no free-constructor
+/// distinctness — but `ax_value` puts `value(cons(1)) ≡ 1` and
+/// `value(cons(4)) ≡ 4` in the graph, and those two literals separate them. That
+/// is what an enum snapshot tower's guards (`snap == cons(k)`) need pinned.
+///
+/// The mirror image of [`ContraCongruenceApplier`], which walks the *other*
+/// direction: from an already-disproven `f(a⃗) == f(b⃗)` to an argument
+/// disequality. Together they close the loop between arguments and applications.
+///
+/// **Unary observations only.** An n-ary `f` would additionally need every other
+/// argument pair proven equal, which is the narrowing search `contra-congruence`
+/// already pays for; the retraction pairs this exists for are all unary, so the
+/// extra generality would be cost with no measured benefit.
+///
+/// No memo: success pins the class to `false`, and the `known_bool` gate below
+/// then skips it forever. A failed scan re-runs, which is what keeps the rule
+/// complete when the observation only shows up in a later iteration.
+struct DistinguishingObsApplier;
+
+/// Every `(f, tys)` this class is the sole argument of, paired with the class of
+/// that application. The observation map of [`DistinguishingObsApplier`].
+fn unary_observations(
+    egraph: &EGraph<Symbolic, ConstFold>,
+    x: Id,
+) -> Vec<((FuncId, Box<[Type]>), Id)> {
+    let x = egraph.find(x);
+    let mut out = Vec::new();
+    for p in egraph[x].parents() {
+        let p = egraph.find(p);
+        for node in &egraph[p].nodes {
+            if let Symbolic::FuncApp(f, tys, args) = node
+                && args.len() == 1
+                && egraph.find(args[0]) == x
+            {
+                out.push(((*f, tys.clone()), p));
+            }
+        }
+    }
+    out
+}
+
+impl Applier<Symbolic, ConstFold> for DistinguishingObsApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        // Only undecided equalities: a proven one is congruence's job, and a
+        // disproven one is already what `contra-congruence` consumes.
+        if known_bool(egraph, eclass).is_some() {
+            return vec![];
+        }
+        let mut disprove = false;
+        'outer: for node in &egraph[eclass].nodes {
+            let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
+                continue;
+            };
+            let (l, r) = (egraph.find(*l), egraph.find(*r));
+            if l == r {
+                continue;
+            }
+            let (obs_l, obs_r) = (unary_observations(egraph, l), unary_observations(egraph, r));
+            if obs_l.is_empty() || obs_r.is_empty() {
+                continue;
+            }
+            for (key_l, app_l) in &obs_l {
+                for (key_r, app_r) in &obs_r {
+                    if key_l != key_r || app_l == app_r {
+                        continue;
+                    }
+                    let (Some(fp_l), Some(fp_r)) = (
+                        egraph[*app_l].data.fingerprint(),
+                        egraph[*app_r].data.fingerprint(),
+                    ) else {
+                        continue;
+                    };
+                    if fp_l.differs_from(&fp_r) {
+                        disprove = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if !disprove {
+            return vec![];
+        }
+        let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+        if egraph.union(eclass, false_) {
+            vec![egraph.find(eclass)]
+        } else {
+            vec![]
+        }
     }
 
     fn vars(&self) -> Vec<Var> {

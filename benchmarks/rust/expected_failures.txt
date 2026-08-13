@@ -8,28 +8,34 @@
 #
 # Keep each entry's reason current. An entry with no live reason is a bug report.
 
-# A primitive snapshot's `cons` disequality is never pinned in-graph.
+# Enum snapshot tower inversion: the OUTERMOST arm.
 #
 # NOT a permission-model gap. `make_generic_Shape` / `make_concrete_Shape` destroy
 # the `p_Shape` chunk and re-inhale a fresh, havocked one; the only link back is
 # the snapshot postconditions plus `make_concrete_s_Shape(make_generic_s_Shape(x))
 # == x`, which yields `p_Shape_snap_old == p_Shape_snap_new`. `p_Shape_snap`'s body
-# is a 5-deep ternary of `s_Shape_k_cons(..)` arms, so recovering `discr == cons(1)`
-# means inverting that tower from both ends.
+# is a 5-deep ternary of `s_Shape_k_cons(..)` arms, so recovering `discr == cons(k)`
+# means inverting that tower.
 #
-# The *arm* half now works: `ite-reduce`'s arm-differs pinning was extended from
-# literals to ADT constructors (see tests/cases/passing/predicates/
-# ctor_tower_inversion_after_snapshot_roundtrip.vpr, which is this exact shape and
-# verifies). What is left is the *condition* half: Prusti encodes `s_Int_isize` as a
-# **domain** with a `cons`/`value` retraction, not as an `adt`, so the tower's
-# guards compare `snap == s_Int_isize_cons(k)` and two `cons` applications carry no
-# free-constructor distinctness. That disequality is refutable but never
-# materialized as an in-graph `Eq(..) = false`, which is what `ite-reduce` and
-# `eq-false-then/else` consume. Minimal shape and the sound derivation (the
-# contrapositive of congruence over `value`, no injectivity needed) are in
-# tests/cases/known_limitations/domain_cons_disequality_not_pinned.vpr.
+# Two of the three pieces now work, and both have their own passing case:
+#   * `distinguishing-observation` pins each `snap == s_Int_isize_cons(k)` guard.
+#     `s_Int_isize` is a *domain* with a `cons`/`value` retraction, not an `adt`, so
+#     two `cons` applications have no free-constructor distinctness; the rule
+#     disproves the equality from `value(cons(1)) != value(cons(4))` instead
+#     (passing/domain_cons_disequality_via_observation.vpr).
+#   * `ite-reduce`'s constructor arm-differs pinning telescopes the tower from the
+#     bottom (passing/predicates/domain_cons_tower_inversion.vpr).
 #
-# Earlier readings of these two, both now refuted: (1) filed with `mat3_mul` as a
+# What is left is the tower's outermost arm. With the class pinned to
+# `Ctor(s_Shape_4_cons)`, the then-arm is the same constructor (no pin, correctly)
+# and the else-arm is an undecided nested `ite` with `Unknown` analysis data, so
+# nothing pins the guard. MEASURED 2026-08-14: asserting the discriminant equality
+# by hand in every arm makes arms 0-3 verify and leaves exactly the arm-4 assert
+# failing. Minimal shape and the two candidate representations (a
+# set-of-constructors lattice value, or a bounded recursive `arm_differs` through
+# undecided arms) are in known_limitations/tower_inversion_outermost_arm.vpr.
+#
+# Earlier readings of these two, all now refuted: (1) filed with `mat3_mul` as a
 # `&mut`-reborrow shape — that one was fixed by making `Chunk::guard` load-bearing
 # and these did not move; (2) filed as a missing link between a match arm's reach
 # literal and the discriminant — the reach literals are in the pc, and splitting
