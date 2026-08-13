@@ -456,6 +456,26 @@ fn eval_pure_inst(
             };
             (id, recipe)
         }
+        // `unwrap(v)`: the `Some` payload of an `Option`. The result type IS the
+        // element type, so it needs no type argument. A certificate walk mirrors
+        // the projection, exactly as a footprint slot's `unwrap(proj_i(s))` does.
+        PureInst::OptionUnwrap(v) => {
+            let opt = state.get_val(ctx, v);
+            let id = ctx.option_unwrap(ty.clone(), opt);
+            let recipe = if ctx.recipe.is_some() {
+                let vr = state.require_recipe(v, OPERAND_RECIPE)?;
+                let unwrap_id = ctx.alloc.option_value();
+                let rb = ctx.recipe.as_mut().unwrap();
+                Some(rb.emit(crate::verify::rewrite::AxiomPure::App {
+                    func: unwrap_id,
+                    type_args: vec![ty.clone()],
+                    args: vec![vr],
+                }))
+            } else {
+                None
+            };
+            (id, recipe)
+        }
         // perm(loc): permission amount held at `loc` in the given heap. Has no
         // pure recipe — a certificate walk rejects it.
         PureInst::Perm(hv, loc) => {
@@ -1933,7 +1953,9 @@ fn eval_heap_inst(
         HeapInst::Add {
             base, loc, perm, ..
         }
-        | HeapInst::Sub { base, loc, perm } => {
+        | HeapInst::Sub {
+            base, loc, perm, ..
+        } => {
             // `Add` carries a `Bind`; `Sub` is read-shaped and carries none.
             let bind = match inst {
                 HeapInst::Add { bind, .. } => Some(bind),
@@ -1971,12 +1993,16 @@ fn eval_heap_inst(
                             "`with fresh` inside a resource body — a body that \
                              mints an observable value is not deterministic"
                         ),
-                        // Wired in the stage that desugars fold/unfold; nothing
-                        // emits it yet.
-                        Bind::Bound(_) => {
-                            return Err(VerifyError::Unimplemented(
-                                "bound slot produce (`with <val>`)",
-                            ));
+                        // The produce half of a desugared `fold`: the chunk
+                        // holds the snapshot the paired `exhale` handed back,
+                        // rather than a fresh value. That shared term IS the
+                        // equation `snap(P(x)) = cons(body)` -- the binding the
+                        // dedicated `Fold` instruction had to preserve is now
+                        // emergent from naming the same `Val` twice.
+                        Bind::Bound(v) => {
+                            let bound = state.get_val(ctx, v);
+                            ch = Chunk::new(ch.addr, perm_id, bound)
+                                .with_recipe(state.recipe_of(v));
                         }
                     }
                     // A resource body's `acc` records a footprint slot in the
@@ -2082,6 +2108,12 @@ fn eval_resource_body_inst(
         // `unfold` inside a resource body verifies identically to a method
         // body (shared `eval_unfold`); only `Unfold` is emitted here.
         InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
+        // The consume half of a desugared `unfold`: yields what it removed.
+        InstKind::Heap(HeapInst::Sub {
+            yields_value: true, ..
+        }) => {
+            eval_sub_yield(ctx, state, inst, &inst.pc)?;
+        }
         // A heap-dependent function call's implicit precondition check, which
         // may appear in a contract body. Non-consuming, so it is legal here where
         // a consuming resource op is not.
@@ -2133,6 +2165,12 @@ fn eval_method_inst(
         // **asserts** it. A self-framed callee additionally yields the snapshot
         // of its footprint as a pure `Val` (the pre-state handle a two-state call
         // receives). Both route through `walk_footprint`.
+        // The consume half of a desugared `unfold`: yields what it removed.
+        InstKind::Heap(HeapInst::Sub {
+            yields_value: true, ..
+        }) => {
+            eval_sub_yield(ctx, state, inst, &inst.pc)?;
+        }
         InstKind::Heap(HeapInst::Inhale { .. } | HeapInst::Exhale { .. }) => {
             eval_resource_op(ctx, program, state, inst, certs)?;
         }
@@ -2654,6 +2692,92 @@ fn eval_unfold(
 }
 
 
+/// Evaluate a **value-yielding** `Sub`: remove the chunk at `loc` and hand back
+/// what was there, as `Option<T>` (`None` iff nothing was removed).
+///
+/// This is the consume half of a desugared `unfold`. Unlike the plain `Sub` in
+/// [`eval_heap_inst`], which subtracts a freshly-minted chunk value, this reads
+/// the **held** chunk's value -- that value *is* the predicate's snapshot, and
+/// sharing it with the paired `inhale` is what makes the fold/unfold round-trip
+/// hold. In a certificate walk the hit chunk's recipe rides along, so the
+/// reconstructed slots purify to `unwrap(proj_i(s))` over it.
+fn eval_sub_yield(
+    ctx: &mut VerifyContext<'_>,
+    state: &mut EvalState,
+    inst: &Inst,
+    pc: &PathConds,
+) -> Result<(), VerifyError> {
+    let InstKind::Heap(HeapInst::Sub {
+        base, loc, perm, ..
+    }) = &inst.kind
+    else {
+        unreachable!("eval_sub_yield called on a non-yielding-Sub instruction");
+    };
+    let base_h = get_heap(state, base);
+    let addr = state.get_val(ctx, loc);
+    let kind = state
+        .loc_kind(loc)
+        .expect("acc location must be Addr-typed");
+    let perm_id = eval_perm(ctx, state, perm);
+    let pc_lits: Vec<(egg::Id, Polarity)> = pc
+        .conds
+        .iter()
+        .map(|(v, p)| (state.get_val(ctx, v), *p))
+        .collect();
+
+    // The held value, and (certificate walks) its provenance. A miss is an
+    // outright failure, which is what makes the `Option` below concretely
+    // `Some` on every path that continues: `None` is reachable only at a
+    // provably-non-positive permission.
+    let a = ctx.egraph.find(addr);
+    let (held, held_recipe) = base_h
+        .entries()
+        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then(|| (c.value, c.recipe.clone())))
+        .ok_or(VerifyError::InsufficientPermission)?;
+    if ctx.recipe.is_some() && held_recipe.is_none() {
+        return Err(VerifyError::Unimplemented(
+            "purify: consume of an unheld location",
+        ));
+    }
+    let out = heap_subtract(
+        ctx,
+        &base_h,
+        &kind,
+        Chunk::new(addr, perm_id, held),
+        &pc_lits,
+    )?;
+    state.push_heap(out);
+
+    // Presence is `0 < perm`, built from the permission the instruction names.
+    // For a literal amount it const-folds to `true` and `option_member` collapses
+    // to a bare `Some`, so the paired `inhale`'s unwrap peels with no proof goal.
+    let present = ctx.perm_positive(perm_id);
+    let elem = kind.value.clone();
+    let opt = ctx.option_member(elem.clone(), present, held);
+    // The recipe must purify the value that is *pushed*, which is the option --
+    // not the held value inside it. Handing the held value's recipe straight
+    // through would leave the paired `OptionUnwrap` emitting `unwrap(held)`, a
+    // stray peel with no `Some` under it: sound in the e-graph, where the
+    // instruction's own `option_member` reduces, but dangling in a certificate
+    // replayed at a client, where it silently severs the fold/unfold identity.
+    // Wrapping here keeps the pair `unwrap(Some(r))`, which reduces by the same
+    // rule on both paths.
+    let opt_recipe = match (ctx.recipe.is_some(), &held_recipe) {
+        (true, Some(hr)) => {
+            let some_id = ctx.alloc.option_some();
+            let rb = ctx.recipe.as_mut().unwrap();
+            Some(rb.emit(crate::verify::rewrite::AxiomPure::App {
+                func: some_id,
+                type_args: vec![elem.clone()],
+                args: vec![hr.clone()],
+            }))
+        }
+        _ => None,
+    };
+    state.push_val(opt, Type::Option(Box::new(elem)), opt_recipe);
+    Ok(())
+}
+
 /// Evaluate a resource `inhale` / `exhale`. `base inhale R(args) p` produces the
 /// resource's footprint into `base` and **assumes** its boolean; `base exhale ..`
 /// consumes it and **asserts** it. A self-framed callee additionally yields the
@@ -2705,6 +2829,9 @@ fn eval_resource_op(
                     bind: Bind::Bound(v),
                     ..
                 } => {
+                    // Always a plain `Snap`: a desugared `unfold` names the
+                    // `PureInst::OptionUnwrap` temp, not the `Option` itself, so
+                    // the seam is explicit in the instruction stream.
                     let sv = state.get_val(ctx, v);
                     ValueSource::ProjectSnap(sv, state.recipe_of(v))
                 }
@@ -3088,6 +3215,7 @@ pub(crate) fn prepare_body(
                 PureInst::Fresh
                 | PureInst::Deref(..)
                 | PureInst::Perm(..)
+                | PureInst::OptionUnwrap(_)
                 | PureInst::Forall(_) => {
                     return Err(VerifyError::Unimplemented("impure inst in axiom body"));
                 }

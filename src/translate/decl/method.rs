@@ -1083,20 +1083,25 @@ fn lower_fold_unfold(
     let hctx = pure_exp::HeapCtx::same_with_old(current_heap, &old);
     let (call, perm) = pure_exp::lower_pred_call(b, env, sink, hctx, pwp)?;
     let perm = sink.gate_perm(perm);
-    let inst = if is_fold {
-        HeapInst::Fold {
-            base: current_heap,
+    if is_fold {
+        Ok(pure_exp::emit_fold_pair(
+            b,
+            sink,
+            current_heap,
+            pwp.pred_call.name.0,
             call,
             perm,
-        }
+        ))
     } else {
-        HeapInst::Unfold {
-            base: current_heap,
+        Ok(pure_exp::emit_unfold_pair(
+            b,
+            sink,
+            current_heap,
+            pwp.pred_call.name.0,
             call,
             perm,
-        }
-    };
-    Ok(sink.emit_heap_guarded(inst))
+        ))
+    }
 }
 
 fn lower_method_call(

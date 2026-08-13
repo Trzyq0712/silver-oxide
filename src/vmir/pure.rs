@@ -131,6 +131,19 @@ pub enum PureInst {
     /// (yielded by the frame-only `exhale` of its `#requires` at the call site)
     /// as an ordinary trailing argument. Generics (`type_args`) live inside the `FunctionCall`.
     FunctionCall(FunctionCall),
+    /// `unwrap(v)` -- the `Some` payload of an `Option`. The result type is the
+    /// option's element type, so no type argument is stored.
+    ///
+    /// This is the **seam** of a desugared `unfold`: the paired `Sub` yields
+    /// `Option<Snap(P)>` because it is the one instruction that *discovers*
+    /// whether the location held anything, and the resource `inhale` needs a
+    /// plain `Snap(P)`. Naming the coercion here rather than performing it
+    /// implicitly keeps `Bind::Bound` plainly typed.
+    ///
+    /// Not a proof obligation: presence is `0 < perm`, which const-folds to
+    /// `true` for a literal amount, so the yield is concretely `Some(v)` and
+    /// this peels by the existing `unwrap o Some` reduction.
+    OptionUnwrap(Val),
     /// Construct ADT value: variant `variant` of the ADT `adt` instantiated at
     /// `type_args`, over `args`. The ADT is named by its (possibly generic)
     /// declaration `MemberId`; `type_args` is its monomorphization (empty for a
@@ -186,6 +199,7 @@ impl PureInst {
             | PureInst::AdtProj { base: v, .. }
             | PureInst::AdtTag { base: v, .. } => f(v),
             PureInst::FunctionCall(fc) => fc.args.iter().for_each(&mut *f),
+            PureInst::OptionUnwrap(v) => f(v),
             PureInst::AdtCons { args, .. } => args.iter().for_each(&mut *f),
             PureInst::Forall(q) => q.free_temps().iter().for_each(|k| f(&Val::Temp(*k))),
         }
@@ -250,6 +264,7 @@ impl<'a> Display for VmirDisplay<'a, &'a PureInst> {
                 write!(f, "{cond} ? {then_val} : {else_val}")
             }
             PureInst::Deref(heap, loc) => write!(f, "*[{heap}] {loc}"),
+            PureInst::OptionUnwrap(v) => write!(f, "unwrap({v})"),
             // `FunctionCall` renders itself (`name[heap](args)`) via its own
             // `VmirDisplay` impl, which resolves the callee `MemberId` -> name.
             PureInst::FunctionCall(call) => write!(f, "{}", self.with(call)),

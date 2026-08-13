@@ -436,6 +436,19 @@ impl Sink {
         })
     }
 
+    /// A value-yielding slot consume: `h1, e1 := h0 - acc <loc> <perm>`. Removes
+    /// the chunk and hands back what was there as `Option<T>`. Only the desugared
+    /// `unfold` wants that, so every other `Sub` leaves the binder `_`.
+    pub fn emit_sub_yielding(&mut self, base: HeapVal, loc: Val, perm: Perm) -> (HeapVal, Val) {
+        let h = self.emit_heap_guarded(HeapInst::Sub {
+            base,
+            loc,
+            perm,
+            yields_value: true,
+        });
+        (h, self.next_val_temp())
+    }
+
     /// A **frame-only** exhale: prove the callee's footprint is held and assert
     /// its boolean, producing the snapshot but **no heap** (`_, e := ..`). This is
     /// the implicit precondition check at a heap-dependent function call --

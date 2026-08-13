@@ -1,0 +1,36 @@
+// A bind point meeting an ALREADY-PRESENT chunk.
+//
+// `+ acc <loc> <perm> with e1` at an occupied address does not *install* the
+// value: it goes through `merge_chunks`, which sums the permissions and, where
+// both fractions are provably positive, unions the two value classes. So the
+// bound snapshot is equated with whatever was already there rather than
+// replacing it.
+//
+// That is the correct reading for a predicate -- two fractions of `P(x)` are one
+// instance and must carry one snapshot -- but it is the case where a desugared
+// `fold` could most easily diverge from the dedicated instruction, so it is
+// pinned here. Verified to behave identically before and after the desugaring.
+//
+// The negative half is `failing/predicates/bind_merge_is_consistent.vpr`.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+// Fold a half onto a half already held: the values must merge, not clobber, so
+// the field value survives the round-trip.
+method fold_onto_existing_half_keeps_value(x: Ref)
+    requires acc(P(x), 1/2) && acc(x.f, 1/2) && x.f == 7
+{
+    fold acc(P(x), 1/2)
+    unfold acc(P(x), write)
+    assert x.f == 7
+}
+
+// The contrasting case: nothing held at the address, so no merge happens.
+method fold_onto_empty(x: Ref)
+    requires acc(x.f) && x.f == 7
+{
+    fold acc(P(x), write)
+    unfold acc(P(x), write)
+    assert x.f == 7
+}

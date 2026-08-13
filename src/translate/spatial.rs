@@ -216,6 +216,8 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
                     base: acc_heap,
                     loc,
                     perm,
+                    // A plain `exhale acc(..)` discards what it removed.
+                    yields_value: false,
                 },
             };
             // Always carry the path condition: an `acc` has a permission ≥ 0

@@ -1,0 +1,45 @@
+// A desugared `unfold` yields `Option<Snap(P)>` from its slot-level `Sub` and peels it
+// with `PureInst::OptionUnwrap`. The recipe the `Sub` pushes must purify the value it
+// *pushes* -- the option -- not the held value inside it.
+//
+// Handing the held value's recipe straight through type-checks and stays green in the
+// live e-graph, because the instruction's own `option_member` folds `0 < 1/1` to `true`
+// and the unwrap reduces against the `Some` it built. But a certificate replayed at a
+// client carries `unwrap(held)` with no `Some` under it, which never reduces -- so
+// `p_S_snap`'s definitional body lands on a term one unwrap deeper than the chunk value
+// the client holds, and the fold/unfold round-trip identity is silently severed.
+//
+// This is the tightest shape that shows it: one method, no call, no `old`. The failure
+// surfaces only through a *resource* recipe (`p_S_snap#requires`), so the assertion has
+// to go through the snap function rather than read the field back directly.
+
+domain s_Int_i32 { }
+
+adt s_S { s_S_cons(s_S_0: s_Int_i32) }
+
+function s_S_field_0(self: Ref): Ref
+  ensures (self == null) == (result == null)
+
+field p_Int_i32_val: s_Int_i32
+
+predicate p_Int_i32(self: Ref) { acc(self.p_Int_i32_val, write) }
+
+function p_Int_i32_snap(self: Ref): s_Int_i32
+  requires acc(p_Int_i32(self), write)
+{ (unfolding acc(p_Int_i32(self), write) in self.p_Int_i32_val) }
+
+predicate p_S(self: Ref) { acc(p_Int_i32(s_S_field_0(self)), write) }
+
+function p_S_snap(self: Ref): s_S
+  requires acc(p_S(self), write)
+{ (unfolding acc(p_S(self), write) in s_S_cons(p_Int_i32_snap(s_S_field_0(self)))) }
+
+method unfold_fold_roundtrip_keeps_snapshot(a: Ref)
+  requires acc(p_S(a), write)
+{
+  var v1: s_Int_i32
+  unfold acc(p_S(a), write)
+  v1 := p_Int_i32_snap(s_S_field_0(a))
+  fold acc(p_S(a), write)
+  assert p_S_snap(a) == s_S_cons(v1)
+}

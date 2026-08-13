@@ -83,6 +83,13 @@ pub enum HeapInst {
         base: HeapVal,
         loc: Val,
         perm: Perm,
+        /// Whether the removed value is **requested**. A `Sub` always discovers
+        /// what the location held -- it is the one instruction that learns
+        /// something the caller did not know -- but only the desugared `unfold`
+        /// wants it, as `Option<T>` (`None` iff nothing was removed). Elsewhere
+        /// the binder is `_` and no `Val` is pushed, so temp numbering is
+        /// unchanged. Output arity, exactly like `Exhale::frame_only`.
+        yields_value: bool,
     },
     /// `h[, s] := base inhale <call> <perm>`. Add the resource's delta (scaled by
     /// `perm`) to `base` **and assume** its boolean condition. When the callee is
@@ -167,6 +174,22 @@ impl HeapInst {
     /// **self-framed** resource produces `s : Snap(callee)` alongside the new
     /// heap. Two-state callees (and every other heap inst) yield none. Derived
     /// from the callee declaration — not stored on the inst.
+    /// Whether this instruction pushes a pure `Val`: a snapshot-yielding
+    /// resource op, or a value-yielding `Sub`. Display and temp numbering both
+    /// key off this, so they cannot disagree with the evaluator about arity.
+    pub fn yields_val(
+        &self,
+        decls: &typed_index_collections::TiVec<MemberId, crate::vmir::Declaration>,
+    ) -> bool {
+        matches!(
+            self,
+            HeapInst::Sub {
+                yields_value: true,
+                ..
+            }
+        ) || self.snap_yield(decls).is_some()
+    }
+
     /// Whether this instruction produces a heap. Everything does except a
     /// **frame-only** exhale, whose binder is `_` (see
     /// [`HeapInst::Exhale::frame_only`]). Output arity is part of an
@@ -199,10 +222,15 @@ impl HeapInst {
         val_ty: impl Fn(&Val) -> Option<Type>,
     ) -> Option<Type> {
         match self {
-            HeapInst::Sub { loc, .. } => {
+            HeapInst::Sub {
+                loc,
+                yields_value: true,
+                ..
+            } => {
                 let held = val_ty(loc)?.addr_value()?.clone();
                 Some(Type::Option(Box::new(held)))
             }
+            HeapInst::Sub { .. } => None,
             _ => self.snap_yield(decls).map(Type::Snap),
         }
     }
@@ -304,9 +332,9 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 perm,
                 bind,
             } => write!(f, "{base} + acc {loc} {} with {bind}", self.with(perm)),
-            HeapInst::Sub { base, loc, perm } => {
-                write!(f, "{base} - acc {loc} {}", self.with(perm))
-            }
+            HeapInst::Sub {
+                base, loc, perm, ..
+            } => write!(f, "{base} - acc {loc} {}", self.with(perm)),
             HeapInst::Inhale {
                 base,
                 bind,
@@ -367,6 +395,7 @@ mod tests {
             base: HeapVal::Empty,
             loc: Val::Temp(0),
             perm: Perm::write(),
+            yields_value: true,
         };
         let got = inst.val_yield(&decls, |_| Some(addr_ty(Type::Int)));
         assert_eq!(got, Some(Type::Option(Box::new(Type::Int))));
@@ -382,6 +411,7 @@ mod tests {
             base: HeapVal::Empty,
             loc: Val::Temp(0),
             perm: Perm::write(),
+            yields_value: true,
         };
         let got = inst.val_yield(&decls, |_| Some(addr_ty(Type::Snap(pred))));
         assert_eq!(got, Some(Type::Option(Box::new(Type::Snap(pred)))));

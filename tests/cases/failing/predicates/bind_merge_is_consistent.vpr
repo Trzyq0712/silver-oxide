@@ -1,0 +1,26 @@
+// The negative half of `passing/predicates/bind_merges_with_existing_chunk.vpr`.
+//
+// Merging a bound value into an already-present chunk unions two value classes.
+// If that union were wrong -- equating values that need not agree -- the state
+// would go inconsistent and `false` would become provable. Both methods must be
+// REJECTED.
+
+field f: Int
+predicate P(x: Ref) { acc(x.f) }
+
+// `Add ... with e1` landing on an existing half.
+method fold_onto_existing_half_is_consistent(x: Ref)
+    requires acc(P(x), 1/2) && acc(x.f, 1/2)
+{
+    fold acc(P(x), 1/2)
+    assert false
+}
+
+// The same shape via `inhale`, whose bind is `fresh`.
+method inhale_onto_existing(x: Ref)
+    requires acc(P(x), 1/2)
+{
+    inhale acc(P(x), 1/2)
+    unfold acc(P(x), write)
+    assert false
+}

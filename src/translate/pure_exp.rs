@@ -55,6 +55,95 @@ impl<'a> HeapCtx<'a> {
     }
 }
 
+/// Emit a desugared `unfold acc(P(args), pe)`: the slot-level consume that hands
+/// back the predicate's snapshot, then the resource-level produce bound to it.
+///
+/// ```text
+/// h1, e1 : Option<Snap(P)> := h0 - acc(P@loc(args), pe)
+/// h2                       := h1 inhale P(args) pe with e1
+/// ```
+///
+/// The order is forced by permission accounting, not by the boolean: the
+/// predicate chunk must be gone before its body's slots are produced, or a
+/// self-referential predicate would briefly hold both. `Sub` and `Add` carry no
+/// boolean at all, so the body's facts land only on the resource op -- assumed
+/// here, asserted on the `fold` side -- which is why neither ordering can
+/// produce a boolean the other instruction was supposed to have justified.
+pub(crate) fn emit_unfold_pair(
+    b: &TranslationContext<'_>,
+    sink: &mut Sink,
+    base: HeapVal,
+    name: Spur,
+    call: ResourceCall,
+    perm: vmir::Perm,
+) -> HeapVal {
+    // The predicate's address: an ordinary application of its own id, typed
+    // `&[group] Snap(P) @ unbounded` (see `resource::lower_resource_addr`).
+    let group = b.group_tag(name);
+    let addr_ty = vmir::Type::addr(group, vmir::Type::Snap(call.resource), vmir::Bound::Unbounded);
+    let addr = sink.emit_pure(
+        addr_ty,
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: call.resource,
+            type_args: Vec::new(),
+            args: call.args.clone().into(),
+        }),
+    );
+    let (h_sub, opt) = sink.emit_sub_yielding(base, addr, perm.clone());
+    // The seam, named rather than implicit: `Sub` yields `Option<Snap(P)>`
+    // because it discovers whether anything was there; the resource produce needs
+    // a plain `Snap(P)`.
+    let snap = sink.emit_pure(
+        vmir::Type::Snap(call.resource),
+        PureInst::OptionUnwrap(opt),
+    );
+    sink.emit_resource_inhale(h_sub, call, perm, vmir::Bind::Bound(snap))
+}
+
+/// Emit a desugared `fold acc(P(args), pe)`: the resource-level consume that
+/// asserts the body and hands back its snapshot, then the slot-level produce
+/// bound to it.
+///
+/// ```text
+/// h1, e1 : Snap(P) := h0 exhale P(args) pe
+/// h2               := h1 + acc(P@loc(args), pe) with e1
+/// ```
+///
+/// The mirror of [`emit_unfold_pair`], and the ordering is forced the same way:
+/// the field chunks must be consumed before the predicate chunk is added, so a
+/// self-referential predicate never briefly holds both. No `unwrap` seam here --
+/// `Exhale`'s yield and `Add`'s bind are both plain, because a consume of a
+/// resource at `perm > 0` cannot come up empty.
+pub(crate) fn emit_fold_pair(
+    b: &TranslationContext<'_>,
+    sink: &mut Sink,
+    base: HeapVal,
+    name: Spur,
+    call: ResourceCall,
+    perm: vmir::Perm,
+) -> HeapVal {
+    let group = b.group_tag(name);
+    let addr_ty = vmir::Type::addr(group, vmir::Type::Snap(call.resource), vmir::Bound::Unbounded);
+    let addr = sink.emit_pure(
+        addr_ty,
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: call.resource,
+            type_args: Vec::new(),
+            args: call.args.clone().into(),
+        }),
+    );
+    let resource = call.resource;
+    let (h_ex, snap) = sink.emit_resource_exhale(base, call, perm.clone(), true);
+    let snap = snap.expect("a predicate is self-framed, so its exhale yields a snapshot");
+    let _ = resource;
+    sink.emit_heap_guarded(vmir::HeapInst::Add {
+        base: h_ex,
+        loc: addr,
+        perm,
+        bind: vmir::Bind::Bound(snap),
+    })
+}
+
 /// Lower a predicate-with-perm (`P(args)` + permission) into a self-framed
 /// `ResourceCall` plus the permission (a source `wildcard` → [`Perm::Wildcard`],
 /// otherwise the amount through the read-only policy — see [`Sink::perm_amount`];
@@ -512,11 +601,7 @@ pub(crate) fn lower_heap_node<Ext: PureExt>(
             // `Unfold`, evaluate `body` against the unfolded heap, then discard it
             // (the surrounding expression keeps reading the original `hctx`).
             let (call, perm) = lower_pred_call(b, env, sink, hctx, pwp)?;
-            let h = sink.emit_heap_guarded(HeapInst::Unfold {
-                base: hctx.value,
-                call,
-                perm,
-            });
+            let h = emit_unfold_pair(b, sink, hctx.value, pwp.pred_call.name.0, call, perm);
             let inner = HeapCtx {
                 value: h,
                 perm: h,
