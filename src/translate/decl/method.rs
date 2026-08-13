@@ -1066,9 +1066,10 @@ fn lower_new(
     }
 }
 
-/// Lower `fold P(args)` / `unfold P(args)` to a `HeapInst::Fold`/`Unfold`. The
-/// predicate id, args, and perm come from the statement; the resulting heap is
-/// the new working heap.
+/// Lower `fold P(args)` / `unfold P(args)` into its bind-point pair -- see
+/// [`pure_exp::emit_fold_pair`] / [`pure_exp::emit_unfold_pair`]. Neither is a
+/// heap instruction: the predicate id, args, and perm come from the statement,
+/// and the pair's second half yields the new working heap.
 fn lower_fold_unfold(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,

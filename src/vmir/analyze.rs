@@ -220,13 +220,17 @@ fn trig_term_deps(term: &crate::vmir::TrigTerm, out: &mut Vec<MemberId>) {
 
 /// Collect the schedulable members referenced by an instruction stream: the
 /// callee of each non-address `FunctionCall`, and the resource of each
-/// inhale/exhale/fold/unfold/snap/from-snap. Shared by resource, method, and
-/// function bodies.
+/// inhale/exhale. Shared by resource, method, and function bodies.
 ///
 /// An **address-typed** `FunctionCall` (result `Type::Addr`) is NOT a dependency:
 /// forming an address needs no certificate, and a predicate's address function is
 /// the predicate's own id, so treating it as a dependency would make a recursive
 /// predicate (`acc(P(this.next))` in `P`'s body) a self-cycle.
+///
+/// This is what keeps a desugared `fold`/`unfold` scheduled correctly now that
+/// neither is a variant: the pair's resource half is an inhale/exhale naming the
+/// predicate, so the dependency is recorded there, while its `P@addr(args)` half
+/// is address-typed and skipped by the rule above.
 fn inst_deps(insts: &[Inst], out: &mut Vec<MemberId>) {
     for inst in insts {
         match &inst.kind {
@@ -234,9 +238,6 @@ fn inst_deps(insts: &[Inst], out: &mut Vec<MemberId>) {
                 out.push(fc.function)
             }
             InstKind::Heap(HeapInst::Inhale { call, .. } | HeapInst::Exhale { call, .. }) => {
-                out.push(call.resource)
-            }
-            InstKind::Heap(HeapInst::Fold { call, .. } | HeapInst::Unfold { call, .. }) => {
                 out.push(call.resource)
             }
             // An inline `forall` depends on whatever its body calls and its

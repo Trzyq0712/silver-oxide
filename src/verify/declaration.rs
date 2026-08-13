@@ -738,15 +738,6 @@ struct LocationChunk {
     bound: Bound,
 }
 
-/// A predicate's address type `&[name] Snap(id) @ *` — the group is the
-/// predicate's interned tag (`Program.groups`), value its snapshot, unbounded.
-fn pred_addr_type(program: &vmir::Program, pred_id: MemberId) -> Type {
-    let group = program
-        .groups
-        .get(program.name(pred_id))
-        .expect("predicate group tag not registered");
-    Type::addr(group, Type::Snap(pred_id), Bound::Unbounded)
-}
 
 /// Extract the location chunks of `h`: for each chunk whose canonical address has
 /// an `Addr{group,bound,..}` type (recovered by `infer_type`, so **computed**
@@ -1527,9 +1518,12 @@ fn heap_subtract_summarized(
 /// not know about. Gated on `SILVER_OXIDE_ASSERT_BLOCK_PC` so it can be run over
 /// the corpus in release builds, where a `debug_assert` would compile out.
 ///
-/// Known violating shape: `unfolding p in e` is a Viper *expression* but is lowered to
-/// a statement-level `HeapInst::Unfold`, so it can sit under an extra ternary guard.
-/// Plan 82 proposes rejecting it until it becomes a scoped node.
+/// Known violating shape: `unfolding p in e` is a Viper *expression* but lowers to
+/// statement-level instructions, so it can sit under an extra ternary guard. Since the
+/// fold/unfold desugaring it is the pair's *resource* half that carries the shape --
+/// the slot halves are sub-statement and were never listed -- so it is still caught,
+/// just through a different variant. Plan 82 proposes rejecting it until it becomes a
+/// scoped node.
 fn assert_statement_pc_is_block_cube(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
@@ -1541,11 +1535,7 @@ fn assert_statement_pc_is_block_cube(
     let statement_level = matches!(
         inst.kind,
         InstKind::Heap(
-            HeapInst::Inhale { .. }
-                | HeapInst::Exhale { .. }
-                | HeapInst::Fold { .. }
-                | HeapInst::Unfold { .. }
-                | HeapInst::Assign(..)
+            HeapInst::Inhale { .. } | HeapInst::Exhale { .. } | HeapInst::Assign(..)
         )
     );
     if !statement_level {
@@ -2037,11 +2027,6 @@ fn eval_heap_inst(
         HeapInst::Inhale { .. } | HeapInst::Exhale { .. } => Err(VerifyError::Unimplemented(
             "resource inhale/exhale outside method body",
         )),
-        // Fold/Unfold need the program + certificates; handled in
-        // `eval_method_inst`.
-        HeapInst::Fold { .. } | HeapInst::Unfold { .. } => Err(VerifyError::Unimplemented(
-            "fold/unfold outside method body",
-        )),
         // Field assignment `loc := val`: requires write permission at `loc`,
         // then updates the chunk's value (permission unchanged).
         HeapInst::Assign(heap, Assign { loc, val }) => {
@@ -2105,9 +2090,6 @@ fn eval_resource_body_inst(
             let (id, recipe) = eval_pure_inst(ctx, state, ty, pi, &pc_lits, Some(&inst.pc))?;
             state.push_val(id, ty.clone(), recipe);
         }
-        // `unfold` inside a resource body verifies identically to a method
-        // body (shared `eval_unfold`); only `Unfold` is emitted here.
-        InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
         // The consume half of a desugared `unfold`: yields what it removed.
         InstKind::Heap(HeapInst::Sub {
             yields_value: true, ..
@@ -2174,57 +2156,6 @@ fn eval_method_inst(
         InstKind::Heap(HeapInst::Inhale { .. } | HeapInst::Exhale { .. }) => {
             eval_resource_op(ctx, program, state, inst, certs)?;
         }
-        // `fold`: consume the predicate footprint (scaled by `perm`), assert the
-        // body's pure facts, and produce a predicate chunk holding the snapshot
-        // (`cons`) of the consumed field values.
-        InstKind::Heap(HeapInst::Fold { base, call, perm }) => {
-            // A function body may `fold` (via `folding … in …`); its recipe
-            // shape is not implemented yet, so a certificate walk rejects it.
-            if ctx.recipe.is_some() {
-                return Err(VerifyError::Unimplemented(
-                    "purify: fold in a function body",
-                ));
-            }
-            let base_h = get_heap(state, base);
-            let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-            let perm_id = eval_perm(ctx, state, perm);
-            let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-
-            // Consume the footprint from the current heap (reading its values),
-            // asserting the predicate body; then place the predicate chunk holding
-            // the snapshot of the consumed values.
-            let FootprintResult {
-                heap: out, members, ..
-            } = walk_footprint(
-                ctx,
-                program,
-                certs,
-                call.resource,
-                &args,
-                base_h.clone(),
-                ValueSource::ReadHeap(base_h),
-                Direction::Consume,
-                Some(perm_id),
-                &pc_lits,
-                &pc_lits,
-                false,
-            )?;
-            let snap = build_snapshot(ctx, call.resource, members);
-            let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
-            let out = heap_union(
-                ctx,
-                &out,
-                &pred_kind,
-                Chunk::new(pred_addr, perm_id, snap),
-                &pc_lits,
-            );
-            state.push_heap(out);
-            ctx.reduce();
-        }
-        // `unfold`: inverse of fold — consume the predicate chunk, reproduce the
-        // footprint (fields recovered by projecting the snapshot), assume the
-        // body's pure facts.
-        InstKind::Heap(HeapInst::Unfold { .. }) => eval_unfold(ctx, program, state, inst, certs)?,
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
@@ -2607,90 +2538,6 @@ fn build_snapshot(
     let cons = ctx.alloc.cons(resource, 0);
     ctx.add_func_app_id(cons, Box::new([]), Type::Snap(resource), members.into())
 }
-
-/// A predicate's location kind and address e-class for `args`: the address is an
-/// ordinary `FuncApp` to the predicate's own id (its `@addr` function), typed by
-/// its recorded `Addr{..}` return type. Shared by `fold` and `unfold`.
-fn predicate_address(
-    ctx: &mut VerifyContext<'_>,
-    program: &vmir::Program,
-    pred: MemberId,
-    args: &[egg::Id],
-) -> (LocationKind, egg::Id) {
-    let addr_ty = pred_addr_type(program, pred);
-    let kind = LocationKind::from_addr_type(&addr_ty).expect("predicate address type");
-    let addr = ctx.add_func_app_id(
-        crate::verify::func_registry::func_id_for_member(pred),
-        Box::new([]),
-        addr_ty,
-        args.into(),
-    );
-    (kind, addr)
-}
-
-/// Evaluate an `unfold`: consume the predicate chunk, reproduce the footprint
-/// (fields recovered by projecting the snapshot), assume the body's pure facts.
-/// Shared by method bodies and resource bodies; grafts the unfolded predicate's
-/// pre-verified certificate (so the predicate must be verified first — a
-/// self/mutual `unfolding` cycle is rejected upstream by `analyze`).
-fn eval_unfold(
-    ctx: &mut VerifyContext<'_>,
-    program: &vmir::Program,
-    state: &mut EvalState,
-    inst: &Inst,
-    certs: &HashMap<MemberId, ResourceDefinition>,
-) -> Result<(), VerifyError> {
-    let InstKind::Heap(HeapInst::Unfold { base, call, perm }) = &inst.kind else {
-        unreachable!("eval_unfold called on a non-Unfold instruction");
-    };
-    let base_h = get_heap(state, base);
-    let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-    let perm_id = eval_perm(ctx, state, perm);
-    let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-
-    // Consume the predicate chunk, recovering the snapshot `s` it holds (and,
-    // in a certificate walk, its recipe — the term the new slots project from).
-    let (pred_kind, pred_addr) = predicate_address(ctx, program, call.resource, &args);
-    let a = ctx.egraph.find(pred_addr);
-    let (s, s_recipe) = base_h
-        .entries()
-        .find_map(|(_, c)| (ctx.egraph.find(c.addr) == a).then(|| (c.value, c.recipe.clone())))
-        .ok_or(VerifyError::InsufficientPermission)?;
-    if ctx.recipe.is_some() && s_recipe.is_none() {
-        return Err(VerifyError::Unimplemented(
-            "purify: unfold of an unheld predicate",
-        ));
-    }
-    let out = heap_subtract(
-        ctx,
-        &base_h,
-        &pred_kind,
-        Chunk::new(pred_addr, perm_id, s),
-        &pc_lits,
-    )?;
-
-    // Reproduce the footprint from `s` (`unwrap(proj_i(s))` per slot), assuming
-    // the predicate body. `reduce()` afterward collapses any snapshot tower a
-    // repeated fold/unfold round-trip created.
-    let FootprintResult { heap: out, .. } = walk_footprint(
-        ctx,
-        program,
-        certs,
-        call.resource,
-        &args,
-        out,
-        ValueSource::ProjectSnap(s, s_recipe),
-        Direction::Produce,
-        Some(perm_id),
-        &pc_lits,
-        &pc_lits,
-        false,
-    )?;
-    state.push_heap(out);
-    ctx.reduce();
-    Ok(())
-}
-
 
 /// Evaluate a **value-yielding** `Sub`: remove the chunk at `loc` and hand back
 /// what was there, as `Option<T>` (`None` iff nothing was removed).
@@ -3950,9 +3797,7 @@ fn inst_obligations(
             HeapInst::Add { perm, .. }
             | HeapInst::Sub { perm, .. }
             | HeapInst::Inhale { perm, .. }
-            | HeapInst::Exhale { perm, .. }
-            | HeapInst::Fold { perm, .. }
-            | HeapInst::Unfold { perm, .. },
+            | HeapInst::Exhale { perm, .. },
         ) if perm.has_wildcard() => vec![],
         // A resource op carries the resource's **boolean**, so at zero permission
         // it would assume or assert facts about a footprint it transferred no
@@ -3973,10 +3818,7 @@ fn inst_obligations(
         // `0` on the `!b` path), so a strict rule here would reject every
         // conditional `acc`.
         InstKind::Heap(
-            HeapInst::Add { perm, .. }
-            | HeapInst::Sub { perm, .. }
-            | HeapInst::Fold { perm, .. }
-            | HeapInst::Unfold { perm, .. },
+            HeapInst::Add { perm, .. } | HeapInst::Sub { perm, .. },
         ) => {
             let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
             let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));

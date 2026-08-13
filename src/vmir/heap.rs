@@ -127,22 +127,6 @@ pub enum HeapInst {
     /// Assign a value to a heap location in a given heap.
     /// SIDECOND: the location must have at least `write` permission.
     Assign(HeapVal, Assign),
-    /// `h := fold call[base] perm`. Consume the predicate's footprint (scaled by
-    /// `perm`) from `base`, assert its body's pure facts, and produce a chunk at
-    /// the predicate address holding the snapshot of the consumed fields.
-    Fold {
-        base: HeapVal,
-        call: ResourceCall,
-        perm: Perm,
-    },
-    /// `h := unfold call[base] perm`. Inverse of `Fold`: consume the predicate
-    /// chunk from `base`, reproduce its footprint (fields recovered from the
-    /// snapshot), and assume the body's pure facts.
-    Unfold {
-        base: HeapVal,
-        call: ResourceCall,
-        perm: Perm,
-    },
     /// `h := heap_of R(args), snap` — widen a snapshot value back into a heap:
     /// `h := merge <cond> ? <then_h> : <els_h>` — the block-IR heap join: select
     /// between two predecessor exit heaps under a binary join condition. The
@@ -349,16 +333,6 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             } => resource_combine(f, base, "exhale", call, perm),
             HeapInst::Assign(base, Assign { loc, val }) => {
                 write!(f, "{base} assign {loc} {val}")
-            }
-            HeapInst::Fold { base, call, perm } => {
-                write!(f, "{base} fold ")?;
-                call_head(f, call)?;
-                write!(f, " {}", self.with(perm))
-            }
-            HeapInst::Unfold { base, call, perm } => {
-                write!(f, "{base} unfold ")?;
-                call_head(f, call)?;
-                write!(f, " {}", self.with(perm))
             }
             HeapInst::Merge {
                 cond,

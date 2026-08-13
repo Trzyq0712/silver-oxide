@@ -209,9 +209,7 @@ fn decls_have_wildcard(decls: &TiVec<MemberId, Declaration>) -> bool {
                 HeapInst::Add { perm, .. }
                 | HeapInst::Sub { perm, .. }
                 | HeapInst::Inhale { perm, .. }
-                | HeapInst::Exhale { perm, .. }
-                | HeapInst::Fold { perm, .. }
-                | HeapInst::Unfold { perm, .. },
+                | HeapInst::Exhale { perm, .. },
             ) => perm.has_wildcard(),
             _ => false,
         })
