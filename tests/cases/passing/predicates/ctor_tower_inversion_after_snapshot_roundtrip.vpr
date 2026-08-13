@@ -1,0 +1,83 @@
+// Inverting a Prusti-shaped enum *snapshot tower* after a snapshot round-trip.
+// This is the end-to-end shape the constructor half of `ite-reduce`'s
+// arm-differs pinning exists for (see ctor_arm_pins_ite_condition.vpr).
+//
+// `make_generic` / `make_concrete` destroy the `Outer` chunk and re-inhale a
+// fresh, havocked one; the only link between old and new is the pair of
+// snapshot postconditions plus `mk_concrete(mk_generic(x)) == x`. That yields
+// `Outer_snap_old == Outer_snap_new`, and `Outer_snap`'s body is a 5-deep
+// ternary of distinct constructors. Under the branch's path condition the old
+// side folds to `c1()`, leaving `tower(discr_new) == c1()`; each non-matching
+// arm then pins its guard false and `ite(false, _, e) => e` exposes the next
+// level, one per saturation iteration, until the bottom arm's ground
+// constructor pins the *matching* guard true. That recovers `discr_new == k1()`
+// — which is the permission gate on the variant's footprint.
+//
+domain PARAM { }
+
+adt D { k0() k1() k2() k3() k4() }
+adt SH { c0() c1() c2() c3() c4() }
+
+function mk_generic(self: SH): PARAM
+  ensures mk_concrete(result) == self
+
+function mk_concrete(snap: PARAM): SH
+  ensures mk_generic(result) == snap
+
+field val: D
+field oval: PARAM
+
+predicate Inner(x: Ref) { acc(x.val, write) }
+
+function isnap(x: Ref): D
+  requires acc(Inner(x), write)
+{ (unfolding acc(Inner(x), write) in x.val) }
+
+function discr(s: Ref): Ref
+
+predicate Q(s: Ref) { acc(s.val, write) }
+
+predicate Outer(s: Ref) {
+  acc(Inner(discr(s)), write) &&
+  (isnap(discr(s)) == k1() ==> acc(Q(s), write))
+}
+
+function Outer_snap(s: Ref): SH
+  requires acc(Outer(s), write)
+{
+  (unfolding acc(Outer(s), write) in
+    (isnap(discr(s)) == k4() ? c4() :
+      (isnap(discr(s)) == k3() ? c3() :
+        (isnap(discr(s)) == k2() ? c2() :
+          (isnap(discr(s)) == k1() ? c1() : c0())))))
+}
+
+predicate Param(s: Ref) { acc(s.oval, write) }
+
+function Param_snap(s: Ref): PARAM
+  requires acc(Param(s), write)
+{ (unfolding acc(Param(s), write) in s.oval) }
+
+method make_generic(self: Ref)
+  requires acc(Outer(self), write)
+  ensures acc(Param(self), write)
+  ensures old(mk_generic(Outer_snap(self))) == Param_snap(self)
+
+method make_concrete(self: Ref)
+  requires acc(Param(self), write)
+  ensures acc(Outer(self), write)
+  ensures old(Param_snap(self)) == mk_generic(Outer_snap(self))
+
+method m(s: Ref)
+  requires acc(Param(s), write)
+{
+  var tmp: D
+  make_concrete(s)
+  tmp := (unfolding acc(Outer(s), wildcard) in isnap(discr(s)))
+  make_generic(s)
+  if (tmp == k1()) {
+    make_concrete(s)
+    unfold acc(Outer(s), write)
+    unfold acc(Q(s), write)
+  }
+}

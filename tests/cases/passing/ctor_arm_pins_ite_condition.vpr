@@ -1,0 +1,34 @@
+// `ite-reduce`'s arm-differs pinning at ADT constructors, not just literals.
+//
+// The class's value is pinned to one constructor; an arm pinned to a *different*
+// constructor of the same ADT cannot be the one taken, so the condition is
+// pinned to the other side. Free constructors are what makes this sound — the
+// same premise `ConstFold` uses to fold a `Ctor == Ctor` comparison to `false`
+// and to declare a two-constructor class inconsistent.
+//
+// The negative half (identical arms, same-constructor arms, and the arm that
+// *does* match) lives in `failing/ctor_ite_*_pins_nothing.vpr`.
+
+adt SH { c0() c1(x: Int) }
+
+// else-arm differs => condition pinned true
+method then_arm_matches(b: Bool)
+{
+  assume (b ? c1(7) : c0()) == c1(7)
+  assert b
+}
+
+// then-arm differs => condition pinned false
+method else_arm_matches(b: Bool, k: Int)
+{
+  assume (b ? c1(k) : c0()) == c0()
+  assert !b
+}
+
+// both arms differ => the two pins contradict, which is the right answer:
+// an `ite` equal to something neither arm can be is unsatisfiable
+method both_arms_differ(b: Bool, k: Int)
+{
+  assume (b ? c1(k) : c1(k)) == c0()
+  assert false
+}

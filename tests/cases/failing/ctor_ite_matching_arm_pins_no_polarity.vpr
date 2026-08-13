@@ -1,0 +1,13 @@
+// Soundness canary for the constructor half of `ite-reduce`'s arm-differs
+// pinning (see passing/ctor_arm_pins_ite_condition.vpr).
+//
+// The class is pinned to the *then* arm, which pins the condition **true**.
+// Nothing pins it false, so the opposite conclusion must stay rejected.
+
+adt SH { c0() c1(x: Int) }
+
+method matching_arm_pins_only_one_polarity(b: Bool)
+{
+  assume (b ? c1(1) : c0()) == c1(1)
+  assert !b
+}

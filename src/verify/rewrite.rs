@@ -878,20 +878,33 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
                 }
                 _ => {}
             }
-            // The same decomposition at **any** literal sort, not just booleans:
-            // if the class folds to `L` and an arm folds to something other than
-            // `L`, that arm cannot be the one taken, so the condition is pinned to
-            // the other side. When *both* arms disagree with `L` the two unions
-            // pin `c` to both polarities, which is exactly the contradiction —
-            // `ite(c, 1, 2) ≡ 0` is refuted without ever splitting on `c`, and
-            // that is how a division guard survives a branch join (`d = c ? 1 : 2`
-            // then `d != 0`).
-            if let Some(self_val) = egraph[eclass].data.known() {
+            // The same decomposition at **any** pinned value, not just booleans
+            // and not just literals: if the class's value is pinned to `V` and an
+            // arm's is pinned to something [`Fingerprint::differs_from`] separates
+            // from `V`, that arm cannot be the one taken, so the condition is
+            // pinned to the other side. When *both* arms disagree with `V` the two
+            // unions pin `c` to both polarities, which is exactly the
+            // contradiction — `ite(c, 1, 2) ≡ 0` is refuted without ever splitting
+            // on `c`, and that is how a division guard survives a branch join
+            // (`d = c ? 1 : 2` then `d != 0`).
+            //
+            // The **constructor** half of the fingerprint is what inverts a Prusti
+            // enum-snapshot tower: `p_Shape_snap`'s body is a nested ite of
+            // `s_Shape_k_cons(..)` arms, and once a snapshot round-trip
+            // (`make_generic_Shape` / `make_concrete_Shape`) equates the whole
+            // tower with one `s_Shape_1_cons(..)`, each non-matching arm pins its
+            // guard false and `ite(false, _, e) ⇒ e` exposes the next level, one
+            // per saturation iteration. The bottom arm is a ground constructor, so
+            // the last step pins the *matching* guard true — recovering
+            // `discr == cons(1)`, which is the permission gate on the variant's
+            // footprint. Identical arms (`ite(c, x, x)`) and same-constructor arms
+            // pin nothing, which is right: neither says anything about `c`.
+            if let Some(self_fp) = egraph[eclass].data.fingerprint() {
                 let arm_differs = |arm: Id| {
                     egraph[arm]
                         .data
-                        .known()
-                        .is_some_and(|lit| lit != self_val)
+                        .fingerprint()
+                        .is_some_and(|fp| fp.differs_from(&self_fp))
                 };
                 if arm_differs(t) {
                     unions.push((c, Target::False));

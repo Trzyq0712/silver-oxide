@@ -31,12 +31,65 @@ pub enum Data {
     Inconsistent,
 }
 
+/// What `ConstFold` has pinned an e-class's *value* to, when it has pinned one:
+/// a folded literal, or an ADT constructor identity. Two classes carrying
+/// fingerprints that [`Fingerprint::differs_from`] separates cannot denote the
+/// same value, so a rule may use the pair to refute one of them.
+///
+/// The constructor half rests on **free constructors** — distinct variants of one
+/// ADT head at one instantiation are disjoint. That is the same premise
+/// [`ConstFold::make`] uses to fold a `Ctor == Ctor` comparison to `false` and
+/// [`ConstFold::merge`] uses to declare a class [`Data::Inconsistent`] (see the
+/// [`Data`] doc). If the ADT encoding ever gains non-free constructors, all three
+/// sites break together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fingerprint<'a> {
+    Lit(&'a Literal),
+    Ctor(FuncId, &'a [Type]),
+}
+
+impl Fingerprint<'_> {
+    /// Whether these two pinned values are provably different.
+    ///
+    /// Conservative in every direction it is not sure about:
+    ///
+    /// * Two constructors are separated only **within one instantiation**. The
+    ///   type args are part of the operator's identity in the polymorphic
+    ///   e-graph, so `List[Int]::Nil` vs `List[Bool]::Nil` is a type error, not a
+    ///   fact about the program — report "not different" and let the merge
+    ///   panic in [`ConstFold::merge`] catch a real violation.
+    /// * The same constructor at different arguments is **not** separated:
+    ///   the fingerprint is the constructor's identity, not the whole term, so
+    ///   `c(x)` vs `c(y)` reports "not different" even when `x ≢ y`. Losing that
+    ///   is incompleteness, never unsoundness.
+    /// * Mixing a literal with a constructor cannot arise (that merge is a type
+    ///   error panic) and reports "not different" if it somehow does.
+    pub fn differs_from(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Fingerprint::Lit(a), Fingerprint::Lit(b)) => a != b,
+            (Fingerprint::Ctor(f, ftys), Fingerprint::Ctor(g, gtys)) => f != g && ftys == gtys,
+            _ => false,
+        }
+    }
+}
+
 impl Data {
     /// The folded literal, if this e-class is a known constant.
     pub fn known(&self) -> Option<&Literal> {
         match self {
             Data::Known(lit) => Some(lit),
             _ => None,
+        }
+    }
+
+    /// This e-class's pinned value, as a comparison key. `None` for `Unknown`
+    /// (nothing pinned) and for `Inconsistent` (the graph is already
+    /// contradictory; other machinery handles it).
+    pub fn fingerprint(&self) -> Option<Fingerprint<'_>> {
+        match self {
+            Data::Known(lit) => Some(Fingerprint::Lit(lit)),
+            Data::Ctor(f, tys) => Some(Fingerprint::Ctor(*f, tys)),
+            Data::Unknown | Data::Inconsistent => None,
         }
     }
 

@@ -8,20 +8,32 @@
 #
 # Keep each entry's reason current. An entry with no live reason is a bug report.
 
-# Permission conditional on an enum DISCRIMINANT, consumed inside a match arm.
+# A primitive snapshot's `cons` disequality is never pinned in-graph.
 #
-# The location's amount is a frontend `c ==> acc` gate — Prusti encodes a
-# variant's footprint as `acc(p_Shape_k(s), discr == k ? write : none)` — so the
-# held perm is `ite(discr == 1, 1/1, 0)` while the demand is `1/1`. Discharging it
-# needs `discr == 1` on this path, and the arm's path condition does not entail
-# it: splitting the amount on its own gate (measured 2026-08-13) reaches the
-# `discr != 1` world and finds it consistent, so this is a missing link between a
-# match arm's reach literal and the discriminant, NOT a permission-arithmetic or
-# chunk-representation gap.
+# NOT a permission-model gap. `make_generic_Shape` / `make_concrete_Shape` destroy
+# the `p_Shape` chunk and re-inhale a fresh, havocked one; the only link back is
+# the snapshot postconditions plus `make_concrete_s_Shape(make_generic_s_Shape(x))
+# == x`, which yields `p_Shape_snap_old == p_Shape_snap_new`. `p_Shape_snap`'s body
+# is a 5-deep ternary of `s_Shape_k_cons(..)` arms, so recovering `discr == cons(1)`
+# means inverting that tower from both ends.
 #
-# These two were previously filed together with `mat3_mul` as one `&mut`-reborrow
-# shape. That was wrong: the reborrow shape was fixed by making `Chunk::guard`
-# load-bearing (guard-aware address gating, structural summarized totals, guards
-# surviving a consume) and these two did not move.
+# The *arm* half now works: `ite-reduce`'s arm-differs pinning was extended from
+# literals to ADT constructors (see tests/cases/passing/predicates/
+# ctor_tower_inversion_after_snapshot_roundtrip.vpr, which is this exact shape and
+# verifies). What is left is the *condition* half: Prusti encodes `s_Int_isize` as a
+# **domain** with a `cons`/`value` retraction, not as an `adt`, so the tower's
+# guards compare `snap == s_Int_isize_cons(k)` and two `cons` applications carry no
+# free-constructor distinctness. That disequality is refutable but never
+# materialized as an in-graph `Eq(..) = false`, which is what `ite-reduce` and
+# `eq-false-then/else` consume. Minimal shape and the sound derivation (the
+# contrapositive of congruence over `value`, no injectivity needed) are in
+# tests/cases/known_limitations/domain_cons_disequality_not_pinned.vpr.
+#
+# Earlier readings of these two, both now refuted: (1) filed with `mat3_mul` as a
+# `&mut`-reborrow shape — that one was fixed by making `Chunk::guard` load-bearing
+# and these did not move; (2) filed as a missing link between a match arm's reach
+# literal and the discriminant — the reach literals are in the pc, and splitting
+# the amount on its own gate (measured 2026-08-13) refuted nothing because the
+# break is upstream, in the snapshot round-trip.
 shape_area m_shape_grow
 shape_area m_shape_translate

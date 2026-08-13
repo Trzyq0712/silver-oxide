@@ -1,0 +1,44 @@
+// KNOWN LIMITATION — should verify, currently rejected.
+//
+// The *second* half of the enum-snapshot gap, and what still blocks
+// `shape_area::m_shape_grow` / `m_shape_translate` in benchmarks/rust.
+//
+// `ite-reduce`'s arm-differs pinning now inverts a snapshot tower whose arms are
+// ADT constructors (passing/predicates/ctor_tower_inversion_after_snapshot_roundtrip.vpr).
+// But Prusti encodes a *primitive* snapshot like `s_Int_isize` as a **domain**
+// with a `cons`/`value` retraction pair, not as an `adt` — so the tower's
+// **conditions** compare `snap == cons(k)`, and two `cons` applications carry no
+// free-constructor distinctness.
+//
+// The disequality is derivable by refutation: `d1` below passes, because
+// `assert x != cons(2)` lets the prover merge `x == cons(2)` in and hit
+// `1 == 2` through the `ax_value` instances. What is missing is the same fact as
+// an in-graph `Eq(..) = false`, which is what `ite-reduce` and
+// `eq-false-then/else` consume. `d2` is exactly that shape and fails.
+//
+// This is the same "recognizer, not producer" asymmetry as the constructor case,
+// one layer down. The sound derivation needs no injectivity — it is the
+// contrapositive of congruence: `value(cons(1))` and `value(cons(2))` fold to
+// different literals, so `cons(1)` and `cons(2)` cannot be one class. Nothing
+// currently scans for such a distinguishing observation.
+
+domain S {
+  function cons(arg0: Int): S
+  function value(arg0: S): Int
+  axiom ax_cons { (forall s: S :: { value(s) } cons(value(s)) == s) }
+  axiom ax_value { (forall v: Int :: { cons(v) } value(cons(v)) == v) }
+}
+
+// Refutable today: this one already passes.
+method d1(x: S)
+{
+  assume x == cons(1)
+  assert x != cons(2)
+}
+
+// The same fact as an `ite` guard — needs the disequality pinned in-graph.
+method d2(x: S)
+{
+  assume x == cons(1)
+  assert (x == cons(2) ? 7 : 9) == 9
+}
