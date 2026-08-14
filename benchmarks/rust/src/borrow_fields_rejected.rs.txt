@@ -1,0 +1,103 @@
+Members dropped from borrow_fields.rs — Prusti cannot encode them (measured 2026-08-14).
+Kept as .txt so encode_all.sh does not pick them up.
+
+Every one of these takes a borrow-holding struct AS A PARAMETER. Prusti encodes them,
+but its own Silicon run then rejects the encoding, and the error cannot be mapped back
+to Rust:
+
+    error: [Prusti internal error] Prusti encountered an unexpected internal error
+    = note: A verification error occurred, but it could not be backtranslated:
+            no handler found for error kind: call.precondition:insufficient.permission
+
+Nine members, nine failures, one per read or write through the stored borrow. Building
+the same struct inside the body from a `&mut Point` parameter verifies fine — that is
+what borrow_fields.rs does instead. So the boundary is the *precondition* for a
+parameter whose type nests a reference, not the nested footprint itself.
+
+Reproduce:
+
+    PRUSTI_CHECK_OVERFLOWS=false /path/to/prusti-rustc \
+        --crate-type=lib --edition=2021 borrow_fields_rejected.rs
+
+--------------------------------------------------------------------------------
+
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub struct Cursor<'a> {
+    pub p: &'a mut Point,
+}
+
+// insufficient.permission at `c.p.x = c.p.x + 1`
+pub fn cursor_bump_x(c: &mut Cursor) {
+    c.p.x = c.p.x + 1;
+}
+
+// insufficient.permission at `c.p.x = nx`
+pub fn cursor_set(c: &mut Cursor, nx: i32, ny: i32) {
+    c.p.x = nx;
+    c.p.y = ny;
+}
+
+// insufficient.permission at `c.p.x` -- a READ is enough, it is not about writing
+pub fn cursor_read_x(c: &Cursor) -> i32 {
+    c.p.x
+}
+
+pub struct Pair<'a> {
+    pub a: &'a mut Point,
+    pub b: &'a mut Point,
+}
+
+// insufficient.permission at `pr.a.x = pr.a.x + 1`
+pub fn pair_bump_both(pr: &mut Pair) {
+    pr.a.x = pr.a.x + 1;
+    pr.b.x = pr.b.x + 1;
+}
+
+// insufficient.permission at `pr.b.x = pr.a.x`
+pub fn pair_copy_x(pr: &mut Pair) {
+    pr.b.x = pr.a.x;
+}
+
+// insufficient.permission at `pr.b.y = pr.b.y + pr.a.y`
+pub fn pair_guarded(pr: &mut Pair, to_a: bool) {
+    if to_a {
+        pr.a.y = pr.a.y + pr.b.y;
+    } else {
+        pr.b.y = pr.b.y + pr.a.y;
+    }
+}
+
+pub enum Target<'a> {
+    Nothing,
+    One(&'a mut Point),
+}
+
+// insufficient.permission at `p.x = p.x + 1`
+pub fn target_bump(t: &mut Target) {
+    match t {
+        Target::Nothing => {}
+        Target::One(p) => p.x = p.x + 1,
+    }
+}
+
+// insufficient.permission at `p.x + p.y`
+pub fn target_read(t: &Target) -> i32 {
+    match t {
+        Target::Nothing => 0,
+        Target::One(p) => p.x + p.y,
+    }
+}
+
+// insufficient.permission at `q.y = q.y + 2` -- built locally, but the borrow reaches
+// the write through an ENUM PAYLOAD, and that is enough to lose it
+pub fn target_here(p: &mut Point, engage: bool) {
+    let mut t = if engage { Target::One(p) } else { Target::Nothing };
+    match &mut t {
+        Target::Nothing => {}
+        Target::One(q) => q.y = q.y + 2,
+    }
+}

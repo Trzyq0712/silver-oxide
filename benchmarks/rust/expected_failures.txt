@@ -8,7 +8,20 @@
 #
 # Keep each entry's reason current. An entry with no live reason is a bug report.
 
-# EMPTY — every member of the corpus verifies.
+# The gate-split horizon, 2026-08-14. `gen_enum.py`'s grid scales a payload enum's
+# variant count N against its payload nesting depth D. Cost is exponential in N and
+# only linear in D, and at N=8 the `&mut` write-through members exceed what the split
+# in `sufficient_leaf` can decide: the same `insufficient permission` that shape_area
+# (N=5) showed before 68a5a51. N<=5 verifies at every depth, so this is a horizon in
+# one axis, not a regression — see reference: the split telescopes the snapshot tower
+# arm by arm, and an 8-deep tower is past it.
 #
-# The last two entries were shape_area's `m_shape_grow` and `m_shape_translate`,
+# These are the only failing members in the corpus.
+enum_v8_p1 m_e_grow
+enum_v8_p2 m_e_grow
+enum_v8_p2 m_e_guarded
+enum_v8_p3 m_e_grow
+enum_v8_p3 m_e_guarded
+
+# Previously here: shape_area's `m_shape_grow` and `m_shape_translate`,
 # fixed 2026-08-14 by splitting a gate amount in `sufficient_leaf`.

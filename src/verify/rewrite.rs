@@ -450,7 +450,7 @@ fn static_rules() -> Vec<Rule> {
         Rewrite::new(
             "distinguishing-observation",
             EqBucketSearcher,
-            DistinguishingObsApplier,
+            DistinguishingObsApplier { memo: Memo::new() },
         )
         .expect("distinguishing-observation rule"),
     );
@@ -755,19 +755,41 @@ impl Applier<Symbolic, ConstFold> for ContraCongruenceApplier {
 /// already pays for; the retraction pairs this exists for are all unary, so the
 /// extra generality would be cost with no measured benefit.
 ///
-/// No memo: success pins the class to `false`, and the `known_bool` gate below
-/// then skips it forever. A failed scan re-runs, which is what keeps the rule
-/// complete when the observation only shows up in a later iteration.
-struct DistinguishingObsApplier;
+/// Success pins the class to `false`, and the `known_bool` gate below then skips
+/// it forever. A **failed** scan is the hot path: it finds nothing, and without a
+/// memo it repeats in full on every saturation iteration, for every undecided
+/// `Eq` class. On a payload enum that dominates everything else — an N=5 grid file
+/// spent 11.9s here for 266 unions (45ms per union), and ablating the rule took
+/// the file from 18.4s to 0.3s.
+///
+/// So a failed scan is memoized on `(l, r, |parents(l)|, |parents(r)|)`. Parent
+/// lists only grow, so the lengths are a free monotone version stamp: the same
+/// pair is re-scanned exactly when either side has gained a parent since the last
+/// failure, which is when a new observation can have appeared.
+///
+/// **This trades completeness, not soundness.** A fingerprint can sharpen without
+/// either class gaining a parent (the application's class merges with a literal),
+/// and that refinement is not re-scanned. Missing a disproof only fails to prove
+/// something — the safe direction — and the corpora pin that nothing regressed.
+struct DistinguishingObsApplier {
+    /// Failed scans, keyed by the pair and its parent-count stamp.
+    memo: Memo<(Id, Id, usize, usize)>,
+}
 
-/// Every `(f, tys)` this class is the sole argument of, paired with the class of
+/// Every `(f, tys)` this class is the sole argument of, mapped to the class of
 /// that application. The observation map of [`DistinguishingObsApplier`].
-fn unary_observations(
-    egraph: &EGraph<Symbolic, ConstFold>,
+///
+/// A map rather than a list: for a *unary* `f` and a fixed argument class, egg's
+/// congruence memo already collapses every `f(x)` into one class, so a key cannot
+/// collide. Building both sides as maps turns the pairing below into a hash join —
+/// it used to be a nested loop over both observation lists. Borrows the type slice
+/// instead of cloning it; the whole scan holds the graph immutably.
+fn unary_observations<'a>(
+    egraph: &'a EGraph<Symbolic, ConstFold>,
     x: Id,
-) -> Vec<((FuncId, Box<[Type]>), Id)> {
+) -> HashMap<(FuncId, &'a [Type]), Id> {
     let x = egraph.find(x);
-    let mut out = Vec::new();
+    let mut out = HashMap::new();
     for p in egraph[x].parents() {
         let p = egraph.find(p);
         for node in &egraph[p].nodes {
@@ -775,7 +797,7 @@ fn unary_observations(
                 && args.len() == 1
                 && egraph.find(args[0]) == x
             {
-                out.push(((*f, tys.clone()), p));
+                out.insert((*f, &tys[..]), p);
             }
         }
     }
@@ -796,34 +818,55 @@ impl Applier<Symbolic, ConstFold> for DistinguishingObsApplier {
         if known_bool(egraph, eclass).is_some() {
             return vec![];
         }
-        let mut disprove = false;
-        'outer: for node in &egraph[eclass].nodes {
+        // Canonical operand pairs of this class, deduplicated: several `Eq` nodes
+        // in one class routinely name the same pair, and each used to pay for its
+        // own pair of observation scans.
+        let mut pairs: Vec<(Id, Id)> = Vec::new();
+        for node in &egraph[eclass].nodes {
             let Symbolic::Binary(BinOp::Eq, [l, r]) = node else {
                 continue;
             };
             let (l, r) = (egraph.find(*l), egraph.find(*r));
-            if l == r {
+            if l != r && !pairs.contains(&(l, r)) {
+                pairs.push((l, r));
+            }
+        }
+
+        let mut disprove = false;
+        'outer: for (l, r) in pairs {
+            // Version stamp: parent lists only grow, so equal lengths mean no new
+            // observation can have shown up on either side since the last failure.
+            let stamp = (
+                l,
+                r,
+                egraph[l].parents().count(),
+                egraph[r].parents().count(),
+            );
+            if !self.memo.insert(stamp) {
                 continue;
             }
-            let (obs_l, obs_r) = (unary_observations(egraph, l), unary_observations(egraph, r));
-            if obs_l.is_empty() || obs_r.is_empty() {
+            let obs_l = unary_observations(egraph, l);
+            if obs_l.is_empty() {
                 continue;
             }
-            for (key_l, app_l) in &obs_l {
-                for (key_r, app_r) in &obs_r {
-                    if key_l != key_r || app_l == app_r {
-                        continue;
-                    }
-                    let (Some(fp_l), Some(fp_r)) = (
-                        egraph[*app_l].data.fingerprint(),
-                        egraph[*app_r].data.fingerprint(),
-                    ) else {
-                        continue;
-                    };
-                    if fp_l.differs_from(&fp_r) {
-                        disprove = true;
-                        break 'outer;
-                    }
+            let obs_r = unary_observations(egraph, r);
+            // Hash join on the observation key instead of the old nested loop.
+            for (key, app_r) in &obs_r {
+                let Some(app_l) = obs_l.get(key) else {
+                    continue;
+                };
+                if app_l == app_r {
+                    continue;
+                }
+                let (Some(fp_l), Some(fp_r)) = (
+                    egraph[*app_l].data.fingerprint(),
+                    egraph[*app_r].data.fingerprint(),
+                ) else {
+                    continue;
+                };
+                if fp_l.differs_from(&fp_r) {
+                    disprove = true;
+                    break 'outer;
                 }
             }
         }

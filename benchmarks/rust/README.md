@@ -16,6 +16,11 @@ Rules for every source here, same as `../../../cases/rust/structs_enums.rs`:
   (framing, fold/unfold, discriminant well-formedness), so the corpus measures the
   encoding every Prusti user pays rather than hand-written specs;
 - **no loops, no recursion, no returned references**; `&mut` parameters are fine;
+- **a borrow may be stored in a struct, but such a struct may not be a parameter** —
+  Prusti encodes `fn f(c: &mut Cursor)` into a program its own Silicon run rejects with
+  `insufficient.permission`, surfacing as `[Prusti internal error] ... could not be
+  backtranslated`. `borrow_fields.rs` therefore packs the borrow inside the body;
+  `borrow_fields_rejected.rs.txt` keeps the nine rejected members verbatim;
 - every member must verify — a failing member stops at its failing instruction and has
   no stable cost.
 
@@ -33,10 +38,14 @@ Rules for every source here, same as `../../../cases/rust/structs_enums.rs`:
 | `bank_transfer.rs` | permission traffic: two `&mut` accounts in one call, guarded debits, swaps |
 | `physics_step.rs` | composition: three bodies through integrate -> clamp -> bounce |
 | `classify_tuple.rs` | many sequential blocks, shallow cubes: an 8-element buffer classified element by element |
+| `borrow_fields.rs` | borrows *stored in* structs: `p_Ref_mutable` nested inside another type predicate, so a fold drags a borrow's permission through the footprint |
 | `depth_d{D}_m{M}.rs` | the two axes separated and scaled: D nesting levels x M statements per block |
+| `enum_v{N}_p{D}.rs` | payload-enum cost separated: N variants x payload nesting depth D, each arm writing through a `&mut` payload — cost is exponential in N, linear in payload size (`../../enum_scaling_2026-08-14.md`) |
 
 ## Encoding
 
+    python3 gen_depth.py         # regenerate the depth_d{D}_m{M} family
+    python3 gen_enum.py          # regenerate the enum_v{N}_p{D} family
     ./encode_all.sh              # all of src/
     ./encode_all.sh mat3_mul     # one file
 

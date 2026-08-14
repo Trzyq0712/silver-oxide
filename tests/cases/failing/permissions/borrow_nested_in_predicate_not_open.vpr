@@ -1,0 +1,24 @@
+// Rejection side of `passing/permissions/borrow_nested_in_predicate.vpr`.
+//
+// The pointee's permission lives two levels down, inside `holder`'s footprint via
+// the nested `ref_mut`. Reaching it needs BOTH unfolds. Opening only the outer one
+// must not hand back the borrow's permission — that is the fabrication this shape
+// invites, since `h.target` becomes readable at exactly the point the pointee is
+// still packed.
+
+field val: Int
+field target: Ref
+
+predicate ref_mut(r: Ref)
+{ acc(r.val) }
+
+predicate holder(h: Ref)
+{ acc(h.target) && acc(ref_mut(h.target)) }
+
+method writes_through_one_unfold(h: Ref)
+    requires acc(holder(h))
+{
+    unfold holder(h)
+    // `ref_mut(h.target)` is still folded, so `h.target.val` is not held
+    h.target.val := 7
+}

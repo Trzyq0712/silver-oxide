@@ -1,0 +1,95 @@
+// A borrow held *inside* another type's footprint: `holder` owns the reference
+// field and, through it, the whole target predicate. This is what Prusti emits for
+// `struct Cursor<'a> { p: &'a mut Point }` — `p_Cursor`'s body is
+// `acc(p_Ref_mutable(s_Cursor_field_0(self), ...))`, a predicate nested in a
+// predicate rather than a plain field.
+//
+// The corpus reaches this shape only through `benchmarks/rust/borrow_fields.rs`,
+// and only where the borrow is packed inside a body: Prusti cannot encode a
+// borrow-holding struct as a *parameter* at all (see that file's header). These
+// cases exercise the encoding directly, so the parameter form is testable here
+// even though no Prusti program can produce it.
+
+field val: Int
+field target: Ref
+
+// the borrow itself: full permission to the pointee
+predicate ref_mut(r: Ref)
+{ acc(r.val) }
+
+// the struct that stores it: the field, plus the borrow it points at
+predicate holder(h: Ref)
+{ acc(h.target) && acc(ref_mut(h.target)) }
+
+// Fold the whole tower, then take it apart again and write through the borrow.
+method pack_then_write(h: Ref, p: Ref)
+{
+    inhale acc(h.target) && h.target == p
+    inhale acc(p.val)
+
+    fold ref_mut(p)
+    fold holder(h)
+
+    unfold holder(h)
+    unfold ref_mut(h.target)
+    h.target.val := 7
+    assert h.target.val == 7
+    assert perm(p.val) == write
+}
+
+// The permission genuinely travels with the holder: after folding, the pointee is
+// no longer directly accessible, and unfolding both levels brings it back.
+method perm_moves_into_the_holder(h: Ref, p: Ref)
+{
+    inhale acc(h.target) && h.target == p
+    inhale acc(p.val)
+
+    fold ref_mut(p)
+    fold holder(h)
+    assert perm(p.val) == none
+
+    unfold holder(h)
+    assert perm(p.val) == none
+    unfold ref_mut(p)
+    assert perm(p.val) == write
+}
+
+// The parameter form Prusti rejects: the holder arrives already folded, and the
+// callee has to open two levels to reach the pointee.
+method write_through_param(h: Ref)
+    requires acc(holder(h))
+    ensures acc(holder(h))
+{
+    unfold holder(h)
+    unfold ref_mut(h.target)
+    h.target.val := h.target.val + 1
+    fold ref_mut(h.target)
+    fold holder(h)
+}
+
+// Two borrows in one footprint (`struct Pair { a: &mut Point, b: &mut Point }`).
+// Folding the pair consumes both, and the two pointees stay distinct through it.
+field left: Ref
+field right: Ref
+
+predicate pair(q: Ref)
+{ acc(q.left) && acc(q.right) && acc(ref_mut(q.left)) && acc(ref_mut(q.right)) }
+
+method pair_keeps_both(q: Ref, a: Ref, b: Ref)
+{
+    inhale acc(q.left) && acc(q.right) && q.left == a && q.right == b
+    inhale acc(a.val) && acc(b.val)
+
+    fold ref_mut(a)
+    fold ref_mut(b)
+    fold pair(q)
+
+    unfold pair(q)
+    unfold ref_mut(q.left)
+    unfold ref_mut(q.right)
+    // two full permissions in hand means the pointees cannot be the same location
+    assert a != b
+    q.left.val := 1
+    q.right.val := 2
+    assert q.left.val == 1
+}
