@@ -1117,21 +1117,84 @@ fn prove_sufficient(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
     prove_perm_leaves(ctx, held, pc_lits, &move |ctx, h, pc| {
-        // Fast path: two known literals that already satisfy `h ≥ needed` need
-        // no prove (the give-back `1/1 ≥ 1/1` case — the vast majority of leaves).
-        // A literal that FAILS may still be a dead branch (`0 ≥ 1` on an
-        // infeasible arm), so it falls through to the pc-aware prove.
-        if let (Some(hr), Some(nr)) = (known_real(ctx, h), known_real(ctx, needed)) {
-            if hr >= nr {
-                return true;
-            }
-        }
-        let false_ = ctx.false_();
-        let true_ = ctx.true_();
-        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, needed]));
-        let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
-        ctx.prove_under_pc(goal, pc)
+        sufficient_leaf(ctx, h, needed, pc, &mut Vec::new())
     })
+}
+
+/// `held ≥ needed` for one `ChunkPerm` leaf, falling back to a **case split on an
+/// `ite`-shaped amount** when the flat prove fails.
+///
+/// [`prove_perm_leaves`] already splits the `Select` structure a *join* builds,
+/// but an amount minted by unfolding a **conditional footprint** carries its
+/// branch inside the graph instead: `p_Shape`'s body gives `p_Shape_1_owned`
+/// the amount `ite(discr == cons(1), 1/1, 0)`. Asking `¬(that < 1/1)` outright
+/// needs the condition decided up front. Splitting asks it per arm instead —
+/// `1/1 ≥ 1/1` under the condition, and `0 ≥ 1/1` under its negation, the
+/// second discharged exactly when assuming the negation **refutes itself**.
+///
+/// That is the same step [`VerifyContext::prove_by_ite_decomposition`] makes for
+/// boolean goals, and the same one a branch-splitting verifier gets for free by
+/// evaluating the ternary per branch. It is a fallback, not the first move: the
+/// flat prove closes the overwhelming majority of leaves, and only the ones it
+/// cannot are worth two extra probes.
+///
+/// `seen` is the classes already split on this path — an `ite` arm can be its own
+/// class in a cyclic e-graph, and re-splitting it would not terminate.
+fn sufficient_leaf(
+    ctx: &mut VerifyContext<'_>,
+    h: egg::Id,
+    needed: egg::Id,
+    pc: &[(egg::Id, Polarity)],
+    seen: &mut Vec<egg::Id>,
+) -> bool {
+    // Fast path: two known literals that already satisfy `h ≥ needed` need
+    // no prove (the give-back `1/1 ≥ 1/1` case — the vast majority of leaves).
+    // A literal that FAILS may still be a dead branch (`0 ≥ 1` on an
+    // infeasible arm), so it falls through to the pc-aware prove.
+    if let (Some(hr), Some(nr)) = (known_real(ctx, h), known_real(ctx, needed)) {
+        if hr >= nr {
+            return true;
+        }
+    }
+    let false_ = ctx.false_();
+    let true_ = ctx.true_();
+    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, needed]));
+    let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+    if ctx.prove_under_pc(goal, pc) {
+        return true;
+    }
+    let cls = ctx.egraph.find(h);
+    if seen.contains(&cls) {
+        return false;
+    }
+    // Only a **gate** is worth splitting: an `ite` whose two arms are constant
+    // amounts, which is the shape a conditional footprint mints (`c ? 1/1 : 0`).
+    // Every other `ite` in an amount's class is give-back residue — a perm tower
+    // over addresses and merge conditions — where the split has nothing to decide
+    // and each arm drags in another two probes. Restricting to the gate is what
+    // keeps this a fallback rather than a search.
+    let ites: Vec<[egg::Id; 3]> = ctx.egraph[cls]
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Symbolic::Ite(arms) => Some(*arms),
+            _ => None,
+        })
+        .filter(|[_, t, e]| known_real(ctx, *t).is_some() && known_real(ctx, *e).is_some())
+        .collect();
+    seen.push(cls);
+    // A class routinely holds several `ite` nodes (every join that produced this
+    // amount left one); any of them is a valid split, so try them in turn.
+    let proved = ites.into_iter().any(|[c, t, e]| {
+        let mut pc_t = pc.to_vec();
+        pc_t.push((c, Polarity::Positive));
+        let mut pc_e = pc.to_vec();
+        pc_e.push((c, Polarity::Negative));
+        sufficient_leaf(ctx, t, needed, &pc_t, seen)
+            && sufficient_leaf(ctx, e, needed, &pc_e, seen)
+    });
+    seen.pop();
+    proved
 }
 
 /// `0 < held` over a structured `held`, per leaf.

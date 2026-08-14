@@ -10,8 +10,9 @@
 // The companion `ctor_tower_inversion_after_snapshot_roundtrip.vpr` is the same
 // shape with an ADT discriminant, which needs only the second half.
 //
-// Targets the tower's *innermost* arm. The outermost arm is still open — see
-// known_limitations/tower_inversion_outermost_arm.vpr.
+// Targets the tower's *innermost* arm; `tower_inversion_outermost_arm.vpr` is the
+// same shape at the outermost one, which additionally needs the gate split in
+// `sufficient_leaf`.
 domain S {
   function cons(arg0: Int): S
   function value(arg0: S): Int

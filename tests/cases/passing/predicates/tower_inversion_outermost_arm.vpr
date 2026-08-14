@@ -1,24 +1,21 @@
-// KNOWN LIMITATION — should verify, currently rejected.
+// Enum snapshot tower inversion at the tower's *outermost* arm.
 //
-// The last gap in enum snapshot tower inversion, and what still blocks
-// `shape_area::m_shape_grow` / `m_shape_translate` in benchmarks/rust (measured:
-// asserting the discriminant equality by hand makes arms 0-3 verify and leaves
-// exactly the arm-4 assert failing).
-//
-// `ite-reduce`'s arm-differs pinning telescopes a tower from the bottom: each
+// `ite-reduce`'s arm-differs pinning telescopes a tower from the outside in: each
 // non-matching arm is a ground constructor whose fingerprint separates it from
 // the class, so its guard pins false and `ite(false, _, e) => e` exposes the next
-// level. That works for every arm *except the outermost*:
+// level. That never reaches the outermost arm's own condition:
 //
 //     T4 = ite(d == cons(4), c4(), T3)
 //
 // with the class pinned to `Ctor(c4)`, the then-arm has the *same* constructor
 // (no pin, correctly — it could be the taken one) and the else-arm `T3` is an
 // undecided `ite`, whose `ConstFold` data is `Unknown`. No fingerprint, no pin.
-// Every leaf of `T3` is a constructor other than `c4`, so the conclusion is
-// available in principle; representing it needs a fingerprint that survives an
-// `ite` — a set-of-constructors lattice value, or a bounded recursive
-// `arm_differs` through undecided arms.
+//
+// What closes it is not a stronger fingerprint but a case split in the right
+// place: `sufficient_leaf` splits the *gate* amount `ite(d == cons(4), 1/1, 0)`
+// and proves `0 >= 1/1` under `d != cons(4)` — discharged because that
+// assumption collapses the tower onto a different constructor and refutes
+// itself. See the doc on `sufficient_leaf` in src/verify/declaration.rs.
 //
 // Identical to passing/predicates/domain_cons_tower_inversion.vpr except that the
 // permission gate and the branch target the tower's outermost arm (cons(4))
