@@ -1,0 +1,68 @@
+// `merge_chunks` must not drop its operands' presence guards.
+//
+// The `if` leaves `x.f` held only under `[b+]`: a chunk with a bare `1/1` amount
+// and that literal as its `Chunk::guard`. The following `inhale` then merges an
+// unconditional `1/2` onto it. Summing the two amounts as if both were held
+// unconditionally gives `3/2`, which the bound axiom in `assume_location_axioms`
+// folds against the field's `1/1` bound into `union(false, true)` — the whole
+// method goes inconsistent and every goal, `false` included, discharges.
+//
+// Regression for a real unsoundness, live until `merge_chunks` learned the rule
+// `union_heaps` already had: carry the guard when both sides share it, otherwise
+// fold each guard into its own amount and sum the gated fractions.
+//
+// The unsoundness is not limited to vacuous `false` — see `concludes_b` below.
+//
+// Same family as `guarded_nonaliasing_two_arms.vpr` (disjoint presence cubes must
+// not be reasoned across), reached through the merge instead of the non-aliasing
+// axiom. Positive controls, which must keep verifying:
+// `tests/cases/passing/permissions/guarded_merge_chunks_still_sums.vpr`.
+
+field f: Int
+
+method inconsistent_from_dropped_guard(x: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, write)
+    }
+    inhale acc(x.f, 1/2)
+    assert false
+}
+
+// The same state proves a plain falsehood, not just `false`: `b` does not follow
+// from anything the program did.
+method concludes_b(x: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, write)
+    }
+    inhale acc(x.f, 1/2)
+    assert b
+}
+
+// Two arms, then an inhale at one of them: the join files complementary guards
+// (`[b+]` on `x.f`, `[b-]` on `y.f`) and the merge lands on `x.f`.
+method two_arms_then_inhale(x: Ref, y: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, write)
+    } else {
+        inhale acc(y.f, write)
+    }
+    inhale acc(x.f, 1/2)
+    assert false
+}
+
+// The consolidating flavour: `inhale x == y` merges the two address classes, so
+// `find_chunk_consolidated` folds both guarded chunks before the inhale is added.
+method consolidated_aliases(x: Ref, y: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, write)
+    } else {
+        inhale acc(y.f, write)
+    }
+    inhale x == y
+    inhale acc(x.f, 1/2)
+    assert false
+}

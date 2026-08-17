@@ -642,18 +642,55 @@ fn perm_recipe(
 /// ternary's asymmetry; with a fraction zero the antecedent is `false` and the
 /// asymmetric pick selects the genuinely-held value. `BinOp` has no `>`/`&&`/
 /// `==>`, so these desugar to `Lt(0, p)` and `Ite` forms.
+///
+/// # Presence guards
+///
+/// Both operands are taken as whole [`Chunk`]s so the two sides' **presence
+/// guards** cannot be forgotten — an earlier signature took bare amounts, and
+/// both call sites silently summed a guarded chunk's amount as if it were held
+/// unconditionally. The bound axiom then folded the over-full total to `false`
+/// and made the whole unit inconsistent, so `if (b) { inhale acc(x.f) }` followed
+/// by any inhale at `x.f` proved everything. See
+/// `tests/cases/failing/guarded_merge_chunks.vpr`.
+///
+/// The rule is [`union_heaps`]'s, which had it right all along:
+/// - **guards equal** — the two are present in exactly the same region, so their
+///   sum is held there too: keep the amounts bare and carry the shared guard.
+///   Flat, no `ite` minted, and the unconditional hot path (both guards empty)
+///   is byte-identical to before.
+/// - **guards differ** — no single flat cube describes the sum, so fold each
+///   guard into its own amount (`guard ? p : 0`) and hand back an honestly
+///   unconditional chunk, with the conditionality inside the total.
+///
+/// The gated amounts flow into [`merge_values`] too, which is what the fix is
+/// worth beyond the bound: its `p0 > 0 && p1 > 0 ==> v0 == v1` reads "both
+/// genuinely held" only when the fractions are gated. Ungated, it equated the
+/// values of two chunks that are never held at the same time.
+///
+/// The total stays one opaque `AddR` leaf, never a [`ChunkPerm::Select`]: a
+/// `Select`'s arms are *alternatives* (the bound axiom is assumed per leaf,
+/// correctly), while these two are *summands* and only their sum is bounded.
 fn merge_chunks(
     ctx: &mut VerifyContext<'_>,
     addr: egg::Id,
-    p0: egg::Id,
-    v0: egg::Id,
-    p1: egg::Id,
-    v1: egg::Id,
+    a: &Chunk,
+    b: &Chunk,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> Chunk {
+    // `cube_eq` (canonical e-class comparison), not the `Rc<[..]>` structural
+    // equality `union_heaps` uses: a false negative is merely conservative — it
+    // takes the gated path, still sound — but costs an `ite` per merge.
+    let (p0, p1, guard): (egg::Id, egg::Id, crate::verify::heap::HeapPc) =
+        if cube_eq(ctx, a.guard(), b.guard()) {
+            (a.perm.to_id(ctx), b.perm.to_id(ctx), a.guard.clone())
+        } else {
+            let ga = gate_perm_by_guard(ctx, &a.perm, a.guard());
+            let gb = gate_perm_by_guard(ctx, &b.perm, b.guard());
+            (ga.to_id(ctx), gb.to_id(ctx), std::rc::Rc::from(Vec::new()))
+        };
     let perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p0, p1]));
-    let value = merge_values(ctx, p0, v0, p1, v1, pc_lits);
-    Chunk::new(addr, perm, value)
+    let value = merge_values(ctx, p0, a.value, p1, b.value, pc_lits);
+    Chunk::new(addr, perm, value).with_guard(guard)
 }
 
 /// The value of a location covered by two chunks, when it is **not** already
@@ -1032,11 +1069,9 @@ fn find_chunk_consolidated(
     let mut acc = first;
     for next in &found[1..] {
         out = out.without_chunk(kind, next.addr);
-        let acc_perm = acc.perm.to_id(ctx);
-        let next_perm = next.perm.to_id(ctx);
-        acc = merge_chunks(
-            ctx, acc.addr, acc_perm, acc.value, next_perm, next.value, pc_lits,
-        );
+        // Keep `acc`'s stored address as the key; `merge_chunks` folds in both
+        // presence guards.
+        acc = merge_chunks(ctx, acc.addr, &acc, next, pc_lits);
     }
     out = out.with_chunk(kind, acc.clone());
     (out, Some(acc))
@@ -1053,17 +1088,9 @@ fn heap_union(
     let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, false);
     if let Some(existing) = existing {
         // Replace the existing chunk in place (keep its stored address key).
-        let existing_perm = existing.perm.to_id(ctx);
-        let chunk2_perm = chunk2.perm.to_id(ctx);
-        let merged = merge_chunks(
-            ctx,
-            existing.addr,
-            existing_perm,
-            existing.value,
-            chunk2_perm,
-            chunk2.value,
-            pc_lits,
-        );
+        // `merge_chunks` reconciles the two presence guards — the held chunk may
+        // be conditional (a one-sided join arm) while an inhaled `chunk2` is not.
+        let merged = merge_chunks(ctx, existing.addr, &existing, &chunk2, pc_lits);
         out = out.with_chunk(kind, merged);
     } else {
         out = out.with_chunk(kind, chunk2);

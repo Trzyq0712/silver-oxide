@@ -1,0 +1,45 @@
+// Positive controls for guard-aware `merge_chunks`: reconciling the two operands'
+// presence guards must not cost a merge that genuinely sums.
+//
+// Rejection side: `tests/cases/failing/guarded_merge_chunks.vpr`.
+// Known cost: `tests/cases/known_limitations/guarded_merge_sum_positivity.vpr`.
+
+field f: Int
+
+// Both guards empty — the unconditional hot path, byte-identical to the
+// pre-fix encoding (`cube_eq` on two empty cubes, bare amounts, `1/2 + 1/2`).
+method both_unguarded(x: Ref)
+{
+    inhale acc(x.f, 1/2)
+    inhale acc(x.f, 1/2)
+    x.f := 7
+    assert x.f == 7
+}
+
+// Both guards equal and non-empty: the chunks are present in exactly the same
+// region, so the sum is carried flat under that shared cube — no `ite` minted,
+// and write permission is still recovered inside the arm.
+method equal_guards_sum_flat(x: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, 1/2)
+        inhale acc(x.f, 1/2)
+        x.f := 7
+        assert x.f == 7
+    }
+}
+
+// Guards differ, so each amount is folded into its own gate before summing. The
+// total is `1/2 + (b ? 1/2 : 0)`, which is full permission under `b` — and the
+// write is attempted under exactly that condition, where the gate resolves.
+method differing_guards_still_write(x: Ref, b: Bool)
+{
+    inhale acc(x.f, 1/2)
+    if (b) {
+        inhale acc(x.f, 1/2)
+    }
+    if (b) {
+        x.f := 7
+        assert x.f == 7
+    }
+}
