@@ -1,0 +1,56 @@
+// A permission SUM involving a wildcard is positive, so a read through it frames.
+//
+// `design/wildcards` [20] gap 1, fixed 2026-08-17. The e-graph has no real-order
+// arithmetic: `0 < w` is assumed at mint and `0 < held - w` explicitly at a
+// wildcard exhale, but `merge_chunks` built its `AddR` total and said nothing, so
+// `0 < 1/2 + w` was underivable and the field read below failed. `merge_chunks`
+// now calls `assume_sum_positive`, which states it when one summand is
+// structurally positive — the other's non-negativity is the chunk-permission
+// invariant (`Combine`'s `perm >= 0` obligation).
+//
+// `m_bare` is the control: a wildcard in an EMPTY location, where the permission
+// is `w` alone and the mint-time fact already carried the read. That is the shape
+// every wildcard in the Prusti corpus has, which is why the corpus stayed green
+// through the whole gap.
+//
+// Negative control: `tests/cases/failing/wildcard_sum_gated.vpr`, where the
+// wildcard is only conditionally present and the sum must NOT be assumed positive.
+
+field f: Int
+
+// Control — chunk permission is `w` alone.
+method m_bare(x: Ref)
+{
+  inhale acc(x.f, wildcard)
+  var v: Int := x.f
+}
+
+// literal + wildcard. Chunk permission is `1/2 + w`.
+method m_lit_plus_wild(x: Ref)
+  requires acc(x.f, 1/2)
+{
+  inhale acc(x.f, wildcard)
+  var v: Int := x.f
+}
+
+// wildcard + wildcard. Chunk permission is `w1 + w2`. Neither summand is a
+// literal, so this one rests entirely on a wildcard being structurally positive.
+method m_wild_plus_wild(x: Ref)
+  requires acc(x.f, wildcard)
+{
+  inhale acc(x.f, wildcard)
+  var v: Int := x.f
+}
+
+// The give-back shape: hold 1/1, exhale a wildcard (remainder `1/1 - w1`, whose
+// positivity is assumed only under the pc), then inhale a wildcard back on top.
+// `SubR` is deliberately NOT treated as non-negative by `perm_known_positive` — a
+// remainder is a fact about a path, not about the term — so this passes on the
+// OTHER summand: `w2` is positive, and `1/1 - w1` needs only the invariant.
+method m_giveback(x: Ref)
+  requires acc(x.f, write)
+{
+  exhale acc(x.f, wildcard)
+  inhale acc(x.f, wildcard)
+  var v: Int := x.f
+}

@@ -94,8 +94,137 @@ pub(crate) fn merge_chunks(
     // the bound ungated and make the unit inconsistent.
     let perm = perm_add(ctx, &pa, &pb);
     let (p0, p1) = (pa.to_id(ctx), pb.to_id(ctx));
+    assume_sum_positive(ctx, &perm, &pa, &pb, p0, p1, &guard, pc_lits);
     let value = merge_values(ctx, p0, a.value, p1, b.value, pc_lits);
     Chunk::new_perm(addr, perm, value).with_guard(guard)
+}
+
+/// Mirror of the consume side's explicit remainder positivity, for the produce
+/// side: assume `0 < p0 + p1` when one summand is **structurally positive**.
+///
+/// The e-graph has no real-order arithmetic, so `0 < 1/2 + w` is underivable even
+/// though `0 < w` was assumed at mint — [`merge_chunks`] simply built an `AddR`
+/// node and said nothing about it. A later `perm > 0` framing check on the merged
+/// chunk (a field read after inhaling a wildcard on top of a fraction held
+/// already) then cannot discharge. This is `design/wildcards` `[20]` gap 1, and
+/// this function is `[30]` Option 1's first half: the same hand-placed-fact
+/// approach [`debit_wildcard`] already takes, applied to the sum.
+///
+/// The other summand's **non-negativity is an invariant, not a proof**: every
+/// permission that reaches a chunk has passed `Combine`'s `perm ≥ 0` obligation,
+/// or — for the wildcard-bearing perms that skip it ([`crate::vmir::Perm`]) — is
+/// non-negative by construction (a wildcard is positive, a gate contributes `0`).
+/// So one positive summand makes the total positive.
+///
+/// Structural positivity ([`perm_known_positive`]) is checked on the operand
+/// **trees**, not on the fused leaves: the tree is what this function built, so
+/// the operands are known to be chunk permissions rather than whatever else may
+/// have landed in the sum's e-class by congruence.
+///
+/// Requiring **every** leaf of an operand to be positive is what makes arm gating
+/// unnecessary, and it is exactly right at a guard: where the two chunks' presence
+/// guards differ, [`merge_chunks`] folds each guard into its amount as
+/// `guard ? p : 0`, whose `0` arm is not positive — so a conditionally-present
+/// wildcard states nothing here, which is the truth. The fact is still gated by
+/// the surviving guard and the pc, both usually empty.
+///
+/// Gated on `has_wildcard` and on the sum actually containing a wildcard: a
+/// wildcard-free program pays one `bool` test, and a concrete sum needs nothing
+/// (`1/2 + 1/2` const-folds, and sufficiency over literals is decidable anyway).
+#[allow(clippy::too_many_arguments)]
+fn assume_sum_positive(
+    ctx: &mut VerifyContext<'_>,
+    sum: &ChunkPerm,
+    pa: &ChunkPerm,
+    pb: &ChunkPerm,
+    p0: egg::Id,
+    p1: egg::Id,
+    guard: &HeapPc,
+    pc_lits: &[(egg::Id, Polarity)],
+) {
+    if !ctx.has_wildcard {
+        return;
+    }
+    if !(perm_tree_known_positive(ctx, pa) || perm_tree_known_positive(ctx, pb)) {
+        return;
+    }
+    if !(contains_wildcard(ctx, p0) || contains_wildcard(ctx, p1)) {
+        return;
+    }
+    let Some(gate) = cube_meet(ctx, pc_lits, guard) else {
+        // pc contradicts the chunk's presence guard: this merge describes no
+        // reachable state, so it states nothing.
+        return;
+    };
+    let mut leaves: Vec<egg::Id> = Vec::new();
+    sum.for_each_leaf_under(&mut |l, _| leaves.push(l));
+    for leaf in leaves {
+        let pos = expr!(ctx, (0/1) <r {leaf});
+        ctx.assume_guarded(pos, gate.iter().rev().copied());
+    }
+}
+
+/// Whether **every** leaf of a permission tree is structurally positive.
+fn perm_tree_known_positive(ctx: &VerifyContext<'_>, p: &ChunkPerm) -> bool {
+    let mut all = true;
+    p.for_each_leaf_under(&mut |l, _| all &= perm_known_positive(ctx, l));
+    all
+}
+
+/// Syntactic `0 < t`, decided by structure alone — no prover call, no saturation.
+///
+/// A wildcard is positive by its mint-time assumption; a real literal by its
+/// value; a sum by one positive and one non-negative summand; a product by two
+/// positive factors; an `ite` when **both** arms are. `SubR` is deliberately
+/// absent: a remainder `held − w` is positive only under the pc that assumed it,
+/// which is a fact about a path, not about the term.
+///
+/// The visited set only breaks cycles — ids are removed on the way out, so a
+/// shared subterm is not poisoned by an in-progress ancestor.
+fn perm_known_positive(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
+    perm_sign(ctx, id, true, &mut std::collections::HashSet::new())
+}
+
+/// `strict`: `0 < t`. Otherwise `0 ≤ t`, which additionally admits `0` itself and
+/// a sum/product/`ite` of non-negatives.
+fn perm_sign(
+    ctx: &VerifyContext<'_>,
+    id: egg::Id,
+    strict: bool,
+    seen: &mut std::collections::HashSet<(egg::Id, bool)>,
+) -> bool {
+    let id = ctx.egraph.find(id);
+    if !seen.insert((id, strict)) {
+        return false;
+    }
+    // A known literal settles the class outright, whatever nodes it holds.
+    let out = match ctx.egraph[id].data.known() {
+        Some(Literal::Real(r)) => {
+            let zero = num::BigRational::from(num::BigInt::from(0));
+            if strict { *r > zero } else { *r >= zero }
+        }
+        // Any node witnessing the sign settles it: all nodes of a class are equal.
+        _ => ctx.egraph[id].nodes.iter().any(|n| match n {
+            Symbolic::Wildcard(_) => true,
+            Symbolic::Ite([_, t, e]) => {
+                perm_sign(ctx, *t, strict, seen) && perm_sign(ctx, *e, strict, seen)
+            }
+            Symbolic::Binary(BinOp::AddR, [x, y]) => {
+                if strict {
+                    (perm_sign(ctx, *x, true, seen) && perm_sign(ctx, *y, false, seen))
+                        || (perm_sign(ctx, *y, true, seen) && perm_sign(ctx, *x, false, seen))
+                } else {
+                    perm_sign(ctx, *x, false, seen) && perm_sign(ctx, *y, false, seen)
+                }
+            }
+            Symbolic::Binary(BinOp::MulR, [x, y]) => {
+                perm_sign(ctx, *x, strict, seen) && perm_sign(ctx, *y, strict, seen)
+            }
+            _ => false,
+        }),
+    };
+    seen.remove(&(id, strict));
+    out
 }
 
 /// The value of a location covered by two chunks, when it is **not** already

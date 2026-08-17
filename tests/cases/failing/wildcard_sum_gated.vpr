@@ -1,0 +1,21 @@
+// Negative control for `assume_sum_positive` (design/wildcards [20] gap 1).
+//
+// The wildcard is inhaled only under `b`, so the merged total is genuinely `0` on
+// the `!b` path and the read must NOT frame. This is the shape the fix has to
+// refuse, and it refuses it structurally rather than by a side condition: where
+// two chunks' presence guards differ, `merge_chunks` folds each guard into its own
+// amount as `guard ? p : 0`, and `perm_known_positive` requires EVERY leaf of a
+// summand to be positive — the `0` arm is not. So a conditionally-present wildcard
+// states nothing here, which is the truth.
+//
+// Positive counterpart: `tests/cases/passing/permissions/wildcard_sum_positivity.vpr`.
+
+field f: Int
+
+method gated_wildcard_does_not_frame(x: Ref, b: Bool)
+{
+  if (b) {
+    inhale acc(x.f, wildcard)
+  }
+  var v: Int := x.f
+}
