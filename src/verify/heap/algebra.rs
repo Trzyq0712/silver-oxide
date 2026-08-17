@@ -12,6 +12,7 @@
 //! (consume) and [`merge_heaps`]/[`union_heaps`] (control-flow join and loop frame
 //! restore). Everything else supports those.
 
+
 use crate::verify::{
     context::VerifyContext,
     error::VerifyError,
@@ -1061,7 +1062,7 @@ pub(crate) fn heap_subtract_summarized_fallbacks(
     //    under the pc and the debit is **gated** by the pc, so off-path — where the
     //    addresses are unrelated — nothing is taken, and ground never consolidates
     //    two chunks that are only conditionally equal.
-    let partners = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
+    let partners = pc_alias_partners(ctx, h1.chunks_of(kind), chunk2.addr, pc_lits);
     if !partners.is_empty() {
         let (set, total) = pc_alias_set(ctx, h1, kind, existing, &partners, pc_lits);
         if !set.is_empty() {
@@ -1253,7 +1254,7 @@ pub(crate) fn heap_subtract_summarized(
         // fractions fold it away.
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [hold, remaining]));
         let take = ctx.add(Symbolic::Ite([lt, hold, remaining]));
-        let gated = ctx.gate_amount_by_pc(take, &cube);
+        let gated = gate_amount_by_pc(ctx, take, &cube);
         let rest = perm_sub(ctx, chunk.ungated_perm(), gated);
         // Debit `remaining` by what was actually taken — the **gated** amount, not
         // `take`. With one shared cube (the pc-alias caller) the two coincide on-path
@@ -1465,7 +1466,7 @@ pub(crate) fn summarize_perm_at(
                 } else {
                     let cube = vec![(eq, Polarity::Positive)];
                     let held = held.to_id(ctx);
-                    let gated = ctx.gate_amount_by_pc(held, &cube);
+                    let gated = gate_amount_by_pc(ctx, held, &cube);
                     (ChunkPerm::Leaf(gated), std::rc::Rc::from(cube))
                 }
             };
@@ -1977,4 +1978,112 @@ mod tests {
             VerifyError::InsufficientPermission
         ));
     }
+}
+
+
+// ---- pc-sensitive location lookups (moved off VerifyContext) ----
+
+/// Resolve which of `chunks` sits at address `addr`, consulting aliasing
+/// that may only hold under the path condition `pc_lits`.
+///
+/// Fast path (what normal framing hits): a canonical match in the **live**
+/// graph — the address `add`ed for the read is congruent to a held chunk's
+/// address. Zero extra cost, no clone.
+///
+/// Slow path (a miss, and only then): clone, assume the path condition, and
+/// saturate. An assumed `x == y` fires `eq-true-union`, congruence then merges
+/// `f(x)` and `f(y)`, so the chunk `acc(x.f)` answers a read of `y.f` — which is
+/// what lets a predicate body like `acc(x.f) && x == y && y.f == 10` frame its
+/// `y.f` deref.
+///
+/// The returned chunk's `perm`/`value` ids are live-graph ids (the probe never
+/// touches live state), so they are valid to discharge obligations over.
+pub(crate) fn chunk_under_pc<'c>(
+        ctx: &mut VerifyContext<'_>,
+    chunks: &'c [Chunk],
+    addr: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Option<&'c Chunk> {
+    let canon = ctx.egraph.find(addr);
+    if let Some(c) = chunks.iter().find(|c| ctx.egraph.find(c.addr) == canon) {
+        return Some(c);
+    }
+    // No unconditional match. Aliasing under the path condition can only help
+    // if there is one; a truly-unheld location stays a miss.
+    if pc_lits.is_empty() {
+        return None;
+    }
+    let mut probe = ctx.egraph.clone();
+    for (id, pol) in pc_lits {
+        let want_true = matches!(pol, Polarity::Positive);
+        // An unsatisfiable path condition makes every read vacuous — leave
+        // the resolution to the (vacuous-pc) obligation check, don't invent
+        // a chunk here.
+        if matches!(probe[*id].data.known(), Some(Literal::Bool(b)) if *b != want_true) {
+            return None;
+        }
+        let lit = probe.add(Symbolic::Lit(Literal::Bool(want_true)));
+        probe.union(*id, lit);
+    }
+    probe.rebuild();
+    let probe = ctx.run_probe(probe);
+    let canon = probe.find(addr);
+    chunks.iter().find(move |c| probe.find(c.addr) == canon)
+}
+
+/// The chunks that alias `addr` **only under `pc_lits`** — pc-equal but not
+/// ground-equal. These are the partners a consume may draw on (invariant 7): at
+/// a state where the pc holds they are the *same* location as `addr`, so their
+/// fractions add, while on ground they stay distinct and must not be merged.
+/// Returns their addresses (stable keys into the heap group). Same probe shape as
+/// [`Self::chunk_under_pc`], but collects every match: sufficiency needs the sum.
+pub(crate) fn pc_alias_partners(
+        ctx: &mut VerifyContext<'_>,
+    chunks: &[Chunk],
+    addr: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Vec<egg::Id> {
+    if pc_lits.is_empty() {
+        return Vec::new();
+    }
+    let ground = ctx.egraph.find(addr);
+    let mut probe = ctx.egraph.clone();
+    for (id, pol) in pc_lits {
+        let want_true = matches!(pol, Polarity::Positive);
+        // Unsatisfiable pc: the consume is vacuous, so inventing partners would
+        // only mask that — leave it to the (vacuous-pc) obligation check.
+        if matches!(probe[*id].data.known(), Some(Literal::Bool(b)) if *b != want_true) {
+            return Vec::new();
+        }
+        let lit = probe.add(Symbolic::Lit(Literal::Bool(want_true)));
+        probe.union(*id, lit);
+    }
+    probe.rebuild();
+    let probe = ctx.run_probe(probe);
+    let canon = probe.find(addr);
+    chunks
+        .iter()
+        .filter(|c| probe.find(c.addr) == canon && ctx.egraph.find(c.addr) != ground)
+        .map(|c| c.addr)
+        .collect()
+}
+
+/// Gate a permission amount by a path condition: `pc ? amount : 0`. The ground
+/// heap records a pc-alias consume as a **guarded** debit (invariant 7) — the
+/// full amount comes off the demanded chunk where the pc holds, and nothing comes
+/// off where it does not (there the chunks are distinct and nothing was given up).
+pub(crate) fn gate_amount_by_pc(
+        ctx: &mut VerifyContext<'_>,
+    amount: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> egg::Id {
+    let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
+    pc_lits.iter().fold(amount, |acc, (lit, pol)| {
+        let arms = if matches!(pol, Polarity::Positive) {
+            [*lit, acc, zero]
+        } else {
+            [*lit, zero, acc]
+        };
+        ctx.add(Symbolic::Ite(arms))
+    })
 }

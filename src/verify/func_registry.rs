@@ -79,9 +79,6 @@ pub struct FuncRegistry {
     /// never from inside a rule, and egg sees the resulting e-node on the next
     /// iteration either way.
     quant_table: std::sync::Arc<std::sync::RwLock<crate::verify::quant::RecipeTable>>,
-    /// Verifier cost metrics, accumulated across every unit of the run (the
-    /// allocator is the per-run shared state threaded into each `VerifyContext`).
-    pub(crate) stats: crate::verify::VerifyStats,
 }
 
 // Builtin reserved operator ids (starting from the top of the usize space).
@@ -161,7 +158,6 @@ impl FuncRegistry {
             variant_names,
             ctor_head,
             quant_table: Default::default(),
-            stats: Default::default(),
         };
         // Mint every head up front. Lazily minting on first use would leave
         // `ctor_head` incomplete for any `ConstFold` built before that use, and
@@ -217,15 +213,7 @@ impl FuncRegistry {
             head_names: HashMap::new(),
             variant_names: HashMap::new(),
             ctor_head,
-            stats: Default::default(),
         }
-    }
-
-    /// Consume the allocator, returning the accumulated verifier cost metrics.
-    pub(crate) fn into_stats(self) -> crate::verify::VerifyStats {
-        let mut stats = self.stats;
-        stats.rule_timing.0 = crate::verify::rewrite::take_rule_timing();
-        stats
     }
 
     /// Constructor id for variant `variant` of `adt` (minting the concept on first

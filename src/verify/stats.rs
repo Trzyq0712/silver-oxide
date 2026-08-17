@@ -3,7 +3,45 @@
 //! fixed rule set + input) are gated as exact-match snapshots; the timing
 //! fields are a non-gating trend (see `plans/verification-perf-regression.md`).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+
+thread_local! {
+    /// The current run's cost metrics. Thread-local for the same reason the
+    /// per-rule timing sink is (`rewrite::timing`): one verification runs on one
+    /// thread, and parallel tests must not bleed into each other.
+    ///
+    /// A sink rather than a field, so counting needs no `&mut` threaded through
+    /// the call graph. It previously lived on `FuncRegistry` purely because the
+    /// allocator happened to be the per-run shared state already being passed
+    /// around — which made `&mut FuncRegistry` look load-bearing at 22 call sites
+    /// when only the ADT id minting actually needs it.
+    static STATS: RefCell<VerifyStats> = RefCell::new(VerifyStats::default());
+}
+
+/// Read or update the run's stats. Do not call recursively — the closure runs
+/// while the sink is mutably borrowed.
+pub(crate) fn with_stats<T>(f: impl FnOnce(&mut VerifyStats) -> T) -> T {
+    STATS.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// Bump a counter. Sugar for the overwhelmingly common [`with_stats`] use.
+pub(crate) fn bump(f: impl FnOnce(&mut VerifyStats)) {
+    with_stats(f);
+}
+
+/// Clear the sink. Called at the start of a run so residue from a previous run
+/// on this thread (or one that panicked mid-way) cannot leak in.
+pub(crate) fn reset_stats() {
+    STATS.with(|s| *s.borrow_mut() = VerifyStats::default());
+}
+
+/// Drain the run's stats, folding in the per-rule timing. Resets the sink.
+pub(crate) fn take_stats() -> VerifyStats {
+    let mut stats = STATS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    stats.rule_timing.0 = crate::verify::rewrite::take_rule_timing();
+    stats
+}
 
 /// Wall-clock saturation time, broken into egg's phases. Non-deterministic —
 /// reported for trends, never compared in the gating snapshot.
@@ -76,29 +114,6 @@ pub struct VerifyStats {
     pub prove_memo: u64,
     pub prove_saturate: u64,
     pub prove_probe: u64,
-    /// In-block obligations split by how their pc relates to the block cube
-    /// (invariant 5 of the two-egraph block model): `cube_only` needs no extra
-    /// assumption beyond what the block already establishes, `extra_pc` carries a
-    /// suffix and should only ever be an expression-embedded side condition — a
-    /// function precondition or a division/mod check. Non-gated (a measurement).
-    pub prove_in_block_cube_only: u64,
-    pub prove_in_block_extra_pc: u64,
-    /// Gate G1 of `plans/…scratch-mode`: in-block obligations raised **after** their
-    /// block's first `probe` tier, i.e. the population a "sticky" scratch (keep proving in
-    /// the scratch once it exists, stop saturating ground) would move off ground —
-    /// and the ground saturations it would eliminate. Non-gated.
-    pub prove_in_block_after_first_probe: u64,
-    pub ground_saturations_after_first_probe: u64,
-    /// Gate G2: `probe`-tier sites classified by whether a *dominator* block with a strictly
-    /// smaller cube had itself built a scratch — i.e. whether there was anything to
-    /// inherit. `dom_reuse_available` counts the sites where there was. Non-gated.
-    pub dom_reuse_available: u64,
-    pub dom_reuse_none: u64,
-    /// `probe`-tier sites that have a strict-subset dominator **regardless** of whether it
-    /// built a scratch. The gap against `dom_reuse_available` is the cost of laziness:
-    /// the chain exists, but no ancestor materialized a graph to inherit — so
-    /// inheritance would have to carry derived *facts* instead. Non-gated.
-    pub dom_chain_available: u64,
     /// Goals discharged by the last tier — non-forking `ite`-goal decomposition
     /// (a constant branch reduces the goal to its other branch, no case split).
     pub prove_ite_decompose: u64,
@@ -135,9 +150,6 @@ pub struct GraphTiming {
     pub probe: f64,
     /// Building a block scratch: the ground clone plus the cube unions/rebuild.
     pub scratch_clone: f64,
-    /// The `ground` share spent after the current block's first `probe`-tier obligation —
-    /// gate G1's denominator-side number (what sticky mode claims to remove).
-    pub ground_after_first_probe: f64,
 }
 
 /// [`GraphTiming`] wrapper, `Eq`-transparent like [`TimingTrend`].

@@ -42,6 +42,7 @@ pub fn verify_with_stats(
     Vec<(String, std::time::Duration)>,
     VerifyStats,
 ) {
+    stats::reset_stats();
     let program = &analyzed.program;
     let mut results = Vec::new();
     let mut member_times: Vec<(String, std::time::Duration)> = Vec::new();
@@ -159,6 +160,6 @@ pub fn verify_with_stats(
             results.push((name, outcome));
         }
     }
-    let stats = alloc.into_stats();
+    let stats = stats::take_stats();
     (results, member_times, stats)
 }

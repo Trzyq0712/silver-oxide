@@ -9,11 +9,12 @@ use crate::{
         heap::{
             Chunk, ChunkPerm, Heap, LocationKind, cube_eq, gate_perm_by_guard, zero_real,
             algebra::{
-                find_chunk_consolidated, heap_subtract, heap_union, merge_heaps, perm_held_at,
+                chunk_under_pc, find_chunk_consolidated, heap_subtract, heap_union, merge_heaps, perm_held_at,
                 prove_perm_positive, prove_perm_write, summarize_perm_at, union_heaps,
             },
         },
         lang::Symbolic,
+        stats,
         viz::Snapshotter,
     },
     vmir::{
@@ -295,7 +296,7 @@ fn eval_pure_inst(
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
             let chunk = state.loc_kind(loc).and_then(|k| {
-                ctx.chunk_under_pc(heap.chunks_of(&k), addr, pc_lits)
+                chunk_under_pc(ctx, heap.chunks_of(&k), addr, pc_lits)
                     .cloned()
             });
             match chunk {
@@ -708,26 +709,6 @@ fn assert_statement_pc_is_block_cube(
     );
 }
 
-/// Nearest common dominator of two blocks, walking the (already-filled) idom chains.
-/// `idoms[i]` is block `i`'s immediate dominator in walk order; both arguments index
-/// blocks that precede the caller topologically, so their entries exist.
-fn nearest_common_dominator(
-    idoms: &[Option<usize>],
-    a: usize,
-    b: usize,
-) -> Option<usize> {
-    let chain = |mut at: Option<usize>| {
-        let mut out = vec![];
-        while let Some(i) = at {
-            out.push(i);
-            at = idoms.get(i).copied().flatten();
-        }
-        out
-    };
-    let a_chain = chain(Some(a));
-    let b_chain = chain(Some(b));
-    a_chain.into_iter().find(|i| b_chain.contains(i))
-}
 
 
 
@@ -2124,7 +2105,7 @@ fn walk_body(
             }
             return Err(err.with_inst(inst_text, inst_idx, insts.len()));
         }
-        ctx.alloc.stats.insts_processed += 1;
+        stats::bump(|s| s.insts_processed += 1);
         if snap.enabled() {
             let highlight =
                 (state.vals.len() > vals_before).then(|| state.vals[state.vals.len() - 1]);
@@ -2156,8 +2137,6 @@ pub(crate) fn verify_method(
     // phase then its `body` phase through the same per-inst engine (`walk_body`)
     // the flat verifier used. The heap threads linearly via each inst's explicit
     // `base: HeapVal`; the per-predecessor structural merge is a later stage.
-    // Immediate dominator per block, in walk order; filled as blocks are walked.
-    let mut idoms: Vec<Option<usize>> = Vec::with_capacity(method.blocks.len());
     for (bid, block) in method.blocks.iter_enumerated() {
         // Stored order is topological: a block's predecessors have smaller ids.
         // (A future lowering bug that broke this would corrupt positional eval.)
@@ -2187,22 +2166,10 @@ pub(crate) fn verify_method(
             eval_method_inst,
             None,
         )?;
-        // Immediate dominator in walk order (blocks are stored topologically, so both
-        // preds are already resolved). A `Join`'s idom is the nearest common ancestor
-        // of its arms — the pre-split block. Only the dominator-reuse *measurement*
-        // consumes this (see `VerifyContext::dom_reuse_source`).
-        let idom = match &block.preds {
-            vmir::Preds::Entry => None,
-            vmir::Preds::From(p) => Some(p.0 as usize),
-            vmir::Preds::Join { then_, els, .. } => {
-                nearest_common_dominator(&idoms, then_.0 as usize, els.0 as usize)
-            }
-        };
-        idoms.push(idom);
         // Record this block's cube for the (experimental) per-block scratch. All
         // body insts share it (vmir::Block::cube), so the scratch assumes it once.
         let cube = collect_pc_lits(&mut ctx, &state, &block.cube);
-        ctx.begin_block(cube, idom);
+        ctx.begin_block(cube);
         walk_body(
             &mut ctx,
             program,
@@ -2602,8 +2569,7 @@ fn inst_obligations(
             let addr = state.get_val(ctx, loc);
             let held = get_heap(state, heap);
             let perm = state.loc_kind(loc).and_then(|k| {
-                let c = ctx
-                    .chunk_under_pc(held.chunks_of(&k), addr, pc_lits)?
+                let c = chunk_under_pc(ctx, held.chunks_of(&k), addr, pc_lits)?
                     .clone();
                 // Frame against the gated perm: a conditionally-held location
                 // frames only where its guard holds.
