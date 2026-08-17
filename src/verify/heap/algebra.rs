@@ -318,8 +318,7 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
         c.perm
             .for_each_leaf_under(&mut |l, arm| leaves.push((l, arm.to_vec())));
         for (leaf, arm) in leaves {
-            let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, leaf]));
-            let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
+            let le = expr!(ctx, not ({b} <r {leaf}));
             // `cube ∧ arm ⇒ leaf ≤ b`; with both empty `implication` returns `le`
             // itself, so the unconditional hot path is the old `union(le, true_)`.
             let Some(gate) = cube_meet(ctx, cube, &arm) else {
@@ -573,10 +572,8 @@ pub(crate) fn sufficient_leaf(
             return true;
         }
     }
-    let false_ = ctx.false_();
-    let true_ = ctx.true_();
-    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, needed]));
-    let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+    // `held >= needed`, i.e. not (held < needed).
+    let goal = expr!(ctx, not ({h} <r {needed}));
     if ctx.prove_under_pc(goal, pc) {
         return true;
     }
@@ -654,10 +651,8 @@ pub(crate) fn prove_perm_write(
             }
         }
         let write = ctx.add(Symbolic::Lit(Literal::Real(cap.clone())));
-        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [h, write]));
-        let false_ = ctx.false_();
-        let true_ = ctx.true_();
-        let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+        // Write permission at this leaf: not (held < cap).
+        let goal = expr!(ctx, not ({h} <r {write}));
         ctx.prove_under_pc(goal, pc)
     })
 }
@@ -859,11 +854,8 @@ pub(crate) fn heap_subtract_inner(
         // `b ==> P(..)` with `b` false) is a no-op, so it need not be held. A
         // wildcard is provably positive, so this (correctly) fails — a wildcard
         // cannot be exhaled from an empty location.
-        let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-        let pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, chunk2_perm]));
-        let false_ = ctx.false_();
-        let true_ = ctx.true_();
-        let nonpos = ctx.add(Symbolic::Ite([pos, false_, true_]));
+        // Nothing demanded: not (0 < needed).
+        let nonpos = expr!(ctx, not ((real 0) <r {chunk2_perm}));
         if ctx.prove_under_pc(nonpos, pc_lits) {
             return Ok(out);
         }

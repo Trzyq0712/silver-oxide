@@ -1,5 +1,10 @@
 use crate::vmir;
 
+// Declared first: `#[macro_use]` scoping is textual, so every module below
+// needs this one above it to see `expr!`.
+#[macro_use]
+mod expr;
+
 mod analysis;
 mod cert;
 mod context;

@@ -2637,12 +2637,10 @@ fn inst_obligations(
         InstKind::Heap(
             HeapInst::Add { perm, .. } | HeapInst::Sub { perm, .. },
         ) => {
-            let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let perm = eval_perm(ctx, state, perm);
             let zero = zero_real(ctx);
-            let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [perm, zero]));
-            let goal = ctx.add(Symbolic::Ite([lt, false_, true_]));
+            // Permission must not be negative: not (perm < 0).
+            let goal = expr!(ctx, not ({perm} <r {zero}));
             vec![(
                 goal,
                 VerifyError::SideCondition("permission may be negative"),
@@ -2651,12 +2649,10 @@ fn inst_obligations(
         // `not(divisor == 0)` desugared to an `Ite`. The divisor is homogeneous
         // with the result (casts), so the VMIR result type gives the zero's type.
         InstKind::Pure(ty, PureInst::Binary(op, _, r)) if op.is_div_or_mod() => {
-            let false_ = ctx.add(Symbolic::Lit(Literal::Bool(false)));
-            let true_ = ctx.add(Symbolic::Lit(Literal::Bool(true)));
             let rv = state.get_val(ctx, r);
             let zero = zero_of(ctx, ty);
-            let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [rv, zero]));
-            let goal = ctx.add(Symbolic::Ite([eq, false_, true_]));
+            // Divisor must be non-zero: not (divisor == 0).
+            let goal = expr!(ctx, not ({rv} == {zero}));
             vec![(goal, VerifyError::SideCondition("divisor may be zero"))]
         }
         _ => vec![],
