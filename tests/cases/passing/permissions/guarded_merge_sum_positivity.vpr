@@ -1,0 +1,44 @@
+// A merged total whose amount differs per branch must stay usable on every branch.
+//
+// `merge_chunks` sums two chunks with differing presence guards by folding each
+// guard into its own amount and adding. The total here is `(b ? 1/2 : 0) + 1/2` —
+// full permission under `b`, a half under `!b`, so the read frames either way. But
+// only if the sum keeps its case structure: as one opaque `AddR` leaf, `0 < that`
+// is not decidable without splitting an `ite`, and the read fails.
+//
+// So the total is built with `perm_add`, which distributes over the gates' `Select`s
+// and leaves one concrete amount per branch. That is sound only because the bound
+// axiom in `assume_location_axioms` gates each leaf by the arm that reaches it
+// (`ChunkPerm::for_each_leaf_under`). Without that gating the *unsound* shape —
+// `if (b) { inhale acc(x.f, write) }` then `inhale acc(x.f, 1/2)`, whose `b` arm
+// sums to `3/2` — would fold the `1/1` bound to `false` ungated and make the whole
+// method inconsistent. See `tests/cases/failing/guarded_merge_chunks.vpr`, and
+// `guarded_merge_chunks_still_sums.vpr` for the merge's other positive controls.
+//
+// Was a known limitation: the flattened-total workaround that the arm-aware bound
+// axiom replaced.
+
+field f: Int
+
+method guarded_half_still_reads(x: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, 1/2)
+    }
+    inhale acc(x.f, 1/2)
+    // Holds `1/2` unconditionally and `1/1` under `b`: positive on both arms.
+    assert x.f == x.f
+}
+
+// The same total is enough for a *write* under `b`, where it reaches `1/1`.
+method guarded_half_writes_under_guard(x: Ref, b: Bool)
+{
+    if (b) {
+        inhale acc(x.f, 1/2)
+    }
+    inhale acc(x.f, 1/2)
+    if (b) {
+        x.f := 7
+        assert x.f == 7
+    }
+}

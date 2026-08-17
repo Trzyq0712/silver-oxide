@@ -679,19 +679,32 @@ fn merge_chunks(
     // `cube_eq` (canonical e-class comparison), not the `Rc<[..]>` structural
     // equality `union_heaps` uses: a false negative is merely conservative — it
     // takes the gated path, still sound — but costs an `ite` per merge.
-    let (p0, p1, guard): (egg::Id, egg::Id, crate::verify::heap::HeapPc) =
+    let (pa, pb, guard): (ChunkPerm, ChunkPerm, crate::verify::heap::HeapPc) =
         if cube_eq(ctx, a.guard(), b.guard()) {
             // Shared cube: amounts stay bare and the guard is re-attached below.
             let g: HeapPc = a.guard_pc();
-            (a.ungated_perm().to_id(ctx), b.ungated_perm().to_id(ctx), g)
+            (
+                a.ungated_perm().clone(),
+                b.ungated_perm().clone(),
+                g,
+            )
         } else {
-            let ga = a.gated_perm(ctx);
-            let gb = b.gated_perm(ctx);
-            (ga.to_id(ctx), gb.to_id(ctx), std::rc::Rc::from(Vec::new()))
+            (
+                a.gated_perm(ctx),
+                b.gated_perm(ctx),
+                std::rc::Rc::from(Vec::new()),
+            )
         };
-    let perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p0, p1]));
+    // Structural sum: `perm_add` distributes over the gates' `Select`s, so the
+    // total keeps one concrete amount per branch (`Select(b, 1/1+1/2, 0+1/2)`)
+    // rather than collapsing to an opaque `AddR` whose positivity nothing can
+    // decide. Safe only because the bound axiom gates each leaf by the arm that
+    // reaches it (`for_each_leaf_under`) — otherwise an over-bound arm would fold
+    // the bound ungated and make the unit inconsistent.
+    let perm = perm_add(ctx, &pa, &pb);
+    let (p0, p1) = (pa.to_id(ctx), pb.to_id(ctx));
     let value = merge_values(ctx, p0, a.value, p1, b.value, pc_lits);
-    Chunk::new(addr, perm, value).with_guard(guard)
+    Chunk::new_perm(addr, perm, value).with_guard(guard)
 }
 
 /// The value of a location covered by two chunks, when it is **not** already
@@ -904,14 +917,27 @@ fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
         };
         let Some(cube) = cube else { continue };
         let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
-        let mut leaves = Vec::new();
-        c.perm.for_each_leaf(&mut |l| leaves.push(l));
-        for leaf in leaves {
+        // Each leaf carries the `Select` conditions that reach it: a leaf states the
+        // permission only *under its own arm*, so the fact is gated by the chunk's
+        // presence cube AND that arm cube. Gating by the chunk cube alone is sound
+        // only while every leaf independently respects the bound — an invariant the
+        // sum sites (`merge_chunks`, `union_heaps`) preserve by flattening a total
+        // into one opaque `AddR`, and which arm-gating here is what would let them
+        // stop doing.
+        let mut leaves: Vec<(egg::Id, Vec<(egg::Id, Polarity)>)> = Vec::new();
+        c.perm
+            .for_each_leaf_under(&mut |l, arm| leaves.push((l, arm.to_vec())));
+        for (leaf, arm) in leaves {
             let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, leaf]));
             let le = ctx.add(Symbolic::Ite([gt, false_, true_]));
-            // `cube ⇒ perm ≤ b`; with an empty cube `implication` returns `le`
-            // itself, so this is the old `union(le, true_)` untouched.
-            let fact = ctx.implication(le, cube.iter().rev().copied());
+            // `cube ∧ arm ⇒ leaf ≤ b`; with both empty `implication` returns `le`
+            // itself, so the unconditional hot path is the old `union(le, true_)`.
+            let Some(gate) = cube_meet(ctx, cube, &arm) else {
+                // Arm contradicts the chunk's presence cube — that leaf describes no
+                // reachable state and states nothing.
+                continue;
+            };
+            let fact = ctx.implication(le, gate.iter().rev().copied());
             ctx.union(fact, true_);
         }
     }

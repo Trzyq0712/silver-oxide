@@ -221,15 +221,36 @@ impl ChunkPerm {
         }
     }
 
-    /// Visit every leaf amount id (the branch conditions are skipped).
-    pub fn for_each_leaf(&self, f: &mut impl FnMut(egg::Id)) {
-        match self {
-            ChunkPerm::Leaf(id) => f(*id),
-            ChunkPerm::Select { then, els, .. } => {
-                then.for_each_leaf(f);
-                els.for_each_leaf(f);
+    /// Visit every leaf amount id **with the branch conditions that reach it** —
+    /// the `Select` conditions on the path from the root, each with the polarity
+    /// of the arm taken.
+    ///
+    /// A leaf only describes the permission *under its own arm*, so any fact
+    /// stated about it must be gated by that cube. [`Self::for_each_leaf`] drops
+    /// this, which is sound only while every leaf independently satisfies the
+    /// fact being stated.
+    pub fn for_each_leaf_under(
+        &self,
+        f: &mut impl FnMut(egg::Id, &[(egg::Id, Polarity)]),
+    ) {
+        fn go(
+            p: &ChunkPerm,
+            path: &mut Vec<(egg::Id, Polarity)>,
+            f: &mut impl FnMut(egg::Id, &[(egg::Id, Polarity)]),
+        ) {
+            match p {
+                ChunkPerm::Leaf(id) => f(*id, path),
+                ChunkPerm::Select { cond, then, els } => {
+                    path.push((*cond, Polarity::Positive));
+                    go(then, path, f);
+                    path.pop();
+                    path.push((*cond, Polarity::Negative));
+                    go(els, path, f);
+                    path.pop();
+                }
             }
         }
+        go(self, &mut Vec::new(), f);
     }
 
     /// A representative e-class id for debug display, WITHOUT mutating the graph
