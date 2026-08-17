@@ -1,0 +1,138 @@
+//! Structural egg rewrite rules for the verifier.
+
+use std::collections::HashSet;
+
+use egg::{
+    Rewrite, Var,
+};
+
+use crate::verify::analysis::ConstFold;
+use crate::verify::lang::Symbolic;
+
+pub(crate) mod memo;
+pub(crate) mod timing;
+pub(crate) mod arith;
+pub(crate) mod ite;
+pub(crate) mod diseq;
+pub(crate) mod adt;
+pub(crate) mod axiom;
+pub(crate) mod function;
+
+pub(crate) use axiom::{
+    AxiomInst, AxiomPure, PreparedTerm, build_instance_releasing_tokens,
+    build_instance_subst, build_instance_vals_guarded, forall_rule,
+};
+pub(crate) use function::{facts_rule, function_post_rule, function_rule};
+pub(crate) use memo::{Memo, ScratchScope, new_memo_unit, new_scope_id};
+pub(crate) use timing::take_rule_timing;
+pub use adt::{inj_rule, proj_rule, tag_rule};
+
+pub(in crate::verify::rewrite) use timing::*;
+pub(in crate::verify::rewrite) use arith::*;
+pub(in crate::verify::rewrite) use ite::*;
+pub(in crate::verify::rewrite) use diseq::*;
+pub(in crate::verify::rewrite) use axiom::*;
+pub(in crate::verify::rewrite) use function::*;
+
+type Rule = Rewrite<Symbolic, ConstFold>;
+
+fn var(name: &str) -> Var {
+    name.parse().expect("valid pattern var")
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/// The static structural rule set. Per-ADT cons/proj/tag reductions are minted
+/// by the registry (`verify::mono`) and appended by `VerifyContext::new`.
+pub fn rules() -> Vec<Rule> {
+    static_rules().into_iter().filter(kept).map(timed).collect()
+}
+
+/// Ablation gate: `SILVER_OXIDE_DROP_RULES=name1,name2` removes those rules from
+/// the saturation and reduction sets. Dropping a rewrite is incomplete, never
+/// unsound.
+fn kept(rule: &Rule) -> bool {
+    use std::sync::OnceLock;
+    static DROP: OnceLock<HashSet<String>> = OnceLock::new();
+    let drop = DROP.get_or_init(|| {
+        std::env::var("SILVER_OXIDE_DROP_RULES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    drop.is_empty() || !drop.contains(rule.name.as_str())
+}
+
+/// The terminating structural reductions used to **normalize** the e-graph after
+/// heap-producing ops (`fold`/`unfold`). The registry's ADT reductions are
+/// appended by `VerifyContext::new`. Kept separate from [`rules`] so that
+/// *non-terminating* rules run only during full saturation.
+pub fn reduce_rules() -> Vec<Rule> {
+    terminating_ite_rules()
+        .into_iter()
+        .filter(kept)
+        .map(timed)
+        .collect()
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
