@@ -10,7 +10,7 @@ use egg::{
 use crate::verify::analysis::ConstFold;
 use crate::verify::cert::FunctionDefinition;
 use crate::verify::lang::{FuncId, Symbolic};
-use crate::vmir::{BinOp, Literal, Polarity, Type, Val};
+use crate::vmir::{Literal, Polarity, Type, Val};
 
 use super::*;
 
@@ -107,7 +107,7 @@ pub(super) fn replay_facts(
         let cond = resolve_val(egraph, vals, &fact.cond);
         let mut imp = fold_guards(egraph, vals, &fact.guards, cond);
         if let Some(tok) = token {
-            imp = egraph.add(Symbolic::Ite([tok, imp, true_]));
+            imp = expr!(egraph, {tok} ==> {imp});
         }
         if egraph.union(imp, true_) {
             changed.push(egraph.find(imp));
@@ -210,9 +210,8 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
                             }
                         }
                         Some(tok) => {
-                            let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-                            let eq = egraph.add(Symbolic::Binary(BinOp::Eq, [eclass, result]));
-                            let rel = egraph.add(Symbolic::Ite([tok, eq, true_]));
+                            let true_ = expr!(egraph, true);
+                            let rel = expr!(egraph, {tok} ==> ({eclass} == {result}));
                             if egraph.union(rel, true_) {
                                 changed.push(egraph.find(rel));
                             }
@@ -236,7 +235,7 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
                     let guarded = fold_guards(egraph, &vals, &ts.guards, tok_node);
                     let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
                     let rel = match tok_id {
-                        Some(tok) => egraph.add(Symbolic::Ite([tok, guarded, true_])),
+                        Some(tok) => expr!(egraph, {tok} ==> {guarded}),
                         None => guarded,
                     };
                     if egraph.union(rel, true_) {

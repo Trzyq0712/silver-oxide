@@ -235,7 +235,7 @@ impl<'a> VerifyContext<'a> {
             stats::bump(|s| s.prove_dead_block += 1);
             return true;
         }
-        let true_ = self.true_();
+        let true_ = expr!(self, true);
         // `goal_true`: unconditionally true, checked before the implication chain
         // is built (see the tier list above).
         if self.egraph.find(goal) == self.egraph.find(true_) {
@@ -362,8 +362,8 @@ impl<'a> VerifyContext<'a> {
         if self.scratch.is_some() {
             return;
         }
-        let true_id = self.true_();
-        let false_id = self.false_();
+        let true_id = expr!(self, true);
+        let false_id = expr!(self, false);
         let cube = std::mem::take(&mut self.current_cube);
         let t_clone = std::time::Instant::now();
         let mut egraph = self.egraph.clone();

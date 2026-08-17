@@ -13,7 +13,7 @@ use crate::{
         rewrite,
         stats,
     },
-    vmir::{BinOp, Declaration, Literal, MemberId, Polarity, Type},
+    vmir::{Declaration, Literal, MemberId, Polarity, Type},
 };
 use lasso::{Rodeo, Spur};
 use typed_index_collections::TiVec;
@@ -333,14 +333,6 @@ impl<'a> VerifyContext<'a> {
         self.add_func_app_id(value_id, tys, elem, Box::new([opt]))
     }
 
-    /// The boolean `0 < perm` (a permission is positive). Lifts a permission
-    /// amount to the snapshot's membership discriminant.
-    pub(crate) fn perm_positive(&mut self, perm: egg::Id) -> egg::Id {
-        let zero = self.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
-            num::BigInt::from(0),
-        ))));
-        self.add(Symbolic::Binary(BinOp::LtR, [zero, perm]))
-    }
 
     /// Run rewrite saturation over the e-graph in place. The rule set is the
     /// static rules plus the ADT reductions minted so far by the allocator
@@ -456,15 +448,7 @@ impl<'a> VerifyContext<'a> {
         }
     }
 
-    /// The `true` boolean-literal e-class.
-    pub(crate) fn true_(&mut self) -> egg::Id {
-        self.add(Symbolic::Lit(Literal::Bool(true)))
-    }
 
-    /// The `false` boolean-literal e-class.
-    pub(crate) fn false_(&mut self) -> egg::Id {
-        self.add(Symbolic::Lit(Literal::Bool(false)))
-    }
 
     /// Add a `FuncApp` over an already-allocated [`FuncId`] (a plain function,
     /// or an ADT constructor/projection/tag id from the allocator). Also used by
@@ -497,8 +481,8 @@ impl<'a> VerifyContext<'a> {
     /// `heap_subtract`).
     pub(crate) fn fresh_wildcard(&mut self) -> egg::Id {
         let w = self.add(Symbolic::Wildcard(crate::verify::lang::fresh_wildcard_id()));
-        let pos = self.perm_positive(w);
-        let true_ = self.true_();
+        let pos = expr!(self, (0/1) <r {w});
+        let true_ = expr!(self, true);
         self.union(pos, true_);
         // No eager `rebuild()`: the wildcard is minted mid-heap-op and every heap
         // op rebuilds downstream (obligation proving / `assume_location_axioms`)
@@ -516,7 +500,7 @@ impl<'a> VerifyContext<'a> {
         consequent: egg::Id,
         antecedents: impl Iterator<Item = (egg::Id, Polarity)>,
     ) -> egg::Id {
-        let true_ = self.true_();
+        let true_ = expr!(self, true);
         let mut imp = consequent;
         for (id, pol) in antecedents {
             imp = match pol {
@@ -541,7 +525,7 @@ impl<'a> VerifyContext<'a> {
         guards: impl Iterator<Item = (egg::Id, Polarity)>,
     ) {
         let imp = self.implication(fact, guards);
-        let true_ = self.true_();
+        let true_ = expr!(self, true);
         self.union(imp, true_);
         // Invariant 4: ground guarded, scratch unguarded.
         self.scratch_assume_unguarded(fact);
@@ -577,7 +561,7 @@ impl<'a> VerifyContext<'a> {
         guards: impl Iterator<Item = (egg::Id, Polarity)>,
     ) {
         let imp = self.implication(token, guards);
-        let true_ = self.true_();
+        let true_ = expr!(self, true);
         self.union(imp, true_);
         self.egraph.rebuild();
     }
@@ -591,7 +575,7 @@ impl<'a> VerifyContext<'a> {
         facts: impl IntoIterator<Item = egg::Id>,
         guards: &[(egg::Id, Polarity)],
     ) {
-        let true_ = self.true_();
+        let true_ = expr!(self, true);
         for fact in facts {
             let imp = self.implication(fact, guards.iter().copied());
             self.union(imp, true_);

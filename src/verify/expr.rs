@@ -27,7 +27,8 @@
 //!
 //! ```text
 //! true | false                 boolean literals
-//! real N | int N               numeric literals
+//! 1                            integer literal
+//! 1/1                          rational literal (`Real`); `0/1` is zero
 //! {e}                          a Rust expression evaluating to an `egg::Id`
 //! (..)                         a nested term
 //!
@@ -91,19 +92,21 @@ macro_rules! expr {
             $crate::verify::lang::Symbolic::Lit($crate::vmir::Literal::Bool(false)),
         )
     };
-    ($s:expr, int $n:literal) => {
+    // Rationals are written `n/d` -- must precede the bare-integer rule, and
+    // both must follow `true`/`false` (which are also `literal`s).
+    ($s:expr, $n:literal / $d:literal) => {
+        $crate::verify::expr::NodeSink::node(
+            $s,
+            $crate::verify::lang::Symbolic::Lit($crate::vmir::Literal::Real(
+                ::num::BigRational::new(::num::BigInt::from($n), ::num::BigInt::from($d)),
+            )),
+        )
+    };
+    ($s:expr, $n:literal) => {
         $crate::verify::expr::NodeSink::node(
             $s,
             $crate::verify::lang::Symbolic::Lit($crate::vmir::Literal::Int(
                 ::num::BigInt::from($n),
-            )),
-        )
-    };
-    ($s:expr, real $n:literal) => {
-        $crate::verify::expr::NodeSink::node(
-            $s,
-            $crate::verify::lang::Symbolic::Lit($crate::vmir::Literal::Real(
-                ::num::BigInt::from($n).into(),
             )),
         )
     };
@@ -207,7 +210,7 @@ mod tests {
     fn nested_terms_compose() {
         let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
-        let z = expr!(&mut ctx, real 0);
+        let z = expr!(&mut ctx, 0/1);
         let p = ctx.fresh_symbolic_value(crate::vmir::Type::Real);
 
         // not (0 < p) — the `perm <= b` / `nonpos` shape, in one line.
@@ -220,15 +223,23 @@ mod tests {
         assert_eq!(built, ctx.add(Symbolic::Ite([lt, f, t])));
     }
 
-    /// The sink is `VerifyContext::add`, so a term built through the macro is
-    /// mirrored into a live block scratch exactly as a hand-built one is.
+    /// Numeric literals land in the same class as the hand-built node, and
+    /// `real 0` is distinct from `int 0` (different `Literal` variants, so
+    /// different e-classes -- the sorts must not collapse).
     #[test]
-    fn real_zero_matches_the_heap_helper() {
+    fn numeric_literals_match_hand_built_nodes() {
         let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
+        let r0 = expr!(&mut ctx, 0/1);
+        let i0 = expr!(&mut ctx, 0);
         assert_eq!(
-            expr!(&mut ctx, real 0),
-            crate::verify::heap::zero_real(&mut ctx)
+            r0,
+            ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())))
         );
+        assert_eq!(
+            i0,
+            ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0))))
+        );
+        assert_ne!(ctx.egraph.find(r0), ctx.egraph.find(i0));
     }
 }

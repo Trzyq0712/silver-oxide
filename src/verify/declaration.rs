@@ -7,7 +7,7 @@ use crate::{
         context::VerifyContext,
         error::VerifyError,
         heap::{
-            Chunk, ChunkPerm, Heap, LocationKind, cube_eq, gate_perm_by_guard, zero_real,
+            Chunk, ChunkPerm, Heap, LocationKind, cube_eq, gate_perm_by_guard,
             algebra::{
                 chunk_under_pc, find_chunk_consolidated, heap_subtract, heap_union, merge_heaps, perm_held_at,
                 prove_perm_positive, prove_perm_write, summarize_perm_at, union_heaps,
@@ -268,7 +268,7 @@ fn eval_pure_inst(
             let cond = state.get_val(ctx, c);
             let then_ = state.get_val(ctx, t);
             let else_ = state.get_val(ctx, e);
-            let id = ctx.add(Symbolic::Ite([cond, then_, else_]));
+            let id = expr!(ctx, if {cond} then {then_} else {else_});
             let recipe = if ctx.recipe.is_some() {
                 let c = state.require_recipe(c, OPERAND_RECIPE)?;
                 let t = state.require_recipe(t, OPERAND_RECIPE)?;
@@ -494,7 +494,7 @@ fn eval_pure_inst(
                     let chunks = heap.chunks_of(&k).to_vec();
                     perm_held_at(ctx, &chunks, addr, pc_lits)
                 }
-                None => zero_real(ctx),
+                None => expr!(ctx, 0/1),
             };
             (id, None)
         }
@@ -609,7 +609,7 @@ fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::Perm) 
             let c = state.get_val(ctx, c);
             let t = eval_perm(ctx, state, t);
             let e = eval_perm(ctx, state, e);
-            ctx.add(Symbolic::Ite([c, t, e]))
+            expr!(ctx, if {c} then {t} else {e})
         }
     }
 }
@@ -860,7 +860,7 @@ fn eval_heap_inst(
             let perm = held
                 .as_ref()
                 .map(|c| c.ungated_perm().clone())
-                .unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx)));
+                .unwrap_or_else(|| ChunkPerm::Leaf(expr!(ctx, 0/1)));
             let guard = held
                 .as_ref()
                 .map(|c| c.guard_pc())
@@ -1273,7 +1273,7 @@ fn walk_footprint(
                     Direction::Consume => heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits)?,
                     Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
                 };
-                ctx.perm_positive(bperm)
+                expr!(ctx, (0/1) <r {bperm})
             }
             // Wildcard `Snap` slot: no heap effect (Snap frames). Presence is the
             // gating guard `0 < ite(guard, 1, 0)` (folds to `guard`, `true` when
@@ -1281,7 +1281,7 @@ fn walk_footprint(
             // must hold a positive share — prove `guard ⇒ 0 < held` against the
             // caller's (concrete) held permission; no wildcard is ever built.
             SlotPerm::Presence(pp) => {
-                let guard = ctx.perm_positive(pp);
+                let guard = expr!(ctx, (0/1) <r {pp});
                 let (_, existing) =
                     find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
                 let suff = match existing {
@@ -1299,9 +1299,7 @@ fn walk_footprint(
                     // No chunk held here: sound only if the slot is not required
                     // on this path (`guard` is false).
                     None => {
-                        let f = ctx.false_();
-                        let t = ctx.true_();
-                        let not_guard = ctx.add(Symbolic::Ite([guard, f, t]));
+                        let not_guard = expr!(ctx, not {guard});
                         ctx.prove_under_pc(not_guard, pc_lits)
                     }
                 };
@@ -1435,7 +1433,7 @@ fn eval_sub_yield(
     // Presence is `0 < perm`, built from the permission the instruction names.
     // For a literal amount it const-folds to `true` and `option_member` collapses
     // to a bare `Some`, so the paired `inhale`'s unwrap peels with no proof goal.
-    let present = ctx.perm_positive(perm_id);
+    let present = expr!(ctx, (0/1) <r {perm_id});
     let elem = kind.value.clone();
     let opt = ctx.option_member(elem.clone(), present, held);
     // The recipe must purify the value that is *pushed*, which is the option --
@@ -1529,7 +1527,7 @@ fn eval_resource_op(
                 }
                 _ => ValueSource::Fresh,
             };
-            let pos = ctx.perm_positive(scale);
+            let pos = expr!(ctx, (0/1) <r {scale});
             let mut guard = vec![(pos, Polarity::Positive)];
             // Fork model: arms run unguarded (the branch no longer rides in
             // the perm scale), so the block cube must guard the inhaled bool
@@ -1711,7 +1709,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
                 }
                 InstKind::Assume(val) => {
                     let id = state.get_val(ctx, val);
-                    let true_ = ctx.true_();
+                    let true_ = expr!(ctx, true);
                     ctx.union(id, true_);
                     ctx.egraph.rebuild();
                 }
@@ -1723,7 +1721,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
             }
         }
         let res = state.get_val(ctx, &ax.body.res);
-        let true_ = ctx.true_();
+        let true_ = expr!(ctx, true);
         ctx.union(res, true_);
         ctx.egraph.rebuild();
     }
@@ -1959,7 +1957,7 @@ fn check_forall_wd_in_scratch(
     // Capture is implicit: the body indexes the *enclosing* value table directly,
     // so the body's state is that table cut to the quantifier's frame. The one slot
     // between is the `forall` step's own boolean, which its body cannot mention.
-    let mut state = host.frame_for(q, ctx.true_());
+    let mut state = host.frame_for(q, expr!(ctx, true));
     for ty in q.bound.iter() {
         let fresh = ctx.fresh_symbolic_value(ty.clone());
         state.push_val(fresh, ty.clone(), None);
@@ -2579,13 +2577,13 @@ fn inst_obligations(
                 // A bare (or absent) perm: the goal `0 < leaf` is discharged by
                 // the caller exactly as before (flag-OFF byte-identical).
                 None => {
-                    let zero = zero_real(ctx);
+                    let zero = expr!(ctx, 0/1);
                     let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, zero]));
                     vec![(goal, VerifyError::InsufficientPermission)]
                 }
                 Some(p @ ChunkPerm::Leaf(_)) => {
                     let leaf = p.as_leaf().unwrap();
-                    let zero = zero_real(ctx);
+                    let zero = expr!(ctx, 0/1);
                     let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, leaf]));
                     vec![(goal, VerifyError::InsufficientPermission)]
                 }
@@ -2596,8 +2594,7 @@ fn inst_obligations(
                     if prove_perm_positive(ctx, &p, pc_lits) {
                         vec![]
                     } else {
-                        let false_ = ctx.false_();
-                        vec![(false_, VerifyError::InsufficientPermission)]
+                        vec![(expr!(ctx, false), VerifyError::InsufficientPermission)]
                     }
                 }
             }
@@ -2624,7 +2621,7 @@ fn inst_obligations(
         // const-folds.
         InstKind::Heap(HeapInst::Inhale { perm, .. } | HeapInst::Exhale { perm, .. }) => {
             let perm = eval_perm(ctx, state, perm);
-            let goal = ctx.perm_positive(perm);
+            let goal = expr!(ctx, (0/1) <r {perm});
             vec![(
                 goal,
                 VerifyError::SideCondition("permission must be positive"),
@@ -2638,7 +2635,7 @@ fn inst_obligations(
             HeapInst::Add { perm, .. } | HeapInst::Sub { perm, .. },
         ) => {
             let perm = eval_perm(ctx, state, perm);
-            let zero = zero_real(ctx);
+            let zero = expr!(ctx, 0/1);
             // Permission must not be negative: not (perm < 0).
             let goal = expr!(ctx, not ({perm} <r {zero}));
             vec![(
@@ -2663,7 +2660,7 @@ fn inst_obligations(
 fn zero_of(ctx: &mut VerifyContext<'_>, ty: &Type) -> egg::Id {
     match ty {
         Type::Int => ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0)))),
-        _ => zero_real(ctx),
+        _ => expr!(ctx, 0/1),
     }
 }
 

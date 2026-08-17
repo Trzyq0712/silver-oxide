@@ -16,7 +16,7 @@
 use crate::verify::{
     context::VerifyContext,
     error::VerifyError,
-    heap::{Chunk, ChunkPerm, Heap, HeapPc, LocationKind, cube_eq, cube_meet, cube_push, zero_real},
+    heap::{Chunk, ChunkPerm, Heap, HeapPc, LocationKind, cube_eq, cube_meet, cube_push},
     lang::Symbolic,
 };
 use crate::vmir::{BinOp, Bound, Literal, Polarity};
@@ -126,14 +126,13 @@ pub(crate) fn assume_values_agree(
     other: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) {
-    let zero = zero_real(ctx);
-    let p_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, p]));
-    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [v, other]));
+    let p_pos = expr!(ctx, (0/1) <r {p});
+    let eq = expr!(ctx, {v} == {other});
     let antecedents = [(p_pos, Polarity::Positive)]
         .into_iter()
         .chain(pc_lits.iter().rev().copied());
     let imp = ctx.implication(eq, antecedents);
-    let true_ = ctx.true_();
+    let true_ = expr!(ctx, true);
     ctx.union(imp, true_);
 }
 
@@ -148,15 +147,15 @@ pub(crate) fn merge_values(
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
         num::BigInt::from(0),
     ))));
-    let p0_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, p0]));
-    let p1_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, p1]));
+    let p0_pos = expr!(ctx, {zero} <r {p0});
+    let p1_pos = expr!(ctx, {zero} <r {p1});
 
-    let value = ctx.add(Symbolic::Ite([p0_pos, v0, v1]));
+    let value = expr!(ctx, if {p0_pos} then {v0} else {v1});
 
     // `(PC ∧ p0 > 0 ∧ p1 > 0) ==> (v0 == v1)` as the golden-rule ITE chain.
     // Fold innermost-first: p1_pos, p0_pos, then PC literals in reverse.
-    let true_ = ctx.true_();
-    let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [v0, v1]));
+    let true_ = expr!(ctx, true);
+    let eq = expr!(ctx, {v0} == {v1});
     let antecedents = [(p1_pos, Polarity::Positive), (p0_pos, Polarity::Positive)]
         .into_iter()
         .chain(pc_lits.iter().rev().copied());
@@ -229,7 +228,7 @@ pub(crate) fn gate_bool_by_cube(
     fact: egg::Id,
     cube: &[(egg::Id, Polarity)],
 ) -> egg::Id {
-    let false_ = ctx.false_();
+    let false_ = expr!(ctx, false);
     cube.iter().fold(fact, |acc, (lit, pol)| {
         let arms = if matches!(pol, Polarity::Positive) {
             [*lit, acc, false_]
@@ -285,8 +284,7 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
     if chunks.is_empty() {
         return;
     }
-    let false_ = ctx.false_();
-    let true_ = ctx.true_();
+    let true_ = expr!(ctx, true);
 
     // The cube each chunk is actually present under: the block's control cube
     // (this heap only exists on that path — `heap_union` runs per `inhale`, inside
@@ -375,8 +373,7 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
                 continue;
             };
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
-            let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [pi, pj]));
-            let gt = ctx.add(Symbolic::Binary(BinOp::LtR, [b, sum]));
+            let gt = expr!(ctx, {b} <r ({pi} +r {pj}));
             // Fold the joint guard into the trigger, preserving the
             // `union(eq, ite(gt, false, eq))` collapse shape — the equation stays
             // valid on every path, so the union may stay unconditional.
@@ -386,8 +383,10 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
                 (chunks[i].addr, chunks[j].addr),
                 (chunks[j].addr, chunks[i].addr),
             ] {
-                let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [x, y]));
-                let imp = ctx.add(Symbolic::Ite([gt, false_, eq]));
+                let eq = expr!(ctx, {x} == {y});
+                // `gt ==> addr_x != addr_y`: when `gt` folds true the `ite`
+                // collapses `eq` to `false`.
+                let imp = expr!(ctx, if {gt} then false else {eq});
                 ctx.union(eq, imp);
             }
         }
@@ -623,8 +622,8 @@ pub(crate) fn prove_perm_positive(
                 return true;
             }
         }
-        let zero = zero_real(ctx);
-        let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, h]));
+        let zero = expr!(ctx, 0/1);
+        let goal = expr!(ctx, {zero} <r {h});
         ctx.prove_under_pc(goal, pc)
     })
 }
@@ -855,7 +854,7 @@ pub(crate) fn heap_subtract_inner(
         // wildcard is provably positive, so this (correctly) fails — a wildcard
         // cannot be exhaled from an empty location.
         // Nothing demanded: not (0 < needed).
-        let nonpos = expr!(ctx, not ((real 0) <r {chunk2_perm}));
+        let nonpos = expr!(ctx, not ((0/1) <r {chunk2_perm}));
         if ctx.prove_under_pc(nonpos, pc_lits) {
             return Ok(out);
         }
@@ -985,12 +984,11 @@ pub(crate) fn debit_wildcard(
     // Wildcard held/needed perms are always leaves (never a join `Select`), so
     // materializing here is a no-op id.
     let existing_perm = existing.ungated_perm().to_id(ctx);
-    let zero = zero_real(ctx);
-    let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing_perm]));
+    let held_pos = expr!(ctx, (0/1) <r {existing_perm});
     if !ctx.prove_under_pc(held_pos, pc_lits) {
         return Err(VerifyError::InsufficientPermission);
     }
-    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2_perm, existing_perm]));
+    let lt = expr!(ctx, {chunk2_perm} <r {existing_perm});
     // Unconditional union is safe here on both counts: `held > 0` was just proven, a
     // wildcard `needed` is positive by construction, so this is the both-held case
     // anyway — and `chunk2.value` is fresh besides.
@@ -1001,7 +999,7 @@ pub(crate) fn debit_wildcard(
     // otherwise a later `perm > 0` framing check on the leftover share (a field read
     // after a wildcard exhale, or a nested consume of the same predicate) could not
     // discharge. Batched into one rebuild.
-    let rem_pos = ctx.perm_positive(remainder);
+    let rem_pos = expr!(ctx, (0/1) <r {remainder});
     ctx.assume_all_guarded([lt, rem_pos], pc_lits);
     Ok(out.with_chunk(
         kind,
@@ -1165,7 +1163,7 @@ pub(crate) fn pc_alias_set(
     let set = members.into_iter().map(|c| (c, cube.clone())).collect();
     (
         set,
-        total.unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx))),
+        total.unwrap_or_else(|| ChunkPerm::Leaf(expr!(ctx, 0/1))),
     )
 }
 
@@ -1233,7 +1231,7 @@ pub(crate) fn heap_subtract_summarized(
     // gate, so a chunk that is only conditionally at this address claims value
     // agreement only under that condition.
     for (chunk, cube) in set {
-        let agree = ctx.add(Symbolic::Binary(BinOp::Eq, [chunk.value, chunk2.value]));
+        let agree = expr!(ctx, {chunk.value} == {chunk2.value});
         ctx.assume_guarded(agree, cube.iter().rev().copied());
     }
 
@@ -1244,8 +1242,9 @@ pub(crate) fn heap_subtract_summarized(
         let hold = chunk.ungated_perm().to_id(ctx);
         // `min(hold, remaining)` — a symbolic hold needs the `ite`; concrete
         // fractions fold it away.
-        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [hold, remaining]));
-        let take = ctx.add(Symbolic::Ite([lt, hold, remaining]));
+        // `min(hold, remaining)` — a symbolic hold needs the `ite`; concrete
+        // fractions fold it away.
+        let take = expr!(ctx, if ({hold} <r {remaining}) then {hold} else {remaining});
         let gated = gate_amount_by_pc(ctx, take, &cube);
         let rest = perm_sub(ctx, chunk.ungated_perm(), gated);
         // Debit `remaining` by what was actually taken — the **gated** amount, not
@@ -1324,7 +1323,7 @@ pub(crate) fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &H
                     let value = if ctx.egraph.find(a.value) == ctx.egraph.find(b.value) {
                         a.value
                     } else {
-                        ctx.add(Symbolic::Ite([cond, a.value, b.value]))
+                        expr!(ctx, if {cond} then {a.value} else {b.value})
                     };
                     if cube_eq(ctx, a.guard(), b.guard()) {
                         // Same presence on both arms → carry with shared guard.
@@ -1438,7 +1437,7 @@ pub(crate) fn summarize_perm_at(
             if ctx.egraph.find(c.addr) == canon {
                 (held, std::rc::Rc::from(Vec::new()))
             } else {
-                let eq = ctx.add(Symbolic::Binary(BinOp::Eq, [c.addr, addr]));
+                let eq = expr!(ctx, {c.addr} == {addr});
                 // Disproven aliasing contributes nothing — skip before minting the gate.
                 if matches!(
                     ctx.egraph[ctx.egraph.find(eq)].data.known(),
@@ -1469,7 +1468,7 @@ pub(crate) fn summarize_perm_at(
         });
     }
     (
-        total.unwrap_or_else(|| ChunkPerm::Leaf(zero_real(ctx))),
+        total.unwrap_or_else(|| ChunkPerm::Leaf(expr!(ctx, 0/1))),
         set,
     )
 }

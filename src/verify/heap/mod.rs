@@ -266,10 +266,6 @@ impl ChunkPerm {
 
 }
 
-/// The real `0` permission literal.
-pub(crate) fn zero_real(ctx: &mut VerifyContext<'_>) -> egg::Id {
-    ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())))
-}
 
 // ---------------------------------------------------------------------------
 // Guard cube algebra
@@ -364,7 +360,7 @@ pub(crate) fn gate_perm_by_guard(
 ) -> ChunkPerm {
     let mut acc = perm.clone();
     for (id, pol) in guard {
-        let zero = ChunkPerm::Leaf(zero_real(ctx));
+        let zero = ChunkPerm::Leaf(expr!(ctx, 0/1));
         acc = match pol {
             Polarity::Positive => ChunkPerm::select(ctx, *id, acc, zero),
             Polarity::Negative => ChunkPerm::select(ctx, *id, zero, acc),
