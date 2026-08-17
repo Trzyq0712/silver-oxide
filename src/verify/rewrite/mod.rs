@@ -15,12 +15,14 @@ pub(crate) mod arith;
 pub(crate) mod ite;
 pub(crate) mod diseq;
 pub(crate) mod adt;
-pub(crate) mod axiom;
+pub(crate) mod forall;
+pub(crate) mod recipe;
 pub(crate) mod function;
 
-pub(crate) use axiom::{
-    AxiomInst, AxiomPure, PreparedTerm, build_instance_releasing_tokens,
-    build_instance_subst, build_instance_vals_guarded, forall_rule,
+pub(crate) use forall::{PreparedTerm, forall_rule};
+pub(crate) use recipe::{
+    AxiomInst, AxiomPure, build_instance_releasing_tokens, build_instance_subst,
+    build_instance_vals_guarded,
 };
 pub(crate) use function::{facts_rule, function_post_rule, function_rule};
 pub(crate) use memo::{Memo, ScratchScope, new_memo_unit, new_scope_id};
@@ -31,7 +33,7 @@ pub(in crate::verify::rewrite) use timing::*;
 pub(in crate::verify::rewrite) use arith::*;
 pub(in crate::verify::rewrite) use ite::*;
 pub(in crate::verify::rewrite) use diseq::*;
-pub(in crate::verify::rewrite) use axiom::*;
+pub(in crate::verify::rewrite) use recipe::*;
 pub(in crate::verify::rewrite) use function::*;
 
 type Rule = Rewrite<Symbolic, ConstFold>;
