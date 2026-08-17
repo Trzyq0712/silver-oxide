@@ -630,15 +630,25 @@ pub(super) fn run_rules<'r>(
     if graph_inconsistent(&egraph) {
         return (egraph, Vec::new());
     }
-    // Explicit limits: egg's defaults (30 iterations, 10k nodes) are SILENT
-    // truncation points — a run that hits one simply stops mid-saturation and
-    // the caller sees an ordinary "not proven", which surfaced as a false
-    // insufficient-permission at ~20 match arms (one tower level collapses per
-    // iteration, so deep-but-terminating collapses need iterations ∝ depth).
+    // Explicit limits: egg's defaults (30 iterations, 10k nodes, **5 seconds**)
+    // are SILENT truncation points — a run that hits one simply stops
+    // mid-saturation and the caller sees an ordinary "not proven", which surfaced
+    // as a false insufficient-permission at ~20 match arms (one tower level
+    // collapses per iteration, so deep-but-terminating collapses need iterations
+    // ∝ depth).
+    //
+    // The time limit is the worst of the three, because it makes a *verdict*
+    // depend on wall clock: `enum_v8_p2::m_e_guarded` was measured failing on a
+    // 119s run and verifying on a 149s one, same binary and input. That also
+    // silently falsifies the premise `perf_regression` rests on ("egg is
+    // deterministic for a fixed rule set + input") for any program whose
+    // saturation approaches it. Disabled outright — the node and iteration limits
+    // are the real backstops, and unlike a clock they are reproducible.
     let runner = egg::Runner::default()
         .with_scheduler(egg::SimpleScheduler)
         .with_node_limit(100_000)
         .with_iter_limit(iter_limit.unwrap_or(100))
+        .with_time_limit(std::time::Duration::MAX)
         .with_egraph(egraph);
     let runner = runner.run(rules);
     (runner.egraph, runner.iterations)
