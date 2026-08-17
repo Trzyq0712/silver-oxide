@@ -1363,16 +1363,71 @@ fn heap_subtract(
     heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, true)
 }
 
-/// `sat_retry`: whether a framing miss may re-try under a **full saturation**
-/// ([`VerifyContext::saturate`]) before reporting insufficient permission. The address
-/// of a `&mut` reborrow passed to a call meets the held chunk's address only after the
-/// full rule set runs — `find_chunk_consolidated`'s own retry runs the terminating
-/// reductions only, which is not enough for it.
+/// Put the found chunk into the form the consume works on, and report the guard the
+/// remainder should be stored back under.
 ///
-/// Placed *after* the provably-zero fallback, not inside the lookup: retrying at
-/// every miss cost 36x on `structs_enums` (1.48s → 53.5s), since a legitimately
-/// absent chunk is common and the zero check closes it without saturation. Here
-/// only an obligation that would otherwise *fail* pays.
+/// A stored chunk keeps a FLAT presence guard and a guard-free amount, so there are
+/// two ways to make it consumable, and which one applies is decided by the pc:
+///
+/// - **pc does not entail the guard** — fold `guard ? perm : 0` into the amount and
+///   hand back a chunk that is unconditional by construction. Sufficiency and the
+///   remainder are then proven against a perm that is present only where the guard
+///   holds. The residual guard is empty: the conditionality now lives in the amount.
+/// - **pc already entails the guard** — the consume happens inside the very region
+///   the chunk is present in, so the gate is a no-op (the pc decides the `ite` arms
+///   anyway) and folding it in is actively *harmful*. The remainder is stored as a
+///   bare amount, so folding would **destroy** the flat cube on the first consume at
+///   the location, leaving the chunk's conditionality visible only as `ite`s buried
+///   in its arithmetic. A later join-level consume then has no structure to
+///   case-split on — precisely how the `&mut` reborrow shape lost its proof. Keep
+///   the amount bare and carry the cube through untouched.
+///
+/// Returns the chunk to consume against and the guard to re-attach to the remainder
+/// (empty in the first case, the chunk's own cube in the second).
+fn normalize_guard_for_consume(
+    ctx: &mut VerifyContext<'_>,
+    existing: Option<Chunk>,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> (Option<Chunk>, crate::verify::heap::HeapPc) {
+    let empty: crate::verify::heap::HeapPc = std::rc::Rc::from(Vec::new());
+    let Some(c) = existing else {
+        return (None, empty);
+    };
+    if c.guard().is_empty() {
+        return (Some(c), empty);
+    }
+    if c.pc_entails_guard(ctx, pc_lits) {
+        let kept = c.guard_pc();
+        (Some(c), kept)
+    } else {
+        let gated = c.gated_perm(ctx);
+        (Some(c.with_perm(gated).with_guard(empty.clone())), empty)
+    }
+}
+
+/// Consume `chunk2` from `h1`. The body is a **ladder, cheapest rung first**, and the
+/// order is load-bearing for cost rather than for correctness — every rung below the
+/// first is reached only by an obligation that would otherwise fail, so a consume
+/// that succeeds outright never pays for the ones under it.
+///
+/// 1. `find_chunk_consolidated` — ground e-class match on the address.
+/// 2. **no chunk**: a provably-zero demand is a no-op (a conditional footprint slot
+///    whose guard is false); else one `saturate` retry; else the summarized
+///    fallbacks.
+/// 3. **wildcard** demand — [`debit_wildcard`], a different rule entirely (hold
+///    *some* share rather than `held ≥ needed`).
+/// 4. **sufficiency proven** — [`debit_direct`], the hot path.
+/// 5. **not proven** — [`heap_subtract_summarized_fallbacks`]: pc-implied aliasing,
+///    then the whole-group Σ-ite summary.
+///
+/// `sat_retry` gates rung 2's re-try under a **full saturation**
+/// ([`VerifyContext::saturate`]): the address of a `&mut` reborrow passed to a call
+/// meets the held chunk's address only after the full rule set runs, and
+/// `find_chunk_consolidated`'s own retry runs the terminating reductions only, which
+/// is not enough for it. It sits *after* the provably-zero check, not inside the
+/// lookup — retrying at every miss cost **36x** on `structs_enums` (1.48s → 53.5s),
+/// since a legitimately absent chunk is common and the zero check closes it without
+/// saturation.
 fn heap_subtract_inner(
     ctx: &mut VerifyContext<'_>,
     h1: &Heap,
@@ -1381,39 +1436,8 @@ fn heap_subtract_inner(
     pc_lits: &[(egg::Id, Polarity)],
     sat_retry: bool,
 ) -> Result<Heap, VerifyError> {
-    let (mut out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
-    // Guarded-merge path: a stored chunk keeps a FLAT presence guard and a
-    // guard-free amount. Reconstruct the exact legacy `guard ? perm : 0`
-    // obligation transiently here — once, per consume — so sufficiency/remainder
-    // are proven against the gated perm (present only where the guard holds),
-    // preserving legacy semantics while merges stay flat.
-    //
-    // …**unless the pc already entails the guard**, i.e. the consume happens
-    // inside the very region the chunk is present in. There the gate is a no-op
-    // (`ite` arms the pc decides anyway) and folding it in is actively harmful:
-    // the remainder is stored as a bare amount, so the guard is *destroyed* by the
-    // first consume at the location and the chunk's conditionality survives only
-    // as `ite`s buried in its arithmetic. A later join-level consume then cannot
-    // see it as structure and has nothing to case-split on — which is precisely
-    // how the `&mut` reborrow shape lost its proof. Keeping the flat cube keeps
-    // the representation the whole guard-hoisted design depends on.
-    let keep_guard = existing
-        .as_ref()
-        .is_some_and(|c| !c.guard().is_empty() && c.pc_entails_guard(ctx, pc_lits));
-    let kept: crate::verify::heap::HeapPc = match (&existing, keep_guard) {
-        (Some(c), true) => c.guard_pc(),
-        _ => std::rc::Rc::from(Vec::new()),
-    };
-    let existing = existing.map(|c| {
-        if !c.guard().is_empty() && !keep_guard {
-            // Fold the guard into the amount and drop it: the conditionality now
-            // lives in the perm, so the chunk is unconditional by construction.
-            let gated = c.gated_perm(ctx);
-            c.with_perm(gated).with_guard(std::rc::Rc::from(Vec::new()))
-        } else {
-            c
-        }
-    });
+    let (out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
+    let (existing, kept) = normalize_guard_for_consume(ctx, existing, pc_lits);
     let chunk2_perm = chunk2.ungated_perm().to_id(ctx);
     let Some(existing) = existing else {
         // No chunk at `addr`. Subtracting a provably-zero permission (e.g. a
@@ -1433,96 +1457,17 @@ fn heap_subtract_inner(
             ctx.saturate();
             return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, false);
         }
-        // Last resort: the demanded address may match a held chunk **only under the
-        // pc** (a `&mut` reborrow inside a branch arm, whose address equality is a
-        // pc-guarded fact that ground e-class matching cannot see). The pc probe
-        // (`chunk_under_pc`'s set-valued sibling) resolves it.
-        //
-        // Consuming through it goes down the invariant-7 path: sufficiency is proven
-        // under the pc and the debit is **gated** by the pc, so off-path — where the
-        // addresses are unrelated — nothing is taken.
-        //
-        // The whole pc-alias *set* is collected, not the first hit: several held
-        // chunks can coincide with the demand under the pc, and only their sum is
-        // the permission at that location. A first-hit lookup is order-dependent —
-        // it can land on a chunk an earlier consume already drained while the full
-        // permission sits in another.
-        let alias_set = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
-        if !alias_set.is_empty() {
-            let (set, total) = pc_alias_set(ctx, h1, kind, None, &alias_set, pc_lits);
-            if !set.is_empty() {
-                return heap_subtract_summarized(
-                    ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
-                );
-            }
-        }
-        // Last-last resort: summarize the *whole* group under the symbolic address
-        // gate. Nothing matched on ground and no pc-implied alias was found, but a
-        // chunk may still sit here under an equality the pc does not mention.
-        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr, pc_lits);
-        if !set.is_empty()
-            && let Ok(h) = heap_subtract_summarized(
-                ctx,
-                out.clone(),
-                kind,
-                &set,
-                total,
-                chunk2.clone(),
-                chunk2_perm,
-                pc_lits,
-            )
-        {
-            return Ok(h);
-        }
-        if std::env::var_os("SILVER_OXIDE_TRACE_MISS").is_some() {
-            eprintln!(
-                "[miss] group {:?} demanded addr:\n{}held addrs ({}):",
-                kind.group,
-                crate::verify::viz::dump_term(ctx, chunk2.addr, 40),
-                h1.chunks_of(kind).len(),
-            );
-            for c in h1.chunks_of(kind).to_vec() {
-                eprintln!("{}", crate::verify::viz::dump_term(ctx, c.addr, 40));
-            }
-        }
-        return Err(VerifyError::InsufficientPermission);
+        // Nothing on ground: the demanded address may still match a held chunk under
+        // the pc (a `&mut` reborrow inside a branch arm, whose address equality is a
+        // pc-guarded fact ground e-class matching cannot see), or under an equality
+        // the pc does not mention.
+        return heap_subtract_summarized_fallbacks(
+            ctx, h1, out, kind, None, chunk2, chunk2_perm, pc_lits,
+        );
     };
 
-    // Wildcard exhale: instead of proving `held ≥ needed` (a wildcard has no
-    // fixed value), require the location hold *some* permission (`held > 0`) and
-    // **assume** the taken share is strictly smaller (`needed < held`) under the
-    // pc — Silicon's constrainable-ARP rule. The `held − needed` remainder stays
-    // positive, so the chunk is never emptied.
     if ctx.has_wildcard && contains_wildcard(ctx, chunk2_perm) {
-        // Wildcard held/needed perms are always leaves (never a join `Select`),
-        // so materializing here is a no-op id.
-        let existing_perm = existing.ungated_perm().to_id(ctx);
-        let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-        let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing_perm]));
-        if !ctx.prove_under_pc(held_pos, pc_lits) {
-            return Err(VerifyError::InsufficientPermission);
-        }
-        let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2_perm, existing_perm]));
-        // Unconditional union is safe here on both counts: `held > 0` was just
-        // proven, a wildcard `needed` is positive by construction, so this is the
-        // both-held case anyway — and `chunk2.value` is fresh besides.
-        ctx.union(existing.value, chunk2.value);
-        let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
-        // Assume `needed < held` and, because the e-graph has no real-order
-        // arithmetic to derive `held − needed > 0` from it, the remainder's
-        // positivity explicitly — otherwise a later `perm > 0` framing check on
-        // the leftover share (a field read after a wildcard exhale, or a nested
-        // consume of the same predicate) could not discharge. Batched into one
-        // rebuild.
-        let rem_pos = ctx.perm_positive(remainder);
-        ctx.assume_all_guarded([lt, rem_pos], pc_lits);
-        out = out.with_chunk(
-            kind,
-            Chunk::new(existing.addr, remainder, existing.value)
-                .with_recipe(existing.recipe.clone())
-                .with_guard(kept.clone()),
-        );
-        return Ok(out);
+        return debit_wildcard(ctx, out, kind, &existing, &chunk2, chunk2_perm, pc_lits, kept);
     }
 
     // Sufficiency `held ≥ needed`, proven per-leaf over the (possibly
@@ -1536,68 +1481,54 @@ fn heap_subtract_inner(
         // ground never consolidates two chunks that are only conditionally equal.
         //
         // Tried only after the plain proof fails: no unaliased consume pays the probe.
-        let partners = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
-        if !partners.is_empty() {
-            let (set, total) =
-                pc_alias_set(ctx, h1, kind, Some(&existing), &partners, pc_lits);
-            return heap_subtract_summarized(
-                ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
-            );
-        }
-        // The demanded chunk alone is not enough and no pc-implied alias exists, but
-        // another chunk of the group may sit at this address under an equality the pc
-        // does not mention. Fall back to the Σ-ite summary over the whole group —
-        // strictly the last resort, so no consume that succeeds outright pays for it.
-        let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr, pc_lits);
-        if set.len() > 1
-            && let Ok(h) = heap_subtract_summarized(
-                ctx,
-                out.clone(),
-                kind,
-                &set,
-                total,
-                chunk2.clone(),
-                chunk2_perm,
-                pc_lits,
-            )
-        {
-            return Ok(h);
-        }
-        // NOT retried under merge guards here, unlike `heap_subtract_summarized`
-        // and the `SlotPerm::Presence` framing check. This is the hot path — every
+        //
+        // NOT retried under merge guards here, unlike `heap_subtract_summarized` and
+        // the `SlotPerm::Presence` framing check. This is the hot path — every
         // `- acc` reaches it — and measurement says the retry buys nothing on it:
-        // where a single chunk's sufficiency is arm-dependent the deciding guard
-        // sits below the depth bound, in give-back residue, and a bound wide enough
-        // to reach it took `shape_area` from 1s to over ten minutes. The two
-        // members that need it are recorded in `expected_failures.txt`.
-        {
-            if crate::verify::viz::dump_perm_enabled() {
-                let existing_perm = existing.ungated_perm().to_id(ctx);
-                eprintln!(
-                    "[perm-dump] insufficient at subtract in group {:?}\n\
-                     held.perm:\n{}needed.perm:\n{}",
-                    kind.group,
-                    crate::verify::viz::dump_term(ctx, existing_perm, 64),
-                    crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
-                );
-            }
-            return Err(VerifyError::InsufficientPermission);
-        }
-        // Sufficiency established per arm; fall through to the ordinary debit.
+        // where a single chunk's sufficiency is arm-dependent the deciding guard sits
+        // below the depth bound, in give-back residue, and a bound wide enough to
+        // reach it took `shape_area` from 1s to over ten minutes. The two members
+        // that need it are recorded in `expected_failures.txt`.
+        return heap_subtract_summarized_fallbacks(
+            ctx,
+            h1,
+            out,
+            kind,
+            Some(&existing),
+            chunk2,
+            chunk2_perm,
+            pc_lits,
+        );
     }
 
-    // Unconditional, unlike the guarded rule `union_heaps` and `merge_chunks` use.
-    // Sound here because the two sides are not symmetric: `chunk2.value` is minted
-    // fresh by `heap_acc` for *this* consume and carries no prior meaning, so the
-    // union constrains only the fresh symbol and cannot corrupt `existing.value`.
-    // (The loop frame restore's bug was the symmetric case — two pre-existing
-    // values, one of them a havoc symbol something downstream reads.) Note this is
-    // NOT implied by the sufficiency proof above: `held ≥ needed` permits
-    // `needed == 0`, so a conditional exhale does bind the slot value off-path.
-    // Probed with complementary conditional exhales and with a call whose `requires`
-    // has a conditional footprint; both are correctly rejected.
-    ctx.union(existing.value, chunk2.value);
+    Ok(debit_direct(
+        ctx, out, kind, &existing, &chunk2, chunk2_perm, kept,
+    ))
+}
 
+/// Take `chunk2_perm` off a single chunk whose sufficiency is already proven, and
+/// store the remainder back under `kept`.
+///
+/// The value union is **unconditional**, unlike the guarded rule [`union_heaps`] and
+/// [`merge_chunks`] use. Sound here because the two sides are not symmetric:
+/// `chunk2.value` is minted fresh by [`heap_acc`] for *this* consume and carries no
+/// prior meaning, so the union constrains only the fresh symbol and cannot corrupt
+/// `existing.value`. (The loop frame restore's bug was the symmetric case — two
+/// pre-existing values, one of them a havoc symbol something downstream reads.) Note
+/// it is NOT implied by the sufficiency proof: `held ≥ needed` permits `needed == 0`,
+/// so a conditional exhale does bind the slot value off-path. Probed with
+/// complementary conditional exhales and with a call whose `requires` has a
+/// conditional footprint; both are correctly rejected.
+fn debit_direct(
+    ctx: &mut VerifyContext<'_>,
+    out: Heap,
+    kind: &LocationKind,
+    existing: &Chunk,
+    chunk2: &Chunk,
+    chunk2_perm: egg::Id,
+    kept: crate::verify::heap::HeapPc,
+) -> Heap {
+    ctx.union(existing.value, chunk2.value);
     // Remainder stays structural (leaves get `SubR`); never an `ite` in the graph.
     let remainder = perm_sub(ctx, existing.ungated_perm(), chunk2_perm);
     // Whether to drop the emptied chunk is a statement about the *heap*, so it has
@@ -1614,21 +1545,178 @@ fn heap_subtract_inner(
     // stay O(1) — asking the prover runs once per chunk per consume and dominated
     // everything (93s vs 4s). Keeping a chunk we merely failed to prove empty is
     // sound: a zero-permission chunk is inert (`perm > 0` gates every use).
-    let empty = perm_all_zero(ctx, &remainder);
-    if empty {
-        out = out.without_chunk(kind, existing.addr);
+    if perm_all_zero(ctx, &remainder) {
+        out.without_chunk(kind, existing.addr)
     } else {
         // The value (and so its recipe provenance) is unchanged by a subtract, and
         // so is the presence guard when the pc entailed it: the chunk is still held
         // exactly where it was, just for less.
-        out = out.with_chunk(
+        out.with_chunk(
             kind,
             Chunk::new_perm(existing.addr, remainder, existing.value)
                 .with_recipe(existing.recipe.clone())
-                .with_guard(kept.clone()),
-        );
+                .with_guard(kept),
+        )
     }
-    Ok(out)
+}
+
+/// Wildcard exhale. Instead of proving `held ≥ needed` (a wildcard has no fixed
+/// value), require the location hold *some* permission (`held > 0`) and **assume**
+/// the taken share is strictly smaller (`needed < held`) under the pc — Silicon's
+/// constrainable-ARP rule. The `held − needed` remainder stays positive, so the
+/// chunk is never emptied and there is no drop-if-zero case.
+#[allow(clippy::too_many_arguments)]
+fn debit_wildcard(
+    ctx: &mut VerifyContext<'_>,
+    out: Heap,
+    kind: &LocationKind,
+    existing: &Chunk,
+    chunk2: &Chunk,
+    chunk2_perm: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+    kept: crate::verify::heap::HeapPc,
+) -> Result<Heap, VerifyError> {
+    // Wildcard held/needed perms are always leaves (never a join `Select`), so
+    // materializing here is a no-op id.
+    let existing_perm = existing.ungated_perm().to_id(ctx);
+    let zero = zero_real(ctx);
+    let held_pos = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, existing_perm]));
+    if !ctx.prove_under_pc(held_pos, pc_lits) {
+        return Err(VerifyError::InsufficientPermission);
+    }
+    let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [chunk2_perm, existing_perm]));
+    // Unconditional union is safe here on both counts: `held > 0` was just proven, a
+    // wildcard `needed` is positive by construction, so this is the both-held case
+    // anyway — and `chunk2.value` is fresh besides.
+    ctx.union(existing.value, chunk2.value);
+    let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
+    // Assume `needed < held` and, because the e-graph has no real-order arithmetic to
+    // derive `held − needed > 0` from it, the remainder's positivity explicitly —
+    // otherwise a later `perm > 0` framing check on the leftover share (a field read
+    // after a wildcard exhale, or a nested consume of the same predicate) could not
+    // discharge. Batched into one rebuild.
+    let rem_pos = ctx.perm_positive(remainder);
+    ctx.assume_all_guarded([lt, rem_pos], pc_lits);
+    Ok(out.with_chunk(
+        kind,
+        Chunk::new(existing.addr, remainder, existing.value)
+            .with_recipe(existing.recipe.clone())
+            .with_guard(kept),
+    ))
+}
+
+/// The two **summarized** resolutions of a consume that the direct path could not
+/// settle, tried in order. Shared by both callers in [`heap_subtract_inner`] — the
+/// no-chunk-at-all case and the chunk-found-but-insufficient case — which ran two
+/// near-copies of this ladder before.
+///
+/// In order, cheapest first:
+/// 1. **pc-implied aliasing** ([`VerifyContext::pc_alias_partners`]) — the demanded
+///    address coincides with held chunks only under the path condition. Needs a
+///    probe, so it is tried only once the direct path has failed.
+/// 2. **whole-group Σ-ite summary** ([`summarize_perm_at`]) — a chunk may still sit
+///    at this address under an equality the pc does not mention. Strictly the last
+///    resort: it walks every chunk of the group.
+///
+/// `existing` is the chunk that matched on ground, if any, and does double duty:
+/// - it **seeds** the pc-alias set, so the ground match's own fraction joins the sum;
+/// - it sets the **bar** for the group summary. With nothing matched, any non-empty
+///   summary is new information. With a chunk already tried and found insufficient, a
+///   one-member summary is that same chunk again — only a genuinely larger set is
+///   worth the attempt.
+///
+/// The pc-alias branch **returns** rather than falling through when it produces a
+/// set: its `Err` is the answer. (With `existing = Some`, the set always contains at
+/// least that chunk, so this is exactly the pre-refactor control flow of both callers.)
+fn heap_subtract_summarized_fallbacks(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    out: Heap,
+    kind: &LocationKind,
+    existing: Option<&Chunk>,
+    chunk2: Chunk,
+    chunk2_perm: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> Result<Heap, VerifyError> {
+    // 1. pc-implied aliasing. The whole partner *set* is collected, not the first
+    //    hit: several held chunks can coincide with the demand under the pc, and only
+    //    their sum is the permission at that location. A first-hit lookup is
+    //    order-dependent — it can land on a chunk an earlier consume already drained
+    //    while the full permission sits in another.
+    //
+    //    Consuming through it goes down the invariant-7 path: sufficiency is proven
+    //    under the pc and the debit is **gated** by the pc, so off-path — where the
+    //    addresses are unrelated — nothing is taken, and ground never consolidates
+    //    two chunks that are only conditionally equal.
+    let partners = ctx.pc_alias_partners(h1.chunks_of(kind), chunk2.addr, pc_lits);
+    if !partners.is_empty() {
+        let (set, total) = pc_alias_set(ctx, h1, kind, existing, &partners, pc_lits);
+        if !set.is_empty() {
+            return heap_subtract_summarized(
+                ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
+            );
+        }
+    }
+    // 2. Whole-group Σ-ite summary.
+    let (total, set) = summarize_perm_at(ctx, h1.chunks_of(kind), chunk2.addr, pc_lits);
+    if set.len() > usize::from(existing.is_some())
+        && let Ok(h) = heap_subtract_summarized(
+            ctx,
+            out.clone(),
+            kind,
+            &set,
+            total,
+            chunk2.clone(),
+            chunk2_perm,
+            pc_lits,
+        )
+    {
+        return Ok(h);
+    }
+    subtract_miss_trace(ctx, h1, kind, existing, &chunk2, chunk2_perm);
+    Err(VerifyError::InsufficientPermission)
+}
+
+/// Env-gated diagnostics for a consume that resolved nowhere. Two different
+/// questions, so two different dumps: with no ground match the useful thing is the
+/// demanded address against the held ones (`SILVER_OXIDE_TRACE_MISS`); with a match
+/// that proved insufficient it is the two permission terms
+/// (`SILVER_OXIDE_DUMP_PERM`).
+fn subtract_miss_trace(
+    ctx: &mut VerifyContext<'_>,
+    h1: &Heap,
+    kind: &LocationKind,
+    existing: Option<&Chunk>,
+    chunk2: &Chunk,
+    chunk2_perm: egg::Id,
+) {
+    match existing {
+        Some(existing) => {
+            if crate::verify::viz::dump_perm_enabled() {
+                let existing_perm = existing.ungated_perm().to_id(ctx);
+                eprintln!(
+                    "[perm-dump] insufficient at subtract in group {:?}\n\
+                     held.perm:\n{}needed.perm:\n{}",
+                    kind.group,
+                    crate::verify::viz::dump_term(ctx, existing_perm, 64),
+                    crate::verify::viz::dump_term(ctx, chunk2_perm, 64),
+                );
+            }
+        }
+        None => {
+            if std::env::var_os("SILVER_OXIDE_TRACE_MISS").is_some() {
+                eprintln!(
+                    "[miss] group {:?} demanded addr:\n{}held addrs ({}):",
+                    kind.group,
+                    crate::verify::viz::dump_term(ctx, chunk2.addr, 40),
+                    h1.chunks_of(kind).len(),
+                );
+                for c in h1.chunks_of(kind).to_vec() {
+                    eprintln!("{}", crate::verify::viz::dump_term(ctx, c.addr, 40));
+                }
+            }
+        }
+    }
 }
 
 /// Build the pc-alias flavour of a [`heap_subtract_summarized`] set: `existing` (when
