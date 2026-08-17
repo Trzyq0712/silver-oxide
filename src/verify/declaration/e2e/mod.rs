@@ -3175,10 +3175,33 @@ method p3(c: Bool, x: Int) { if (c) { assume x > 0  assert x > 0 } }
 }
 
 #[test]
+#[ignore = "needs the removed nested same-condition ite shapes; see the header"]
 fn both_arms_establishing_a_fact_verifies_via_structural_join() {
+    // IGNORED — the rules this depended on were removed deliberately.
+    //
     // Both arms inhale `x > 0`, so it genuinely holds at the merge: the structural
     // block join recombines `c ⇒ x>0` and `¬c ⇒ x>0` into `x > 0` with no case
     // split. Silicon proves it too.
+    //
+    // It was discharged by the two nested same-condition `ite` shapes in
+    // `IteReduceApplier`: `ite(c, true, x>0)` lands in the `true` class by
+    // congruence, which puts an inner ite on the same `c` inside the outer ite's
+    // else-arm, and the mirror shape collapses it. That scan is over a whole branch
+    // class, so it carried a `NESTED_SCAN_BOUND = 64` cutoff — and the class it has
+    // to search is the `true` class, the one that accretes past 64 immediately.
+    // Measured: this shape verifies with 0 or 20 unrelated facts in scope and
+    // **fails at 60**, so the rules had been inert on every non-trivial program
+    // since the bound landed (2026-07-28, `9cf90c4`). This test passed only because
+    // its graph is 16 nodes.
+    //
+    // Nothing else needed them: the full Prusti corpus (4494 members) and the
+    // panic-freedom suite are byte-identical without them, and the permission-side
+    // analogue of the identity is applied structurally at construction by
+    // `ChunkPerm::collapse_same_cond` — no scan, no budget.
+    //
+    // Re-enable if a case-split rule `(c ⇒ f) ∧ (¬c ⇒ f) ⊢ f` is ever added: record
+    // each polarity on union into `true` and fire when both appear, which is O(1)
+    // and states the inference directly instead of pattern-matching its residue.
     let input = r#"
 method give(x: Int) ensures x > 0
 method p2(c: Bool, x: Int) { if (c) { give(x) } else { give(x) }  assert x > 0 }

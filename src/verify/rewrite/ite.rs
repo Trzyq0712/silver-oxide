@@ -74,15 +74,6 @@ pub(super) fn known_bool(egraph: &EGraph<Symbolic, ConstFold>, class: Id) -> Opt
 
 pub(super) struct IteReduceApplier;
 
-/// Measurement gate for the two nested same-condition `ite` shapes
-/// (`ite(c, ite(c, x, y), _)` and its mirror). Set `SILVER_OXIDE_NO_NESTED_ITE=1`
-/// to drop them and cost out the nested branch-class scan.
-pub(super) fn nested_ite_shapes_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SILVER_OXIDE_NO_NESTED_ITE").is_none())
-}
-
 impl Applier<Symbolic, ConstFold> for IteReduceApplier {
     fn apply_one(
         &self,
@@ -197,63 +188,6 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
             if t_lit == Some(false) && e == c {
                 unions.push((eclass, Target::False));
             }
-            // Nested same-condition ite in one branch — `c ? (c ? x : y) : e` and
-            // its mirror. Every arm collapses the whole class, so the first hit
-            // makes any further match redundant: stop on the first collapse and
-            // skip the else-branch scan if the then-branch produced one.
-            let mut collapsed = false;
-            // Large branch classes (the `true` class alone reaches ~1600 nodes on
-            // enum-match) almost never hold an inner ite on the same `c`, so
-            // scanning them per outer-ite per iteration was 55% of runtime. Skip
-            // them — the load-bearing structural-join shape keeps its branch
-            // classes tiny, and skipping a rewrite is incomplete, not unsound.
-            const NESTED_SCAN_BOUND: usize = 64;
-            let nested = nested_ite_shapes_enabled();
-            let scan_t = nested && egraph[t].nodes.len() <= NESTED_SCAN_BOUND;
-            let scan_e = nested && egraph[e].nodes.len() <= NESTED_SCAN_BOUND;
-            //   c ? (c ? x : y) : e
-            for inner in scan_t.then(|| &egraph[t].nodes).into_iter().flatten() {
-                let Symbolic::Ite([c2, x, y]) = inner else {
-                    continue;
-                };
-                if egraph.find(*c2) != c {
-                    continue;
-                }
-                // c ? (c ? x : y) : x => x
-                if egraph.find(*x) == e {
-                    unions.push((eclass, Target::Class(e)));
-                    collapsed = true;
-                    break;
-                }
-                // c ? (c ? x : y) : y => c ? x : y
-                if egraph.find(*y) == e {
-                    unions.push((eclass, Target::Class(t)));
-                    collapsed = true;
-                    break;
-                }
-            }
-            // Nested same-condition ite in the false branch:
-            //   c ? t : (c ? x : y)
-            if !collapsed && scan_e {
-                for inner in &egraph[e].nodes {
-                    let Symbolic::Ite([c2, x, y]) = inner else {
-                        continue;
-                    };
-                    if egraph.find(*c2) != c {
-                        continue;
-                    }
-                    // c ? x : (c ? y : x) => x
-                    if egraph.find(*y) == t {
-                        unions.push((eclass, Target::Class(t)));
-                        break;
-                    }
-                    // c ? x : (c ? x : y) => c ? x : y
-                    if egraph.find(*x) == t {
-                        unions.push((eclass, Target::Class(e)));
-                        break;
-                    }
-                }
-            }
         }
 
         let mut changed = Vec::new();
@@ -286,14 +220,20 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
 /// over a bucket holding thousands of classes. The fused pass is linear in the
 /// bucket (plus the two branch classes' nodes) and union-only.
 ///
-/// Shapes (c ⋄ t ⋄ e over one node, plus one nested level):
+/// Shapes, all decided from a single `Ite` node and its two branch classes:
 /// - `ite(true, x, y) ⇒ x`, `ite(false, x, y) ⇒ y` (via `ConstFold` on `c`)
 /// - `ite(c, x, x) ⇒ x`
 /// - `ite(c, true, false) ⇒ c`
 /// - `ite(c, c, false) ⇒ c`, `ite(c, true, c) ⇒ c`
 /// - `ite(c, c, true) ⇒ true`, `ite(c, false, c) ⇒ false`
-/// - `ite(c, ite(c, x, y), x) ⇒ x`, `ite(c, x, ite(c, y, x)) ⇒ x`
-/// - `ite(c, ite(c, x, y), y) ⇒ ite(c, x, y)`, `ite(c, x, ite(c, x, y)) ⇒ ite(c, x, y)`
+///
+/// The two **nested** same-condition shapes (`ite(c, ite(c, x, y), _)` and its
+/// mirror) were removed: they needed a scan of a whole branch class, which is why
+/// they carried a `NESTED_SCAN_BOUND` cutoff — and that cutoff disabled them on
+/// every non-trivial program, since the class they had to search is the `true`
+/// class. The permission-side analogue of the same identity is applied
+/// structurally at construction by [`ChunkPerm::collapse_same_cond`], with no scan
+/// and no budget.
 pub(super) fn terminating_ite_rules() -> Vec<Rule> {
     vec![Rewrite::new("ite-reduce", IteBucketSearcher, IteReduceApplier).expect("ite rule")]
 }
