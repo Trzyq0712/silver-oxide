@@ -11,6 +11,8 @@ pub mod lang;
 mod quant;
 mod rewrite;
 mod stats;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod types;
 mod viz;
 

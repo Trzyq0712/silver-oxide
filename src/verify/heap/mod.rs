@@ -1,3 +1,5 @@
+pub(crate) mod algebra;
+
 use std::cell::Cell;
 use std::rc::Rc;
 
