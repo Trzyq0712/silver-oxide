@@ -243,6 +243,113 @@ impl ChunkPerm {
 
 }
 
+/// The real `0` permission literal.
+pub(crate) fn zero_real(ctx: &mut VerifyContext<'_>) -> egg::Id {
+    ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())))
+}
+
+// ---------------------------------------------------------------------------
+// Guard cube algebra
+//
+// A presence guard is a flat conjunctive cube of e-class literals ([`HeapPc`]).
+// These four operations are the whole vocabulary over it. They live here, beside
+// the private [`Chunk::guard`] field they read, so the encapsulation the accessors
+// below establish is not leaked back out to every caller that needs to compare or
+// extend a cube.
+// ---------------------------------------------------------------------------
+
+/// The conjunction of two presence cubes, or `None` when they are **disjoint** —
+/// some literal occurs in both with opposite polarity, so the two chunks are
+/// never held in the same state and no joint fact about them may be stated.
+///
+/// Decided in Rust by e-class identity rather than left to saturation: the
+/// complementary pair (`[c+]` and `[c−]`, the two one-sided chunks of a single
+/// join) is exactly the case that must be dropped, and dropping it must not
+/// depend on an `ite`-idempotence rewrite firing.
+pub(crate) fn cube_meet(
+    ctx: &VerifyContext<'_>,
+    a: &[(egg::Id, Polarity)],
+    b: &[(egg::Id, Polarity)],
+) -> Option<Vec<(egg::Id, Polarity)>> {
+    let mut out: Vec<(egg::Id, Polarity)> = a.to_vec();
+    for (id, pol) in b {
+        let c = ctx.egraph.find(*id);
+        match out.iter().find(|(i, _)| ctx.egraph.find(*i) == c) {
+            Some((_, p)) if p == pol => {}
+            Some(_) => return None,
+            None => out.push((*id, *pol)),
+        }
+    }
+    Some(out)
+}
+
+/// Whether `cube` entails `sub`: every literal of `sub` already appears in `cube`
+/// with the same polarity, so `sub` holds wherever `cube` does. Syntactic on
+/// e-classes, like [`cube_eq`] — no prove, no saturation.
+pub(crate) fn cube_entails(
+    ctx: &VerifyContext<'_>,
+    cube: &[(egg::Id, Polarity)],
+    sub: &[(egg::Id, Polarity)],
+) -> bool {
+    sub.iter().all(|(id, pol)| {
+        let c = ctx.egraph.find(*id);
+        cube.iter().any(|(i, p)| p == pol && ctx.egraph.find(*i) == c)
+    })
+}
+
+/// Set-equality of two guard cubes under canonical e-classes (order-insensitive;
+/// guards are small).
+pub(crate) fn cube_eq(
+    ctx: &VerifyContext<'_>,
+    a: &[(egg::Id, Polarity)],
+    b: &[(egg::Id, Polarity)],
+) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|(ia, pa)| {
+            let ca = ctx.egraph.find(*ia);
+            b.iter()
+                .any(|(ib, pb)| pa == pb && ctx.egraph.find(*ib) == ca)
+        })
+}
+
+/// Append `lit` to a guard cube (idempotent under canonical e-classes).
+pub(crate) fn cube_push(
+    ctx: &VerifyContext<'_>,
+    base: &[(egg::Id, Polarity)],
+    lit: (egg::Id, Polarity),
+) -> HeapPc {
+    let c = ctx.egraph.find(lit.0);
+    if base
+        .iter()
+        .any(|(i, p)| *p == lit.1 && ctx.egraph.find(*i) == c)
+    {
+        return Rc::from(base.to_vec());
+    }
+    let mut v = base.to_vec();
+    v.push(lit);
+    Rc::from(v)
+}
+
+/// Materialize `guard ? perm : 0`. With an empty guard this is `perm` unchanged
+/// (no node minted), which is why the unconditional hot path pays nothing for
+/// gating. Prefer [`Chunk::gated_perm`]; this free form is for the two callers
+/// that hold a [`ChunkPerm`] without its chunk.
+pub(crate) fn gate_perm_by_guard(
+    ctx: &mut VerifyContext<'_>,
+    perm: &ChunkPerm,
+    guard: &[(egg::Id, Polarity)],
+) -> ChunkPerm {
+    let mut acc = perm.clone();
+    for (id, pol) in guard {
+        let zero = ChunkPerm::Leaf(zero_real(ctx));
+        acc = match pol {
+            Polarity::Positive => ChunkPerm::select(ctx, *id, acc, zero),
+            Polarity::Negative => ChunkPerm::select(ctx, *id, zero, acc),
+        };
+    }
+    acc
+}
+
 /// The **kind** of a heap location: a field/predicate group, the held value
 /// type, and the permission bound. This is exactly the content of a location's
 /// `Type::Addr` — the chunks of one kind share a group in the heap. Sourced
@@ -276,7 +383,11 @@ impl LocationKind {
 pub struct Chunk {
     /// The address e-class this chunk sits at (its identity within a group).
     pub(crate) addr: egg::Id,
-    pub(crate) perm: ChunkPerm,
+    /// The **ungated** amount. Private: a chunk's real permission is
+    /// `guard ? perm : 0`, and reading this raw reports a conditionally-held
+    /// chunk as fully held. Go through [`Chunk::gated_perm`] unless the call site
+    /// re-attaches the guard itself — see [`Chunk::ungated_perm`].
+    perm: ChunkPerm,
     pub(crate) value: egg::Id,
     /// Reachability guard: the flat cube of branch literals under which this
     /// chunk is present (empty = unconditional). A held-on-one-arm conditional
@@ -285,8 +396,12 @@ pub struct Chunk {
     /// `perm` stays a guard-free amount and no `0` leaf is ever built. Presence is
     /// `guard ∧` the consuming instruction's pc; the amount holds unconditionally
     /// under it, and the consume sites reconstruct the `guard?perm:0` obligation
-    /// transiently (`gate_perm_by_guard`).
-    pub(crate) guard: HeapPc,
+    /// transiently ([`Chunk::gated_perm`]).
+    ///
+    /// Private for the same reason as `perm`: the two are only meaningful
+    /// together. Read it through [`Chunk::guard`], and prefer the derived
+    /// [`Chunk::presence_cube`] / [`Chunk::pc_entails_guard`] where they fit.
+    guard: HeapPc,
     /// Recipe provenance of `value` — the recipe-space temp a certificate walk
     /// (function/resource verification) associates with the held value, so a
     /// later `Deref` purifies to the pure term this chunk was produced from.
@@ -324,10 +439,81 @@ impl Chunk {
         &self.guard
     }
 
+    /// This chunk's guard as a shared [`HeapPc`], for re-attaching to a chunk
+    /// derived from it ([`Chunk::with_guard`]). `Rc` clone — O(1), unlike
+    /// rebuilding one from [`Chunk::guard`].
+    pub(crate) fn guard_pc(&self) -> HeapPc {
+        self.guard.clone()
+    }
+
     /// Return this chunk with residual presence guard `guard` (structural share).
     pub(crate) fn with_guard(mut self, guard: HeapPc) -> Self {
         self.guard = guard;
         self
+    }
+
+    /// Return this chunk holding permission `perm` (guard and value unchanged).
+    pub(crate) fn with_perm(mut self, perm: ChunkPerm) -> Self {
+        self.perm = perm;
+        self
+    }
+
+    /// **The permission this chunk actually holds**: `guard ? perm : 0`. With an
+    /// empty guard this is the bare amount and mints no node, so the
+    /// unconditional path is free.
+    ///
+    /// This is the default reading. A conditionally-held chunk keeps a flat cube
+    /// and a guard-free amount, so anything that states a *fact* about the
+    /// permission — a bound, a disequality, a sufficiency proof, a framing check —
+    /// must ask for it this way or it will treat a conditional footprint as fully
+    /// held. That mistake has produced two soundness bugs
+    /// (`tests/cases/failing/guarded_nonaliasing_two_arms.vpr`,
+    /// `guarded_merge_chunks.vpr`).
+    pub(crate) fn gated_perm(&self, ctx: &mut VerifyContext<'_>) -> ChunkPerm {
+        gate_perm_by_guard(ctx, &self.perm, &self.guard)
+    }
+
+    /// The **raw** amount, guard NOT folded in.
+    ///
+    /// Valid only when the call site discharges the guard itself, in one of two
+    /// ways, and says which in a comment:
+    /// (a) it re-attaches this chunk's guard to whatever it builds
+    ///     ([`Chunk::with_guard`]), so the conditionality is preserved, or
+    /// (b) it gates the result by a cube that entails the guard — including the
+    ///     case where the instruction's `pc` already does
+    ///     ([`Chunk::pc_entails_guard`]), which makes the gate a no-op.
+    ///
+    /// If neither holds, use [`Chunk::gated_perm`].
+    pub(crate) fn ungated_perm(&self) -> &ChunkPerm {
+        &self.perm
+    }
+
+    /// The cube this chunk is actually present under here: `pc ∧ guard`, or
+    /// `None` when the two are disjoint — the chunk is unreachable in this state
+    /// and states nothing.
+    pub(crate) fn presence_cube(
+        &self,
+        ctx: &VerifyContext<'_>,
+        pc: &[(egg::Id, Polarity)],
+    ) -> Option<Vec<(egg::Id, Polarity)>> {
+        cube_meet(ctx, pc, &self.guard)
+    }
+
+    /// Whether `pc` already entails this chunk's guard, i.e. the consume happens
+    /// inside the very region the chunk is present in — so gating would be a
+    /// no-op and the flat cube should be carried through untouched.
+    pub(crate) fn pc_entails_guard(
+        &self,
+        ctx: &VerifyContext<'_>,
+        pc: &[(egg::Id, Polarity)],
+    ) -> bool {
+        cube_entails(ctx, pc, &self.guard)
+    }
+
+    /// A representative e-class id for this chunk's amount, WITHOUT mutating the
+    /// graph. Debug/tests only — not a real permission id.
+    pub(crate) fn perm_repr_id(&self) -> egg::Id {
+        self.perm.repr_id()
     }
 }
 
