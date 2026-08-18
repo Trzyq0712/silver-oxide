@@ -863,6 +863,40 @@ pub(crate) fn perm_sub(ctx: &mut VerifyContext<'_>, held: &ChunkPerm, needed: eg
     }
 }
 
+/// [`perm_sub`], but descending the **demand's** branch structure as well as the
+/// held one, so arms that agree on a condition cancel per branch instead of leaving
+/// the whole demand inside every leaf.
+///
+/// A guarded consume is the case that matters. [`perm_sub`] pushes the flat demand
+/// into each held leaf, so exhaling `c ? 1/1 : 0` from `1/1` gives
+/// `1/1 - (c ? 1/1 : 0/1)` — correct, but opaque: nothing const-folds, and
+/// [`perm_all_zero`] cannot see that the chunk is emptied under `c`. Aligning the
+/// arms gives `c ? (1/1 - 1/1) : (1/1 - 0/1)`, whose leaves fold to `c ? 0 : 1/1`.
+///
+/// Alignment is [`ChunkPerm::restrict`]'s job, not ours: it takes the matching arm
+/// when the held perm branches on the same condition and carries the whole term in
+/// when it does not. So a held perm on an *unrelated* condition degrades to exactly
+/// [`perm_sub`]'s behaviour rather than being mishandled — the encoding stays correct
+/// and only the precision varies. This is the dual of [`perm_add_wildcard`]'s
+/// `Select` arms on the add side.
+pub(crate) fn perm_sub_aligned(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    needed: &ChunkPerm,
+) -> ChunkPerm {
+    match needed {
+        // Demand is flat: nothing to align against, so this is `perm_sub`.
+        ChunkPerm::Leaf(n) => perm_sub(ctx, held, *n),
+        ChunkPerm::Select { cond, then, els } => {
+            let ht = ChunkPerm::restrict(ctx, *cond, held.clone(), true);
+            let he = ChunkPerm::restrict(ctx, *cond, held.clone(), false);
+            let t = perm_sub_aligned(ctx, &ht, then);
+            let e = perm_sub_aligned(ctx, &he, els);
+            ChunkPerm::select(ctx, *cond, t, e)
+        }
+    }
+}
+
 /// Whether every leaf of `perm` const-folds to `0` (the chunk is emptied on
 /// every branch, so it can be dropped). Const-fold only, no `Select` in the graph.
 pub(crate) fn perm_all_zero(ctx: &VerifyContext<'_>, perm: &ChunkPerm) -> bool {
@@ -1085,9 +1119,7 @@ pub(crate) fn heap_subtract_inner(
         );
     }
 
-    Ok(debit_direct(
-        ctx, out, kind, &existing, &chunk2, chunk2_perm, kept,
-    ))
+    Ok(debit_direct(ctx, out, kind, &existing, &chunk2, kept))
 }
 
 /// Take `chunk2_perm` off a single chunk whose sufficiency is already proven, and
@@ -1109,12 +1141,14 @@ pub(crate) fn debit_direct(
     kind: &LocationKind,
     existing: &Chunk,
     chunk2: &Chunk,
-    chunk2_perm: egg::Id,
     kept: crate::verify::heap::HeapPc,
 ) -> Heap {
     ctx.union(existing.value, chunk2.value);
     // Remainder stays structural (leaves get `SubR`); never an `ite` in the graph.
-    let remainder = perm_sub(ctx, existing.ungated_perm(), chunk2_perm);
+    // Aligned against the *demand's* structure too, so a guarded consume cancels per
+    // arm (`c ? 0 : 1/1`) rather than leaving `1/1 - (c ? 1/1 : 0/1)` in every leaf --
+    // which is what lets `perm_all_zero` below see the emptied branch.
+    let remainder = perm_sub_aligned(ctx, existing.ungated_perm(), chunk2.ungated_perm());
     // Whether to drop the emptied chunk is a statement about the *heap*, so it has
     // to hold at the heap's scope — **unconditionally**, not under this
     // instruction's `pc`.
