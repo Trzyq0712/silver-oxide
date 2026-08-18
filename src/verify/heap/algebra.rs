@@ -941,9 +941,6 @@ pub(crate) fn perm_sub_aligned(
         // Demand is flat: nothing to align against, so this is `perm_sub`.
         ChunkPerm::Leaf(n) => perm_sub(ctx, held, *n),
         ChunkPerm::Select { cond, then, els } => {
-            if std::env::var_os("SO_TRACE_ALIGNED").is_some() {
-                eprintln!("[perm-sub-aligned] Select hit");
-            }
             let ht = ChunkPerm::restrict(ctx, *cond, held.clone(), true);
             let he = ChunkPerm::restrict(ctx, *cond, held.clone(), false);
             let t = perm_sub_aligned(ctx, &ht, then);
