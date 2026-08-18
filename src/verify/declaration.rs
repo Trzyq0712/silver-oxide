@@ -9,7 +9,8 @@ use crate::{
         heap::{
             Chunk, ChunkPerm, Heap, LocationKind, cube_eq, gate_perm_by_guard,
             algebra::{
-                chunk_under_pc, find_chunk_consolidated, heap_subtract, heap_union, merge_heaps, perm_held_at,
+                Demand, chunk_under_pc, find_chunk_consolidated, heap_subtract, heap_union,
+                merge_heaps, perm_held_at,
                 prove_perm_positive, prove_perm_write, summarize_perm_at, union_heaps,
             },
         },
@@ -614,6 +615,17 @@ fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::Perm) 
     }
 }
 
+/// Which consume rule a [`vmir::Perm`] demand selects. Read off the IR, where the
+/// answer is already known, rather than recognised in the e-graph after the fact --
+/// see [`Demand`].
+fn demand_of(perm: &vmir::Perm) -> Demand {
+    if perm.has_wildcard() {
+        Demand::Wildcard
+    } else {
+        Demand::Concrete
+    }
+}
+
 /// The recipe-space term of a [`vmir::Perm`] footprint-slot permission (resource
 /// certificate build). A `Wildcard` emits an [`AxiomPure::Wildcard`] step so
 /// each graft mints a fresh share; `Amount`/`Ite` map to their operand recipes.
@@ -840,7 +852,7 @@ fn eval_heap_inst(
                         "purify: unsupported heap inst in a resource body",
                     ));
                 }
-                heap_subtract(ctx, &base_h, &kind, ch, &pc_lits)
+                heap_subtract(ctx, &base_h, &kind, ch, &pc_lits, demand_of(perm))
             }
         }
         // Resource inhale/exhale need the program + certificates; method-only.
@@ -1200,7 +1212,15 @@ fn walk_footprint(
         // indicator rather than the wildcard perm — the same recipe with the
         // wildcard leaf replaced by full permission `1`, so `ite(guard, 1, 0)`
         // whose `0 < …` folds to the gating guard.
-        let wc_slot = frame_only && recipe_has_wildcard(&slot.perm);
+        // The recipe is also the static source for the consume rule this slot's
+        // demand selects, at the `SlotPerm::Amount` consume below -- see [`Demand`].
+        let slot_wildcard = recipe_has_wildcard(&slot.perm);
+        let slot_demand = if slot_wildcard {
+            Demand::Wildcard
+        } else {
+            Demand::Concrete
+        };
+        let wc_slot = frame_only && slot_wildcard;
         let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
         let bperm = if wc_slot {
@@ -1270,7 +1290,9 @@ fn walk_footprint(
                 };
                 let chunk = Chunk::new(addr, p, value).with_recipe(recipe.clone());
                 heap = match direction {
-                    Direction::Consume => heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits)?,
+                    Direction::Consume => {
+                        heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits, slot_demand)?
+                    }
                     Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
                 };
                 expr!(ctx, (0/1) <r {bperm})
@@ -1427,6 +1449,7 @@ fn eval_sub_yield(
         &kind,
         Chunk::new(addr, perm_id, held),
         &pc_lits,
+        demand_of(perm),
     )?;
     state.push_heap(out);
 

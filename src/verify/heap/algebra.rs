@@ -920,8 +920,31 @@ pub(crate) fn heap_subtract(
     kind: &LocationKind,
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
+    demand: Demand,
 ) -> Result<Heap, VerifyError> {
-    heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, true)
+    heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, demand, true)
+}
+
+/// What kind of permission a consume demands, which selects the rule
+/// ([`debit_wildcard`] vs [`prove_sufficient`]).
+///
+/// Carried from the **static** source rather than recognised in the e-graph: the
+/// demanded amount is a `vmir::Perm` (or, on a certificate walk, a slot recipe)
+/// long before it is a term, and both know the answer outright --
+/// [`crate::vmir::Perm::has_wildcard`] and `recipe_has_wildcard`. Asking the
+/// e-graph instead means asking about an **e-class**, which congruence can put
+/// other nodes into -- the same lesson the produce side learned when positivity
+/// had to be read off operand trees rather than off the fused leaf.
+///
+/// The produce side keeps [`contains_wildcard`]: there the two summands come out
+/// of the heap, and their provenance is genuinely gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Demand {
+    /// A fixed amount: prove `held >= needed`.
+    Concrete,
+    /// Mentions a `wildcard`, bare or under gating/scaling: prove `0 < held` and
+    /// hand back a fresh smaller share.
+    Wildcard,
 }
 
 /// Put the found chunk into the form the consume works on, and report the guard the
@@ -995,6 +1018,7 @@ pub(crate) fn heap_subtract_inner(
     kind: &LocationKind,
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
+    demand: Demand,
     sat_retry: bool,
 ) -> Result<Heap, VerifyError> {
     let (out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
@@ -1013,7 +1037,7 @@ pub(crate) fn heap_subtract_inner(
         }
         if sat_retry {
             ctx.saturate();
-            return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, false);
+            return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, demand, false);
         }
         // Nothing on ground: the demanded address may still match a held chunk under
         // the pc (a `&mut` reborrow inside a branch arm, whose address equality is a
@@ -1024,7 +1048,7 @@ pub(crate) fn heap_subtract_inner(
         );
     };
 
-    if ctx.has_wildcard && contains_wildcard(ctx, chunk2_perm) {
+    if demand == Demand::Wildcard {
         return debit_wildcard(ctx, out, kind, &existing, &chunk2, pc_lits, kept);
     }
 
@@ -1869,7 +1893,7 @@ mod tests {
         ctx.egraph.rebuild();
 
         let one = real(&mut ctx, 1, 1);
-        let out = heap_subtract(&mut ctx, &h, &test_kind(), Chunk::new(a, one, v0), &[])
+        let out = heap_subtract(&mut ctx, &h, &test_kind(), Chunk::new(a, one, v0), &[], Demand::Concrete)
             .expect("full permission is held across the two aliased fragments");
         // 1/2 + 1/2 − 1/1 = 0 const-folds → the emptied chunk is dropped.
         assert_eq!(out.entries().count(), 0);
@@ -2026,7 +2050,7 @@ mod tests {
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p_have, v1));
         // Symbolic perms → `have >= take` not provable by equality saturation.
-        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p_take, v2), &[])
+        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p_take, v2), &[], Demand::Concrete)
             .err()
             .expect("symbolic-perm exhale must fail without a proof");
         assert!(matches!(
@@ -2051,7 +2075,7 @@ mod tests {
         ctx.union(a, b);
         ctx.egraph.rebuild();
 
-        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(b, p1, v2), &[])
+        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(b, p1, v2), &[], Demand::Concrete)
             .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
@@ -2075,7 +2099,7 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
-        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v2), &[])
+        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v2), &[], Demand::Concrete)
             .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
@@ -2097,7 +2121,7 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
-        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p2, v2), &[])
+        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p2, v2), &[], Demand::Concrete)
             .err()
             .expect("over-consumption must fail");
         assert!(matches!(
@@ -2117,7 +2141,7 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty();
-        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v1), &[])
+        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v1), &[], Demand::Concrete)
             .err()
             .expect("subtract from empty must fail");
         assert!(matches!(
