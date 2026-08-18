@@ -460,8 +460,11 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    /// Build a chunk from a bare permission id (the common case). Wraps the id
-    /// as a `ChunkPerm::Leaf`.
+    /// Build a chunk from a bare permission id, wrapped as a concrete
+    /// `ChunkPerm::Leaf`. Test-only: production code builds the permission as a
+    /// [`ChunkPerm`] first, so that a wildcard's origin and a gate's branch
+    /// structure are not lost on the way in.
+    #[cfg(test)]
     pub fn new(addr: egg::Id, perm: egg::Id, value: egg::Id) -> Self {
         Self::new_perm(addr, ChunkPerm::leaf(perm), value)
     }

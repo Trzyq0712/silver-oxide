@@ -1254,35 +1254,97 @@ pub(crate) fn debit_wildcard(
     pc_lits: &[(egg::Id, Polarity)],
     kept: crate::verify::heap::HeapPc,
 ) -> Result<Heap, VerifyError> {
-    // Wildcard held/needed perms are always leaves (never a join `Select`), so
-    // materializing here is a no-op id.
-    let existing_perm = existing.ungated_perm().to_id(ctx);
-    let held_pos = expr!(ctx, (0/1) <r {existing_perm});
-    if !ctx.prove_under_pc(held_pos, pc_lits) {
-        return Err(VerifyError::InsufficientPermission);
+    // Walk the DEMAND's branch structure: a gated `exhale b ==> acc(x.f, wildcard)`
+    // takes a share only where `b` holds, and states nothing where it does not.
+    // Flat, the rule read only `chunk2.value` and constrained the remainder
+    // `r < held` on both arms — including the arm where nothing was demanded, which
+    // is imprecise rather than unsound but throws away permission the program kept.
+    let (perm, value, err) = debit_wildcard_walk(
+        ctx,
+        existing.ungated_perm(),
+        chunk2.ungated_perm(),
+        existing.value,
+        chunk2.value,
+        pc_lits,
+    );
+    if let Some(e) = err {
+        return Err(e);
     }
-    // Unconditional union is safe here on both counts: `held > 0` was just proven, a
-    // wildcard `needed` is positive by construction, so this is the both-held case
-    // anyway — and `chunk2.value` is fresh besides.
-    ctx.union(existing.value, chunk2.value);
-    // The remainder is a **fresh share**, not a `SubR` node. `held − w` would be an
-    // opaque leaf: with no real-order arithmetic, neither `0 < held − w` nor
-    // `held − w < held` follows from it, so both had to be assumed about a term that
-    // then kept growing. A fresh `r` states the same two things once — `0 < r` free
-    // from the mint, and `r < held` here — and `r < held` is what makes
-    // `assert perm(x.f) < 1/2` provable after a wildcard exhale.
-    //
-    // Positivity is why there is still no drop-if-zero case: the remainder is a
-    // wildcard, so the chunk is never emptied.
-    let remainder = ctx.fresh_wildcard();
-    let lt = expr!(ctx, {remainder} <r {existing_perm});
-    ctx.assume_all_guarded([lt], pc_lits);
     Ok(out.with_chunk(
         kind,
-        Chunk::new(existing.addr, remainder, existing.value)
+        Chunk::new_perm(existing.addr, perm, value)
             .with_recipe(existing.recipe.clone())
             .with_guard(kept),
     ))
+}
+
+/// One arm of a wildcard consume, recursing on the demand.
+///
+/// At a demand **leaf**:
+/// - a provably-zero demand is a no-op — the held permission is returned untouched,
+///   with no `held > 0` obligation and no fact about a fresh share. This is the arm
+///   a gate switches off;
+/// - otherwise the wildcard rule: require the location hold *some* permission
+///   (`held > 0`) — a wildcard has no fixed value to compare against — and hand back
+///   a **fresh remainder** assumed strictly smaller (`r < held`) under the pc,
+///   Silicon's constrainable-ARP rule. The demanded amount never enters the result:
+///   what leaves is only known positive and smaller, which is all a wildcard says.
+///
+/// A fresh `r` rather than a `held − w` node, because with no real-order arithmetic
+/// neither `0 < held − w` nor `held − w < held` follows from such a term, so both
+/// would have to be assumed about a tree that keeps growing. `r` states them once,
+/// and `r < held` is what makes `assert perm(x.f) < 1/2` provable after a wildcard
+/// exhale. Positivity is also why there is no drop-if-zero case: the remainder is a
+/// wildcard, so the chunk is never emptied.
+///
+/// The error is returned rather than propagated with `?` so a failing arm does not
+/// abandon the walk mid-way through mutating the graph.
+fn debit_wildcard_walk(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    needed: &ChunkPerm,
+    held_value: egg::Id,
+    needed_value: egg::Id,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> (ChunkPerm, egg::Id, Option<VerifyError>) {
+    match needed {
+        ChunkPerm::Leaf { id, .. } => {
+            // Nothing demanded on this arm: no obligation, no fact, no debit.
+            let nonpos = expr!(ctx, not ((0/1) <r {*id}));
+            if ctx.prove_under_pc(nonpos, pc_lits) {
+                return (held.clone(), held_value, None);
+            }
+            let held_id = held.to_id(ctx);
+            let held_pos = expr!(ctx, (0/1) <r {held_id});
+            if !ctx.prove_under_pc(held_pos, pc_lits) {
+                return (
+                    held.clone(),
+                    held_value,
+                    Some(VerifyError::InsufficientPermission),
+                );
+            }
+            // Unconditional union is safe on both counts: `held > 0` was just proven
+            // and a wildcard `needed` is positive by construction, so this is the
+            // both-held case — and `chunk2.value` is fresh besides.
+            ctx.union(held_value, needed_value);
+            let remainder = ctx.fresh_wildcard();
+            let lt = expr!(ctx, {remainder} <r {held_id});
+            ctx.assume_all_guarded([lt], pc_lits);
+            (ChunkPerm::wild_leaf(remainder), held_value, None)
+        }
+        ChunkPerm::Select { cond, then, els } => {
+            let ht = ChunkPerm::restrict(ctx, *cond, held.clone(), true);
+            let mut pc_t = pc_lits.to_vec();
+            pc_t.push((*cond, Polarity::Positive));
+            let (t, value, e1) =
+                debit_wildcard_walk(ctx, &ht, then, held_value, needed_value, &pc_t);
+            let he = ChunkPerm::restrict(ctx, *cond, held.clone(), false);
+            let mut pc_e = pc_lits.to_vec();
+            pc_e.push((*cond, Polarity::Negative));
+            let (e, _, e2) = debit_wildcard_walk(ctx, &he, els, held_value, needed_value, &pc_e);
+            (ChunkPerm::select(ctx, *cond, t, e), value, e1.or(e2))
+        }
+    }
 }
 
 /// The two **summarized** resolutions of a consume that the direct path could not
@@ -1771,7 +1833,18 @@ pub(crate) fn perm_held_at(
     // `perm(loc)` is asked for as a *value*, so the branch structure has to be
     // materialized here — the one place it is.
     let total = summarize_perm_at(ctx, chunks, addr, pc_lits).0;
-    total.to_id(ctx)
+    let id = total.to_id(ctx);
+    // Flattening loses what the tree made obvious. `perm(x.f)` after a gated
+    // wildcard exhale is `ite(c, r, 1/1)`: positive on both arms, but deciding that
+    // from the flat term needs a case split the prover will not make for a `<r`
+    // goal. [`perm_known_positive`] reads it off the structure (its `Ite` arm
+    // requires both), so state the fact here, once, where the value is built.
+    if perm_known_positive(ctx, id) {
+        let pos = expr!(ctx, (0/1) <r {id});
+        let t = expr!(ctx, true);
+        ctx.union(pos, t);
+    }
+    id
 }
 
 /// The **sum** of two heaps held simultaneously (`HeapInst::Union`).

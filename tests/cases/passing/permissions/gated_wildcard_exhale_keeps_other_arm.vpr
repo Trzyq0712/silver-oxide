@@ -1,0 +1,19 @@
+// A gated wildcard exhale states nothing on the arm where nothing was demanded.
+// The flat rule read only the demanded chunk's value and constrained the fresh
+// remainder `r < held` on BOTH arms, so the permission kept under `!c` was lost.
+field f: Int
+
+method gated_wildcard_keeps_other_arm(x: Ref, c: Bool)
+{
+    inhale acc(x.f)
+    exhale c ==> acc(x.f, wildcard)
+    assert !c ==> perm(x.f) == write
+}
+
+// And the arm that was demanded still holds *some* share.
+method gated_wildcard_leaves_a_share(x: Ref, c: Bool)
+{
+    inhale acc(x.f)
+    exhale c ==> acc(x.f, wildcard)
+    assert none < perm(x.f)
+}
