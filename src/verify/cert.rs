@@ -13,6 +13,7 @@ use crate::verify::error::VerifyError;
 use crate::verify::heap::LocationKind;
 use crate::verify::lang::{FuncId, Symbolic};
 use crate::verify::rewrite::{AxiomInst, AxiomPure};
+use crate::vmir;
 use crate::vmir::{MemberId, Polarity, Type, Val};
 /// A (non-recursive) function's verified body as a **pure term recipe** — the
 /// definition `f(params) == <steps>[res]`, add-only. Unlike a certificate this
@@ -142,39 +143,22 @@ impl BodyRecipe {
             changed,
         )
     }
-
-    /// [`Self::build`], but every `wildcard` leaf is replaced by `wildcard_repl`
-    /// (a positive constant) rather than a fresh wildcard. Used to build a
-    /// wildcard footprint slot's **presence** indicator without polluting the
-    /// persistent graph — see [`build_instance_subst`](crate::verify::rewrite::build_instance_subst).
-    pub(crate) fn build_wildcard_as(
-        &self,
-        egraph: &mut EGraph<Symbolic, ConstFold>,
-        resolve: impl Fn(&SeedRef) -> Id,
-        changed: &mut Vec<Id>,
-        wildcard_repl: Id,
-    ) -> Id {
-        let seed: Vec<Id> = self.seed_refs.iter().map(resolve).collect();
-        crate::verify::rewrite::build_instance_subst(
-            egraph,
-            &self.steps,
-            &self.res,
-            &seed,
-            changed,
-            wildcard_repl,
-        )
-    }
 }
 
 /// One footprint slot of a [`ResourceDefinition`]: its location kind and element
 /// type, plus recipes for its address and permission (over the params and any
 /// earlier slot values — see [`SeedRef`]).
+///
+/// `perm` keeps the IR's [`vmir::Perm`] **shape** and recipes only the amount
+/// operands. A `wildcard` is therefore a `Perm::Wildcard` node with nothing under
+/// it, picked when the slot is grafted, rather than a recipe step that would be
+/// re-minted wherever the recipe happens to be rebuilt.
 #[derive(Clone)]
 pub(crate) struct SlotRecipe {
     pub(crate) kind: LocationKind,
     pub(crate) elem: Type,
     pub(crate) addr: BodyRecipe,
-    pub(crate) perm: BodyRecipe,
+    pub(crate) perm: vmir::Perm<BodyRecipe>,
 }
 
 /// A resource's verified body as a **pure term recipe**. Each call site rebuilds
@@ -235,7 +219,7 @@ pub(crate) struct RecipeBuilder {
     /// the slot's location kind, element type, and the recipe temps of its
     /// address and permission (sliced into standalone [`SlotRecipe`]s at the
     /// end of the walk).
-    pub(crate) pending_slots: Vec<(LocationKind, Type, Val, Val)>,
+    pub(crate) pending_slots: Vec<(LocationKind, Type, Val, vmir::Perm<Val>)>,
     /// This recipe is a **spec** body — a contract function (`#requires` /
     /// `#ensures`), i.e. a lowered pre/postcondition. Its nested function calls
     /// are spec-position occurrences (Silicon's limited symbol), so they emit **no**
@@ -549,8 +533,6 @@ fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
             }
             AxiomPure::RealCast(v) => f(v),
             AxiomPure::App { args, .. } => args.iter().for_each(f),
-            // A fresh wildcard has no operands.
-            AxiomPure::Wildcard => {}
         },
         AxiomInst::Forall { caps, .. } => caps.iter().for_each(f),
         AxiomInst::Assume(v) => f(v),
@@ -578,7 +560,6 @@ pub(crate) fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomI
                 type_args: type_args.clone(),
                 args: args.iter().map(&tr).collect(),
             },
-            AxiomPure::Wildcard => AxiomPure::Wildcard,
         }),
         AxiomInst::Forall { recipe, caps } => AxiomInst::Forall {
             recipe: *recipe,

@@ -13,22 +13,66 @@ pub enum HeapVal {
 ///
 /// A `wildcard` is a symbolic positive-but-unspecified share; it is legal
 /// **only** here (never as a first-class [`Val`]), matching Viper. `Ite` gates a
-/// permission by a boolean `Val` — this carries both `Sink::gate_perm`'s branch
+/// permission by a boolean operand — this carries both `Sink::gate_perm`'s branch
 /// gating and the `p > 0 ? wildcard : 0` lowering of function-context
 /// permissions (so a dead branch reduces to `0`).
+///
+/// Generic over the **operand** type `A`, with two instantiations:
+///
+/// - `Perm<Val>` (the default) — the IR, where an amount is a body temp. Also the
+///   form a resource certificate walk accumulates, since recipe temps are `Val`s
+///   too.
+/// - `Perm<BodyRecipe>` — a resource footprint slot's permission, where each
+///   amount is a standalone sliced recipe (see `verify::cert::SlotRecipe`).
+///
+/// The point of the parameter is that [`Self::has_wildcard`] is then **one**
+/// function serving both spaces. It used to have a recipe-space twin
+/// (`recipe_has_wildcard`) that scanned for an `AxiomPure::Wildcard` step, which
+/// only existed because the permission *shape* was flattened into recipe steps;
+/// `Demand`'s doc already named the two as the same predicate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Perm {
-    /// A concrete permission value (`1/1`, `1/2`, a symbolic real, …). This is
+pub enum Perm<A = Val> {
+    /// A concrete permission amount (`1/1`, `1/2`, a symbolic real, …). This is
     /// the only variant a non-wildcard program ever produces, and it lowers to
     /// exactly the same e-graph term as before the `Perm` split.
-    Amount(Val),
-    /// Viper's `wildcard`: a fresh positive-but-unspecified share.
+    Amount(A),
+    /// Viper's `wildcard`: a positive-but-unspecified share, **picked at graft
+    /// time** rather than named here. Deliberately carries no operand — that is
+    /// what keeps it out of recipe space.
     Wildcard,
     /// `cond ? then : else` over permissions.
-    Ite(Val, Box<Perm>, Box<Perm>),
+    Ite(A, Box<Perm<A>>, Box<Perm<A>>),
 }
 
-impl Perm {
+impl<A> Perm<A> {
+    /// Whether any leaf of this permission is a [`Perm::Wildcard`]. Operand-type
+    /// agnostic: the answer is in the shape, not the amounts.
+    pub fn has_wildcard(&self) -> bool {
+        match self {
+            Perm::Amount(_) => false,
+            Perm::Wildcard => true,
+            Perm::Ite(_, t, e) => t.has_wildcard() || e.has_wildcard(),
+        }
+    }
+
+    /// Rebuild this permission with every amount operand mapped through `f`,
+    /// preserving the shape (and so `has_wildcard`). The `Val`-tree a certificate
+    /// walk accumulates becomes a `BodyRecipe`-tree this way, one `slice` per
+    /// operand.
+    pub fn try_map<B, E>(&self, f: &mut impl FnMut(&A) -> Result<B, E>) -> Result<Perm<B>, E> {
+        Ok(match self {
+            Perm::Amount(a) => Perm::Amount(f(a)?),
+            Perm::Wildcard => Perm::Wildcard,
+            Perm::Ite(c, t, e) => Perm::Ite(
+                f(c)?,
+                Box::new(t.try_map(f)?),
+                Box::new(e.try_map(f)?),
+            ),
+        })
+    }
+}
+
+impl Perm<Val> {
     /// The zero permission (`none`).
     pub fn none() -> Self {
         Perm::Amount(crate::vmir::none())
@@ -36,14 +80,6 @@ impl Perm {
     /// The full permission (`write`, `1/1`).
     pub fn write() -> Self {
         Perm::Amount(crate::vmir::write())
-    }
-    /// Whether any leaf of this permission is a [`Perm::Wildcard`].
-    pub fn has_wildcard(&self) -> bool {
-        match self {
-            Perm::Amount(_) => false,
-            Perm::Wildcard => true,
-            Perm::Ite(_, t, e) => t.has_wildcard() || e.has_wildcard(),
-        }
     }
 }
 

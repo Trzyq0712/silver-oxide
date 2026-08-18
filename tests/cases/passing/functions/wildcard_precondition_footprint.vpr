@@ -1,0 +1,42 @@
+// A heap-dependent function whose precondition footprint is all `wildcard` slots.
+//
+// Covers the two wildcard paths that are NOT the source-level `wildcard` case (see
+// passing/permissions/wildcard_in_predicate_footprint.vpr for that one). Both come
+// from `read_only` lowering, which weakens every `acc` in a function precondition to
+// a wildcard:
+//
+//   * `sum`'s body entry PRODUCES its own `sum#requires` footprint from the snapshot
+//     parameter -- the path that used to mint a wildcard from inside an egg applier,
+//     via a process-global counter, because the permission had been flattened into
+//     recipe steps. A census (2026-08-18) attributed every such mint to exactly this
+//     shape: one per heap-dependent function in a file.
+//   * `client`'s two calls each do a frame-only exhale of `sum#requires`, which takes
+//     the PRESENCE path -- sufficiency is `guard ==> 0 < held`, and no wildcard is
+//     built at all. That path is the overwhelming majority of wildcard-bearing slot
+//     builds in the corpus.
+//
+// `a == b` is the framing check: two calls with the footprint untouched in between
+// must land in the same e-class, which needs the frame-only exhale to leave the
+// caller's permission alone.
+
+field f: Int
+field g: Int
+
+predicate P(x: Ref) {
+    acc(x.f) && acc(x.g) && x.f > 0
+}
+
+function sum(x: Ref): Int
+    requires acc(P(x))
+{
+    unfolding acc(P(x)) in x.f + x.g
+}
+
+method client(x: Ref)
+    requires acc(P(x))
+    ensures  acc(P(x))
+{
+    var a: Int := sum(x)
+    var b: Int := sum(x)
+    assert a == b
+}

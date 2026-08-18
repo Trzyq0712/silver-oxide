@@ -626,22 +626,60 @@ fn demand_of(perm: &vmir::Perm) -> Demand {
     }
 }
 
-/// The recipe-space term of a [`vmir::Perm`] footprint-slot permission (resource
-/// certificate build). A `Wildcard` emits an [`AxiomPure::Wildcard`] step so
-/// each graft mints a fresh share; `Amount`/`Ite` map to their operand recipes.
+/// The recipe-space form of a [`vmir::Perm`] footprint-slot permission (resource
+/// certificate build): the **same shape**, with each amount operand replaced by its
+/// recipe temp.
+///
+/// Deliberately *not* flattened into pure steps. A permission amount is a pure
+/// function of the params and earlier slot values, so it belongs in a recipe — but a
+/// `wildcard` is not an amount, it is a symbolic picked when the slot is grafted.
+/// Flattening used to force an `AxiomPure::Wildcard` *step* to exist, and a step is
+/// rebuilt wherever the recipe is rebuilt — including inside an egg applier, which
+/// has no [`VerifyContext`] and so minted from a process-global counter. Keeping the
+/// shape means [`build_perm`] does the picking, at a site that holds `ctx`.
 fn perm_recipe(
-    rb: &mut crate::verify::cert::RecipeBuilder,
     state: &EvalState,
     perm: &vmir::Perm,
-) -> Result<Val, VerifyError> {
+) -> Result<vmir::Perm<Val>, VerifyError> {
+    perm.try_map(&mut |v: &Val| state.require_recipe(v, OPERAND_RECIPE))
+}
+
+/// What a [`vmir::Perm::Wildcard`] leaf becomes when a footprint slot's permission
+/// is grafted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WildcardAs {
+    /// A freshly minted positive share (`0 < w` assumed) — the real permission.
+    Fresh,
+    /// Full permission `1`, so a gated wildcard builds the slot's **presence**
+    /// indicator `ite(guard, 1, 0)` whose `0 < …` folds to `guard`. Used by a
+    /// frame-only exhale, which needs presence but no amount: building the wildcard
+    /// would leave un-collapsible `ite` residue in the persistent graph for
+    /// `ite-reduce` to churn on.
+    One,
+}
+
+/// Graft a footprint slot's permission: [`eval_perm`]'s three-arm descent, over a
+/// slot recipe instead of an [`EvalState`]. One wildcard is picked per
+/// [`vmir::Perm::Wildcard`] **leaf** reached, eagerly — a leaf under a false guard
+/// still mints, and the enclosing `ite` discards it.
+fn build_perm(
+    ctx: &mut VerifyContext<'_>,
+    perm: &vmir::Perm<crate::verify::cert::BodyRecipe>,
+    resolve: &impl Fn(&crate::verify::cert::SeedRef) -> egg::Id,
+    changed: &mut Vec<egg::Id>,
+    wildcard_as: WildcardAs,
+) -> egg::Id {
     match perm {
-        vmir::Perm::Amount(v) => state.require_recipe(v, OPERAND_RECIPE),
-        vmir::Perm::Wildcard => Ok(rb.emit(crate::verify::rewrite::AxiomPure::Wildcard)),
+        vmir::Perm::Amount(r) => r.build(&mut ctx.egraph, resolve, changed),
+        vmir::Perm::Wildcard => match wildcard_as {
+            WildcardAs::Fresh => ctx.fresh_wildcard(),
+            WildcardAs::One => ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into()))),
+        },
         vmir::Perm::Ite(c, t, e) => {
-            let c = state.require_recipe(c, OPERAND_RECIPE)?;
-            let t = perm_recipe(rb, state, t)?;
-            let e = perm_recipe(rb, state, e)?;
-            Ok(rb.emit(crate::verify::rewrite::AxiomPure::Ternary(c, t, e)))
+            let c = c.build(&mut ctx.egraph, resolve, changed);
+            let t = build_perm(ctx, t, resolve, changed, wildcard_as);
+            let e = build_perm(ctx, e, resolve, changed, wildcard_as);
+            expr!(ctx, if {c} then {t} else {e})
         }
     }
 }
@@ -835,8 +873,7 @@ fn eval_heap_inst(
                     // so a later `Deref` purifies to the slot value.
                     if ctx.recipe.is_some() {
                         let addr_r = state.require_recipe(loc, OPERAND_RECIPE)?;
-                        let rb = ctx.recipe.as_mut().unwrap();
-                        let perm_r = perm_recipe(rb, state, perm)?;
+                        let perm_r = perm_recipe(state, perm)?;
                         let elem = kind.value.clone();
                         let rb = ctx.recipe.as_mut().unwrap();
                         let i = rb.pending_slots.len();
@@ -1109,19 +1146,6 @@ struct FootprintResult {
     slot_recipes: Vec<Option<Val>>,
 }
 
-/// Whether a permission recipe mentions a `wildcard` (bare or gated) — the shape
-/// of a function-precondition footprint slot. At a `Snap` such a slot needs no
-/// permission *amount*: presence is the gating guard (`true` when bare) and
-/// sufficiency is just "the caller holds a positive share where the slot is
-/// required". Building the wildcard would leave un-collapsible `ite` residue in
-/// the persistent graph.
-fn recipe_has_wildcard(perm: &crate::verify::cert::BodyRecipe) -> bool {
-    use crate::verify::rewrite::{AxiomInst, AxiomPure};
-    perm.steps
-        .iter()
-        .any(|s| matches!(s, AxiomInst::Val(AxiomPure::Wildcard)))
-}
-
 /// A footprint slot's permission as built for the current walk: either the real
 /// `Amount` (drives the heap effect), or, for a wildcard slot at a `Snap`, a
 /// `Presence` indicator `ite(guard, 1, 0)` standing in for the wildcard (drives
@@ -1208,13 +1232,15 @@ fn walk_footprint(
         // recipe is add-only, so if `build` added no e-node then every term it named
         // was already present, hence already normalized. Reducing unconditionally
         // per slot re-runs the ADT rule set over the whole graph and costs ~3.5x.
-        // A wildcard slot at a `Snap` (bare or gated): build its **presence**
-        // indicator rather than the wildcard perm — the same recipe with the
-        // wildcard leaf replaced by full permission `1`, so `ite(guard, 1, 0)`
+        // A wildcard slot at a frame-only exhale (bare or gated): build its
+        // **presence** indicator rather than the wildcard perm — the same shape with
+        // the wildcard leaf built as full permission `1`, so `ite(guard, 1, 0)`
         // whose `0 < …` folds to the gating guard.
-        // The recipe is also the static source for the consume rule this slot's
-        // demand selects, at the `SlotPerm::Amount` consume below -- see [`Demand`].
-        let slot_wildcard = recipe_has_wildcard(&slot.perm);
+        // The slot's permission shape is also the static source for the consume rule
+        // its demand selects, at the `SlotPerm::Amount` consume below -- see
+        // [`Demand`]. Same predicate the IR side uses (`vmir::Perm::has_wildcard`),
+        // now literally the same function.
+        let slot_wildcard = slot.perm.has_wildcard();
         let slot_demand = if slot_wildcard {
             Demand::Wildcard
         } else {
@@ -1223,14 +1249,18 @@ fn walk_footprint(
         let wc_slot = frame_only && slot_wildcard;
         let before = ctx.egraph.total_number_of_nodes();
         let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
-        let bperm = if wc_slot {
-            let one = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
-            let pp = slot
-                .perm
-                .build_wildcard_as(&mut ctx.egraph, resolve, &mut changed, one);
-            SlotPerm::Presence(pp)
+        let wildcard_as = if wc_slot {
+            WildcardAs::One
         } else {
-            SlotPerm::Amount(slot.perm.build(&mut ctx.egraph, resolve, &mut changed))
+            WildcardAs::Fresh
+        };
+        let bperm = {
+            let p = build_perm(ctx, &slot.perm, &resolve, &mut changed, wildcard_as);
+            if wc_slot {
+                SlotPerm::Presence(p)
+            } else {
+                SlotPerm::Amount(p)
+            }
         };
         if ctx.egraph.total_number_of_nodes() != before {
             ctx.reduce();
@@ -2299,7 +2329,10 @@ pub(crate) fn verify_resource(
                 kind: kind.clone(),
                 elem: elem.clone(),
                 addr: rb.slice(addr)?,
-                perm: rb.slice(perm)?,
+                // One `slice` per amount operand, shape preserved. Sibling arms may
+                // duplicate a step; perm trees are shallow (a `Perm::Ite` only ever
+                // arises around a wildcard — see `Sink::gate_perm`).
+                perm: perm.try_map(&mut |v: &Val| rb.slice(v))?,
             })
         })
         .collect::<Result<Vec<_>, VerifyError>>()?;

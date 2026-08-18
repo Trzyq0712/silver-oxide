@@ -30,9 +30,6 @@ pub(crate) enum AxiomPure {
         type_args: Vec<Type>,
         args: Vec<Val>,
     },
-    /// A fresh `wildcard` permission share (a resource footprint slot lowered
-    /// from a function precondition). Each graft mints a new positive symbolic.
-    Wildcard,
 }
 
 /// One instruction of a prepared body: a value-producing pure step, an
@@ -177,24 +174,6 @@ pub(crate) fn build_instance_releasing_tokens(
     resolve_val(egraph, &vals, res)
 }
 
-/// [`build_instance`], but every `AxiomPure::Wildcard` step is replaced by the
-/// fixed id `wildcard_repl` instead of a fresh positive wildcard. Used to build a
-/// footprint slot's **presence** term (`wildcard → 1`, so `ite(guard, 1, 0)`
-/// whose `0 < …` folds to `guard`) without ever minting a `Symbolic::Wildcard` —
-/// keeping the un-collapsible wildcard `ite` out of the persistent graph.
-pub(crate) fn build_instance_subst(
-    egraph: &mut EGraph<Symbolic, ConstFold>,
-    insts: &[AxiomInst],
-    res: &Val,
-    vals_seed: &[Id],
-    changed: &mut Vec<Id>,
-    wildcard_repl: Id,
-) -> Id {
-    let vals =
-        build_instance_vals_impl(egraph, insts, vals_seed, changed, Some(wildcard_repl), None);
-    resolve_val(egraph, &vals, res)
-}
-
 /// Resolve a recipe-space `Val` against a built instance's temp slots.
 pub(super) fn resolve_val(egraph: &mut EGraph<Symbolic, ConstFold>, vals: &[Id], v: &Val) -> Id {
     match v {
@@ -212,7 +191,7 @@ pub(crate) fn build_instance_vals(
     vals_seed: &[Id],
     changed: &mut Vec<Id>,
 ) -> Vec<Id> {
-    build_instance_vals_impl(egraph, insts, vals_seed, changed, None, None)
+    build_instance_vals_impl(egraph, insts, vals_seed, changed, None)
 }
 
 /// [`build_instance_vals`] with the enclosing release gate, so a `g%pre` token
@@ -227,19 +206,17 @@ pub(crate) fn build_instance_vals_guarded(
     changed: &mut Vec<Id>,
     token_guard: Option<Id>,
 ) -> Vec<Id> {
-    build_instance_vals_impl(egraph, insts, vals_seed, changed, None, token_guard)
+    build_instance_vals_impl(egraph, insts, vals_seed, changed, token_guard)
 }
 
-/// [`build_instance_vals`] with an optional wildcard substitution (see
-/// [`build_instance_subst`]) and an optional `token_guard` (see
-/// [`build_instance_vals_guarded`]). `wildcard_repl = None` mints fresh
-/// wildcards; `token_guard = None` releases any propagated token unguarded.
+/// [`build_instance_vals`] with an optional `token_guard` (see
+/// [`build_instance_vals_guarded`]). `token_guard = None` releases any propagated
+/// token unguarded.
 pub(super) fn build_instance_vals_impl(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     vals_seed: &[Id],
     changed: &mut Vec<Id>,
-    wildcard_repl: Option<Id>,
     token_guard: Option<Id>,
 ) -> Vec<Id> {
     let mut vals: Vec<Id> = vals_seed.to_vec();
@@ -276,24 +253,6 @@ pub(super) fn build_instance_vals_impl(
                         let args: Box<[Id]> = args.iter().map(|v| get(egraph, &vals, v)).collect();
                         egraph.add(Symbolic::FuncApp(*func, tys, args))
                     }
-                    AxiomPure::Wildcard => match wildcard_repl {
-                        // Presence build: use the fixed replacement (a positive
-                        // constant), no fresh wildcard.
-                        Some(repl) => repl,
-                        // Mint a fresh positive wildcard: `w` with `0 < w` assumed.
-                        None => {
-                            let w = egraph
-                                .add(Symbolic::Wildcard(crate::verify::lang::fresh_wildcard_id()));
-                            let zero = egraph
-                                .add(Symbolic::Lit(Literal::Real(num::BigInt::from(0).into())));
-                            let pos = egraph.add(Symbolic::Binary(BinOp::LtR, [zero, w]));
-                            let t = true_of(egraph);
-                            if egraph.union(pos, t) {
-                                changed.push(egraph.find(pos));
-                            }
-                            w
-                        }
-                    },
                 };
                 vals.push(id);
             }

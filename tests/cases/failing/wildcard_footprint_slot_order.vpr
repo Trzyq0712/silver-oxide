@@ -1,0 +1,30 @@
+// Slot ORDER matters at a mixed concrete/wildcard footprint, and that is correct.
+//
+// `p_wild_rev` is `p_wild` with the conjuncts swapped. Conjunction is commutative, so
+// this looks like an incompleteness -- it is not. Once an unknown-but-positive share has
+// been taken from a location, nothing concrete about the remainder is recoverable, so a
+// following `>= 1/2` demand cannot be met: the wildcard could have been almost all of it.
+// The order that DOES verify (see passing/permissions/wildcard_in_predicate_footprint.vpr)
+// works only because a concrete remainder const-folds -- an accident of ordering, not a
+// guarantee Viper makes.
+//
+// This was recorded as "gap 3" until 2026-08-18, when Silicon 1.1-SNAPSHOT (cec06e49+) was
+// measured rejecting both methods below. Split out of
+// design/wildcards/repro/mixed_footprint.vpr.
+
+field f: Int
+
+predicate p_wild_rev(x: Ref) {
+    acc(x.f, wildcard) && acc(x.f, 1/2)
+}
+
+// Identical to the verifying `pass` except for the conjunct order.
+method rev_pass(x: Ref) {
+    inhale acc(x.f, 2/3)
+    fold p_wild_rev(x)
+}
+
+method rev_fail(x: Ref) {
+    inhale acc(x.f, 1/2)
+    fold p_wild_rev(x)
+}

@@ -1,0 +1,17 @@
+// The gate is TRUE and nothing is held, so the wildcard slot demands a positive share
+// of `x.f` that the caller does not have. Correct rejection.
+//
+// Companion to passing/permissions/wildcard_gated_in_predicate.vpr, whose
+// `fold_when_gated_off` verifies with no permission held because the gate is false.
+// Together they pin that the gate actually drives the demand, rather than the slot
+// being uniformly demanded or uniformly skipped.
+
+field f: Int
+
+predicate q(b: Bool, x: Ref) {
+    b ==> acc(x.f, wildcard)
+}
+
+method fold_gate_on_without_perm(x: Ref) {
+    fold q(true, x)
+}

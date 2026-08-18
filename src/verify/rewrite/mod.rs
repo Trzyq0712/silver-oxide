@@ -21,7 +21,7 @@ pub(crate) mod function;
 
 pub(crate) use forall::{PreparedTerm, forall_rule};
 pub(crate) use recipe::{
-    AxiomInst, AxiomPure, build_instance_releasing_tokens, build_instance_subst,
+    AxiomInst, AxiomPure, build_instance_releasing_tokens,
     build_instance_vals_guarded,
 };
 pub(crate) use function::{facts_rule, function_post_rule, function_rule};

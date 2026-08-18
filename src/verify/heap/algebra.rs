@@ -929,12 +929,14 @@ pub(crate) fn heap_subtract(
 /// ([`debit_wildcard`] vs [`prove_sufficient`]).
 ///
 /// Carried from the **static** source rather than recognised in the e-graph: the
-/// demanded amount is a `vmir::Perm` (or, on a certificate walk, a slot recipe)
-/// long before it is a term, and both know the answer outright --
-/// [`crate::vmir::Perm::has_wildcard`] and `recipe_has_wildcard`. Asking the
-/// e-graph instead means asking about an **e-class**, which congruence can put
-/// other nodes into -- the same lesson the produce side learned when positivity
-/// had to be read off operand trees rather than off the fused leaf.
+/// demanded amount is a [`crate::vmir::Perm`] long before it is a term, and knows the
+/// answer outright -- [`crate::vmir::Perm::has_wildcard`]. That is now literally one
+/// function for both the IR (`Perm<Val>`) and a footprint slot
+/// (`Perm<BodyRecipe>`), since a slot keeps the permission *shape* and recipes only
+/// its amount operands; the recipe-space twin that scanned for a flattened wildcard
+/// step is gone. Asking the e-graph instead means asking about an **e-class**, which
+/// congruence can put other nodes into -- the same lesson the produce side learned
+/// when positivity had to be read off operand trees rather than off the fused leaf.
 ///
 /// The produce side keeps [`contains_wildcard`]: there the two summands come out
 /// of the heap, and their provenance is genuinely gone.

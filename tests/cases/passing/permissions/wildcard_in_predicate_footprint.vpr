@@ -1,0 +1,44 @@
+// A `wildcard` inside a PREDICATE BODY, consumed by `fold`.
+//
+// This is the only coverage of that path. A census over benchmarks/rust/vpr/ and
+// tests/cases/ (2026-08-18) found the consuming wildcard-slot build --
+// `dir=consume frame_only=false src=readheap` -- occurs ZERO times in either corpus:
+// every other wildcard slot is either a `f#requires` produce at a heap-dependent
+// function's entry, or a frame-only exhale taking the presence path (which builds no
+// wildcard at all). Split out of design/wildcards/repro/mixed_footprint.vpr, whose
+// expected-failure half lives in failing/wildcard_footprint_needs_strict_surplus.vpr
+// and failing/wildcard_footprint_slot_order.vpr.
+//
+// The declined incompleteness of the original reproducer (sufficiency over a sum) is
+// tests/cases/known_limitations/wildcard_sum_sufficiency.vpr.
+
+field f: Int
+
+// A footprint naming ONE location at both a concrete amount and a wildcard, so the
+// slot permissions must be summed rather than matched individually.
+predicate p_wild(x: Ref) {
+    acc(x.f, 1/2) && acc(x.f, wildcard)
+}
+
+predicate p_normal(x: Ref) {
+    acc(x.f, 1/2)
+}
+
+// 2/3 > 1/2, so there is room for a positive wildcard on top. Slot 0 leaves the
+// CONCRETE remainder 2/3 - 1/2, which const-folds to 1/6, and slot 1's `0 < 1/6`
+// folds true.
+method pass(x: Ref) {
+    inhale acc(x.f, 2/3)
+    fold p_wild(x)
+}
+
+// The same held amount with no wildcard conjunct: `held >= 1/2` suffices.
+method pass_without(x: Ref) {
+    inhale acc(x.f, 1/2)
+    fold p_normal(x)
+}
+
+method write_ok(x: Ref) {
+    inhale acc(x.f, write)
+    fold p_wild(x)
+}

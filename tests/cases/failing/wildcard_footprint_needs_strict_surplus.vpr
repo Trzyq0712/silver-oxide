@@ -1,0 +1,19 @@
+// A wildcard conjunct makes a footprint's demand STRICT: `1/2 + w` with `0 < w`
+// needs `held > 1/2`, not `held >= 1/2`. Correct rejection, not an incompleteness --
+// Silicon 1.1-SNAPSHOT rejects it too.
+//
+// Companion to passing/permissions/wildcard_in_predicate_footprint.vpr, whose
+// `pass_without` verifies at exactly this held amount because it folds a predicate
+// with no wildcard conjunct. Split out of design/wildcards/repro/mixed_footprint.vpr.
+
+field f: Int
+
+predicate p_wild(x: Ref) {
+    acc(x.f, 1/2) && acc(x.f, wildcard)
+}
+
+// Exactly 1/2 leaves remainder 0 for the wildcard slot, and `0 < 0` is false.
+method fail(x: Ref) {
+    inhale acc(x.f, 1/2)
+    fold p_wild(x)
+}

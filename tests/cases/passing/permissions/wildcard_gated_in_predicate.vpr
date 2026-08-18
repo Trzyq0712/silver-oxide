@@ -1,0 +1,37 @@
+// A GATED `wildcard` in a predicate body: `b ==> acc(x.f, wildcard)`.
+//
+// `Sink::gate_perm` cannot gate a wildcard inside its value the way it gates a
+// concrete amount -- there is no term to wrap -- so the permission TREE grows the
+// conditional instead, and the slot's permission is
+//
+//     Perm::Ite(b, Wildcard, Amount(0))
+//
+// which is why `has_wildcard` has to recurse through `Ite` rather than look at a
+// single leaf. This case pins that recursion: get it wrong and the slot silently
+// takes the concrete consume rule (`prove_sufficient`) instead of the wildcard one
+// (`debit_wildcard`).
+//
+// `fold_when_gated_off` holds NO permission and must still verify: with the gate
+// false the slot's amount is `0`, so nothing is demanded. The companion rejection --
+// gate true, nothing held -- is failing/wildcard_gated_on_without_perm.vpr.
+
+field f: Int
+
+predicate q(b: Bool, x: Ref) {
+    b ==> acc(x.f, wildcard)
+}
+
+method fold_when_held(x: Ref) {
+    inhale acc(x.f, 1/2)
+    fold q(true, x)
+}
+
+method fold_when_gated_off(x: Ref) {
+    fold q(false, x)
+}
+
+method roundtrip(x: Ref) {
+    inhale acc(x.f, 1/2)
+    fold q(true, x)
+    unfold q(true, x)
+}
