@@ -22,15 +22,6 @@ pub struct FuncId(pub usize);
 )]
 pub struct RecipeId(pub usize);
 
-/// A process-global monotonic source of [`Symbolic::Wildcard`] ids. Wildcards
-/// are always mutually distinct fresh shares, so a plain global counter suffices
-/// (and lets `build_instance` mint one without a `VerifyContext`).
-pub(crate) fn fresh_wildcard_id() -> u32 {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
     Fresh(u32),

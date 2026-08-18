@@ -49,10 +49,16 @@ pub(crate) struct VerifyContext<'a> {
     /// `rewrite::function_rule`).
     /// Chained into full saturation (incl. the `probe` tier) but not `reduce`.
     pub(crate) axiom_rules: Vec<egg::Rewrite<Symbolic, ConstFold>>,
-    /// Monotonic source of fresh-value ids (`Symbolic::Fresh(n)`). A plain counter
-    /// now that nothing mints fresh values at saturation time — both certificate
-    /// kinds are add-only recipes, so `transplant` (which threaded a shared
-    /// counter) is gone.
+    /// Monotonic source of symbolic ids — both `Symbolic::Fresh(n)` and
+    /// `Symbolic::Wildcard(n)`. A plain counter now that nothing mints either at
+    /// saturation time: both certificate kinds are add-only recipes, so `transplant`
+    /// (which threaded a shared counter) is gone, and a slot permission keeps the
+    /// `vmir::Perm` shape rather than flattening a wildcard into a recipe step.
+    ///
+    /// Shared between the two node kinds on purpose. They could not collide anyway
+    /// (different constructors, and only `Fresh` is keyed into `fresh_types`), but one
+    /// counter means no id is ever reused across them — so folding `Wildcard` into
+    /// `Fresh` later needs no id migration.
     fresh_counter: u32,
     /// Cheap string repr for member/constructor names.
     pub(crate) interner: &'a Rodeo,
@@ -480,7 +486,11 @@ impl<'a> VerifyContext<'a> {
     /// node lets an exhale recognise a wildcard-bearing permission (see
     /// `heap_subtract`).
     pub(crate) fn fresh_wildcard(&mut self) -> egg::Id {
-        let w = self.add(Symbolic::Wildcard(crate::verify::lang::fresh_wildcard_id()));
+        let id = self.fresh_counter;
+        self.fresh_counter += 1;
+        // No `fresh_types` entry: a wildcard self-types as `Real` from the node
+        // (`verify::types`), which is why it needs no id-to-type record.
+        let w = self.add(Symbolic::Wildcard(id));
         let pos = expr!(self, (0/1) <r {w});
         let true_ = expr!(self, true);
         self.union(pos, true_);
