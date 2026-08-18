@@ -95,12 +95,14 @@ impl ChunkPerm {
 }
 
 /// A chunk's permission as an explicit term, held OUTSIDE the union-find so a
-/// control-flow join can build a structural `Select` that collapses without
-/// saturation. `Leaf` is an e-class id (a literal `1/1`, a symbolic real, a
-/// wildcard-bearing term, or a program-written `c ==> acc` gate) and is treated
-/// as OPAQUE — never structurally decomposed. `Select` is built ONLY by the
-/// control-flow join merge ([`ChunkPerm::select`]); a perm the frontend built
-/// is always a `Leaf`, for which [`ChunkPerm::to_id`] is the identity.
+/// branch structure collapses without saturation. `Leaf` is an e-class id (a
+/// literal `1/1`, a symbolic real, a wildcard) and is treated as OPAQUE — never
+/// structurally decomposed. A `Select` comes from either of two places, both via
+/// the [`ChunkPerm::select`] smart constructor: a control-flow **join** merge, and
+/// a **gated `acc`** — `Sink::gate_perm` keeps a path condition as `vmir::Perm::Ite`
+/// structure rather than folding it into the amount, so `build_perm` lands it here.
+/// An ungated frontend perm is still a `Leaf`, for which [`ChunkPerm::to_id`] is
+/// the identity.
 #[derive(Debug, Clone)]
 pub enum ChunkPerm {
     Leaf(egg::Id),

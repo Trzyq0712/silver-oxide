@@ -168,13 +168,14 @@ impl Sink {
     /// (top-level) path condition returns `perm` unchanged. Only *branch*
     /// conditions gate; a separating-conjunction `Fact` keeps the bare permission.
     ///
-    /// A concrete [`Perm::Amount`] gates by emitting a `Val` ternary via
-    /// [`Sink::gate_perm_val`]; a wildcard-bearing permission gates *structurally*
-    /// as [`Perm::Ite`] so the wildcard survives to the verifier.
+    /// Every permission gates *structurally* as [`Perm::Ite`] — a concrete amount
+    /// no less than a wildcard-bearing one. The gate is the same term either way
+    /// (`eval_perm`/`build_perm` build the `Symbolic::Ite` a folded `Ternary` temp
+    /// used to build), but keeping it as `Perm` structure is what lets a consume
+    /// align the demand's arms against the held permission's rather than proving
+    /// against an opaque `ite`. Folding it into the value instead is what left
+    /// `perm_sub_aligned` dead and made `fold q(c, x)` fail while holding `acc(x.f)`.
     pub(crate) fn gate_perm(&mut self, perm: Perm) -> Perm {
-        if let Perm::Amount(v) = perm {
-            return Perm::Amount(self.gate_perm_val(v));
-        }
         let mut p = perm;
         for (lit, pol) in self.branch_conds().into_iter().rev() {
             p = match pol {
@@ -183,21 +184,6 @@ impl Sink {
             };
         }
         p
-    }
-
-    /// Gate a concrete permission *value* — the original `gate_perm`, kept for the
-    /// [`Perm::Amount`] fast path.
-    fn gate_perm_val(&mut self, perm: Val) -> Val {
-        let mut v = perm;
-        // Innermost literal first, so the outermost guard ends outermost.
-        for (lit, pol) in self.branch_conds().into_iter().rev() {
-            let (then_, else_) = match pol {
-                Polarity::Positive => (v, none()),
-                Polarity::Negative => (none(), v),
-            };
-            v = self.emit_pure(Type::Real, PureInst::Ternary(lit, then_, else_));
-        }
-        v
     }
 
     /// Map a lowered permission *value* to a [`Perm`], applying the read-only

@@ -888,6 +888,9 @@ pub(crate) fn perm_sub_aligned(
         // Demand is flat: nothing to align against, so this is `perm_sub`.
         ChunkPerm::Leaf(n) => perm_sub(ctx, held, *n),
         ChunkPerm::Select { cond, then, els } => {
+            if std::env::var_os("SO_TRACE_ALIGNED").is_some() {
+                eprintln!("[perm-sub-aligned] Select hit");
+            }
             let ht = ChunkPerm::restrict(ctx, *cond, held.clone(), true);
             let he = ChunkPerm::restrict(ctx, *cond, held.clone(), false);
             let t = perm_sub_aligned(ctx, &ht, then);
@@ -924,6 +927,17 @@ pub(crate) fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
     ) -> bool {
         let id = ctx.egraph.find(id);
         if !seen.insert(id) {
+            return false;
+        }
+        // A class with a known rational value is a **fixed amount**, whatever other
+        // nodes congruence has put in it -- and it routinely holds wildcard-bearing
+        // ones (`0/1`'s class carries every `w * 0`, `1/1`'s every `w / w`). Reading
+        // those as "this permission mentions a wildcard" made `perm_add_wildcard`
+        // replace an exact sum like `0 + 1/1` with an opaque fresh share, losing the
+        // full permission a later consume needs. Same judgement `perm_sign` makes
+        // one function above: the literal settles the class outright.
+        if known_real(ctx, id).is_some() {
+            seen.remove(&id);
             return false;
         }
         for n in &ctx.egraph[id].nodes {
