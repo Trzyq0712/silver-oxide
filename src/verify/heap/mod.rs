@@ -88,7 +88,7 @@ impl ChunkPerm {
     /// The `Select`-nesting depth of this perm tree (a `Leaf` is 0). Diagnostic.
     fn depth(&self) -> u32 {
         match self {
-            ChunkPerm::Leaf(_) => 0,
+            ChunkPerm::Leaf { .. } => 0,
             ChunkPerm::Select { then, els, .. } => 1 + then.depth().max(els.depth()),
         }
     }
@@ -105,7 +105,16 @@ impl ChunkPerm {
 /// the identity.
 #[derive(Debug, Clone)]
 pub enum ChunkPerm {
-    Leaf(egg::Id),
+    Leaf {
+        id: egg::Id,
+        /// Whether this amount **came from** a `wildcard` — origin, not sign. A
+        /// `1/2` is positive too, and must not trigger [`perm_add_wildcard`]'s
+        /// fresh-share rule; a `wildcard` must, however its class const-folds.
+        /// Carried structurally because the e-graph cannot answer it: congruence
+        /// puts wildcard-bearing terms into a literal's class, and by the time the
+        /// merge side sees two amounts their provenance is otherwise gone.
+        wild: bool,
+    },
     Select {
         cond: egg::Id,
         then: Box<ChunkPerm>,
@@ -114,11 +123,30 @@ pub enum ChunkPerm {
 }
 
 impl ChunkPerm {
+    /// A concrete leaf: an amount with no `wildcard` in its provenance.
+    pub(crate) fn leaf(id: egg::Id) -> Self {
+        ChunkPerm::Leaf { id, wild: false }
+    }
+
+    /// A leaf minted from a `wildcard` (or from a term one flowed into). Selects
+    /// the fresh-share rule on the produce side; see the `wild` field.
+    pub(crate) fn wild_leaf(id: egg::Id) -> Self {
+        ChunkPerm::Leaf { id, wild: true }
+    }
+
+    /// Whether any leaf of this tree came from a `wildcard`.
+    pub(crate) fn has_wild(&self) -> bool {
+        match self {
+            ChunkPerm::Leaf { wild, .. } => *wild,
+            ChunkPerm::Select { then, els, .. } => then.has_wild() || els.has_wild(),
+        }
+    }
+
     /// Structural equality with LEAVES compared by e-class `find` (so a `1/1`
     /// from either arm counts as equal). O(size), no saturation.
     pub(crate) fn same(ctx: &VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> bool {
         match (a, b) {
-            (ChunkPerm::Leaf(x), ChunkPerm::Leaf(y)) => {
+            (ChunkPerm::Leaf { id: x, .. }, ChunkPerm::Leaf { id: y, .. }) => {
                 ctx.egraph.find(*x) == ctx.egraph.find(*y)
             }
             (
@@ -208,7 +236,7 @@ impl ChunkPerm {
     /// heap ops are byte-identical to Stage 3.
     pub fn to_id(&self, ctx: &mut VerifyContext<'_>) -> egg::Id {
         match self {
-            ChunkPerm::Leaf(id) => *id,
+            ChunkPerm::Leaf { id, .. } => *id,
             ChunkPerm::Select { cond, then, els } => {
                 let t = then.to_id(ctx);
                 let e = els.to_id(ctx);
@@ -220,7 +248,7 @@ impl ChunkPerm {
     /// The leaf amount id if this is a bare `Leaf` (no branch structure).
     pub fn as_leaf(&self) -> Option<egg::Id> {
         match self {
-            ChunkPerm::Leaf(id) => Some(*id),
+            ChunkPerm::Leaf { id, .. } => Some(*id),
             ChunkPerm::Select { .. } => None,
         }
     }
@@ -243,7 +271,7 @@ impl ChunkPerm {
             f: &mut impl FnMut(egg::Id, &[(egg::Id, Polarity)]),
         ) {
             match p {
-                ChunkPerm::Leaf(id) => f(*id, path),
+                ChunkPerm::Leaf { id, .. } => f(*id, path),
                 ChunkPerm::Select { cond, then, els } => {
                     path.push((*cond, Polarity::Positive));
                     go(then, path, f);
@@ -261,7 +289,7 @@ impl ChunkPerm {
     /// (a `Leaf`'s id, or a `Select`'s condition). Viz only — not a real perm id.
     pub fn repr_id(&self) -> egg::Id {
         match self {
-            ChunkPerm::Leaf(id) => *id,
+            ChunkPerm::Leaf { id, .. } => *id,
             ChunkPerm::Select { cond, .. } => *cond,
         }
     }
@@ -362,7 +390,7 @@ pub(crate) fn gate_perm_by_guard(
 ) -> ChunkPerm {
     let mut acc = perm.clone();
     for (id, pol) in guard {
-        let zero = ChunkPerm::Leaf(expr!(ctx, 0/1));
+        let zero = ChunkPerm::leaf(expr!(ctx, 0/1));
         acc = match pol {
             Polarity::Positive => ChunkPerm::select(ctx, *id, acc, zero),
             Polarity::Negative => ChunkPerm::select(ctx, *id, zero, acc),
@@ -435,7 +463,7 @@ impl Chunk {
     /// Build a chunk from a bare permission id (the common case). Wraps the id
     /// as a `ChunkPerm::Leaf`.
     pub fn new(addr: egg::Id, perm: egg::Id, value: egg::Id) -> Self {
-        Self::new_perm(addr, ChunkPerm::Leaf(perm), value)
+        Self::new_perm(addr, ChunkPerm::leaf(perm), value)
     }
 
     /// Build a chunk from an explicit permission term (the join merge's select).

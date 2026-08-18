@@ -634,8 +634,8 @@ fn eval_perm_structural(
     perm: &vmir::Perm,
 ) -> ChunkPerm {
     match perm {
-        vmir::Perm::Amount(v) => ChunkPerm::Leaf(state.get_val(ctx, v)),
-        vmir::Perm::Wildcard => ChunkPerm::Leaf(ctx.fresh_wildcard()),
+        vmir::Perm::Amount(v) => ChunkPerm::leaf(state.get_val(ctx, v)),
+        vmir::Perm::Wildcard => ChunkPerm::wild_leaf(ctx.fresh_wildcard()),
         vmir::Perm::Ite(c, t, e) => {
             let c = state.get_val(ctx, c);
             let t = eval_perm_structural(ctx, state, t);
@@ -714,11 +714,15 @@ fn build_perm(
     wildcard_as: WildcardAs,
 ) -> ChunkPerm {
     match perm {
-        vmir::Perm::Amount(r) => ChunkPerm::Leaf(r.build(&mut ctx.egraph, resolve, changed)),
-        vmir::Perm::Wildcard => ChunkPerm::Leaf(match wildcard_as {
-            WildcardAs::Fresh => ctx.fresh_wildcard(),
-            WildcardAs::One => ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into()))),
-        }),
+        vmir::Perm::Amount(r) => ChunkPerm::leaf(r.build(&mut ctx.egraph, resolve, changed)),
+        // `WildcardAs::One` builds a **presence** indicator, not a share: it is the
+        // literal `1`, with no wildcard left in it, so the leaf is concrete.
+        vmir::Perm::Wildcard => match wildcard_as {
+            WildcardAs::Fresh => ChunkPerm::wild_leaf(ctx.fresh_wildcard()),
+            WildcardAs::One => ChunkPerm::leaf(
+                ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into()))),
+            ),
+        },
         vmir::Perm::Ite(c, t, e) => {
             let c = c.build(&mut ctx.egraph, resolve, changed);
             let t = build_perm(ctx, t, resolve, changed, wildcard_as);
@@ -734,12 +738,17 @@ fn build_perm(
 /// is what keeps the `ChunkPerm` tree intact through an `unfolding`'s multiplier. The
 /// two are equal but not identical; `mul-one-real-l` puts them in one class once the
 /// slot's `ctx.reduce()` runs, which is why the common `1/1` scale costs nothing.
-fn scale_perm(ctx: &mut VerifyContext<'_>, pm: egg::Id, perm: ChunkPerm) -> ChunkPerm {
+fn scale_perm(ctx: &mut VerifyContext<'_>, pm: egg::Id, pm_wild: bool, perm: ChunkPerm) -> ChunkPerm {
     match perm {
-        ChunkPerm::Leaf(p) => ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::MulR, [pm, p]))),
+        // A wildcard *scale* (an `unfolding` inside a function body) makes every
+        // scaled leaf wildcard-derived, whatever the slot's own amount was.
+        ChunkPerm::Leaf { id, wild } => ChunkPerm::Leaf {
+            id: ctx.add(Symbolic::Binary(BinOp::MulR, [pm, id])),
+            wild: wild || pm_wild,
+        },
         ChunkPerm::Select { cond, then, els } => {
-            let t = scale_perm(ctx, pm, *then);
-            let e = scale_perm(ctx, pm, *els);
+            let t = scale_perm(ctx, pm, pm_wild, *then);
+            let e = scale_perm(ctx, pm, pm_wild, *els);
             ChunkPerm::select(ctx, cond, t, e)
         }
     }
@@ -970,7 +979,7 @@ fn eval_heap_inst(
             let perm = held
                 .as_ref()
                 .map(|c| c.ungated_perm().clone())
-                .unwrap_or_else(|| ChunkPerm::Leaf(expr!(ctx, 0/1)));
+                .unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0/1)));
             let guard = held
                 .as_ref()
                 .map(|c| c.guard_pc())
@@ -1239,6 +1248,9 @@ fn walk_footprint(
     source: ValueSource,
     direction: Direction,
     scale: Option<egg::Id>,
+    // `scale_wild`: whether `scale` itself came from a `wildcard` (an `unfolding`
+    // in a function body), which makes every scaled leaf wildcard-derived.
+    scale_wild: bool,
     pc_lits: &[(egg::Id, Polarity)],
     // The guard under which the body boolean is discharged (asserted for
     // `Consume`, assumed for `Produce`). Usually `pc_lits`; an `inhale` passes
@@ -1366,7 +1378,7 @@ fn walk_footprint(
             // (subtract/union), presence is `0 < perm`.
             SlotPerm::Amount(bperm) => {
                 let p = match scale {
-                    Some(pm) => scale_perm(ctx, pm, bperm.clone()),
+                    Some(pm) => scale_perm(ctx, pm, scale_wild, bperm.clone()),
                     None => bperm.clone(),
                 };
                 let chunk = Chunk::new_perm(addr, p, value).with_recipe(recipe.clone());
@@ -1668,6 +1680,7 @@ fn eval_resource_op(
             // slot permission as `1 * p`, which is equal but not identical,
             // and identity is what the `old(f(x)) == f(x)` congruence needs.
             if frame_only { None } else { Some(scale) },
+            perm.has_wildcard(),
             &pc_lits,
             &bool_guard,
             frame_only,
@@ -1767,6 +1780,7 @@ fn eval_from_snap(
         ValueSource::ProjectSnap(s, s_recipe),
         Direction::Produce,
         None,
+        false,
         &pc_lits,
         &pc_lits,
         false,
@@ -2691,7 +2705,7 @@ fn inst_obligations(
                     let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, zero]));
                     vec![(goal, VerifyError::InsufficientPermission)]
                 }
-                Some(p @ ChunkPerm::Leaf(_)) => {
+                Some(p @ ChunkPerm::Leaf { .. }) => {
                     let leaf = p.as_leaf().unwrap();
                     let zero = expr!(ctx, 0/1);
                     let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, leaf]));

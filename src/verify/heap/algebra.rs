@@ -99,7 +99,7 @@ pub(crate) fn merge_chunks(
     // it is not built: [`perm_add_wildcard`] replaces the wildcard-bearing leaves
     // with fresh shares carrying the facts instead. Gated on `has_wildcard` first,
     // so a wildcard-free program builds byte-identical terms for one `bool` test.
-    let perm = if ctx.has_wildcard && (contains_wildcard(ctx, p0) || contains_wildcard(ctx, p1)) {
+    let perm = if ctx.has_wildcard && (pa.has_wild() || pb.has_wild()) {
         perm_add_wildcard(ctx, &pa, &pb)
     } else {
         perm_add(ctx, &pa, &pb)
@@ -153,12 +153,17 @@ pub(crate) fn merge_chunks(
 /// why no pc/guard cube is threaded here, unlike the bound axiom.
 fn perm_add_wildcard(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> ChunkPerm {
     match (a, b) {
-        (ChunkPerm::Leaf(x), ChunkPerm::Leaf(y)) => {
-            let (x, y) = (*x, *y);
+        (
+            ChunkPerm::Leaf { id: x, wild: wx },
+            ChunkPerm::Leaf { id: y, wild: wy },
+        ) => {
+            let (x, y, wild) = (*x, *y, *wx || *wy);
             let (xpos, ypos) = (perm_known_positive(ctx, x), perm_known_positive(ctx, y));
-            let wild = contains_wildcard(ctx, x) || contains_wildcard(ctx, y);
             if !wild || !(xpos || ypos) {
-                return ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::AddR, [x, y])));
+                return ChunkPerm::Leaf {
+                    id: ctx.add(Symbolic::Binary(BinOp::AddR, [x, y])),
+                    wild,
+                };
             }
             // `0 < s` comes with the mint.
             let s = ctx.fresh_wildcard();
@@ -175,7 +180,7 @@ fn perm_add_wildcard(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) 
                 facts.push(expr!(ctx, {y} <r {s}));
             }
             ctx.assume_all_guarded(facts, &[]);
-            ChunkPerm::Leaf(s)
+            ChunkPerm::wild_leaf(s)
         }
         // Descend on `a` (this arm also covers `Select`/`Select`).
         (ChunkPerm::Select { cond, then, els }, other) => {
@@ -684,7 +689,7 @@ pub(crate) fn prove_perm_leaves(
     mk: &dyn Fn(&mut VerifyContext<'_>, egg::Id, &[(egg::Id, Polarity)]) -> bool,
 ) -> bool {
     match perm {
-        ChunkPerm::Leaf(h) => mk(ctx, *h, pc_lits),
+        ChunkPerm::Leaf { id, .. } => mk(ctx, *id, pc_lits),
         ChunkPerm::Select { cond, then, els } => {
             let mut pc_t = pc_lits.to_vec();
             pc_t.push((*cond, Polarity::Positive));
@@ -743,7 +748,7 @@ pub(crate) fn prove_sufficient_aligned(
     pc_lits: &[(egg::Id, Polarity)],
 ) -> bool {
     match needed {
-        ChunkPerm::Leaf(n) => {
+        ChunkPerm::Leaf { id: n, .. } => {
             // Nothing demanded on this arm: every held amount is ≥ 0.
             if let Some(r) = known_real(ctx, *n) {
                 if r <= num::BigRational::from(num::BigInt::from(0)) {
@@ -910,9 +915,13 @@ pub(crate) fn prove_perm_write(
 /// literals the participating chunks' guards mention, never by a search bound.
 pub(crate) fn perm_add(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> ChunkPerm {
     match (a, b) {
-        (ChunkPerm::Leaf(x), ChunkPerm::Leaf(y)) => {
-            ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::AddR, [*x, *y])))
-        }
+        (
+            ChunkPerm::Leaf { id: x, wild: wx },
+            ChunkPerm::Leaf { id: y, wild: wy },
+        ) => ChunkPerm::Leaf {
+            id: ctx.add(Symbolic::Binary(BinOp::AddR, [*x, *y])),
+            wild: *wx || *wy,
+        },
         // Descend on `a` (this arm also covers `Select`/`Select`).
         (ChunkPerm::Select { cond, then, els }, other) => {
             let ot = ChunkPerm::restrict(ctx, *cond, other.clone(), true);
@@ -935,9 +944,12 @@ pub(crate) fn perm_add(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm
 /// `Select` via the smart constructor so it never materializes as an `ite`).
 pub(crate) fn perm_sub(ctx: &mut VerifyContext<'_>, held: &ChunkPerm, needed: egg::Id) -> ChunkPerm {
     match held {
-        ChunkPerm::Leaf(h) => {
-            ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::SubR, [*h, needed])))
-        }
+        // The demand is concrete on this path (a wildcard demand goes to
+        // `debit_wildcard`), so the remainder's provenance is the held side's.
+        ChunkPerm::Leaf { id, wild } => ChunkPerm::Leaf {
+            id: ctx.add(Symbolic::Binary(BinOp::SubR, [*id, needed])),
+            wild: *wild,
+        },
         ChunkPerm::Select { cond, then, els } => {
             let t = perm_sub(ctx, then, needed);
             let e = perm_sub(ctx, els, needed);
@@ -969,7 +981,7 @@ pub(crate) fn perm_sub_aligned(
 ) -> ChunkPerm {
     match needed {
         // Demand is flat: nothing to align against, so this is `perm_sub`.
-        ChunkPerm::Leaf(n) => perm_sub(ctx, held, *n),
+        ChunkPerm::Leaf { id: n, .. } => perm_sub(ctx, held, *n),
         ChunkPerm::Select { cond, then, els } => {
             let ht = ChunkPerm::restrict(ctx, *cond, held.clone(), true);
             let he = ChunkPerm::restrict(ctx, *cond, held.clone(), false);
@@ -984,61 +996,14 @@ pub(crate) fn perm_sub_aligned(
 /// every branch, so it can be dropped). Const-fold only, no `Select` in the graph.
 pub(crate) fn perm_all_zero(ctx: &VerifyContext<'_>, perm: &ChunkPerm) -> bool {
     match perm {
-        ChunkPerm::Leaf(h) => matches!(
-            ctx.egraph[ctx.egraph.find(*h)].data.known(),
+        ChunkPerm::Leaf { id, .. } => matches!(
+            ctx.egraph[ctx.egraph.find(*id)].data.known(),
             Some(Literal::Real(r)) if *r == num::BigRational::from(num::BigInt::from(0))
         ),
         ChunkPerm::Select { then, els, .. } => {
             perm_all_zero(ctx, then) && perm_all_zero(ctx, els)
         }
     }
-}
-
-/// Whether a permission term is — or, through `ite` gating or `*`/`+`/`-`
-/// scaling, contains — a [`Symbolic::Wildcard`]. Selects the wildcard exhale
-/// rule (require `held > 0`, assume `needed < held`) over the concrete one
-/// (prove `held ≥ needed`). Bounded by a visited set; a non-wildcard perm term
-/// (a literal / small gating `ite`) is walked in O(size).
-pub(crate) fn contains_wildcard(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
-    fn go(
-        ctx: &VerifyContext<'_>,
-        id: egg::Id,
-        seen: &mut std::collections::HashSet<egg::Id>,
-    ) -> bool {
-        let id = ctx.egraph.find(id);
-        if !seen.insert(id) {
-            return false;
-        }
-        // A class with a known rational value is a **fixed amount**, whatever other
-        // nodes congruence has put in it -- and it routinely holds wildcard-bearing
-        // ones (`0/1`'s class carries every `w * 0`, `1/1`'s every `w / w`). Reading
-        // those as "this permission mentions a wildcard" made `perm_add_wildcard`
-        // replace an exact sum like `0 + 1/1` with an opaque fresh share, losing the
-        // full permission a later consume needs. Same judgement `perm_sign` makes
-        // one function above: the literal settles the class outright.
-        if known_real(ctx, id).is_some() {
-            seen.remove(&id);
-            return false;
-        }
-        for n in &ctx.egraph[id].nodes {
-            match n {
-                Symbolic::Wildcard(_) => return true,
-                Symbolic::Ite(ch) => {
-                    if ch.iter().any(|c| go(ctx, *c, seen)) {
-                        return true;
-                    }
-                }
-                Symbolic::Binary(BinOp::MulR | BinOp::AddR | BinOp::SubR, ch) => {
-                    if ch.iter().any(|c| go(ctx, *c, seen)) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-    go(ctx, id, &mut std::collections::HashSet::new())
 }
 
 /// Heap subtraction for a single location chunk of kind `kind`.
@@ -1474,7 +1439,7 @@ pub(crate) fn pc_alias_set(
     let set = members.into_iter().map(|c| (c, cube.clone())).collect();
     (
         set,
-        total.unwrap_or_else(|| ChunkPerm::Leaf(expr!(ctx, 0/1))),
+        total.unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0/1))),
     )
 }
 
@@ -1769,7 +1734,13 @@ pub(crate) fn summarize_perm_at(
                     let cube = vec![(eq, Polarity::Positive)];
                     let held = held.to_id(ctx);
                     let gated = gate_amount_by_pc(ctx, held, &cube);
-                    (ChunkPerm::Leaf(gated), std::rc::Rc::from(cube))
+                    (
+                        ChunkPerm::Leaf {
+                            id: gated,
+                            wild: c.ungated_perm().has_wild(),
+                        },
+                        std::rc::Rc::from(cube),
+                    )
                 }
             };
         set.push((c.clone(), cube));
@@ -1779,7 +1750,7 @@ pub(crate) fn summarize_perm_at(
         });
     }
     (
-        total.unwrap_or_else(|| ChunkPerm::Leaf(expr!(ctx, 0/1))),
+        total.unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0/1))),
         set,
     )
 }
@@ -1909,8 +1880,7 @@ pub(crate) fn union_heaps(
         // permission the graph cannot see is one, since deciding it needs a case
         // split. That is exactly a loop's frame restore under a path condition: the
         // invariant's footprint on one arm, the frame's residual on the other.
-        let sum = if ctx.has_wildcard && (contains_wildcard(ctx, ia) || contains_wildcard(ctx, ib))
-        {
+        let sum = if ctx.has_wildcard && (pa.has_wild() || pb.has_wild()) {
             perm_add_wildcard(ctx, &pa, &pb)
         } else {
             perm_add(ctx, &pa, &pb)
