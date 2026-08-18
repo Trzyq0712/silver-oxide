@@ -57,9 +57,11 @@ use crate::vmir::{BinOp, Bound, Literal, Polarity};
 /// genuinely held" only when the fractions are gated. Ungated, it equated the
 /// values of two chunks that are never held at the same time.
 ///
-/// The total stays one opaque `AddR` leaf, never a [`ChunkPerm::Select`]: a
+/// The total of two amounts stays one leaf, never a [`ChunkPerm::Select`]: a
 /// `Select`'s arms are *alternatives* (the bound axiom is assumed per leaf,
-/// correctly), while these two are *summands* and only their sum is bounded.
+/// correctly), while these two are *summands* and only their sum is bounded. A
+/// concrete leaf is an `AddR` (which const-folds); a wildcard-bearing one is a
+/// fresh share carrying facts — see [`perm_add_wildcard`].
 pub(crate) fn merge_chunks(
     ctx: &mut VerifyContext<'_>,
     addr: egg::Id,
@@ -92,83 +94,105 @@ pub(crate) fn merge_chunks(
     // decide. Safe only because the bound axiom gates each leaf by the arm that
     // reaches it (`for_each_leaf_under`) — otherwise an over-bound arm would fold
     // the bound ungated and make the unit inconsistent.
-    let perm = perm_add(ctx, &pa, &pb);
     let (p0, p1) = (pa.to_id(ctx), pb.to_id(ctx));
-    assume_sum_positive(ctx, &perm, &pa, &pb, p0, p1, &guard, pc_lits);
+    // A sum with a wildcard in it is an opaque `AddR` leaf nothing can decide, so
+    // it is not built: [`perm_add_wildcard`] replaces the wildcard-bearing leaves
+    // with fresh shares carrying the facts instead. Gated on `has_wildcard` first,
+    // so a wildcard-free program builds byte-identical terms for one `bool` test.
+    let perm = if ctx.has_wildcard && (contains_wildcard(ctx, p0) || contains_wildcard(ctx, p1)) {
+        perm_add_wildcard(ctx, &pa, &pb)
+    } else {
+        perm_add(ctx, &pa, &pb)
+    };
     let value = merge_values(ctx, p0, a.value, p1, b.value, pc_lits);
     Chunk::new_perm(addr, perm, value).with_guard(guard)
 }
 
-/// Mirror of the consume side's explicit remainder positivity, for the produce
-/// side: assume `0 < p0 + p1` when one summand is **structurally positive**.
+/// [`perm_add`], but a leaf whose sum mentions a `wildcard` becomes a **fresh
+/// share carrying facts** instead of an `AddR` node.
 ///
-/// The e-graph has no real-order arithmetic, so `0 < 1/2 + w` is underivable even
-/// though `0 < w` was assumed at mint — [`merge_chunks`] simply built an `AddR`
-/// node and said nothing about it. A later `perm > 0` framing check on the merged
-/// chunk (a field read after inhaling a wildcard on top of a fraction held
-/// already) then cannot discharge. This is `design/wildcards` `[20]` gap 1, and
-/// this function is `[30]` Option 1's first half: the same hand-placed-fact
-/// approach [`debit_wildcard`] already takes, applied to the sum.
+/// The e-graph has no real-order arithmetic, so an `AddR` over a wildcard is an
+/// opaque leaf: `0 < 1/2 + w` is underivable even though `0 < w` was assumed at
+/// mint, and so is `1/2 < 1/2 + w`. Building the node and then bolting facts onto
+/// it means restating those facts over a tree that keeps getting deeper. Building
+/// a fresh `s` instead states the same thing once, at any depth:
 ///
-/// The other summand's **non-negativity is an invariant, not a proof**: every
-/// permission that reaches a chunk has passed `Combine`'s `perm ≥ 0` obligation,
-/// or — for the wildcard-bearing perms that skip it ([`crate::vmir::Perm`]) — is
-/// non-negative by construction (a wildcard is positive, a gate contributes `0`).
-/// So one positive summand makes the total positive.
+/// - `0 < s` — free, from [`VerifyContext::fresh_wildcard`]'s mint-time assumption;
+/// - `x < s` for each summand `x` whose **other** summand is positive.
 ///
-/// Structural positivity ([`perm_known_positive`]) is checked on the operand
-/// **trees**, not on the fused leaves: the tree is what this function built, so
-/// the operands are known to be chunk permissions rather than whatever else may
-/// have landed in the sum's e-class by congruence.
+/// That second fact is what the `AddR` never gave: it makes `perm(x.f) > 1/2`
+/// provable after inhaling a wildcard onto `1/2`, and — meeting the bound axiom's
+/// `not (b <r leaf)` in [`assume_location_axioms`] — makes `inhale write; inhale
+/// wildcard` inconsistent, which is Silicon's verdict on that state.
 ///
-/// Requiring **every** leaf of an operand to be positive is what makes arm gating
-/// unnecessary, and it is exactly right at a guard: where the two chunks' presence
-/// guards differ, [`merge_chunks`] folds each guard into its amount as
-/// `guard ? p : 0`, whose `0` arm is not positive — so a conditionally-present
-/// wildcard states nothing here, which is the truth. The fact is still gated by
-/// the surviving guard and the pc, both usually empty.
+/// Silicon materializes the same sums we do and leans on Z3's linear real
+/// arithmetic (`PermPlus` → `mkAdd`); it has no wildcard case for `+` at all. What
+/// it *does* do is throw a wildcard's magnitude away under `*`
+/// (`WildcardSimplifyingPermTimes`: `w * q` with `q` a positive literal collapses
+/// to `w`), which is the same observation from the other side — a wildcard carries
+/// no magnitude, only a sign.
 ///
-/// Gated on `has_wildcard` and on the sum actually containing a wildcard: a
-/// wildcard-free program pays one `bool` test, and a concrete sum needs nothing
-/// (`1/2 + 1/2` const-folds, and sufficiency over literals is decidable anyway).
-#[allow(clippy::too_many_arguments)]
-fn assume_sum_positive(
-    ctx: &mut VerifyContext<'_>,
-    sum: &ChunkPerm,
-    pa: &ChunkPerm,
-    pb: &ChunkPerm,
-    p0: egg::Id,
-    p1: egg::Id,
-    guard: &HeapPc,
-    pc_lits: &[(egg::Id, Polarity)],
-) {
-    if !ctx.has_wildcard {
-        return;
+/// # Per leaf, not per tree
+///
+/// Both tests are made on the **leaf**, after [`perm_add`]'s distribution over the
+/// operands' `Select`s has already split the guard arms apart:
+///
+/// - **`contains_wildcard`** — a concrete leaf keeps its `AddR`, which const-folds
+///   (`1/2 + 0` is `1/2`, not an opaque symbol). Replacing those would *lose*
+///   information, so the arm where a gated wildcard chunk is absent — a literal
+///   `0` leaf — is untouched.
+/// - **[`perm_known_positive`]** — a fresh share may only be minted where the sum
+///   really is positive. A conditionally-present wildcard (`ite(g, w, 0)`) is not
+///   positive, so a leaf with no positive summand keeps its `AddR` and states
+///   nothing, which is the truth.
+///
+/// Both facts are **ungated**: [`perm_known_positive`] is a structural,
+/// path-independent judgement, so `x < x + y` with `y` positive holds on every
+/// path. The arm-dependence lives entirely in *which leaf* — which the per-leaf
+/// positivity test already decides — not in whether the leaf's fact holds. This is
+/// why no pc/guard cube is threaded here, unlike the bound axiom.
+fn perm_add_wildcard(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> ChunkPerm {
+    match (a, b) {
+        (ChunkPerm::Leaf(x), ChunkPerm::Leaf(y)) => {
+            let (x, y) = (*x, *y);
+            let (xpos, ypos) = (perm_known_positive(ctx, x), perm_known_positive(ctx, y));
+            let wild = contains_wildcard(ctx, x) || contains_wildcard(ctx, y);
+            if !wild || !(xpos || ypos) {
+                return ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::AddR, [x, y])));
+            }
+            // `0 < s` comes with the mint.
+            let s = ctx.fresh_wildcard();
+            // `x < x + y` needs *y* strictly positive, and vice versa. The other
+            // summand's non-negativity is the chunk-permission invariant, not a
+            // proof: every permission reaching a chunk has passed `Combine`'s
+            // `perm ≥ 0`, or — for the wildcard-bearing perms that skip it
+            // ([`crate::vmir::Perm`]) — is non-negative by construction.
+            let mut facts: Vec<egg::Id> = Vec::new();
+            if ypos {
+                facts.push(expr!(ctx, {x} <r {s}));
+            }
+            if xpos {
+                facts.push(expr!(ctx, {y} <r {s}));
+            }
+            ctx.assume_all_guarded(facts, &[]);
+            ChunkPerm::Leaf(s)
+        }
+        // Descend on `a` (this arm also covers `Select`/`Select`).
+        (ChunkPerm::Select { cond, then, els }, other) => {
+            let ot = ChunkPerm::restrict(ctx, *cond, other.clone(), true);
+            let oe = ChunkPerm::restrict(ctx, *cond, other.clone(), false);
+            let t = perm_add_wildcard(ctx, then, &ot);
+            let e = perm_add_wildcard(ctx, els, &oe);
+            ChunkPerm::select(ctx, *cond, t, e)
+        }
+        (other, ChunkPerm::Select { cond, then, els }) => {
+            let ot = ChunkPerm::restrict(ctx, *cond, other.clone(), true);
+            let oe = ChunkPerm::restrict(ctx, *cond, other.clone(), false);
+            let t = perm_add_wildcard(ctx, &ot, then);
+            let e = perm_add_wildcard(ctx, &oe, els);
+            ChunkPerm::select(ctx, *cond, t, e)
+        }
     }
-    if !(perm_tree_known_positive(ctx, pa) || perm_tree_known_positive(ctx, pb)) {
-        return;
-    }
-    if !(contains_wildcard(ctx, p0) || contains_wildcard(ctx, p1)) {
-        return;
-    }
-    let Some(gate) = cube_meet(ctx, pc_lits, guard) else {
-        // pc contradicts the chunk's presence guard: this merge describes no
-        // reachable state, so it states nothing.
-        return;
-    };
-    let mut leaves: Vec<egg::Id> = Vec::new();
-    sum.for_each_leaf_under(&mut |l, _| leaves.push(l));
-    for leaf in leaves {
-        let pos = expr!(ctx, (0/1) <r {leaf});
-        ctx.assume_guarded(pos, gate.iter().rev().copied());
-    }
-}
-
-/// Whether **every** leaf of a permission tree is structurally positive.
-fn perm_tree_known_positive(ctx: &VerifyContext<'_>, p: &ChunkPerm) -> bool {
-    let mut all = true;
-    p.for_each_leaf_under(&mut |l, _| all &= perm_known_positive(ctx, l));
-    all
 }
 
 /// Syntactic `0 < t`, decided by structure alone — no prover call, no saturation.
@@ -1001,7 +1025,7 @@ pub(crate) fn heap_subtract_inner(
     };
 
     if ctx.has_wildcard && contains_wildcard(ctx, chunk2_perm) {
-        return debit_wildcard(ctx, out, kind, &existing, &chunk2, chunk2_perm, pc_lits, kept);
+        return debit_wildcard(ctx, out, kind, &existing, &chunk2, pc_lits, kept);
     }
 
     // Sufficiency `held ≥ needed`, proven per-leaf over the (possibly
@@ -1095,10 +1119,11 @@ pub(crate) fn debit_direct(
 }
 
 /// Wildcard exhale. Instead of proving `held ≥ needed` (a wildcard has no fixed
-/// value), require the location hold *some* permission (`held > 0`) and **assume**
-/// the taken share is strictly smaller (`needed < held`) under the pc — Silicon's
-/// constrainable-ARP rule. The `held − needed` remainder stays positive, so the
-/// chunk is never emptied and there is no drop-if-zero case.
+/// value), require the location hold *some* permission (`held > 0`) and hand back a
+/// **fresh remainder** assumed strictly smaller (`r < held`) under the pc —
+/// Silicon's constrainable-ARP rule. The demanded amount never enters the result:
+/// what leaves is only known to be positive and smaller, which is all a wildcard
+/// ever says.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn debit_wildcard(
     ctx: &mut VerifyContext<'_>,
@@ -1106,7 +1131,6 @@ pub(crate) fn debit_wildcard(
     kind: &LocationKind,
     existing: &Chunk,
     chunk2: &Chunk,
-    chunk2_perm: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
     kept: crate::verify::heap::HeapPc,
 ) -> Result<Heap, VerifyError> {
@@ -1117,19 +1141,22 @@ pub(crate) fn debit_wildcard(
     if !ctx.prove_under_pc(held_pos, pc_lits) {
         return Err(VerifyError::InsufficientPermission);
     }
-    let lt = expr!(ctx, {chunk2_perm} <r {existing_perm});
     // Unconditional union is safe here on both counts: `held > 0` was just proven, a
     // wildcard `needed` is positive by construction, so this is the both-held case
     // anyway — and `chunk2.value` is fresh besides.
     ctx.union(existing.value, chunk2.value);
-    let remainder = ctx.add(Symbolic::Binary(BinOp::SubR, [existing_perm, chunk2_perm]));
-    // Assume `needed < held` and, because the e-graph has no real-order arithmetic to
-    // derive `held − needed > 0` from it, the remainder's positivity explicitly —
-    // otherwise a later `perm > 0` framing check on the leftover share (a field read
-    // after a wildcard exhale, or a nested consume of the same predicate) could not
-    // discharge. Batched into one rebuild.
-    let rem_pos = expr!(ctx, (0/1) <r {remainder});
-    ctx.assume_all_guarded([lt, rem_pos], pc_lits);
+    // The remainder is a **fresh share**, not a `SubR` node. `held − w` would be an
+    // opaque leaf: with no real-order arithmetic, neither `0 < held − w` nor
+    // `held − w < held` follows from it, so both had to be assumed about a term that
+    // then kept growing. A fresh `r` states the same two things once — `0 < r` free
+    // from the mint, and `r < held` here — and `r < held` is what makes
+    // `assert perm(x.f) < 1/2` provable after a wildcard exhale.
+    //
+    // Positivity is why there is still no drop-if-zero case: the remainder is a
+    // wildcard, so the chunk is never emptied.
+    let remainder = ctx.fresh_wildcard();
+    let lt = expr!(ctx, {remainder} <r {existing_perm});
+    ctx.assume_all_guarded([lt], pc_lits);
     Ok(out.with_chunk(
         kind,
         Chunk::new(existing.addr, remainder, existing.value)

@@ -1,0 +1,43 @@
+// KNOWN LIMITATION — should verify, currently rejected. DECLINED, not unfixed.
+//
+// `design/wildcards` [20] gap 2. Holding `1/2 + w` and exhaling `1/2` requires
+// `1/2 + w >= 1/2`. `perm_add_wildcard` hands back a fresh `s` with `1/2 < s`
+// assumed, and the sufficiency goal is `not (s <r 1/2)` (`prove_sufficient` ->
+// `sufficient_leaf`). Bridging the two needs asymmetry of a strict order,
+// `a < b ==> not (b < a)`, which the rule set does not have: there is no `LeR` at
+// all (`<=` is encoded as `not (<)`), and `LtR` is only const-folded on two
+// literals.
+//
+// Silicon accepts it — `PermPlus(1/2, w)` goes to `ctx.mkAdd` and Z3's linear real
+// arithmetic closes it. That completeness comes from the solver, not from the
+// representation, so it is not something the fact-based scheme can copy.
+//
+// DECLINED 2026-08-18, deliberately. The fix is one extra union at the produce
+// mint (`not (s < held)` alongside `held < s`) or one generic asymmetry rule.
+// Neither was taken: no corpus case exercises this shape (all 24 corpus wildcards
+// are `unfolding acc(p_Maybe(_1p), wildcard)` predicate scales into EMPTY
+// locations), and leaving it keeps the incompleteness boundary one coherent story
+// — no order reasoning beyond what is directly assumed.
+//
+// Two neighbours on the same boundary, also declined:
+//
+//   - `inhale 1/2; inhale w; inhale w; assert perm(x.f) > 1/2` needs `<`
+//     TRANSITIVITY to chain `1/2 < s1` with `s1 < s2`. Note the single-wildcard
+//     case DOES verify (`wildcard_perm_order.vpr`) — the wall is at two facts
+//     chaining, not at two wildcards.
+//   - `inhale 1/2; exhale w; inhale 1/2; exhale 1/3` needs the concrete part
+//     tracked apart from the positive part: the second inhale is concrete, so
+//     `merge_chunks` still builds `AddR(r, 1/2)` and the `1/3` exhale has nothing
+//     to work with. That one needs the `[30]` Option 2 `concrete + sum-of-wildcards`
+//     normal form, not another fact.
+//
+// If a real program produces this shape, re-read `[30]` before adding fact number
+// four — see `feedback_budget_rules_are_a_smell`.
+
+field f: Int
+
+method m_sum_is_sufficient(x: Ref) {
+    inhale acc(x.f, 1/2)
+    inhale acc(x.f, wildcard)
+    exhale acc(x.f, 1/2)
+}

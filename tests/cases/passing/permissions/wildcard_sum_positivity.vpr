@@ -1,12 +1,13 @@
 // A permission SUM involving a wildcard is positive, so a read through it frames.
 //
 // `design/wildcards` [20] gap 1, fixed 2026-08-17. The e-graph has no real-order
-// arithmetic: `0 < w` is assumed at mint and `0 < held - w` explicitly at a
-// wildcard exhale, but `merge_chunks` built its `AddR` total and said nothing, so
-// `0 < 1/2 + w` was underivable and the field read below failed. `merge_chunks`
-// now calls `assume_sum_positive`, which states it when one summand is
-// structurally positive — the other's non-negativity is the chunk-permission
-// invariant (`Combine`'s `perm >= 0` obligation).
+// arithmetic, so `merge_chunks` built an opaque `AddR` total and said nothing
+// about it: `0 < 1/2 + w` was underivable even with `0 < w` assumed at mint, and
+// the field read below failed. `merge_chunks` now routes a wildcard-bearing sum
+// through `perm_add_wildcard`, which hands back a fresh share whose positivity
+// comes with the mint — sound because one summand is structurally positive and
+// the other's non-negativity is the chunk-permission invariant (`Combine`'s
+// `perm >= 0` obligation).
 //
 // `m_bare` is the control: a wildcard in an EMPTY location, where the permission
 // is `w` alone and the mint-time fact already carried the read. That is the shape

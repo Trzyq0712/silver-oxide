@@ -1,0 +1,48 @@
+// A wildcard produce/exhale states an ORDER fact about the resulting amount, not
+// just its sign.
+//
+// `design/wildcards` [20]. Wildcard permissions used to reach the e-graph as
+// arithmetic terms: a produce built `AddR(held, w)`, a wildcard exhale built
+// `SubR(held, w)`. The e-graph has no real-order arithmetic, so both were opaque
+// leaves, and each site bolted hand-placed facts onto the result to buy back the
+// one consequence it needed (`0 < sum`, `0 < held - w`). Neither could state that
+// the amount actually GREW or SHRANK, so both asserts below failed.
+//
+// Both now hand back a fresh share carrying the facts instead of the node:
+// `merge_chunks` -> `perm_add_wildcard` (`0 < s`, `held < s`), and
+// `debit_wildcard` (`0 < r`, `r < held`). Silicon proves both, non-vacuously.
+//
+// Verified against Silicon 1.1-SNAPSHOT (cec06e49+) 2026-08-18; both methods are
+// non-vacuous there and here (`assert false` rejected).
+//
+// See `wildcard_overinhale_is_inconsistent.vpr` for the third consequence of the
+// same facts, and `tests/cases/known_limitations/wildcard_sum_sufficiency.vpr`
+// for the boundary these facts deliberately stop at.
+
+field f: Int
+
+// Produce: the amount grew. `1/2 < 1/2 + w` needs `w > 0`, which the mint states,
+// plus monotonicity of `+`, which nothing could supply over an `AddR` leaf.
+method m_produce_grew(x: Ref) {
+    inhale acc(x.f, 1/2)
+    inhale acc(x.f, wildcard)
+    assert perm(x.f) > 1/2
+}
+
+// Exhale: the amount shrank, and is still positive. The second is what lets a
+// wildcard be exhaled again (see `m_exhale_twice`); the first is new.
+method m_exhale_shrank(x: Ref) {
+    inhale acc(x.f, 1/2)
+    exhale acc(x.f, wildcard)
+    assert perm(x.f) < 1/2
+    assert perm(x.f) > none
+}
+
+// Control: repeated wildcard exhale, which only ever needed the sign. This kept
+// working through the whole gap and must keep working — the remainder is a
+// wildcard, so the chunk is never emptied and there is no drop-if-zero case.
+method m_exhale_twice(x: Ref) {
+    inhale acc(x.f, 1/2)
+    exhale acc(x.f, wildcard)
+    exhale acc(x.f, wildcard)
+}

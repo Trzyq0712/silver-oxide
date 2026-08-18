@@ -1,0 +1,28 @@
+// Inhaling a wildcard on top of FULL permission is an inconsistent state.
+//
+// This file verifies BY PROVING `false`, deliberately. A field is bounded at
+// `perm <= 1/1`, so holding `1/1 + w` with `w > 0` describes no state at all.
+// Silicon agrees: with `assert false` appended, Silicon 1.1-SNAPSHOT (cec06e49+)
+// ACCEPTS this method — the state is genuinely contradictory there too (measured
+// 2026-08-18).
+//
+// It did NOT hold here before `design/wildcards` [20]: the merged amount was an
+// opaque `AddR(1/1, w)`, the bound axiom assumed `not (1/1 <r AddR)` about that
+// leaf, `0 < w` was assumed about `w`, and nothing connected the two. The state
+// stayed satisfiable and this method was non-vacuous.
+//
+// `perm_add_wildcard` now hands back a fresh `s` with `1/1 < s` assumed. The bound
+// axiom (`assume_location_axioms`) assumes `not (1/1 <r s)` about the SAME leaf, so
+// the two meet in one e-class with both polarities and the state collapses.
+//
+// The gate value is the pair with `wildcard_perm_order.vpr`: that file's methods
+// must reject an `assert false`, this one must accept it. A change that made
+// wildcard facts vacuously strong would pass one and fail the other.
+
+field f: Int
+
+method m_full_plus_wildcard_is_dead(x: Ref) {
+    inhale acc(x.f, write)
+    inhale acc(x.f, wildcard)
+    assert false
+}
