@@ -405,7 +405,7 @@ mod bench {
             concepts.push((cons_id, proj_id));
         }
         for j in 0..n_filler {
-            g.add(Symbolic::Fresh(1_000_000 + j as u32));
+            g.add(Symbolic::Fresh((n_concepts + j) as u32));
         }
         g.rebuild();
         (g, concepts)
