@@ -1,0 +1,30 @@
+// Folding a predicate whose only footprint is gated by a symbolic condition,
+// while holding FULL permission. The slot demands `c ? 1/1 : 0`, and proving
+// `not (1/1 < ite(c, 1/1, 0))` outright needs `c` decided; `prove_sufficient_aligned`
+// splits the DEMAND instead — `1/1 >= 1/1` under `c`, `1/1 >= 0` under `!c`.
+field f: Int
+
+predicate q(b: Bool, x: Ref) {
+    b ==> acc(x.f)
+}
+
+method fold_symbolic_gate(x: Ref, c: Bool)
+{
+    inhale acc(x.f)
+    fold q(c, x)
+}
+
+// The gate false: nothing is demanded, so nothing need be held.
+method fold_gate_false_without_perm(x: Ref)
+{
+    fold q(false, x)
+}
+
+// Unfolding gives the gated permission back under the same condition.
+method unfold_symbolic_gate(x: Ref, c: Bool)
+  requires acc(q(c, x), write)
+  requires c
+{
+    unfold q(c, x)
+    x.f := 3
+}

@@ -1,0 +1,12 @@
+// The concrete-gate mirror of `failing/wildcard_gated_on_without_perm.vpr`: with
+// the gate TRUE the slot demands full permission, which is not held.
+field f: Int
+
+predicate q(b: Bool, x: Ref) {
+    b ==> acc(x.f)
+}
+
+method gate_true_without_perm(x: Ref)
+{
+    fold q(true, x)
+}

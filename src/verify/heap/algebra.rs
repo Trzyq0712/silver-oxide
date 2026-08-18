@@ -689,6 +689,59 @@ pub(crate) fn prove_sufficient(
     })
 }
 
+/// `held ≥ needed` descending the **demand's** branch structure as well as the
+/// held one — the dual of [`prove_perm_leaves`], which splits only what the heap
+/// holds.
+///
+/// A gated `acc` is why this exists. `predicate q(b, x) { b ==> acc(x.f) }` demands
+/// `b ? 1/1 : 0` of a chunk holding a flat `1/1`, and proving
+/// `not (1/1 < ite(b, 1/1, 0))` outright needs `b` decided up front.
+/// [`sufficient_leaf`] has a case-split fallback for exactly that shape, but it
+/// splits the *held* amount, and here the held side is the flat one. Splitting the
+/// demand instead asks `1/1 ≥ 1/1` under `b` and `1/1 ≥ 0` under `¬b`, both trivial.
+/// For an enum predicate — one gated slot per variant — each slot is discharged
+/// under its own discriminant test.
+///
+/// Zero arms cost nothing: a demand leaf that const-folds to `0` is discharged
+/// without a probe, so an N-variant enum pays for the one live arm rather than two
+/// probes per dead one. That is what keeps pushing demand literals onto the pc from
+/// multiplying with the arms it introduces.
+pub(crate) fn prove_sufficient_aligned(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    needed: &ChunkPerm,
+    pc_lits: &[(egg::Id, Polarity)],
+) -> bool {
+    match needed {
+        ChunkPerm::Leaf(n) => {
+            // Nothing demanded on this arm: every held amount is ≥ 0.
+            if let Some(r) = known_real(ctx, *n) {
+                if r <= num::BigRational::from(num::BigInt::from(0)) {
+                    return true;
+                }
+            }
+            prove_sufficient(ctx, held, *n, pc_lits)
+        }
+        ChunkPerm::Select { cond, then, els } => {
+            // The demand's own branch, taken both ways: `held ≥ needed` follows by
+            // case analysis. `restrict` aligns the held side — it takes the matching
+            // arm when held branches on the same condition class and carries the
+            // whole tree in when it does not, so an unrelated held structure degrades
+            // to today's behaviour rather than being mishandled.
+            let ht = ChunkPerm::restrict(ctx, *cond, held.clone(), true);
+            let mut pc_t = pc_lits.to_vec();
+            pc_t.push((*cond, Polarity::Positive));
+            if !prove_sufficient_aligned(ctx, &ht, then, &pc_t) {
+                return false;
+            }
+            let he = ChunkPerm::restrict(ctx, *cond, held.clone(), false);
+            let mut pc_e = pc_lits.to_vec();
+            pc_e.push((*cond, Polarity::Negative));
+            prove_sufficient_aligned(ctx, &he, els, &pc_e)
+        }
+    }
+}
+
 /// `held ≥ needed` for one `ChunkPerm` leaf, falling back to a **case split on an
 /// `ite`-shaped amount** when the flat prove fails.
 ///
@@ -1104,7 +1157,8 @@ pub(crate) fn heap_subtract_inner(
 
     // Sufficiency `held ≥ needed`, proven per-leaf over the (possibly
     // branch-structured) held perm — the `Select` never enters the graph.
-    let proven = prove_sufficient(ctx, existing.ungated_perm(), chunk2_perm, pc_lits);
+    let proven =
+        prove_sufficient_aligned(ctx, existing.ungated_perm(), chunk2.ungated_perm(), pc_lits);
     if !proven {
         // Invariant 7 — consume under **pc-implied aliasing**. `acc(x.f,1/2)` and
         // `acc(y.f,1/2)` are distinct chunks on ground, but under an in-branch

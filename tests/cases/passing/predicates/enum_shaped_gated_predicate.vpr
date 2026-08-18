@@ -1,0 +1,31 @@
+// The shape every enum predicate lowers to: one gated footprint slot per variant,
+// each `ite(is_variant_k, 1/1, 0)`. Folded and unfolded on a live variant, with the
+// discriminant only symbolically known.
+field a: Int
+field b: Int
+
+predicate two_variant(x: Ref, tag: Int) {
+    (tag == 0 ==> acc(x.a)) &&
+    (tag == 1 ==> acc(x.b))
+}
+
+method fold_variant_zero(x: Ref)
+{
+    inhale acc(x.a)
+    fold two_variant(x, 0)
+}
+
+method fold_variant_one(x: Ref)
+{
+    inhale acc(x.b)
+    fold two_variant(x, 1)
+}
+
+method roundtrip_variant_zero(x: Ref)
+{
+    inhale acc(x.a)
+    x.a := 1
+    fold two_variant(x, 0)
+    unfold two_variant(x, 0)
+    assert x.a == 1
+}
