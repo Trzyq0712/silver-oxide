@@ -479,18 +479,21 @@ impl<'a> VerifyContext<'a> {
         self.add(Symbolic::Fresh(id))
     }
 
-    /// Mint a fresh `wildcard` permission: a [`Symbolic::Wildcard`] (a symbolic
-    /// `Real`) assumed strictly positive (`0 < w`). Viper's `wildcard` — an
-    /// unspecified positive share. Its upper bound (`w ≤ 1` for a field via the
-    /// location axiom, `w < held` at exhale) is imposed elsewhere. The distinct
-    /// node lets an exhale recognise a wildcard-bearing permission (see
-    /// `heap_subtract`).
+    /// Mint a fresh `wildcard` permission: an ordinary [`Symbolic::Fresh`] real
+    /// assumed strictly positive (`0 < w`). Viper's `wildcard` — an unspecified
+    /// positive share. Its upper bound (`w ≤ 1` for a field via the location axiom,
+    /// `w < held` at exhale) is imposed elsewhere.
+    ///
+    /// No distinct node: nothing reads a wildcard off the graph any more. The two
+    /// things that did are now answered where the answer actually lives —
+    /// positivity by the `0 < w` fact this mints (`perm_sign`), and *origin* by
+    /// `ChunkPerm::Leaf`'s `wild` flag, which an e-class could never have supplied
+    /// since congruence puts wildcard-bearing terms into a literal's class.
     pub(crate) fn fresh_wildcard(&mut self) -> egg::Id {
         let id = self.fresh_counter;
         self.fresh_counter += 1;
-        // No `fresh_types` entry: a wildcard self-types as `Real` from the node
-        // (`verify::types`), which is why it needs no id-to-type record.
-        let w = self.add(Symbolic::Wildcard(id));
+        self.fresh_types.insert(id, crate::vmir::Type::Real);
+        let w = self.add(Symbolic::Fresh(id));
         let pos = expr!(self, (0/1) <r {w});
         let true_ = expr!(self, true);
         self.union(pos, true_);

@@ -36,7 +36,6 @@ pub(crate) fn infer_type(
             Symbolic::RealCast(_) => Some(Type::Real),
             Symbolic::Fresh(u) => fresh_types.get(u).cloned(),
             // A wildcard is always a permission (`Real`).
-            Symbolic::Wildcard(_) => Some(Type::Real),
             // Addresses are ordinary func apps: a field/predicate address function
             // records its `Addr{..}` return type in `func_ret_types` like any other.
             Symbolic::FuncApp(f, _, _) => func_ret_types.get(f).cloned(),

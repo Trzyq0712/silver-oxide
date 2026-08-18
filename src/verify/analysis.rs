@@ -145,7 +145,6 @@ impl Analysis<Symbolic> for ConstFold {
             // the instantiation rule (guarded merges with `true`), never by its
             // payload or its capture children.
             Symbolic::Fresh(_)
-            | Symbolic::Wildcard(_)
             | Symbolic::FuncApp(..)
             | Symbolic::Forall(..) => Unknown,
 

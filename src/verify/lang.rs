@@ -25,12 +25,6 @@ pub struct RecipeId(pub usize);
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Symbolic {
     Fresh(u32),
-    /// A `wildcard` permission share (Viper): a fresh symbolic real, distinct
-    /// from [`Symbolic::Fresh`] only so it can be *recognised* — an exhale of a
-    /// wildcard-bearing permission assumes `needed < held` instead of proving
-    /// `held ≥ needed` (see `heap_subtract`). Assumed strictly positive (`0 < w`)
-    /// at creation. Type is always `Real` (recorded in `fresh_types`).
-    Wildcard(u32),
     Lit(Literal),
     Binary(BinOp, [Id; 2]),
     Ite([Id; 3]),
@@ -69,7 +63,6 @@ pub enum Symbolic {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Discriminant {
     Fresh(u32),
-    Wildcard(u32),
     Lit(Literal),
     Binary(BinOp),
     Ite,
@@ -96,7 +89,6 @@ impl Language for Symbolic {
         use Symbolic as S;
         match self {
             S::Fresh(s) => D::Fresh(*s),
-            S::Wildcard(s) => D::Wildcard(*s),
             S::Lit(l) => D::Lit(l.clone()),
             S::Binary(op, _) => D::Binary(*op),
             S::Ite(_) => D::Ite,
@@ -110,7 +102,6 @@ impl Language for Symbolic {
         use Symbolic::*;
         match (self, other) {
             (Fresh(s1), Fresh(s2)) => s1 == s2,
-            (Wildcard(s1), Wildcard(s2)) => s1 == s2,
             (Lit(l1), Lit(l2)) => l1 == l2,
             (Binary(op1, _), Binary(op2, _)) => op1 == op2,
             (Ite(_), Ite(_)) => true,
@@ -129,7 +120,7 @@ impl Language for Symbolic {
     fn children(&self) -> &[Id] {
         use Symbolic::*;
         match self {
-            Fresh(..) | Wildcard(..) | Lit(..) => &[],
+            Fresh(..) | Lit(..) => &[],
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_ref(id),
@@ -143,7 +134,7 @@ impl Language for Symbolic {
     fn children_mut(&mut self) -> &mut [Id] {
         use Symbolic::*;
         match self {
-            Fresh(..) | Wildcard(..) | Lit(..) => &mut [],
+            Fresh(..) | Lit(..) => &mut [],
             Binary(_, ids) => ids,
             Ite(ids) => ids,
             RealCast(id) => std::slice::from_mut(id),
@@ -157,7 +148,6 @@ impl Display for Symbolic {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Symbolic::Fresh(id) => write!(f, "fresh{id}"),
-            Symbolic::Wildcard(id) => write!(f, "wild{id}"),
             Symbolic::Lit(l) => write!(f, "{l}"),
             Symbolic::Binary(op, _) => write!(f, "{op}"),
             Symbolic::Ite(_) => write!(f, "ITE"),

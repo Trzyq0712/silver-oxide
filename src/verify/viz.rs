@@ -379,7 +379,7 @@ fn render_node(ctx: &VerifyContext<'_>, node: &Symbolic) -> String {
     let kid = |c: &egg::Id| format!("@{}", usize::from(ctx.egraph.find(*c)));
     let kids: Vec<String> = node.children().iter().map(kid).collect();
     match node {
-        Symbolic::Fresh(_) | Symbolic::Wildcard(_) | Symbolic::Lit(_) => node.to_string(),
+        Symbolic::Fresh(_) | Symbolic::Lit(_) => node.to_string(),
         Symbolic::FuncApp(m, tys, _) => {
             let name = ctx.func_name(*m);
             let head = if tys.is_empty() {
