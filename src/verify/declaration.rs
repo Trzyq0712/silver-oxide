@@ -662,24 +662,55 @@ enum WildcardAs {
 /// slot recipe instead of an [`EvalState`]. One wildcard is picked per
 /// [`vmir::Perm::Wildcard`] **leaf** reached, eagerly — a leaf under a false guard
 /// still mints, and the enclosing `ite` discards it.
+///
+/// Keeps the **branch structure** as a [`ChunkPerm`] rather than flattening it into
+/// one `Ite` term.
+///
+/// The structure is what lets a consume align the demand's arms against the held
+/// permission's (see `heap_subtract`): `ChunkPerm::restrict` takes the matching arm
+/// when both branch on the same condition and carries the whole term in otherwise, so
+/// precision falls out of the shapes agreeing rather than out of any case analysis
+/// here. Flattened into an `Ite`, that structure survives only inside the e-graph term
+/// and the consume cannot see it.
+///
+/// `ChunkPerm::select` is the smart constructor: it flattens arms branching on the
+/// same condition, collapses `then ≡ els`, and drops an arm whose condition
+/// const-folds — so a wildcard-free program still builds exactly what it did before.
 fn build_perm(
     ctx: &mut VerifyContext<'_>,
     perm: &vmir::Perm<crate::verify::cert::BodyRecipe>,
     resolve: &impl Fn(&crate::verify::cert::SeedRef) -> egg::Id,
     changed: &mut Vec<egg::Id>,
     wildcard_as: WildcardAs,
-) -> egg::Id {
+) -> ChunkPerm {
     match perm {
-        vmir::Perm::Amount(r) => r.build(&mut ctx.egraph, resolve, changed),
-        vmir::Perm::Wildcard => match wildcard_as {
+        vmir::Perm::Amount(r) => ChunkPerm::Leaf(r.build(&mut ctx.egraph, resolve, changed)),
+        vmir::Perm::Wildcard => ChunkPerm::Leaf(match wildcard_as {
             WildcardAs::Fresh => ctx.fresh_wildcard(),
             WildcardAs::One => ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into()))),
-        },
+        }),
         vmir::Perm::Ite(c, t, e) => {
             let c = c.build(&mut ctx.egraph, resolve, changed);
             let t = build_perm(ctx, t, resolve, changed, wildcard_as);
             let e = build_perm(ctx, e, resolve, changed, wildcard_as);
-            expr!(ctx, if {c} then {t} else {e})
+            ChunkPerm::select(ctx, c, t, e)
+        }
+    }
+}
+
+/// Scale every leaf of a permission by `pm`, preserving the branch structure.
+///
+/// Distributing rather than wrapping (`ite(c, pm*t, pm*e)` over `pm * ite(c, t, e)`)
+/// is what keeps the `ChunkPerm` tree intact through an `unfolding`'s multiplier. The
+/// two are equal but not identical; `mul-one-real-l` puts them in one class once the
+/// slot's `ctx.reduce()` runs, which is why the common `1/1` scale costs nothing.
+fn scale_perm(ctx: &mut VerifyContext<'_>, pm: egg::Id, perm: ChunkPerm) -> ChunkPerm {
+    match perm {
+        ChunkPerm::Leaf(p) => ChunkPerm::Leaf(ctx.add(Symbolic::Binary(BinOp::MulR, [pm, p]))),
+        ChunkPerm::Select { cond, then, els } => {
+            let t = scale_perm(ctx, pm, *then);
+            let e = scale_perm(ctx, pm, *els);
+            ChunkPerm::select(ctx, cond, t, e)
         }
     }
 }
@@ -1151,17 +1182,8 @@ struct FootprintResult {
 /// `Presence` indicator `ite(guard, 1, 0)` standing in for the wildcard (drives
 /// only the snapshot member + a "holds a positive share" sufficiency prove).
 enum SlotPerm {
-    Amount(egg::Id),
-    Presence(egg::Id),
-}
-
-impl SlotPerm {
-    fn map_id(self, f: impl FnOnce(egg::Id) -> egg::Id) -> SlotPerm {
-        match self {
-            SlotPerm::Amount(i) => SlotPerm::Amount(f(i)),
-            SlotPerm::Presence(i) => SlotPerm::Presence(f(i)),
-        }
-    }
+    Amount(ChunkPerm),
+    Presence(ChunkPerm),
 }
 
 /// The single per-slot footprint loop behind `fold`, `unfold`, `snap` and
@@ -1266,7 +1288,6 @@ fn walk_footprint(
             ctx.reduce();
         }
         let addr = ctx.egraph.find(addr);
-        let bperm = bperm.map_id(|b| ctx.egraph.find(b));
         let elem = slot.elem.clone();
         let (value, recipe) = match &source {
             // Values are read from the *original* heap (aliased slots agree);
@@ -1315,17 +1336,18 @@ fn walk_footprint(
             // (subtract/union), presence is `0 < perm`.
             SlotPerm::Amount(bperm) => {
                 let p = match scale {
-                    Some(pm) => ctx.add(Symbolic::Binary(BinOp::MulR, [pm, bperm])),
-                    None => bperm,
+                    Some(pm) => scale_perm(ctx, pm, bperm.clone()),
+                    None => bperm.clone(),
                 };
-                let chunk = Chunk::new(addr, p, value).with_recipe(recipe.clone());
+                let chunk = Chunk::new_perm(addr, p, value).with_recipe(recipe.clone());
                 heap = match direction {
                     Direction::Consume => {
                         heap_subtract(ctx, &heap, &slot.kind, chunk, pc_lits, slot_demand)?
                     }
                     Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
                 };
-                expr!(ctx, (0/1) <r {bperm})
+                let bperm_id = bperm.to_id(ctx);
+                expr!(ctx, (0/1) <r {bperm_id})
             }
             // Wildcard `Snap` slot: no heap effect (Snap frames). Presence is the
             // gating guard `0 < ite(guard, 1, 0)` (folds to `guard`, `true` when
@@ -1333,6 +1355,7 @@ fn walk_footprint(
             // must hold a positive share — prove `guard ⇒ 0 < held` against the
             // caller's (concrete) held permission; no wildcard is ever built.
             SlotPerm::Presence(pp) => {
+                let pp = pp.to_id(ctx);
                 let guard = expr!(ctx, (0/1) <r {pp});
                 let (_, existing) =
                     find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
