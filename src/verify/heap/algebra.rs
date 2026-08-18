@@ -209,6 +209,30 @@ fn perm_known_positive(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
     perm_sign(ctx, id, true, &mut std::collections::HashSet::new())
 }
 
+/// Whether `0 < id` is already a **proven** fact in the graph, by pure lookup: the
+/// `<r` node must exist and its class be the `true` class. Both are true for a
+/// freshly minted share, whose positivity is unioned into `true` at the mint.
+///
+/// Deliberately not a `prove_under_pc`: this runs inside [`perm_sign`], a structural
+/// path-independent judgement on the *term*, and a probe there would put a prover
+/// call under every leaf of every merge.
+fn positivity_known(ctx: &VerifyContext<'_>, id: egg::Id) -> bool {
+    let zero = num::BigRational::from(num::BigInt::from(0));
+    let Some(z) = ctx.egraph.lookup(Symbolic::Lit(Literal::Real(zero))) else {
+        return false;
+    };
+    let Some(lt) = ctx
+        .egraph
+        .lookup(Symbolic::Binary(BinOp::LtR, [z, ctx.egraph.find(id)]))
+    else {
+        return false;
+    };
+    matches!(
+        ctx.egraph[ctx.egraph.find(lt)].data.known(),
+        Some(Literal::Bool(true))
+    )
+}
+
 /// `strict`: `0 < t`. Otherwise `0 ≤ t`, which additionally admits `0` itself and
 /// a sum/product/`ite` of non-negatives.
 fn perm_sign(
@@ -227,9 +251,15 @@ fn perm_sign(
             let zero = num::BigRational::from(num::BigInt::from(0));
             if strict { *r > zero } else { *r >= zero }
         }
+        // A standing positivity fact settles it too, without inspecting nodes: a
+        // wildcard is minted with `0 < w` unioned into `true`, and so is every fresh
+        // share `perm_add_wildcard` hands back. Reading the fact rather than
+        // recognising the `Wildcard` node keeps this true of any leaf the graph
+        // happens to know is positive, and is what lets the node itself go away.
+        // A pure `lookup` — no node is added, so asking never grows the graph.
+        _ if strict && positivity_known(ctx, id) => true,
         // Any node witnessing the sign settles it: all nodes of a class are equal.
         _ => ctx.egraph[id].nodes.iter().any(|n| match n {
-            Symbolic::Wildcard(_) => true,
             Symbolic::Ite([_, t, e]) => {
                 perm_sign(ctx, *t, strict, seen) && perm_sign(ctx, *e, strict, seen)
             }
