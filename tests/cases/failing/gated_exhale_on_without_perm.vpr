@@ -1,0 +1,7 @@
+// The gate is true and nothing is held: the conditional exhale must fail.
+field f: Int
+
+method gated_exhale_on_without_perm(x: Ref)
+{
+    exhale true ==> acc(x.f)
+}

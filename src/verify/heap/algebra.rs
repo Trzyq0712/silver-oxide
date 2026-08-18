@@ -1873,8 +1873,19 @@ pub(crate) fn union_heaps(
             }
             (false, false) => merge_values(ctx, ia, ca.value, ib, cb.value, pc_lits),
         };
-        let sum = ctx.add(Symbolic::Binary(BinOp::AddR, [ia, ib]));
-        let merged = Chunk::new(ca.addr, sum, value)
+        // Structural sum, the same dispatch [`merge_chunks`] makes: `perm_add`
+        // distributes over the operands' `Select`s, so two arm-wise perms cancel per
+        // branch. Flattening first left `ite(c, 1/1, 0) + ite(c, 0, 1/1)` — a full
+        // permission the graph cannot see is one, since deciding it needs a case
+        // split. That is exactly a loop's frame restore under a path condition: the
+        // invariant's footprint on one arm, the frame's residual on the other.
+        let sum = if ctx.has_wildcard && (contains_wildcard(ctx, ia) || contains_wildcard(ctx, ib))
+        {
+            perm_add_wildcard(ctx, &pa, &pb)
+        } else {
+            perm_add(ctx, &pa, &pb)
+        };
+        let merged = Chunk::new_perm(ca.addr, sum, value)
             .with_guard(guard)
             .with_recipe(ca.recipe.clone().or_else(|| cb.recipe.clone()));
         out = out.with_chunk(kind, merged);

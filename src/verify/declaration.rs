@@ -587,7 +587,7 @@ fn eval_pure_inst(
     })
 }
 
-fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: egg::Id, state: &EvalState) -> Heap {
+fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: ChunkPerm, state: &EvalState) -> Heap {
     let addr = state.get_val(ctx, loc);
     // The location kind (group + held value type + bound) comes straight from the
     // address operand's VMIR `Type::Addr` — no e-graph inference.
@@ -595,7 +595,7 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: egg::Id, state: &EvalS
         .loc_kind(loc)
         .expect("acc location must be Addr-typed");
     let value = ctx.fresh_symbolic_value(kind.value.clone());
-    Heap::empty().with_chunk(&kind, Chunk::new(addr, perm, value))
+    Heap::empty().with_chunk(&kind, Chunk::new_perm(addr, perm, value))
 }
 
 /// Resolve a [`vmir::Perm`] to its e-class id, minting a fresh positive
@@ -611,6 +611,36 @@ fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::Perm) 
             let t = eval_perm(ctx, state, t);
             let e = eval_perm(ctx, state, e);
             expr!(ctx, if {c} then {t} else {e})
+        }
+    }
+}
+
+/// [`eval_perm`], but keeping the permission's **branch structure** as a
+/// [`ChunkPerm`] instead of flattening it into one `Ite` term — the method-body
+/// twin of [`build_perm`], which does the same for a footprint slot.
+///
+/// The term is identical either way (`ChunkPerm::to_id` rebuilds exactly the `Ite`
+/// this used to add); what differs is that the structure is visible ABOVE the
+/// e-graph, so a consume can align the demand's arms against the held permission's
+/// (`prove_sufficient_aligned`, `perm_sub_aligned`) rather than proving against an
+/// opaque `ite`. Without this, `exhale c ==> acc(x.f)` in a *method* stays opaque
+/// even though the same assertion inside a predicate does not.
+///
+/// `ChunkPerm::select` is the smart constructor, so an ungated permission still
+/// builds exactly the `Leaf` it did before.
+fn eval_perm_structural(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    perm: &vmir::Perm,
+) -> ChunkPerm {
+    match perm {
+        vmir::Perm::Amount(v) => ChunkPerm::Leaf(state.get_val(ctx, v)),
+        vmir::Perm::Wildcard => ChunkPerm::Leaf(ctx.fresh_wildcard()),
+        vmir::Perm::Ite(c, t, e) => {
+            let c = state.get_val(ctx, c);
+            let t = eval_perm_structural(ctx, state, t);
+            let e = eval_perm_structural(ctx, state, e);
+            ChunkPerm::select(ctx, c, t, e)
         }
     }
 }
@@ -853,8 +883,8 @@ fn eval_heap_inst(
                 _ => None,
             };
             let base_h = get_heap(state, base);
-            let perm_id = eval_perm(ctx, state, perm);
-            let chunk = heap_acc(ctx, loc, perm_id, state);
+            let cperm = eval_perm_structural(ctx, state, perm);
+            let chunk = heap_acc(ctx, loc, cperm.clone(), state);
             let pc_lits: Vec<(egg::Id, Polarity)> = pc
                 .conds
                 .iter()
@@ -892,7 +922,7 @@ fn eval_heap_inst(
                         // emergent from naming the same `Val` twice.
                         Bind::Bound(v) => {
                             let bound = state.get_val(ctx, v);
-                            ch = Chunk::new(ch.addr, perm_id, bound)
+                            ch = Chunk::new_perm(ch.addr, cperm.clone(), bound)
                                 .with_recipe(state.recipe_of(v));
                         }
                     }
@@ -1475,7 +1505,7 @@ fn eval_sub_yield(
     let kind = state
         .loc_kind(loc)
         .expect("acc location must be Addr-typed");
-    let perm_id = eval_perm(ctx, state, perm);
+    let cperm = eval_perm_structural(ctx, state, perm);
     let pc_lits: Vec<(egg::Id, Polarity)> = pc
         .conds
         .iter()
@@ -1500,7 +1530,7 @@ fn eval_sub_yield(
         ctx,
         &base_h,
         &kind,
-        Chunk::new(addr, perm_id, held),
+        Chunk::new_perm(addr, cperm.clone(), held),
         &pc_lits,
         demand_of(perm),
     )?;
@@ -1509,6 +1539,7 @@ fn eval_sub_yield(
     // Presence is `0 < perm`, built from the permission the instruction names.
     // For a literal amount it const-folds to `true` and `option_member` collapses
     // to a bare `Some`, so the paired `inhale`'s unwrap peels with no proof goal.
+    let perm_id = cperm.to_id(ctx);
     let present = expr!(ctx, (0/1) <r {perm_id});
     let elem = kind.value.clone();
     let opt = ctx.option_member(elem.clone(), present, held);

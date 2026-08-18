@@ -1,0 +1,33 @@
+// The method-level twin of `fold_symbolic_gate.vpr`: a conditional `acc` in an
+// `exhale` (not in a predicate body). `eval_perm_structural` keeps the gate as
+// `ChunkPerm::Select`, so sufficiency splits the demand — `1/1 >= 1/1` under `c`,
+// `1/1 >= 0` under `!c` — instead of proving against an opaque `ite`.
+field f: Int
+
+method exhale_gated_while_holding_full(x: Ref, c: Bool)
+{
+    inhale acc(x.f)
+    exhale c ==> acc(x.f)
+}
+
+// Gate false: nothing demanded, nothing held.
+method exhale_gated_off_without_perm(x: Ref)
+{
+    exhale false ==> acc(x.f)
+}
+
+// The remainder is arm-wise, so the permission survives on the arm that gave
+// nothing up.
+method gated_exhale_keeps_the_other_arm(x: Ref, c: Bool)
+{
+    inhale acc(x.f)
+    exhale c ==> acc(x.f)
+    assert !c ==> perm(x.f) == write
+}
+
+// A gated wildcard exhale in a method body.
+method exhale_gated_wildcard(x: Ref, c: Bool)
+{
+    inhale acc(x.f)
+    exhale c ==> acc(x.f, wildcard)
+}
