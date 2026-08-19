@@ -729,6 +729,53 @@ impl<'a> VerifyContext<'a> {
         matches!(probe[probe.find(id)].data.known(), Some(Literal::Bool(v)) if *v == b)
     }
 
+    /// Which held chunk addresses coincide with `addr` in the **block scratch** —
+    /// the graph that already has this block's cube assumed and saturated, reused
+    /// across the block's obligations. `None` outside a block (functions and
+    /// resources have no CFG, so no scratch); the caller then falls back to its own
+    /// clone-and-probe.
+    ///
+    /// This is the pc-alias question [`pc_alias_partners`](crate::verify::heap::algebra::pc_alias_partners)
+    /// asks, answered by `find` instead of by a fresh saturation.
+    pub(crate) fn scratch_alias_partners(
+        &mut self,
+        addr: egg::Id,
+        chunk_addrs: &[egg::Id],
+    ) -> Option<Vec<egg::Id>> {
+        if !self.in_block {
+            return None;
+        }
+        self.ensure_scratch();
+        if self.block_dead {
+            return None;
+        }
+        // Translate everything first: `tr` can import nodes and dirty the scratch.
+        let ta = self.tr(addr);
+        let tcs: Vec<egg::Id> = chunk_addrs.iter().map(|c| self.tr(*c)).collect();
+        self.saturate_scratch();
+        let ground = self.egraph.find(addr);
+        let sc = self.scratch.as_ref().unwrap();
+        let canon = sc.egraph.find(ta);
+        let mut out = Vec::new();
+        for (c, tc) in chunk_addrs.iter().zip(tcs) {
+            if sc.egraph.find(tc) == canon && self.egraph.find(*c) != ground {
+                out.push(*c);
+            }
+        }
+        Some(out)
+    }
+
+    /// Whether `pc_lits` *is* the current block's control cube — the precondition
+    /// for reading an answer off the scratch, which has assumed exactly that cube.
+    pub(crate) fn cube_matches(&self, pc_lits: &[(egg::Id, Polarity)]) -> bool {
+        self.current_cube.len() == pc_lits.len()
+            && self
+                .current_cube
+                .iter()
+                .zip(pc_lits)
+                .all(|(a, b)| self.egraph.find(a.0) == self.egraph.find(b.0) && a.1 == b.1)
+    }
+
     /// Saturate a detached probe e-graph with the full rule set, inside a
     /// scratch memo scope (its instantiations die with the probe; the live
     /// base memo lets it skip rebuilding every already-live instance).

@@ -2446,6 +2446,22 @@ pub(crate) fn pc_alias_partners(
     if pc_lits.is_empty() {
         return Vec::new();
     }
+    // Inside a method block the answer is already sitting in the block scratch: it is
+    // ground with this block's cube assumed and saturated, warm from the sufficiency
+    // proof that got us here. Reading the coincidence off it costs a `find` per
+    // chunk, where the clone+saturate below is a full probe — half of every probe
+    // saturation on the enum grid was this one lookup (40 of `enum_v8_p1`'s 80,
+    // 16.8s of its 70.5s). Measured to return the identical partner set on every
+    // call it was asked (55/55 across `structs_enums` and `enum_v5_p1`).
+    //
+    // Only when the instruction's pc *is* the block cube: a wider pc would ask the
+    // scratch about literals it never assumed.
+    if ctx.cube_matches(pc_lits)
+        && let Some(partners) =
+            ctx.scratch_alias_partners(addr, &chunks.iter().map(|c| c.addr).collect::<Vec<_>>())
+    {
+        return partners;
+    }
     let ground = ctx.egraph.find(addr);
     let mut probe = ctx.egraph.clone();
     for (id, pol) in pc_lits {
