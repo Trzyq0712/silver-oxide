@@ -1150,14 +1150,58 @@ pub(crate) fn heap_subtract_inner(
         // `b ==> P(..)` with `b` false) is a no-op, so it need not be held. A
         // wildcard is provably positive, so this (correctly) fails — a wildcard
         // cannot be exhaled from an empty location.
+        // Ask the pc-alias sum *before* the zero-demand probe. Both rungs answer a
+        // ground miss, but their costs have inverted: the partner lookup now reads
+        // the block scratch (a `find` per chunk) while the probe assumes the pc on
+        // a clone and saturates it — 1.8s of `enum_v8_p1` over 16 calls. A census
+        // of every cold consume event in the corpus found the probe closing **0 of
+        // 261**, and the alias leg resolving all 398, so this is the likely answer
+        // first rather than a new one.
+        //
+        // Gated on the demand being a **known positive literal**, which is exactly
+        // when the zero-demand probe below cannot succeed. Without that guard this
+        // reorder is wrong rather than merely eager: for a provably-zero demand the
+        // summarized path still rewrites the group, and `borrow_fields`'s
+        // `m_pair_guarded_here` then failed a later consume for want of the
+        // permission that rewrite had restructured.
+        //
+        // Only on the **retry** pass. On the first pass the saturate-and-retry
+        // below is what finds the chunk for 6 of every 21 misses, and consuming
+        // from an alias set before that has run took `m_pair_guarded_here` out.
+        //
+        // Both rungs stay: an `Err` falls through to the probe below.
+        let demand_positive = !matches!(pass, ConsumePass::First)
+            && known_real(ctx, chunk2_perm)
+            .is_some_and(|r| r > num::BigRational::from(num::BigInt::from(0)));
+        if demand_positive
+            && let Ok(h) = heap_subtract_summarized_fallbacks(
+            ctx,
+            h1,
+            out.clone(),
+            kind,
+            None,
+            chunk2.clone(),
+            chunk2_perm,
+            pc_lits,
+        )
+        {
+            return Ok(h);
+        }
         // Nothing demanded: not (0 < needed). Skipped on a retry whose saturate
         // was a no-op — see [`ConsumePass::Retry`].
-        if !matches!(
-            pass,
-            ConsumePass::Retry {
-                zero_demand_settled: true
-            }
-        ) {
+        // Never on the first pass: the saturate-and-retry below is cheap (its
+        // `saturate` was measured a no-op in 49 of 49 miss events) and can find the
+        // chunk outright, and the alias sum above gets its turn before this probe
+        // on the way back — so asking here only pays for an answer the retry
+        // usually makes irrelevant. This probe closed 0 of 261 calls corpus-wide.
+        if !matches!(pass, ConsumePass::First)
+            && !matches!(
+                pass,
+                ConsumePass::Retry {
+                    zero_demand_settled: true
+                }
+            )
+        {
             let nonpos = expr!(ctx, not ((0/1) <r {chunk2_perm}));
             if ctx.prove_under_pc(nonpos, pc_lits) {
                 return Ok(out);
@@ -1211,7 +1255,7 @@ pub(crate) fn heap_subtract_inner(
         // below the depth bound, in give-back residue, and a bound wide enough to
         // reach it took `shape_area` from 1s to over ten minutes. The two members
         // that need it are recorded in `expected_failures.txt`.
-        return heap_subtract_summarized_fallbacks(
+        let r = heap_subtract_summarized_fallbacks(
             ctx,
             h1,
             out,
@@ -1221,6 +1265,7 @@ pub(crate) fn heap_subtract_inner(
             chunk2_perm,
             pc_lits,
         );
+        return r;
     }
 
     Ok(debit_direct(ctx, out, kind, &existing, &chunk2, kept))
@@ -1438,9 +1483,10 @@ pub(crate) fn heap_subtract_summarized_fallbacks(
     if !partners.is_empty() {
         let (set, total) = pc_alias_set(ctx, h1, kind, existing, &partners, pc_lits);
         if !set.is_empty() {
-            return heap_subtract_summarized(
+            let r = heap_subtract_summarized(
                 ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
             );
+            return r;
         }
     }
     // 2. Whole-group Σ-ite summary.
