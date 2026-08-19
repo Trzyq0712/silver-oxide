@@ -1724,13 +1724,6 @@ fn eval_resource_op(
             };
             state.push_val(s, Type::Snap(res_id), recipe);
         }
-        if frame_only {
-            // As the dedicated `Snap` instruction did: the two snapshots of
-            // one untouched footprint (say `old(f(x))` and `f(x)`) only land
-            // in the same e-class once the `1 * p` scale and the `proj`/`cons`
-            // round-trips have reduced.
-            ctx.reduce();
-        }
     Ok(())
 }
 
