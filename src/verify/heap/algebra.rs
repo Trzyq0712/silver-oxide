@@ -1015,7 +1015,32 @@ pub(crate) fn heap_subtract(
     pc_lits: &[(egg::Id, Polarity)],
     demand: Demand,
 ) -> Result<Heap, VerifyError> {
-    heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, demand, true)
+    heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, demand, ConsumePass::First)
+}
+
+/// Where a [`heap_subtract_inner`] call sits in the ground-miss retry cycle.
+///
+/// A miss first asks whether the demand is provably zero, then saturates and tries
+/// the whole lookup once more. The second pass is what makes a recipe-rebuilt
+/// address meet its chunk — but the *saturation* it depends on is the one
+/// [`VerifyContext::prove_under_pc`] runs at its own `saturate` tier while failing
+/// that zero-demand probe, not the explicit call on the retry line, which is
+/// normally a no-op against an already-clean graph.
+///
+/// So the retry must still happen, while the zero-demand probe must not be re-asked
+/// for nothing: an unchanged graph cannot give a different verdict, and a failed
+/// probe is **not** memoized ([`VerifyContext::prove_under_pc`] records only
+/// successes), so re-asking pays the full ladder — clone and all — a second time.
+#[derive(Clone, Copy)]
+pub(crate) enum ConsumePass {
+    /// First attempt; the saturate-and-retry rung is still available.
+    First,
+    /// The retry. `zero_demand_settled` says the explicit saturate found the graph
+    /// already at a fixpoint, so nothing moved since the first pass asked, and its
+    /// `false` still stands. When the saturate *did* work the question is genuinely
+    /// open again — a gate collapsing to `0` is exactly what the probe looks for —
+    /// and it is re-asked.
+    Retry { zero_demand_settled: bool },
 }
 
 /// What kind of permission a consume demands, which selects the rule
@@ -1114,7 +1139,7 @@ pub(crate) fn heap_subtract_inner(
     chunk2: Chunk,
     pc_lits: &[(egg::Id, Polarity)],
     demand: Demand,
-    sat_retry: bool,
+    pass: ConsumePass,
 ) -> Result<Heap, VerifyError> {
     let (out, existing) = find_chunk_consolidated(ctx, h1, kind, chunk2.addr, pc_lits, true);
     let (existing, kept) = normalize_guard_for_consume(ctx, existing, pc_lits);
@@ -1125,14 +1150,33 @@ pub(crate) fn heap_subtract_inner(
         // `b ==> P(..)` with `b` false) is a no-op, so it need not be held. A
         // wildcard is provably positive, so this (correctly) fails — a wildcard
         // cannot be exhaled from an empty location.
-        // Nothing demanded: not (0 < needed).
-        let nonpos = expr!(ctx, not ((0/1) <r {chunk2_perm}));
-        if ctx.prove_under_pc(nonpos, pc_lits) {
-            return Ok(out);
+        // Nothing demanded: not (0 < needed). Skipped on a retry whose saturate
+        // was a no-op — see [`ConsumePass::Retry`].
+        if !matches!(
+            pass,
+            ConsumePass::Retry {
+                zero_demand_settled: true
+            }
+        ) {
+            let nonpos = expr!(ctx, not ((0/1) <r {chunk2_perm}));
+            if ctx.prove_under_pc(nonpos, pc_lits) {
+                return Ok(out);
+            }
         }
-        if sat_retry {
+        if matches!(pass, ConsumePass::First) {
+            let settled = ctx.is_saturated();
             ctx.saturate();
-            return heap_subtract_inner(ctx, h1, kind, chunk2, pc_lits, demand, false);
+            return heap_subtract_inner(
+                ctx,
+                h1,
+                kind,
+                chunk2,
+                pc_lits,
+                demand,
+                ConsumePass::Retry {
+                    zero_demand_settled: settled,
+                },
+            );
         }
         // Nothing on ground: the demanded address may still match a held chunk under
         // the pc (a `&mut` reborrow inside a branch arm, whose address equality is a
