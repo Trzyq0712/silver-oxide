@@ -651,6 +651,9 @@ pub(super) fn run_rules<'r>(
     if graph_inconsistent(&egraph) {
         return (egraph, Vec::new());
     }
+    // The observation cache describes the graph this run walks; a run on a
+    // different graph must not read it (ground and its clones share ids).
+    crate::verify::rewrite::diseq::new_scan_generation();
     // Explicit limits: egg's defaults (30 iterations, 10k nodes, **5 seconds**)
     // are SILENT truncation points — a run that hits one simply stops
     // mid-saturation and the caller sees an ordinary "not proven", which surfaced

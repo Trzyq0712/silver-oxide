@@ -3,6 +3,7 @@
 //! distinguishing-observation appliers.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use egg::{
     Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
@@ -264,6 +265,25 @@ pub(super) struct DistinguishingObsApplier {
     pub(super) memo: Memo<(Id, Id, usize, usize)>,
 }
 
+thread_local! {
+    /// Observation maps built during the current saturation run, keyed by the
+    /// class and its parent-count stamp. Scoped to one run (see
+    /// [`new_scan_generation`]) so a map built on one e-graph can never be read
+    /// on another — ground and its clones share ids, and a clone's extra unions
+    /// give the same id a different observation set.
+    static OBS_CACHE: std::cell::RefCell<HashMap<(Id, usize), Arc<Observations>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Start a new observation-cache generation. Called once per saturation run: the
+/// cached maps describe the graph that run is walking and nothing else.
+pub(crate) fn new_scan_generation() {
+    OBS_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// The unary applications of one class: `(f, type args)` to the class of `f(x)`.
+pub(super) type Observations = HashMap<(FuncId, Vec<Type>), Id>;
+
 /// Every `(f, tys)` this class is the sole argument of, mapped to the class of
 /// that application. The observation map of [`DistinguishingObsApplier`].
 ///
@@ -272,12 +292,22 @@ pub(super) struct DistinguishingObsApplier {
 /// collide. Building both sides as maps turns the pairing below into a hash join —
 /// it used to be a nested loop over both observation lists. Borrows the type slice
 /// instead of cloning it; the whole scan holds the graph immutably.
-pub(super) fn unary_observations<'a>(
-    egraph: &'a EGraph<Symbolic, ConstFold>,
+pub(super) fn unary_observations(
+    egraph: &EGraph<Symbolic, ConstFold>,
     x: Id,
-) -> HashMap<(FuncId, &'a [Type]), Id> {
+) -> Arc<Observations> {
     let x = egraph.find(x);
-    let mut out = HashMap::new();
+    // Parent lists only grow, so the count is a free monotone version stamp —
+    // the same one the failure memo uses. An enum match asks `s == cons(k)` once
+    // per variant, and every one of those pairs used to rebuild `s`'s map by
+    // walking its whole parent list: 83% of the scans on `enum_v5_p1` were a
+    // repeat of a key already built, and the walk is what the rule's time is
+    // (937k parents walked on its scratch graphs alone).
+    let key = (x, egraph[x].parents().count());
+    if let Some(hit) = OBS_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let mut out = Observations::new();
     for p in egraph[x].parents() {
         let p = egraph.find(p);
         for node in &egraph[p].nodes {
@@ -285,10 +315,12 @@ pub(super) fn unary_observations<'a>(
                 && args.len() == 1
                 && egraph.find(args[0]) == x
             {
-                out.insert((*f, &tys[..]), p);
+                out.insert((*f, tys.to_vec()), p);
             }
         }
     }
+    let out = Arc::new(out);
+    OBS_CACHE.with(|c| c.borrow_mut().insert(key, Arc::clone(&out)));
     out
 }
 
@@ -339,7 +371,7 @@ impl Applier<Symbolic, ConstFold> for DistinguishingObsApplier {
             }
             let obs_r = unary_observations(egraph, r);
             // Hash join on the observation key instead of the old nested loop.
-            for (key, app_r) in &obs_r {
+            for (key, app_r) in obs_r.iter() {
                 let Some(app_l) = obs_l.get(key) else {
                     continue;
                 };
