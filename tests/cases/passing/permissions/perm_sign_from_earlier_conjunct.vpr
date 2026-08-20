@@ -1,0 +1,19 @@
+// The perm-sign side condition of `acc(x.f, p)` is discharged from the facts
+// established by *earlier* parts of the same specification: `0/1 < p` is stated
+// before the `acc`, so `p` is provably non-negative by the time the obligation
+// `not (p < 0/1)` is raised.
+//
+// The bridge from the strict fact to the non-strict obligation is the
+// `lt-asymmetry-real` rule (`verify/rewrite/arith.rs`): the assumed class
+// `0/1 <r p` pins its mirror `p <r 0/1` false, and `ite-reduce` collapses the
+// negation. Before that rule this was a known limitation — the side condition saw
+// the preceding conjunct but had no order theory to use it.
+//
+// Was tests/cases/known_limitations/, promoted 2026-08-20.
+
+field f: Int
+
+method n(x: Ref, p: Perm)
+    requires 0/1 < p
+    requires acc(x.f, p)
+{}

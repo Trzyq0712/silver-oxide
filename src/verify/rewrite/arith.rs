@@ -3,10 +3,13 @@
 
 
 use egg::{
-    Rewrite,
+    Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
     rewrite as rw,
 };
 
+use crate::verify::analysis::ConstFold;
+use crate::verify::lang::{Discriminant, Symbolic};
+use crate::vmir::{BinOp, Literal};
 
 use super::*;
 
@@ -105,5 +108,122 @@ pub(super) fn static_rules() -> Vec<Rule> {
         .expect("distinguishing-observation rule"),
     );
     rules.extend(disequality_unit_prop_rules());
+    rules.extend(lt_asymmetry_rules());
     rules
+}
+
+/// Asymmetry of the strict orders: `a < b` proven true refutes `b < a`.
+///
+/// This is the one order fact the rule set needs to take a *strict* inequality
+/// to the *non-strict* one a side condition asks for. An assumed `p > none`
+/// lowers to `0/1 <r p` (`translate::pure_exp`, `B::Gt` swaps the operands), and
+/// the non-negativity obligation on a slot op is `not (p <r 0/1)`, i.e. the
+/// mirror class pinned false — exactly what this supplies.
+///
+/// **Lookup-only**: the mirror node is *found*, never minted. Minting it would
+/// add a node per `<` in the program whether or not anything asks about the
+/// reverse direction; a lookup fires only when the goal (or another assumption)
+/// has already put the mirror in the graph, which is the only case where the
+/// derived `false` can be read back out.
+fn lt_asymmetry_rules() -> Vec<Rule> {
+    [BinOp::LtI, BinOp::LtR]
+        .into_iter()
+        .map(|op| {
+            let name = match op {
+                BinOp::LtI => "lt-asymmetry-int",
+                _ => "lt-asymmetry-real",
+            };
+            Rewrite::new(name, LtBucketSearcher(op), LtAsymmetryApplier(op))
+                .expect("lt-asymmetry rule")
+        })
+        .collect()
+}
+
+/// Searcher over the `<` op bucket for one operand sort. One empty subst per
+/// class; the applier re-reads the nodes.
+struct LtBucketSearcher(BinOp);
+
+impl Searcher<Symbolic, ConstFold> for LtBucketSearcher {
+    fn search_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        limit: usize,
+    ) -> Vec<SearchMatches<'_, Symbolic>> {
+        let Some(classes) = egraph.classes_for_op(&Discriminant::Binary(self.0)) else {
+            return vec![];
+        };
+        classes
+            .take(limit)
+            // Only a class already *proven* true can refute anything, and that is
+            // a rare shape — filtering here keeps the applier off every `<` node.
+            .filter(|eclass| known_bool(egraph, *eclass) == Some(true))
+            .map(|eclass| SearchMatches {
+                eclass,
+                substs: vec![Subst::default()],
+                ast: None,
+            })
+            .collect()
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _limit: usize,
+    ) -> Option<SearchMatches<'_, Symbolic>> {
+        (known_bool(egraph, eclass) == Some(true)
+            && egraph[eclass]
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Symbolic::Binary(op, _) if *op == self.0)))
+        .then(|| SearchMatches {
+            eclass,
+            substs: vec![Subst::default()],
+            ast: None,
+        })
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
+}
+
+struct LtAsymmetryApplier(BinOp);
+
+impl Applier<Symbolic, ConstFold> for LtAsymmetryApplier {
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<Symbolic, ConstFold>,
+        eclass: Id,
+        _subst: &Subst,
+        _searcher_ast: Option<&PatternAst<Symbolic>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        // Collect first: the lookup needs `&egraph`, the union `&mut`.
+        let mirrors: Vec<Id> = egraph[eclass]
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                Symbolic::Binary(op, [a, b]) if *op == self.0 => {
+                    egraph.lookup(Symbolic::Binary(*op, [*b, *a]))
+                }
+                _ => None,
+            })
+            .collect();
+        if mirrors.is_empty() {
+            return vec![];
+        }
+        let f = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+        let mut changed = Vec::new();
+        for mirror in mirrors {
+            if egraph.union(mirror, f) {
+                changed.push(egraph.find(mirror));
+            }
+        }
+        changed
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        vec![]
+    }
 }

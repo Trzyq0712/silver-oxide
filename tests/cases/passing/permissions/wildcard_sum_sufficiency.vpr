@@ -1,0 +1,39 @@
+// `design/wildcards` [20] gap 2, CLOSED 2026-08-20.
+//
+// Holding `1/2 + w` and exhaling `1/2` requires `1/2 + w >= 1/2`.
+// `perm_add_wildcard` hands back a fresh `s` with `1/2 < s` assumed, and the
+// sufficiency goal is `not (s <r 1/2)` (`prove_sufficient` -> `sufficient_leaf`).
+// Bridging the two needs asymmetry of a strict order, `a < b ==> not (b < a)`,
+// which is now `lt-asymmetry-real` in `verify/rewrite/arith.rs` — the "one generic
+// asymmetry rule" this file's earlier header named as the fix and declined.
+//
+// The rule is lookup-only: it pins the mirror class false when that class already
+// exists (here, minted by the goal), so it adds no node per `<` in the program.
+//
+// Scope: this closes the ONE-slot shape, which is gap 2 as `[20]` states it.
+// `repro/mixed_footprint.vpr`'s `now_pass` still fails, and measurably not for
+// this reason: each slot passes on its own (`exhale acc(x.f, 1/2)` and
+// `exhale acc(x.f, wildcard)` off the same sum), and only the *sequence* fails.
+// The second slot needs the post-debit remainder to be positive, which is a
+// different fact from asymmetry — do not read `now_pass` as a regression here.
+//
+// Three neighbours on this boundary are still open, and none is fixed by an
+// order rule of this kind:
+//
+//   - the remainder positivity just described.
+//   - `inhale 1/2; inhale w; inhale w; assert perm(x.f) > 1/2` needs `<`
+//     TRANSITIVITY to chain `1/2 < s1` with `s1 < s2`. The single-wildcard case
+//     verifies (`wildcard_perm_order.vpr`); the wall is two facts chaining.
+//   - `inhale 1/2; exhale w; inhale 1/2; exhale 1/3` needs the concrete part
+//     tracked apart from the positive part — the `[30]` Option 2
+//     `concrete + sum-of-wildcards` normal form, not another fact.
+//
+// Was tests/cases/known_limitations/, promoted 2026-08-20.
+
+field f: Int
+
+method m_sum_is_sufficient(x: Ref) {
+    inhale acc(x.f, 1/2)
+    inhale acc(x.f, wildcard)
+    exhale acc(x.f, 1/2)
+}
