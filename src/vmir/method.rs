@@ -88,13 +88,15 @@ impl Method {
 // DISPLAY INFRASTRUCTURE
 // ======================
 
-/// Count the value/heap temps an instruction slice produces, to advance the
-/// running `eN`/`hN` display counters across blocks. Mirrors the inst-walker
-/// (`vmir/inst.rs`): a `Pure` inst yields a value temp; a `Heap` inst yields a
-/// heap temp, plus a value temp when it is snapshot-yielding.
-fn count_temps(insts: &[Inst], decls: &TiVec<MemberId, Declaration>) -> (usize, usize) {
+/// Count the value/heap/permission temps an instruction slice produces, to
+/// advance the running `eN`/`hN`/`pN` display counters across blocks. Mirrors the
+/// inst-walker (`vmir/inst.rs`): a `Pure` inst yields a value temp; a `Heap` inst
+/// yields a heap temp, plus a value temp when it is snapshot-yielding; a `Perm`
+/// inst yields a permission temp.
+fn count_temps(insts: &[Inst], decls: &TiVec<MemberId, Declaration>) -> (usize, usize, usize) {
     let mut vals = 0;
     let mut heaps = 0;
+    let mut perms = 0;
     for inst in insts {
         match &inst.kind {
             InstKind::Pure(..) => vals += 1,
@@ -106,10 +108,11 @@ fn count_temps(insts: &[Inst], decls: &TiVec<MemberId, Declaration>) -> (usize, 
                     vals += 1;
                 }
             }
+            InstKind::Perm(_) => perms += 1,
             InstKind::Assume(_) | InstKind::Assert(_) | InstKind::Refute(_) => {}
         }
     }
-    (vals, heaps)
+    (vals, heaps, perms)
 }
 
 impl<'a> Display for VmirDisplay<'a, &'a Method> {
@@ -120,6 +123,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Method> {
         // (topological) order so ids match the flat stream.
         let mut e_idx = 0usize;
         let mut h_idx = 0usize;
+        let mut p_idx = 0usize;
         for (bid, blk) in self.item.blocks.iter_enumerated() {
             // Header: `bbK <cube>[ from bbP | join <cond> [bbT, bbE]]:`.
             let cube = Cube(&blk.cube);
@@ -136,16 +140,18 @@ impl<'a> Display for VmirDisplay<'a, &'a Method> {
             // one level deeper. Counters advance across both.
             if !blk.join.is_empty() {
                 writeln!(f, "    join:")?;
-                write!(f, "{}", self.with_nested((e_idx, h_idx, &blk.join[..])))?;
-                let (dv, dh) = count_temps(&blk.join, self.decls);
+                write!(f, "{}", self.with_nested((e_idx, h_idx, p_idx, &blk.join[..])))?;
+                let (dv, dh, dp) = count_temps(&blk.join, self.decls);
                 e_idx += dv;
                 h_idx += dh;
+                p_idx += dp;
             }
             writeln!(f, "    body:")?;
-            write!(f, "{}", self.with_nested((e_idx, h_idx, &blk.body[..])))?;
-            let (dv, dh) = count_temps(&blk.body, self.decls);
+            write!(f, "{}", self.with_nested((e_idx, h_idx, p_idx, &blk.body[..])))?;
+            let (dv, dh, dp) = count_temps(&blk.body, self.decls);
             e_idx += dv;
             h_idx += dh;
+            p_idx += dp;
         }
         write!(f, "}}")
     }

@@ -9,88 +9,121 @@ pub enum HeapVal {
     Temp(usize),
 }
 
-/// A permission amount attached to a heap operation.
+/// A permission value: the `p` namespace, VMIR's third kind of operand beside
+/// values (`e`) and heaps (`h`).
 ///
 /// A `wildcard` is a symbolic positive-but-unspecified share; it is legal
-/// **only** here (never as a first-class [`Val`]), matching Viper. `Ite` gates a
-/// permission by a boolean operand — this carries both `Sink::gate_perm`'s branch
-/// gating and the `p > 0 ? wildcard : 0` lowering of function-context
-/// permissions (so a dead branch reduces to `0`).
+/// **only** here (never as a first-class [`Val`]), matching Viper. Keeping
+/// permissions in their own namespace is what makes "a permission never lands in
+/// the e-graph" a property of the *types* rather than of a check.
 ///
-/// Generic over the **operand** type `A`, with two instantiations:
+/// Leaves are inline. A plain `acc(x.f, write)` carries its amount here and emits
+/// no instruction, so the overwhelmingly common concrete permission costs
+/// nothing; only *composition* needs a name, and that is [`PermInst`]. A `Temp`
+/// names an earlier `PermInst` in the same block — permissions never cross a
+/// block boundary, because a permission has no join (heaps own those).
 ///
-/// - `Perm<Val>` (the default) — the IR, where an amount is a body temp. Also the
-///   form a resource certificate walk accumulates, since recipe temps are `Val`s
-///   too.
-/// - `Perm<BodyRecipe>` — a resource footprint slot's permission, where each
-///   amount is a standalone sliced recipe (see `verify::cert::SlotRecipe`).
+/// Generic over the **amount** operand `A`, with two instantiations:
 ///
-/// The point of the parameter is that [`Self::has_wildcard`] is then **one**
-/// function serving both spaces. It used to have a recipe-space twin
-/// (`recipe_has_wildcard`) that scanned for an `AxiomPure::Wildcard` step, which
-/// only existed because the permission *shape* was flattened into recipe steps;
-/// `Demand`'s doc already named the two as the same predicate.
+/// - `PermVal<Val>` (the default) — the IR, where an amount is a body temp.
+/// - `PermVal<BodyRecipe>` — recipe space (`verify::cert::PermRecipe`), where
+///   each amount is a standalone sliced recipe.
+///
+/// The point of the parameter is that [`PermInst::try_map`] is then **one**
+/// function serving both spaces.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Perm<A = Val> {
+pub enum PermVal<A = Val> {
     /// A concrete permission amount (`1/1`, `1/2`, a symbolic real, …). This is
-    /// the only variant a non-wildcard program ever produces, and it lowers to
-    /// exactly the same e-graph term as before the `Perm` split.
+    /// the only variant a non-wildcard, unbranched program ever produces, and it
+    /// lowers to exactly the same e-graph term as a bare amount always did.
     Amount(A),
-    /// Viper's `wildcard`: a positive-but-unspecified share, **picked at graft
-    /// time** rather than named here. Deliberately carries no operand — that is
-    /// what keeps it out of recipe space.
+    /// Viper's `wildcard`: a positive-but-unspecified share, **picked when the
+    /// permission is evaluated** rather than named here. Deliberately carries no
+    /// operand — that is what keeps it out of value space.
     Wildcard,
-    /// `cond ? then : else` over permissions.
-    Ite(A, Box<Perm<A>>, Box<Perm<A>>),
+    /// An earlier [`PermInst`] in this block.
+    Temp(usize),
 }
 
-impl<A> Perm<A> {
-    /// Whether any leaf of this permission is a [`Perm::Wildcard`]. Operand-type
-    /// agnostic: the answer is in the shape, not the amounts.
-    pub fn has_wildcard(&self) -> bool {
-        match self {
-            Perm::Amount(_) => false,
-            Perm::Wildcard => true,
-            Perm::Ite(_, t, e) => t.has_wildcard() || e.has_wildcard(),
-        }
+/// A permission-producing instruction — the definition of a `p` temp.
+///
+/// Only *conditional composition* needs one: `Ite` carries both
+/// `Sink::gate_perm`'s branch gating and the `p > 0 ? wildcard : 0` lowering of
+/// function-context permissions (so a dead branch reduces to `0`). Nesting is a
+/// chain of `p` temps rather than a boxed expression, so a permission reads like
+/// every other VMIR operand.
+///
+/// Deliberately **not** a [`PureInst`](crate::vmir::PureInst): its result is a
+/// `PermVal`, not a `Val`, so nothing can route a permission into a pure term.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PermInst<A = Val> {
+    /// `cond ? then : else` over permissions. `cond` is a boolean operand of the
+    /// *value* space; the arms are permissions.
+    Ite(A, PermVal<A>, PermVal<A>),
+}
+
+impl<A> PermVal<A> {
+    /// Whether this value is *itself* a `wildcard`. A `Temp` cannot answer on its
+    /// own — ask the evaluated `ChunkPerm`'s provenance (`ChunkPerm::has_wild`)
+    /// or, statically, scan the defining instructions.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, PermVal::Wildcard)
     }
 
-    /// Rebuild this permission with every amount operand mapped through `f`,
-    /// preserving the shape (and so `has_wildcard`). The `Val`-tree a certificate
-    /// walk accumulates becomes a `BodyRecipe`-tree this way, one `slice` per
-    /// operand.
-    pub fn try_map<B, E>(&self, f: &mut impl FnMut(&A) -> Result<B, E>) -> Result<Perm<B>, E> {
+    /// Rebuild with the amount operand mapped through `f`.
+    pub fn try_map<B, E>(&self, f: &mut impl FnMut(&A) -> Result<B, E>) -> Result<PermVal<B>, E> {
         Ok(match self {
-            Perm::Amount(a) => Perm::Amount(f(a)?),
-            Perm::Wildcard => Perm::Wildcard,
-            Perm::Ite(c, t, e) => Perm::Ite(
-                f(c)?,
-                Box::new(t.try_map(f)?),
-                Box::new(e.try_map(f)?),
-            ),
+            PermVal::Amount(a) => PermVal::Amount(f(a)?),
+            PermVal::Wildcard => PermVal::Wildcard,
+            PermVal::Temp(i) => PermVal::Temp(*i),
         })
     }
 }
 
-impl Perm<Val> {
-    /// The zero permission (`none`).
-    pub fn none() -> Self {
-        Perm::Amount(crate::vmir::none())
+impl<A> PermInst<A> {
+    /// Whether either arm is a bare `wildcard`.
+    pub fn has_wildcard_arm(&self) -> bool {
+        match self {
+            PermInst::Ite(_, t, e) => t.is_wildcard() || e.is_wildcard(),
+        }
     }
-    /// The full permission (`write`, `1/1`).
-    pub fn write() -> Self {
-        Perm::Amount(crate::vmir::write())
+
+    /// Rebuild with every operand (the condition included) mapped through `f`,
+    /// preserving the shape. The `Val`-operand form a certificate walk
+    /// accumulates becomes a `BodyRecipe`-operand one this way, one `slice` per
+    /// operand.
+    pub fn try_map<B, E>(&self, f: &mut impl FnMut(&A) -> Result<B, E>) -> Result<PermInst<B>, E> {
+        Ok(match self {
+            PermInst::Ite(c, t, e) => PermInst::Ite(f(c)?, t.try_map(f)?, e.try_map(f)?),
+        })
     }
 }
 
-impl Display for VmirDisplay<'_, &Perm> {
+impl PermVal<Val> {
+    /// The zero permission (`none`).
+    pub fn none() -> Self {
+        PermVal::Amount(crate::vmir::none())
+    }
+    /// The full permission (`write`, `1/1`).
+    pub fn write() -> Self {
+        PermVal::Amount(crate::vmir::write())
+    }
+}
+
+impl Display for PermVal<Val> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            PermVal::Amount(v) => write!(f, "{v}"),
+            PermVal::Wildcard => write!(f, "wildcard"),
+            PermVal::Temp(i) => write!(f, "p{i}"),
+        }
+    }
+}
+
+impl Display for VmirDisplay<'_, &PermInst> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.item {
-            Perm::Amount(v) => write!(f, "{v}"),
-            Perm::Wildcard => write!(f, "wildcard"),
-            Perm::Ite(c, t, e) => {
-                write!(f, "{c} ? {} : {}", self.with(&**t), self.with(&**e))
-            }
+            PermInst::Ite(c, t, e) => write!(f, "{c} ? {t} : {e}"),
         }
     }
 }
@@ -109,7 +142,7 @@ pub enum HeapInst {
     Add {
         base: HeapVal,
         loc: Val,
-        perm: Perm,
+        perm: PermVal,
         bind: Bind,
     },
     /// `h := base - acc <loc> <perm>`. Subtracts the single location chunk at
@@ -118,7 +151,7 @@ pub enum HeapInst {
     Sub {
         base: HeapVal,
         loc: Val,
-        perm: Perm,
+        perm: PermVal,
         /// Whether the removed value is **requested**. A `Sub` always discovers
         /// what the location held -- it is the one instruction that learns
         /// something the caller did not know -- but only the desugared `unfold`
@@ -140,7 +173,7 @@ pub enum HeapInst {
         /// heap and the pre-state its `#ensures` reconstructs the *same* terms.
         bind: Bind,
         call: ResourceCall,
-        perm: Perm,
+        perm: PermVal,
     },
     /// `h[, s] := base exhale <call> <perm>`. Subtract the resource's delta (scaled by
     /// `perm`) from `base` **and assert** its boolean condition. Yields a snapshot
@@ -158,7 +191,7 @@ pub enum HeapInst {
         frame_only: bool,
         base: HeapVal,
         call: ResourceCall,
-        perm: Perm,
+        perm: PermVal,
     },
     /// Assign a value to a heap location in a given heap.
     /// SIDECOND: the location must have at least `write` permission.
@@ -340,10 +373,10 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
         };
         // Render `base <kw> call perm` for a resource inhale/exhale.
         let resource_combine =
-            |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &Perm| {
+            |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &PermVal| {
                 write!(f, "{base} {kw} ")?;
                 call_head(f, call)?;
-                write!(f, " {}", self.with(perm))
+                write!(f, " {perm}")
             };
         match self.item {
             HeapInst::Add {
@@ -351,10 +384,10 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 loc,
                 perm,
                 bind,
-            } => write!(f, "{base} + acc {loc} {} with {bind}", self.with(perm)),
+            } => write!(f, "{base} + acc {loc} {perm} with {bind}"),
             HeapInst::Sub {
                 base, loc, perm, ..
-            } => write!(f, "{base} - acc {loc} {}", self.with(perm)),
+            } => write!(f, "{base} - acc {loc} {perm}"),
             HeapInst::Inhale {
                 base,
                 bind,
@@ -383,7 +416,7 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmir::{Bound, Perm};
+    use crate::vmir::{Bound, PermVal};
     use lasso::Rodeo;
     use typed_index_collections::TiVec;
 
@@ -404,7 +437,7 @@ mod tests {
         let inst = HeapInst::Sub {
             base: HeapVal::Empty,
             loc: Val::Temp(0),
-            perm: Perm::write(),
+            perm: PermVal::write(),
             yields_value: true,
         };
         let got = inst.val_yield(&decls, |_| Some(addr_ty(Type::Int)));
@@ -420,7 +453,7 @@ mod tests {
         let inst = HeapInst::Sub {
             base: HeapVal::Empty,
             loc: Val::Temp(0),
-            perm: Perm::write(),
+            perm: PermVal::write(),
             yields_value: true,
         };
         let got = inst.val_yield(&decls, |_| Some(addr_ty(Type::Snap(pred))));
@@ -435,7 +468,7 @@ mod tests {
         let inst = HeapInst::Add {
             base: HeapVal::Empty,
             loc: Val::Temp(0),
-            perm: Perm::write(),
+            perm: PermVal::write(),
             bind: Bind::Fresh,
         };
         assert_eq!(inst.val_yield(&decls, |_| Some(addr_ty(Type::Int))), None);

@@ -52,8 +52,8 @@ pub(crate) struct VerifyContext<'a> {
     /// Monotonic source of symbolic ids — both `Symbolic::Fresh(n)` and
     /// `Symbolic::Wildcard(n)`. A plain counter now that nothing mints either at
     /// saturation time: both certificate kinds are add-only recipes, so `transplant`
-    /// (which threaded a shared counter) is gone, and a slot permission keeps the
-    /// `vmir::Perm` shape rather than flattening a wildcard into a recipe step.
+    /// (which threaded a shared counter) is gone, and a slot permission keeps its
+    /// own `PermRecipe` steps rather than flattening a wildcard into a pure step.
     ///
     /// Shared between the two node kinds on purpose. They could not collide anyway
     /// (different constructors, and only `Fresh` is keyed into `fresh_types`), but one
@@ -134,9 +134,10 @@ pub(crate) struct VerifyContext<'a> {
 
 
 
-/// Whether any declaration uses a `wildcard` permission (a heap-op `Perm` with
-/// a wildcard leaf). Scanned once per unit at [`VerifyContext::new`]; lets a
-/// wildcard-free program skip the per-subtract `contains_wildcard` walk.
+/// Whether any declaration uses a `wildcard` permission. Scanned once per unit at
+/// [`VerifyContext::new`]; lets a wildcard-free program skip the wildcard rules
+/// entirely. A `wildcard` is either inline on a heap op or an arm of a permission
+/// instruction, so this is a flat scan — no tree walk.
 fn decls_have_wildcard(decls: &TiVec<MemberId, Declaration>) -> bool {
     use crate::vmir::{HeapInst, Inst, InstKind};
     fn insts_wild(insts: &[Inst]) -> bool {
@@ -146,7 +147,8 @@ fn decls_have_wildcard(decls: &TiVec<MemberId, Declaration>) -> bool {
                 | HeapInst::Sub { perm, .. }
                 | HeapInst::Inhale { perm, .. }
                 | HeapInst::Exhale { perm, .. },
-            ) => perm.has_wildcard(),
+            ) => perm.is_wildcard(),
+            InstKind::Perm(pi) => pi.has_wildcard_arm(),
             _ => false,
         })
     }

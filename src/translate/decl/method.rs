@@ -1050,7 +1050,7 @@ fn lower_new(
             let mut heap = current_heap;
             for f in fields {
                 let (loc, perm) = resource::field_acc(b, sink, v.clone(), f.0, vmir::write())?;
-                let perm = sink.gate_perm(vmir::Perm::Amount(perm));
+                let perm = sink.gate_perm(vmir::PermVal::Amount(perm));
                 heap = sink.emit_heap(HeapInst::Add {
                     base: heap,
                     loc,
@@ -1208,6 +1208,6 @@ fn emit_resource_exhale(
 /// Gate the permission by the current branch path condition so a contract
 /// inhaled/exhaled inside an `if` arm contributes nothing on the other path
 /// (the empty top-level pc leaves `write` unchanged).
-fn contract_perm(sink: &mut Sink) -> vmir::Perm {
-    sink.gate_perm(vmir::Perm::write())
+fn contract_perm(sink: &mut Sink) -> vmir::PermVal {
+    sink.gate_perm(vmir::PermVal::write())
 }

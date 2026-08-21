@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::verify::cert::PermRecipe;
 use crate::vmir::display::VmirDisplay;
 use crate::{
     verify::{
@@ -37,6 +38,15 @@ struct EvalState {
     /// desync from the eval column.
     recipes: Vec<Option<Val>>,
     heaps: Vec<Heap>,
+    /// Permission temps (`p`), evaluated at their defining instruction. A `p`
+    /// temp denotes ONE permission: a `wildcard` under it is minted once here, so
+    /// reading the temp twice reads the same share.
+    perms: Vec<ChunkPerm>,
+    /// The defining instruction of each `perms` entry, kept in lockstep. The
+    /// certificate walk needs the permission's *shape* (not its e-classes) to
+    /// slice a [`PermRecipe`], and a `ChunkPerm` has already lost which operands
+    /// it came from.
+    perm_defs: Vec<vmir::PermInst>,
     /// Heap temps produced on a **provably unreachable** path (a block whose
     /// cube is refuted in the ground graph — e.g. after `bb_unreach`'s `inhale
     /// false`). The Stage-4 join merge drops such an arm outright instead of
@@ -52,6 +62,8 @@ impl EvalState {
             val_types: Vec::new(),
             recipes: Vec::new(),
             heaps: Vec::new(),
+            perms: Vec::new(),
+            perm_defs: Vec::new(),
             dead_heaps: std::collections::HashSet::new(),
         }
     }
@@ -65,6 +77,8 @@ impl EvalState {
             val_types: arg_types,
             recipes,
             heaps: Vec::new(),
+            perms: Vec::new(),
+            perm_defs: Vec::new(),
             dead_heaps: std::collections::HashSet::new(),
         }
     }
@@ -122,6 +136,9 @@ impl EvalState {
             val_types: self.val_types.clone(),
             recipes: self.recipes.clone(),
             heaps: Vec::new(),
+            // A quantifier body is permission-free, like it is heap-free.
+            perms: Vec::new(),
+            perm_defs: Vec::new(),
             dead_heaps: std::collections::HashSet::new(),
         };
         frame.vals.resize(q.binder_base, dead);
@@ -138,6 +155,21 @@ impl EvalState {
     fn push_heap(&mut self, heap: Heap) {
         self.heaps.push(heap);
     }
+    fn push_perm(&mut self, perm: ChunkPerm, def: vmir::PermInst) {
+        self.perms.push(perm);
+        self.perm_defs.push(def);
+    }
+
+    /// Whether a permission operand is wildcard-derived, without evaluating it.
+    /// A `Temp` answers from its already-evaluated `ChunkPerm`, whose `wild` flag
+    /// carries the provenance the e-graph cannot.
+    fn perm_is_wild(&self, pv: &vmir::PermVal) -> bool {
+        match pv {
+            vmir::PermVal::Amount(_) => false,
+            vmir::PermVal::Wildcard => true,
+            vmir::PermVal::Temp(i) => self.perms[*i].has_wild(),
+        }
+    }
 }
 
 /// Render a single instruction (method or resource body) for error context.
@@ -150,7 +182,7 @@ fn format_inst(
     heap_base: usize,
 ) -> String {
     VmirDisplay::new(
-        (val_base, heap_base, std::slice::from_ref(inst)),
+        (val_base, heap_base, 0usize, std::slice::from_ref(inst)),
         decls,
         interner,
         groups,
@@ -598,21 +630,14 @@ fn heap_acc(ctx: &mut VerifyContext<'_>, loc: &Val, perm: ChunkPerm, state: &Eva
     Heap::empty().with_chunk(&kind, Chunk::new_perm(addr, perm, value))
 }
 
-/// Resolve a [`vmir::Perm`] to its e-class id, minting a fresh positive
-/// [`Symbolic::Wildcard`] for each `Perm::Wildcard`. A concrete `Amount` is
-/// exactly the value it wraps, so a non-wildcard program builds the same term as
-/// before the `Perm` split.
-fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::Perm) -> egg::Id {
-    match perm {
-        vmir::Perm::Amount(v) => state.get_val(ctx, v),
-        vmir::Perm::Wildcard => ctx.fresh_wildcard(),
-        vmir::Perm::Ite(c, t, e) => {
-            let c = state.get_val(ctx, c);
-            let t = eval_perm(ctx, state, t);
-            let e = eval_perm(ctx, state, e);
-            expr!(ctx, if {c} then {t} else {e})
-        }
-    }
+/// Resolve a [`vmir::PermVal`] to its e-class id, minting a fresh positive share
+/// for a bare `wildcard`. A concrete `Amount` is exactly the value it wraps, so a
+/// non-wildcard program builds the same term it always did.
+///
+/// A `Temp` was evaluated at its defining instruction, so it costs a lookup and
+/// mints nothing: a `p` temp denotes one permission however many times it is read.
+fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::PermVal) -> egg::Id {
+    eval_perm_structural(ctx, state, perm).to_id(ctx)
 }
 
 /// [`eval_perm`], but keeping the permission's **branch structure** as a
@@ -631,12 +656,24 @@ fn eval_perm(ctx: &mut VerifyContext<'_>, state: &EvalState, perm: &vmir::Perm) 
 fn eval_perm_structural(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
-    perm: &vmir::Perm,
+    perm: &vmir::PermVal,
 ) -> ChunkPerm {
     match perm {
-        vmir::Perm::Amount(v) => ChunkPerm::leaf(state.get_val(ctx, v)),
-        vmir::Perm::Wildcard => ChunkPerm::wild_leaf(ctx.fresh_wildcard()),
-        vmir::Perm::Ite(c, t, e) => {
+        vmir::PermVal::Amount(v) => ChunkPerm::leaf(state.get_val(ctx, v)),
+        vmir::PermVal::Wildcard => ChunkPerm::wild_leaf(ctx.fresh_wildcard()),
+        vmir::PermVal::Temp(i) => state.perms[*i].clone(),
+    }
+}
+
+/// Evaluate a permission *instruction*, the definition of a `p` temp. The one
+/// place a permission gains branch structure in a method body.
+fn eval_perm_inst(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    inst: &vmir::PermInst,
+) -> ChunkPerm {
+    match inst {
+        vmir::PermInst::Ite(c, t, e) => {
             let c = state.get_val(ctx, c);
             let t = eval_perm_structural(ctx, state, t);
             let e = eval_perm_structural(ctx, state, e);
@@ -645,37 +682,62 @@ fn eval_perm_structural(
     }
 }
 
-/// Which consume rule a [`vmir::Perm`] demand selects. Read off the IR, where the
-/// answer is already known, rather than recognised in the e-graph after the fact --
-/// see [`Demand`].
-fn demand_of(perm: &vmir::Perm) -> Demand {
-    if perm.has_wildcard() {
+/// Which consume rule a permission demand selects. Read off the *evaluated*
+/// permission's provenance, which `ChunkPerm::Leaf`'s `wild` flag carries
+/// structurally -- not recognised in the e-graph after the fact, where congruence
+/// can put a wildcard-bearing term into a literal's class. See [`Demand`].
+fn demand_of(perm: &ChunkPerm) -> Demand {
+    if perm.has_wild() {
         Demand::Wildcard
     } else {
         Demand::Concrete
     }
 }
 
-/// The recipe-space form of a [`vmir::Perm`] footprint-slot permission (resource
-/// certificate build): the **same shape**, with each amount operand replaced by its
-/// recipe temp.
+/// The recipe-space form of a footprint-slot permission (resource certificate
+/// build): the `p` steps the slot's permission reaches, in dependency order, with
+/// each operand replaced by its recipe temp.
 ///
-/// Deliberately *not* flattened into pure steps. A permission amount is a pure
-/// function of the params and earlier slot values, so it belongs in a recipe — but a
-/// `wildcard` is not an amount, it is a symbolic picked when the slot is grafted.
-/// Flattening used to force an `AxiomPure::Wildcard` *step* to exist, and a step is
-/// rebuilt wherever the recipe is rebuilt — including inside an egg applier, which
-/// has no [`VerifyContext`] and so minted from a process-global counter. Keeping the
-/// shape means [`build_perm`] does the picking, at a site that holds `ctx`.
-fn perm_recipe(
-    state: &EvalState,
-    perm: &vmir::Perm,
-) -> Result<vmir::Perm<Val>, VerifyError> {
-    perm.try_map(&mut |v: &Val| state.require_recipe(v, OPERAND_RECIPE))
+/// Deliberately *not* flattened into pure steps — see [`PermRecipe`] for why the
+/// `wildcard` must stay out of a rebuilt step stream.
+///
+/// The walk memoizes per body temp, so a permission read twice yields one step and
+/// hence one wildcard at graft time, matching what the IR says: a `p` temp is one
+/// permission.
+fn perm_recipe(state: &EvalState, perm: &vmir::PermVal) -> Result<PermRecipe<Val>, VerifyError> {
+    fn leaf(
+        state: &EvalState,
+        pv: &vmir::PermVal,
+        steps: &mut Vec<vmir::PermInst<Val>>,
+        memo: &mut HashMap<usize, usize>,
+    ) -> Result<vmir::PermVal<Val>, VerifyError> {
+        Ok(match pv {
+            vmir::PermVal::Amount(v) => {
+                vmir::PermVal::Amount(state.require_recipe(v, OPERAND_RECIPE)?)
+            }
+            vmir::PermVal::Wildcard => vmir::PermVal::Wildcard,
+            vmir::PermVal::Temp(i) => {
+                if let Some(j) = memo.get(i) {
+                    return Ok(vmir::PermVal::Temp(*j));
+                }
+                let vmir::PermInst::Ite(c, t, e) = &state.perm_defs[*i];
+                let t = leaf(state, t, steps, memo)?;
+                let e = leaf(state, e, steps, memo)?;
+                let c = state.require_recipe(c, OPERAND_RECIPE)?;
+                steps.push(vmir::PermInst::Ite(c, t, e));
+                let j = steps.len() - 1;
+                memo.insert(*i, j);
+                vmir::PermVal::Temp(j)
+            }
+        })
+    }
+    let mut steps = Vec::new();
+    let mut memo = HashMap::new();
+    let res = leaf(state, perm, &mut steps, &mut memo)?;
+    Ok(PermRecipe { steps, res })
 }
 
-/// What a [`vmir::Perm::Wildcard`] leaf becomes when a footprint slot's permission
-/// is grafted.
+/// What a `wildcard` leaf becomes when a footprint slot's permission is grafted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WildcardAs {
     /// A freshly minted positive share (`0 < w` assumed) — the real permission.
@@ -688,10 +750,10 @@ enum WildcardAs {
     One,
 }
 
-/// Graft a footprint slot's permission: [`eval_perm`]'s three-arm descent, over a
-/// slot recipe instead of an [`EvalState`]. One wildcard is picked per
-/// [`vmir::Perm::Wildcard`] **leaf** reached, eagerly — a leaf under a false guard
-/// still mints, and the enclosing `ite` discards it.
+/// Graft a footprint slot's permission: [`eval_perm_structural`]'s descent, over a
+/// slot recipe instead of an [`EvalState`]. One wildcard is picked per `wildcard`
+/// **leaf** reached, eagerly — a leaf under a false guard still mints, and the
+/// enclosing `ite` discards it.
 ///
 /// Keeps the **branch structure** as a [`ChunkPerm`] rather than flattening it into
 /// one `Ite` term.
@@ -708,28 +770,44 @@ enum WildcardAs {
 /// const-folds — so a wildcard-free program still builds exactly what it did before.
 fn build_perm(
     ctx: &mut VerifyContext<'_>,
-    perm: &vmir::Perm<crate::verify::cert::BodyRecipe>,
+    perm: &PermRecipe,
     resolve: &impl Fn(&crate::verify::cert::SeedRef) -> egg::Id,
     changed: &mut Vec<egg::Id>,
     wildcard_as: WildcardAs,
 ) -> ChunkPerm {
-    match perm {
-        vmir::Perm::Amount(r) => ChunkPerm::leaf(r.build(&mut ctx.egraph, resolve, changed)),
-        // `WildcardAs::One` builds a **presence** indicator, not a share: it is the
-        // literal `1`, with no wildcard left in it, so the leaf is concrete.
-        vmir::Perm::Wildcard => match wildcard_as {
-            WildcardAs::Fresh => ChunkPerm::wild_leaf(ctx.fresh_wildcard()),
-            WildcardAs::One => ChunkPerm::leaf(
-                ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into()))),
-            ),
-        },
-        vmir::Perm::Ite(c, t, e) => {
-            let c = c.build(&mut ctx.egraph, resolve, changed);
-            let t = build_perm(ctx, t, resolve, changed, wildcard_as);
-            let e = build_perm(ctx, e, resolve, changed, wildcard_as);
-            ChunkPerm::select(ctx, c, t, e)
+    fn leaf(
+        ctx: &mut VerifyContext<'_>,
+        pv: &vmir::PermVal<crate::verify::cert::BodyRecipe>,
+        built: &[ChunkPerm],
+        resolve: &impl Fn(&crate::verify::cert::SeedRef) -> egg::Id,
+        changed: &mut Vec<egg::Id>,
+        wildcard_as: WildcardAs,
+    ) -> ChunkPerm {
+        match pv {
+            vmir::PermVal::Amount(r) => {
+                ChunkPerm::leaf(r.build(&mut ctx.egraph, resolve, changed))
+            }
+            // `WildcardAs::One` builds a **presence** indicator, not a share: it is
+            // the literal `1`, with no wildcard left in it, so the leaf is concrete.
+            vmir::PermVal::Wildcard => match wildcard_as {
+                WildcardAs::Fresh => ChunkPerm::wild_leaf(ctx.fresh_wildcard()),
+                WildcardAs::One => ChunkPerm::leaf(
+                    ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into()))),
+                ),
+            },
+            // A step only names earlier ones, so this is always already built.
+            vmir::PermVal::Temp(i) => built[*i].clone(),
         }
     }
+    let mut built: Vec<ChunkPerm> = Vec::with_capacity(perm.steps.len());
+    for step in &perm.steps {
+        let vmir::PermInst::Ite(c, t, e) = step;
+        let c = c.build(&mut ctx.egraph, resolve, changed);
+        let t = leaf(ctx, t, &built, resolve, changed, wildcard_as);
+        let e = leaf(ctx, e, &built, resolve, changed, wildcard_as);
+        built.push(ChunkPerm::select(ctx, c, t, e));
+    }
+    leaf(ctx, &perm.res, &built, resolve, changed, wildcard_as)
 }
 
 /// Scale every leaf of a permission by `pm`, preserving the branch structure.
@@ -959,7 +1037,7 @@ fn eval_heap_inst(
                         "purify: unsupported heap inst in a resource body",
                     ));
                 }
-                heap_subtract(ctx, &base_h, &kind, ch, &pc_lits, demand_of(perm))
+                heap_subtract(ctx, &base_h, &kind, ch, &pc_lits, demand_of(&cperm))
             }
         }
         // Resource inhale/exhale need the program + certificates; method-only.
@@ -1058,6 +1136,10 @@ fn eval_resource_body_inst(
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
         }
+        InstKind::Perm(pi) => {
+            let p = eval_perm_inst(ctx, state, pi);
+            state.push_perm(p, pi.clone());
+        }
         InstKind::Assume(_) | InstKind::Assert(_) | InstKind::Refute(_) => {
             return Err(VerifyError::Unimplemented(
                 "effectful inst in resource body",
@@ -1098,6 +1180,10 @@ fn eval_method_inst(
         InstKind::Heap(hi) => {
             let heap = eval_heap_inst(ctx, state, hi, &inst.pc)?;
             state.push_heap(heap);
+        }
+        InstKind::Perm(pi) => {
+            let p = eval_perm_inst(ctx, state, pi);
+            state.push_perm(p, pi.clone());
         }
         InstKind::Assume(val) => {
             let id = state.get_val(ctx, val);
@@ -1302,8 +1388,7 @@ fn walk_footprint(
         // whose `0 < …` folds to the gating guard.
         // The slot's permission shape is also the static source for the consume rule
         // its demand selects, at the `SlotPerm::Amount` consume below -- see
-        // [`Demand`]. Same predicate the IR side uses (`vmir::Perm::has_wildcard`),
-        // now literally the same function.
+        // [`Demand`]. Shape-only, so it is the same predicate the IR side asks.
         let slot_wildcard = slot.perm.has_wildcard();
         let slot_demand = if slot_wildcard {
             Demand::Wildcard
@@ -1544,7 +1629,7 @@ fn eval_sub_yield(
         &kind,
         Chunk::new_perm(addr, cperm.clone(), held),
         &pc_lits,
-        demand_of(perm),
+        demand_of(&cperm),
     )?;
     state.push_heap(out);
 
@@ -1680,7 +1765,7 @@ fn eval_resource_op(
             // slot permission as `1 * p`, which is equal but not identical,
             // and identity is what the `old(f(x)) == f(x)` congruence needs.
             if frame_only { None } else { Some(scale) },
-            perm.has_wildcard(),
+            state.perm_is_wild(perm),
             &pc_lits,
             &bool_guard,
             frame_only,
@@ -2106,6 +2191,12 @@ fn check_forall_wd_in_scratch(
                 let id = state.get_val(ctx, val);
                 ctx.assume_guarded(id, pc_lits.iter().rev().copied());
             }
+            // A quantifier body is heap-free, hence permission-free.
+            InstKind::Perm(_) => {
+                return Err(VerifyError::Unimplemented(
+                    "permission instruction in a quantifier body",
+                ));
+            }
             // A callee's precondition, stitched at the call site: the other half of
             // a quantifier body's well-definedness, and the reason a WD check needs
             // the *ambient* facts (the guard establishing it may be the body's own
@@ -2153,7 +2244,7 @@ fn walk_body(
     insts: &[Inst],
     certs: &HashMap<MemberId, ResourceDefinition>,
     eval: EvalFn,
-    mut footprint_ops: Option<&mut Vec<(Val, vmir::Perm)>>,
+    mut footprint_ops: Option<&mut Vec<(Val, vmir::PermVal)>>,
 ) -> Result<(), VerifyError> {
     for (inst_idx, inst) in insts.iter().enumerate() {
         assert_statement_pc_is_block_cube(ctx, state, inst);
@@ -2390,9 +2481,9 @@ pub(crate) fn verify_resource(
                 kind: kind.clone(),
                 elem: elem.clone(),
                 addr: rb.slice(addr)?,
-                // One `slice` per amount operand, shape preserved. Sibling arms may
-                // duplicate a step; perm trees are shallow (a `Perm::Ite` only ever
-                // arises around a wildcard — see `Sink::gate_perm`).
+                // One `slice` per operand, shape preserved. Permission step lists
+                // are short (a `PermInst::Ite` only arises from a branch gate or a
+                // read-only weakening — see `Sink::gate_perm`).
                 perm: perm.try_map(&mut |v: &Val| rb.slice(v))?,
             })
         })
@@ -2729,7 +2820,7 @@ fn inst_obligations(
             | HeapInst::Sub { perm, .. }
             | HeapInst::Inhale { perm, .. }
             | HeapInst::Exhale { perm, .. },
-        ) if perm.has_wildcard() => vec![],
+        ) if state.perm_is_wild(perm) => vec![],
         // A resource op carries the resource's **boolean**, so at zero permission
         // it would assume or assert facts about a footprint it transferred no
         // share of — a vacuous operation. Viper rejects `fold`/`unfold` at a

@@ -13,8 +13,7 @@ use crate::verify::error::VerifyError;
 use crate::verify::heap::LocationKind;
 use crate::verify::lang::{FuncId, Symbolic};
 use crate::verify::rewrite::{AxiomInst, AxiomPure};
-use crate::vmir;
-use crate::vmir::{MemberId, Polarity, Type, Val};
+use crate::vmir::{MemberId, PermInst, PermVal, Polarity, Type, Val};
 /// A (non-recursive) function's verified body as a **pure term recipe** — the
 /// definition `f(params) == <steps>[res]`, add-only. Unlike a certificate this
 /// imports **no e-classes**: the function unfold rule rebuilds `steps` at each
@@ -145,20 +144,59 @@ impl BodyRecipe {
     }
 }
 
+/// A footprint slot's permission in recipe space: the IR's `p`-temp steps with
+/// every operand replaced by its own recipe. `res` names the result — an inline
+/// leaf, or `PermVal::Temp(i)` indexing `steps`, which live in their own dense
+/// space (`Temp(i)` refers to `steps[i]`, and a step only ever names earlier
+/// ones).
+///
+/// Deliberately **not** flattened into [`AxiomInst`] steps. A permission amount
+/// is a pure function of the params and earlier slot values, so it belongs in a
+/// recipe — but a `wildcard` is not an amount, it is a symbolic picked when the
+/// slot is grafted. Flattening used to force an `AxiomPure::Wildcard` *step* to
+/// exist, and a step is rebuilt wherever the recipe is rebuilt — including inside
+/// an egg applier, which has no `VerifyContext` and so minted from a
+/// process-global counter. Keeping the permission in its own space means
+/// `build_perm` does the picking, at a site that holds `ctx`.
+#[derive(Clone)]
+pub(crate) struct PermRecipe<A = BodyRecipe> {
+    pub(crate) steps: Vec<PermInst<A>>,
+    pub(crate) res: PermVal<A>,
+}
+
+impl<A> PermRecipe<A> {
+    /// Whether any leaf of this permission is a `wildcard`. Shape-only, so it
+    /// serves both spaces — the same predicate the IR side asks.
+    pub(crate) fn has_wildcard(&self) -> bool {
+        self.res.is_wildcard() || self.steps.iter().any(PermInst::has_wildcard_arm)
+    }
+
+    /// Rebuild with every operand mapped through `f` (one `slice` per operand
+    /// when going from body temps to standalone recipes), shape preserved.
+    pub(crate) fn try_map<B, E>(
+        &self,
+        f: &mut impl FnMut(&A) -> Result<B, E>,
+    ) -> Result<PermRecipe<B>, E> {
+        Ok(PermRecipe {
+            steps: self
+                .steps
+                .iter()
+                .map(|st| st.try_map(f))
+                .collect::<Result<Vec<_>, E>>()?,
+            res: self.res.try_map(f)?,
+        })
+    }
+}
+
 /// One footprint slot of a [`ResourceDefinition`]: its location kind and element
 /// type, plus recipes for its address and permission (over the params and any
 /// earlier slot values — see [`SeedRef`]).
-///
-/// `perm` keeps the IR's [`vmir::Perm`] **shape** and recipes only the amount
-/// operands. A `wildcard` is therefore a `Perm::Wildcard` node with nothing under
-/// it, picked when the slot is grafted, rather than a recipe step that would be
-/// re-minted wherever the recipe happens to be rebuilt.
 #[derive(Clone)]
 pub(crate) struct SlotRecipe {
     pub(crate) kind: LocationKind,
     pub(crate) elem: Type,
     pub(crate) addr: BodyRecipe,
-    pub(crate) perm: vmir::Perm<BodyRecipe>,
+    pub(crate) perm: PermRecipe,
 }
 
 /// A resource's verified body as a **pure term recipe**. Each call site rebuilds
@@ -219,7 +257,7 @@ pub(crate) struct RecipeBuilder {
     /// the slot's location kind, element type, and the recipe temps of its
     /// address and permission (sliced into standalone [`SlotRecipe`]s at the
     /// end of the walk).
-    pub(crate) pending_slots: Vec<(LocationKind, Type, Val, vmir::Perm<Val>)>,
+    pub(crate) pending_slots: Vec<(LocationKind, Type, Val, PermRecipe<Val>)>,
     /// This recipe is a **spec** body — a contract function (`#requires` /
     /// `#ensures`), i.e. a lowered pre/postcondition. Its nested function calls
     /// are spec-position occurrences (Silicon's limited symbol), so they emit **no**

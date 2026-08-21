@@ -233,7 +233,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Forall> {
         write!(
             f,
             "{}",
-            self.with_nested((q.step_base(), 0usize, &q.body.insts[..]))
+            self.with_nested((q.step_base(), 0usize, 0usize, &q.body.insts[..]))
         )?;
         writeln!(f, "{body_indent}result: {}", q.body.res)?;
         write!(f, "{}}}", self.indent())

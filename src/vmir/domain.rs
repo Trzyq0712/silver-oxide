@@ -46,7 +46,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Axiom> {
         write!(
             f,
             "{}",
-            self.with((0usize, 0usize, &self.item.body.insts[..]))
+            self.with((0usize, 0usize, 0usize, &self.item.body.insts[..]))
         )?;
         writeln!(f, "  result: {}", self.item.body.res)?;
         write!(f, "}}")

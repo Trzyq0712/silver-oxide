@@ -195,7 +195,7 @@ impl<'a> Display for VmirDisplay<'a, &'a Function> {
                 write!(
                     f,
                     "{}",
-                    self.with((self.item.params.0.len(), 0usize, &body.insts[..]))
+                    self.with((self.item.params.0.len(), 0usize, 0usize, &body.insts[..]))
                 )?;
                 writeln!(f, "  result: {}", body.res)?;
                 write!(f, "}}")

@@ -1,5 +1,5 @@
 use crate::vmir::display::VmirDisplay;
-use crate::vmir::{HeapInst, HeapVal, PureInst, Type, Val};
+use crate::vmir::{HeapInst, HeapVal, PermInst, PureInst, Type, Val};
 
 use std::fmt::{self, Display, Formatter};
 
@@ -25,6 +25,12 @@ pub enum InstKind {
     Pure(Type, PureInst),
     /// Produces a heap value.
     Heap(HeapInst),
+    /// Produces a **permission** temp (`p`). Separate from `Pure` because its
+    /// result is a `PermVal`, not a `Val`: a permission is consumed by heap
+    /// operations and by further `Perm` insts, and by nothing else, so it can
+    /// never reach the e-graph as a term. Block-local — a permission has no
+    /// join, so nothing carries one across a block boundary.
+    Perm(PermInst),
     /// Assume a boolean fact. Produces no value.
     Assume(Val),
     /// Assert a boolean obligation. Produces no value.
@@ -89,6 +95,9 @@ impl Inst {
         match &self.kind {
             InstKind::Pure(_, pi) => pi.for_each_operand(f),
             InstKind::Assume(v) | InstKind::Assert(v) | InstKind::Refute(v) => f(v),
+            // The condition of a permission `ite` is a *value* operand and must
+            // be walked; the arms are permissions, not `Val`s.
+            InstKind::Perm(PermInst::Ite(c, _, _)) => f(c),
             // Heap instructions cannot occur in a quantifier body, the only place
             // operand walking is used today.
             InstKind::Heap(_) => {}
@@ -100,15 +109,16 @@ impl Inst {
 // DISPLAY INFRASTRUCTURE
 // ======================
 
-/// Walk an instruction stream. Wraps `(val_base, heap_base, &[Inst])` in a
-/// `VmirDisplay` so the iteration lives behind a regular `Display` impl.
+/// Walk an instruction stream. Wraps `(val_base, heap_base, perm_base, &[Inst])`
+/// in a `VmirDisplay` so the iteration lives behind a regular `Display` impl.
 /// Callers — `Display for VmirDisplay<&Method>`, `&Resource>`, `&ResourceBody>`
-/// — invoke via `self.with((val_base, heap_base, &insts[..]))`.
-impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
+/// — invoke via `self.with((val_base, heap_base, perm_base, &insts[..]))`.
+impl<'a> Display for VmirDisplay<'a, (usize, usize, usize, &'a [Inst])> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let (val_base, heap_base, insts) = self.item;
+        let (val_base, heap_base, perm_base, insts) = self.item;
         let mut e_idx = val_base;
         let mut h_idx = heap_base;
+        let mut p_idx = perm_base;
         let indent = self.indent();
         for inst in insts {
             // The check-in heap of an obligation, rendered `[h3]` where it belongs
@@ -154,6 +164,15 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, &'a [Inst])> {
                     if hi.produces_heap() {
                         h_idx += 1;
                     }
+                }
+                InstKind::Perm(pi) => {
+                    writeln!(
+                        f,
+                        "{indent}p{p_idx}: perm := {}{}",
+                        PcPrefix(&inst.pc),
+                        self.with(pi)
+                    )?;
+                    p_idx += 1;
                 }
                 InstKind::Assume(v) => writeln!(f, "{indent}{}assume {v}", PcPrefix(&inst.pc))?,
                 InstKind::Assert(v) => {

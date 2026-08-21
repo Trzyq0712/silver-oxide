@@ -58,6 +58,11 @@ pub enum AnalysisError {
     /// non-function member. (Function-only cycles are permitted — the
     /// limited-function encoding handles them.) Carries the member names.
     CircularDependency(Vec<String>),
+    /// A permission temp read outside the block that defines it. Permissions are
+    /// **block-local** by construction: a permission has no join (heaps own
+    /// those), so nothing may carry one across a block boundary. Carries the
+    /// member name and the offending `p` index.
+    PermTempEscapesBlock(String, usize),
 }
 
 impl std::fmt::Display for AnalysisError {
@@ -65,6 +70,9 @@ impl std::fmt::Display for AnalysisError {
         match self {
             Self::CircularDependency(names) => {
                 write!(f, "circular resource dependency: {}", names.join(" -> "))
+            }
+            Self::PermTempEscapesBlock(name, i) => {
+                write!(f, "{name}: permission temp p{i} read outside its block")
             }
         }
     }
@@ -92,12 +100,91 @@ pub fn analyze(program: Program) -> Result<AnalyzedProgram, AnalysisError> {
             return Err(AnalysisError::CircularDependency(names));
         }
     }
+    for (id, decl) in program.decls.iter_enumerated() {
+        check_perm_locality(decl, || program.name(id).to_string())?;
+    }
     dump_callgraph(&dep_graph, &program);
     Ok(AnalyzedProgram {
         program,
         dep_graph,
         scc_order,
     })
+}
+
+/// Check that every `PermVal::Temp` is defined **earlier in the same block**.
+///
+/// Permission temps are numbered per declaration (one sink), so "same block" is
+/// "index at or after the count of perm insts preceding this block". The
+/// def-before-use half also rules out a cycle, which is why a permission can
+/// never feed itself.
+///
+/// The remaining permission invariants need no check: a `PermVal` is reachable
+/// only from a `PermInst` arm or a heap instruction's `perm` field, because those
+/// are the only places the Rust types admit one. That is the point of giving
+/// permissions their own namespace rather than a `Val` type tag.
+fn check_perm_locality(
+    decl: &Declaration,
+    name: impl Fn() -> String,
+) -> Result<(), AnalysisError> {
+    use crate::vmir::{HeapInst, PermInst, PermVal};
+
+    // `(first p index of this block, count after this phase)`, threaded across
+    // phases and blocks in stored order — the same numbering the display walker
+    // and the verifier's eval state use.
+    fn phase(
+        insts: &[Inst],
+        block_base: usize,
+        count: &mut usize,
+        name: &impl Fn() -> String,
+    ) -> Result<(), AnalysisError> {
+        for inst in insts {
+            let check = |pv: &PermVal| match pv {
+                PermVal::Temp(i) if *i < block_base || *i >= *count => {
+                    Err(AnalysisError::PermTempEscapesBlock(name(), *i))
+                }
+                _ => Ok(()),
+            };
+            match &inst.kind {
+                InstKind::Perm(PermInst::Ite(_, t, e)) => {
+                    check(t)?;
+                    check(e)?;
+                    *count += 1;
+                }
+                InstKind::Heap(
+                    HeapInst::Add { perm, .. }
+                    | HeapInst::Sub { perm, .. }
+                    | HeapInst::Inhale { perm, .. }
+                    | HeapInst::Exhale { perm, .. },
+                ) => check(perm)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    match decl {
+        Declaration::Method(m) => {
+            let mut count = 0usize;
+            for blk in &m.blocks {
+                let base = count;
+                phase(&blk.join, base, &mut count, &name)?;
+                phase(&blk.body, base, &mut count, &name)?;
+            }
+        }
+        // Every other body is a single straight-line stream — one block.
+        Declaration::Function(f) => {
+            if let Some(b) = &f.body {
+                phase(&b.insts, 0, &mut 0, &name)?;
+            }
+        }
+        Declaration::Resource(r) => {
+            if let Some(b) = &r.body {
+                phase(&b.insts, 0, &mut 0, &name)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Build the dependency graph over `program`'s schedulable members
@@ -329,7 +416,7 @@ mod tests {
                 bind: crate::vmir::Bind::Fresh,
                 base: HeapVal::Empty,
                 call,
-                perm: crate::vmir::Perm::write(),
+                perm: crate::vmir::PermVal::write(),
             }),
         };
         Declaration::Method(Method {

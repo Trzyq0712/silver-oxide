@@ -916,7 +916,7 @@ method m() {
 
 #[test]
 fn translation_error_returns_err_without_panicking() {
-    // A bare `wildcard` permission is now lowerable (→ `Perm::Wildcard`), but a
+    // A bare `wildcard` permission is now lowerable (→ `PermVal::Wildcard`), but a
     // `wildcard` used *arithmetically* (not directly as the permission amount) is
     // still rejected — `lower_acc`'s `is_wildcard` sees a `Binary`, not a bare
     // `wildcard`, so it routes through `pure_exp::lower` →

@@ -75,7 +75,7 @@ pub(crate) fn emit_unfold_pair(
     base: HeapVal,
     name: Spur,
     call: ResourceCall,
-    perm: vmir::Perm,
+    perm: vmir::PermVal,
 ) -> HeapVal {
     // The predicate's address: an ordinary application of its own id, typed
     // `&[group] Snap(P) @ unbounded` (see `resource::lower_resource_addr`).
@@ -120,7 +120,7 @@ pub(crate) fn emit_fold_pair(
     base: HeapVal,
     name: Spur,
     call: ResourceCall,
-    perm: vmir::Perm,
+    perm: vmir::PermVal,
 ) -> HeapVal {
     let group = b.group_tag(name);
     let addr_ty = vmir::Type::addr(group, vmir::Type::Snap(call.resource), vmir::Bound::Unbounded);
@@ -145,7 +145,7 @@ pub(crate) fn emit_fold_pair(
 }
 
 /// Lower a predicate-with-perm (`P(args)` + permission) into a self-framed
-/// `ResourceCall` plus the permission (a source `wildcard` → [`Perm::Wildcard`],
+/// `ResourceCall` plus the permission (a source `wildcard` → [`PermVal::Wildcard`],
 /// otherwise the amount through the read-only policy — see [`Sink::perm_amount`];
 /// **not** pc-gated — the caller gates). Shared by `unfolding` expressions and
 /// method-body `fold`/`unfold` statements.
@@ -155,7 +155,7 @@ pub(crate) fn lower_pred_call<Ext: PureExt>(
     sink: &mut Sink,
     hctx: HeapCtx<'_>,
     pwp: &typed::PredicateWithPerm<Ext>,
-) -> Result<(ResourceCall, vmir::Perm), TranslationError> {
+) -> Result<(ResourceCall, vmir::PermVal), TranslationError> {
     let pred_id = *b.name_map.get(&pwp.pred_call.name.0).ok_or_else(|| {
         TranslationError::UnknownIdent(b.interner.resolve(&pwp.pred_call.name.0).to_string())
     })?;
@@ -164,7 +164,7 @@ pub(crate) fn lower_pred_call<Ext: PureExt>(
         args.push(lower(b, env, sink, hctx, a)?);
     }
     let perm = if crate::translate::spatial::is_wildcard(&pwp.perm) {
-        vmir::Perm::Wildcard
+        vmir::PermVal::Wildcard
     } else {
         let perm_val = lower(b, env, sink, hctx, &pwp.perm)?;
         sink.perm_amount(perm_val)
@@ -552,7 +552,7 @@ fn lower_func_app<Ext: PureExt>(
                 resource: req_id,
                 args: args.clone(),
             },
-            vmir::Perm::write(),
+            vmir::PermVal::write(),
         );
         call_args.push(s);
     } else if let Some(req_id) = requires {
@@ -1034,7 +1034,7 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
                 // slot's own permission, so `1/1` reproduces the amounts the
                 // dedicated instruction used (`1 * p` folds away). A wildcard
                 // scale would silently rewrite every slot to `w * p`.
-                perm: vmir::Perm::write(),
+                perm: vmir::PermVal::write(),
             }),
         None => heap,
     };

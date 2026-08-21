@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use crate::vmir::{
-    self, BinOp, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, Perm, Polarity, PureInst,
-    ResourceCall, Type, Val, none,
+    self, BinOp, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, PermInst, PermVal, Polarity,
+    PureInst, ResourceCall, Type, Val, none,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -39,6 +39,9 @@ pub(crate) struct Sink {
     pub val_base: usize,
     pub val_count: usize,
     pub heap_count: usize,
+    /// Running `p` counter. Starts at 0 in every sink: permissions have no
+    /// parameters and no cross-stream continuation (see [`Sink::gate_perm`]).
+    pub perm_count: usize,
     /// Running path condition of the lowering point. Sidecond instructions
     /// are emitted gated by this; branch arms push/pop guards via `with_cond`.
     pub pc: Vec<(Val, Polarity, PcKind)>,
@@ -85,6 +88,7 @@ impl Sink {
             val_base,
             val_count: 0,
             heap_count: heap_base,
+            perm_count: 0,
             pc: Vec::new(),
             heap: None,
             memo: HashMap::new(),
@@ -168,25 +172,37 @@ impl Sink {
     /// (top-level) path condition returns `perm` unchanged. Only *branch*
     /// conditions gate; a separating-conjunction `Fact` keeps the bare permission.
     ///
-    /// Every permission gates *structurally* as [`Perm::Ite`] — a concrete amount
-    /// no less than a wildcard-bearing one. The gate is the same term either way
-    /// (`eval_perm`/`build_perm` build the `Symbolic::Ite` a folded `Ternary` temp
-    /// used to build), but keeping it as `Perm` structure is what lets a consume
-    /// align the demand's arms against the held permission's rather than proving
-    /// against an opaque `ite`. Folding it into the value instead is what left
-    /// `perm_sub_aligned` dead and made `fold q(c, x)` fail while holding `acc(x.f)`.
-    pub(crate) fn gate_perm(&mut self, perm: Perm) -> Perm {
+    /// Every permission gates *structurally* as a [`PermInst::Ite`] step — a
+    /// concrete amount no less than a wildcard-bearing one. The gate is the same
+    /// term either way (`eval_perm`/`build_perm` build the `Symbolic::Ite` a folded
+    /// `Ternary` temp used to build), but keeping it as permission structure is what
+    /// lets a consume align the demand's arms against the held permission's rather
+    /// than proving against an opaque `ite`. Folding it into the value instead is
+    /// what left `perm_sub_aligned` dead and made `fold q(c, x)` fail while holding
+    /// `acc(x.f)`.
+    pub(crate) fn gate_perm(&mut self, perm: PermVal) -> PermVal {
         let mut p = perm;
         for (lit, pol) in self.branch_conds().into_iter().rev() {
             p = match pol {
-                Polarity::Positive => Perm::Ite(lit, Box::new(p), Box::new(Perm::none())),
-                Polarity::Negative => Perm::Ite(lit, Box::new(Perm::none()), Box::new(p)),
+                Polarity::Positive => self.emit_perm(PermInst::Ite(lit, p, PermVal::none())),
+                Polarity::Negative => self.emit_perm(PermInst::Ite(lit, PermVal::none(), p)),
             };
         }
         p
     }
 
-    /// Map a lowered permission *value* to a [`Perm`], applying the read-only
+    /// Emit a permission instruction, yielding the `p` temp it defines.
+    ///
+    /// **Never value-numbered**, unlike [`Sink::emit_pure`]. Two syntactically
+    /// identical gated wildcards (`acc(x.f, wildcard)` and `acc(y.f, wildcard)`
+    /// under one branch) must stay two temps: a `p` temp denotes *one* share, so
+    /// sharing the temp would hand two distinct locations the same wildcard.
+    pub(crate) fn emit_perm(&mut self, inst: PermInst) -> PermVal {
+        self.insts.push(Inst::new(PathConds::default(), InstKind::Perm(inst)));
+        self.next_perm_temp()
+    }
+
+    /// Map a lowered permission *value* to a [`PermVal`], applying the read-only
     /// The [`Bind`] for a footprint `acc` emitted by this sink: the enclosing
     /// resource's next own slot inside a resource body, an unconstrained fresh
     /// value in a method body. There is no third case — a bind to a named term
@@ -202,23 +218,23 @@ impl Sink {
     /// (function) policy when [`Sink::read_only`] is set: a constant `0` stays
     /// `0`; a constant nonzero amount becomes `wildcard`; any other (symbolic)
     /// amount `p` becomes `p > 0 ? wildcard : 0`. Outside read-only context the
-    /// amount is kept exactly ([`Perm::Amount`]).
-    pub(crate) fn perm_amount(&mut self, p: Val) -> Perm {
+    /// amount is kept exactly ([`PermVal::Amount`]).
+    pub(crate) fn perm_amount(&mut self, p: Val) -> PermVal {
         if !self.read_only {
-            return Perm::Amount(p);
+            return PermVal::Amount(p);
         }
         match &p {
             Val::Literal(Literal::Real(r)) => {
                 if *r == num::BigRational::from(num::BigInt::from(0)) {
-                    Perm::none()
+                    PermVal::none()
                 } else {
-                    Perm::Wildcard
+                    PermVal::Wildcard
                 }
             }
             _ => {
                 // p > 0  ==  0 < p
                 let gt = self.emit_pure(Type::Bool, PureInst::Binary(BinOp::LtR, none(), p));
-                Perm::Ite(gt, Box::new(Perm::Wildcard), Box::new(Perm::none()))
+                self.emit_perm(PermInst::Ite(gt, PermVal::Wildcard, PermVal::none()))
             }
         }
     }
@@ -255,6 +271,12 @@ impl Sink {
         let id = self.val_base + self.val_count;
         self.val_count += 1;
         Val::Temp(id)
+    }
+
+    pub fn next_perm_temp(&mut self) -> PermVal {
+        let id = self.perm_count;
+        self.perm_count += 1;
+        PermVal::Temp(id)
     }
 
     pub fn next_heap_temp(&mut self) -> HeapVal {
@@ -411,7 +433,7 @@ impl Sink {
         &mut self,
         base: HeapVal,
         call: ResourceCall,
-        perm: Perm,
+        perm: PermVal,
         bind: crate::vmir::Bind,
     ) -> HeapVal {
         self.emit_heap_guarded(HeapInst::Inhale {
@@ -425,7 +447,7 @@ impl Sink {
     /// A value-yielding slot consume: `h1, e1 := h0 - acc <loc> <perm>`. Removes
     /// the chunk and hands back what was there as `Option<T>`. Only the desugared
     /// `unfold` wants that, so every other `Sub` leaves the binder `_`.
-    pub fn emit_sub_yielding(&mut self, base: HeapVal, loc: Val, perm: Perm) -> (HeapVal, Val) {
+    pub fn emit_sub_yielding(&mut self, base: HeapVal, loc: Val, perm: PermVal) -> (HeapVal, Val) {
         let h = self.emit_heap_guarded(HeapInst::Sub {
             base,
             loc,
@@ -443,7 +465,7 @@ impl Sink {
         &mut self,
         base: HeapVal,
         call: ResourceCall,
-        perm: Perm,
+        perm: PermVal,
     ) -> Val {
         // NOT `emit_heap_guarded`: that mints a heap temp, and this instruction
         // produces no heap. Only the `Val` counter advances.
@@ -465,7 +487,7 @@ impl Sink {
         &mut self,
         base: HeapVal,
         call: ResourceCall,
-        perm: Perm,
+        perm: PermVal,
         yields_snap: bool,
     ) -> (HeapVal, Option<Val>) {
         let h = self.emit_heap_guarded(HeapInst::Exhale {

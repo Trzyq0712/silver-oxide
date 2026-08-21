@@ -99,7 +99,7 @@ impl ChunkPerm {
 /// literal `1/1`, a symbolic real, a wildcard) and is treated as OPAQUE — never
 /// structurally decomposed. A `Select` comes from either of two places, both via
 /// the [`ChunkPerm::select`] smart constructor: a control-flow **join** merge, and
-/// a **gated `acc`** — `Sink::gate_perm` keeps a path condition as `vmir::Perm::Ite`
+/// a **gated `acc`** — `Sink::gate_perm` keeps a path condition as a `PermInst::Ite`
 /// structure rather than folding it into the amount, so `build_perm` lands it here.
 /// An ungated frontend perm is still a `Leaf`, for which [`ChunkPerm::to_id`] is
 /// the identity.

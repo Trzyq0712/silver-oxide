@@ -11,7 +11,7 @@ use crate::translate::sink::{PcKind, Sink};
 use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
 use crate::vmir::{
-    self, FALSE, HeapInst, HeapVal, Perm, Polarity, PureInst, TRUE, Type, Val,
+    self, FALSE, HeapInst, HeapVal, PermVal, Polarity, PureInst, TRUE, Type, Val,
 };
 
 /// Direction and heap semantics of a spatial lowering.
@@ -149,7 +149,7 @@ sink.emit_heap(HeapInst::Inhale {
                 // slot's own permission, so `1/1` reproduces the amounts the
                 // dedicated instruction used (`1 * p` folds away). A wildcard
                 // scale would silently rewrite every slot to `w * p`.
-                perm: vmir::Perm::write(),
+                perm: vmir::PermVal::write(),
             })
         },
     );
@@ -302,7 +302,7 @@ pub(crate) fn lower_spatial<Ext: PureExt>(
 
 /// Lower `acc(res, perm)` to its location and (pc-gated) permission. The caller
 /// emits the `HeapInst::Add`/`HeapInst::Sub` that adds/subtracts the chunk. A source-level
-/// `wildcard` maps directly to [`Perm::Wildcard`]; otherwise the amount is
+/// `wildcard` maps directly to [`PermVal::Wildcard`]; otherwise the amount is
 /// lowered and passed through the read-only policy (see [`Sink::perm_amount`]).
 fn lower_acc<Ext: PureExt>(
     b: &TranslationContext<'_>,
@@ -311,9 +311,9 @@ fn lower_acc<Ext: PureExt>(
     hctx: HeapCtx<'_>,
     res: &typed::ResourceExp<Ext>,
     perm: &typed::TypedPureExp<Ext>,
-) -> Result<(Val, Perm), TranslationError> {
+) -> Result<(Val, PermVal), TranslationError> {
     let perm = if is_wildcard(perm) {
-        Perm::Wildcard
+        PermVal::Wildcard
     } else {
         let perm_val = pure_exp::lower(b, env, sink, hctx, perm)?;
         sink.perm_amount(perm_val)

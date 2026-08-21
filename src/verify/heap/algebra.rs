@@ -171,7 +171,7 @@ fn perm_add_wildcard(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) 
             // summand's non-negativity is the chunk-permission invariant, not a
             // proof: every permission reaching a chunk has passed `Combine`'s
             // `perm ≥ 0`, or — for the wildcard-bearing perms that skip it
-            // ([`crate::vmir::Perm`]) — is non-negative by construction.
+            // (a [`crate::vmir::PermVal`]) — is non-negative by construction.
             let mut facts: Vec<egg::Id> = Vec::new();
             if ypos {
                 facts.push(expr!(ctx, {x} <r {s}));
@@ -1046,13 +1046,11 @@ pub(crate) enum ConsumePass {
 /// What kind of permission a consume demands, which selects the rule
 /// ([`debit_wildcard`] vs [`prove_sufficient`]).
 ///
-/// Carried from the **static** source rather than recognised in the e-graph: the
-/// demanded amount is a [`crate::vmir::Perm`] long before it is a term, and knows the
-/// answer outright -- [`crate::vmir::Perm::has_wildcard`]. That is now literally one
-/// function for both the IR (`Perm<Val>`) and a footprint slot
-/// (`Perm<BodyRecipe>`), since a slot keeps the permission *shape* and recipes only
-/// its amount operands; the recipe-space twin that scanned for a flattened wildcard
-/// step is gone. Asking the e-graph instead means asking about an **e-class**, which
+/// Carried from the permission's **provenance** rather than recognised in the
+/// e-graph: `ChunkPerm::Leaf`'s `wild` flag records that a leaf came from a
+/// `wildcard`, set where the permission was evaluated (`eval_perm_structural`,
+/// `build_perm`) from the IR's own `PermVal::Wildcard`. Asking the e-graph instead
+/// means asking about an **e-class**, which
 /// congruence can put other nodes into -- the same lesson the produce side learned
 /// when positivity had to be read off operand trees rather than off the fused leaf.
 ///
