@@ -131,7 +131,7 @@ impl Display for VmirDisplay<'_, &PermInst> {
 /// Heap instructions. All heap instructions produce new heaps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HeapInst {
-    /// `h := base + acc <loc> <perm> with <bind>`. Adds the single location
+    /// `h := base + <loc> @ <perm> with <bind>`. Adds the single location
     /// chunk at `loc` with permission `perm` to `base`. Pure heap accounting —
     /// no boolean is assumed or asserted (cf. `Inhale`/`Exhale`).
     ///
@@ -145,7 +145,7 @@ pub enum HeapInst {
         perm: PermVal,
         bind: Bind,
     },
-    /// `h := base - acc <loc> <perm>`. Subtracts the single location chunk at
+    /// `h := base - <loc> @ <perm>`. Subtracts the single location chunk at
     /// `loc` with permission `perm` from `base`. Pure heap accounting — no
     /// boolean is assumed or asserted (cf. `Inhale`/`Exhale`).
     Sub {
@@ -160,7 +160,7 @@ pub enum HeapInst {
         /// unchanged. Output arity, exactly like `Exhale::frame_only`.
         yields_value: bool,
     },
-    /// `h[, s] := base inhale <call> <perm>`. Add the resource's delta (scaled by
+    /// `h[, s] := base inhale <call> @ <perm>`. Add the resource's delta (scaled by
     /// `perm`) to `base` **and assume** its boolean condition. When the callee is
     /// **self-framed** the inst additionally yields a pure `Val` `s : Snap(callee)`
     /// — the snapshot of the just-inhaled resource (see [`HeapInst::snap_yield`]),
@@ -175,7 +175,7 @@ pub enum HeapInst {
         call: ResourceCall,
         perm: PermVal,
     },
-    /// `h[, s] := base exhale <call> <perm>`. Subtract the resource's delta (scaled by
+    /// `h[, s] := base exhale <call> @ <perm>`. Subtract the resource's delta (scaled by
     /// `perm`) from `base` **and assert** its boolean condition. Yields a snapshot
     /// `Val` exactly like `Inhale` (values = the consumed caller chunk values).
     Exhale {
@@ -376,7 +376,7 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &PermVal| {
                 write!(f, "{base} {kw} ")?;
                 call_head(f, call)?;
-                write!(f, " {perm}")
+                write!(f, " @ {perm}")
             };
         match self.item {
             HeapInst::Add {
@@ -384,10 +384,10 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
                 loc,
                 perm,
                 bind,
-            } => write!(f, "{base} + acc {loc} {perm} with {bind}"),
+            } => write!(f, "{base} + {loc} @ {perm} with {bind}"),
             HeapInst::Sub {
                 base, loc, perm, ..
-            } => write!(f, "{base} - acc {loc} {perm}"),
+            } => write!(f, "{base} - {loc} @ {perm}"),
             HeapInst::Inhale {
                 base,
                 bind,

@@ -138,7 +138,7 @@ impl<'a> Display for VmirDisplay<'a, (usize, usize, usize, &'a [Inst])> {
                 }
                 InstKind::Heap(hi) => {
                     // A snapshot-yielding inhale/exhale also produces a pure
-                    // temp: `h1, e5 := h0 inhale R(...) 1/1`. A frame-only exhale
+                    // temp: `h1, e5 := h0 inhale R(...) @ 1/1`. A frame-only exhale
                     // produces the temp but no heap: `_, e5 := h0 exhale R(..)`.
                     if hi.yields_val(self.decls) {
                         let heap_binder = if hi.produces_heap() {

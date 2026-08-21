@@ -444,7 +444,7 @@ impl Sink {
         })
     }
 
-    /// A value-yielding slot consume: `h1, e1 := h0 - acc <loc> <perm>`. Removes
+    /// A value-yielding slot consume: `h1, e1 := h0 - <loc> @ <perm>`. Removes
     /// the chunk and hands back what was there as `Option<T>`. Only the desugared
     /// `unfold` wants that, so every other `Sub` leaves the binder `_`.
     pub fn emit_sub_yielding(&mut self, base: HeapVal, loc: Val, perm: PermVal) -> (HeapVal, Val) {
