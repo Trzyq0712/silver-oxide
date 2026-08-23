@@ -202,12 +202,17 @@ impl<'a> VerifyContext<'a> {
     ///    obligation merged it, or it is trivial), or sits in `proven_imps`.
     /// 5. `saturate` — saturate the live graph (only **unconditional** facts
     ///    live there) and re-check. No clone.
-    /// 6. `probe` — the only tier that clones: the block scratch, or a ground
-    ///    clone, with the path condition assumed and saturated.
+    /// 6. `probe` — the only tier that clones: the block scratch, or (functions
+    ///    and resources, which have no CFG) a ground clone with the path condition
+    ///    assumed and saturated.
     /// 7. `ite_decompose` — non-forking `ite`-goal decomposition on that probe,
     ///    see [`Self::prove_by_ite_decomposition`]. The last resort: there is
     ///    **no case split**, so a goal needing genuine reasoning-by-cases over
     ///    an opaque condition is reported unproven.
+    ///
+    /// In a block these last two are **one** step rather than two: the pc is not
+    /// assumed by a loop of its own, it is handed to the decomposition *as* the
+    /// implication and telescoped there — see [`Self::prove_via_scratch`].
     ///
     /// On success the implication is merged with `true` in the live graph so the
     /// next identical obligation hits `memo`. (Tiers 1–5 already have it merged.)
@@ -289,7 +294,7 @@ impl<'a> VerifyContext<'a> {
             )
         }) {
             let probe = self.egraph.clone();
-            let proven = self.prove_by_ite_decomposition(&probe, goal);
+            let proven = self.prove_by_ite_decomposition(&probe, goal, true);
             if proven {
                 self.record_proven(imp, true_, pc_lits.is_empty());
             }
@@ -323,7 +328,7 @@ impl<'a> VerifyContext<'a> {
             let probe = self.run_probe(probe);
             // Last resort is the non-forking ite-goal decomposition; there is no
             // case split beyond it.
-            probe.find(goal) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, goal)
+            probe.find(goal) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, goal, true)
         };
 
         // Persist the result so future identical obligations hit the `memo` tier.
@@ -490,7 +495,10 @@ impl<'a> VerifyContext<'a> {
     /// cube assumed and saturated, so an obligation whose pc is fully implied by
     /// the cube is discharged with no per-obligation clone (a "free hit").
     /// Obligations carrying extra pc literals (a perm-`Select` branch condition)
-    /// clone the *warm* scratch and assume only those, then saturate.
+    /// clone the *warm* scratch and hand `pc ⇒ goal` — the extra literals only — to
+    /// [`Self::prove_by_ite_decomposition`], which assumes them by telescoping the
+    /// chain. Assuming them here in a loop and saturating would be the same work
+    /// with a full saturation where a reduce per literal does.
     pub(super) fn prove_via_scratch(&mut self, goal: egg::Id, pc_lits: &[(egg::Id, Polarity)]) -> bool {
         // Ground size at the moment the `probe` tier is reached, before the scratch is built or
         // touched — paired below with the scratch size the obligation actually
@@ -570,26 +578,42 @@ impl<'a> VerifyContext<'a> {
         // go straight to the goal-structural decomposition on the warm scratch.
         if all_sat {
             stats::bump(|s| s.block_scratch_freehits += 1);
-            return self.prove_by_ite_decomposition(&probe_base, tg);
+            return self.prove_by_ite_decomposition(&probe_base, tg, true);
         }
 
-        // Extra literals: assume them on a clone of the warm scratch.
+        // Off-path: a literal that already folds against its required polarity
+        // makes `pc ⇒ goal` vacuously true. O(k) folds, no allocation — kept ahead
+        // of the chain below, which would only reach that literal after
+        // telescoping the ones outside it.
+        if tpc.iter().any(|(tid, pol)| {
+            matches!(
+                probe_base[probe_base.find(*tid)].data.known(),
+                Some(Literal::Bool(b)) if *b != matches!(pol, Polarity::Positive)
+            )
+        }) {
+            return true;
+        }
+
+        // Extra literals: rather than assume them and saturate, hand the
+        // *implication* to the decomposition and let it telescope them — that is
+        // the same work, one reduce per literal instead of one saturation for the
+        // batch, and it shares the machinery that already had to handle a guarded
+        // goal. The chain is built exactly as `VerifyContext::implication` builds
+        // the ground one, but in scratch space, so the nodes die with the clone;
+        // `prove_under_pc` still memoizes the ground `imp`.
         let mut probe = probe_base;
         let true_p = probe.add(Symbolic::Lit(Literal::Bool(true)));
-        let false_p = probe.add(Symbolic::Lit(Literal::Bool(false)));
-        for (id, pol) in &tpc {
-            let want_true = matches!(pol, Polarity::Positive);
-            match probe[*id].data.known() {
-                // Off-path literal ⇒ `pc ⇒ goal` holds vacuously.
-                Some(Literal::Bool(b)) if *b != want_true => return true,
-                _ => {
-                    probe.union(*id, if want_true { true_p } else { false_p });
-                }
-            }
+        let mut imp = tg;
+        for (id, pol) in tpc.iter().rev() {
+            imp = match pol {
+                Polarity::Positive => probe.add(Symbolic::Ite([*id, imp, true_p])),
+                Polarity::Negative => probe.add(Symbolic::Ite([*id, true_p, imp])),
+            };
         }
         probe.rebuild();
-        let probe = self.run_probe(probe);
-        probe.find(tg) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, tg)
+        // The scratch arrives saturated and the chain assumes nothing until its
+        // first pick, so no saturation is owed up front.
+        self.prove_by_ite_decomposition(&probe, imp, true)
     }
 
     /// Persist a proven obligation so future identical ones hit the `memo` tier.
@@ -639,7 +663,25 @@ impl<'a> VerifyContext<'a> {
     /// Terminates without a depth cap: each iteration assumes one
     /// *previously-unknown* condition and the e-graph has finitely many, which the
     /// `assumed` set makes explicit. `SILVER_OXIDE_NO_ITE_DECOMPOSE=1` disables it.
-    fn prove_by_ite_decomposition(&mut self, probe: &egg::EGraph<Symbolic, ConstFold>, goal: egg::Id) -> bool {
+    ///
+    /// **Cost model.** A link only needs the *terminating* reductions: assuming
+    /// `cᵢ` const-folds the `ite` and the next link is the surviving arm's own
+    /// class, so the loop runs [`Self::run_reduce`] per pick and escalates to a
+    /// full [`Self::run_probe`] only when the chain **stalls** — no candidate in
+    /// the goal class. That is where rules are genuinely needed: a guarded fact
+    /// that reaches the goal class through an axiom or a quantifier instantiation,
+    /// or an arm whose `true` only shows after saturation. Saturations are then
+    /// bounded by *stalls*, not by picks (one, for a chain that telescopes
+    /// cleanly), where the previous shape paid one per pick.
+    ///
+    /// `saturated` says whether `probe` arrives saturated; it is cleared by every
+    /// assumption, since a union invalidates the fixpoint.
+    fn prove_by_ite_decomposition(
+        &mut self,
+        probe: &egg::EGraph<Symbolic, ConstFold>,
+        goal: egg::Id,
+        mut saturated: bool,
+    ) -> bool {
         if std::env::var_os("SILVER_OXIDE_NO_ITE_DECOMPOSE").is_some() {
             return false;
         }
@@ -703,7 +745,17 @@ impl<'a> VerifyContext<'a> {
                 }
             }
             let Some((cond, want, branch)) = plan else {
-                return false;
+                // Stalled: no usable candidate in the goal class. If the working
+                // graph is only reduced, the missing link may be one the full rule
+                // set produces (a guarded fact carried in by an axiom or a
+                // quantifier instantiation) — spend the saturation here, once,
+                // rather than after every pick, and retry.
+                if saturated {
+                    return false;
+                }
+                work = self.run_probe(work);
+                saturated = true;
+                continue;
             };
             // If the condition already can't take `want`, the constant-`true`
             // arm is the only reachable one — the goal holds outright.
@@ -719,7 +771,11 @@ impl<'a> VerifyContext<'a> {
             let lit = work.add(Symbolic::Lit(Literal::Bool(want)));
             work.union(cond, lit);
             work.rebuild();
-            work = self.run_probe(work);
+            // The assumption invalidates the fixpoint; collapsing the arm needs
+            // only the terminating reductions, so pay those and let a later stall
+            // decide whether the full rule set is warranted.
+            work = self.run_reduce(work);
+            saturated = false;
             goal = branch;
         }
     }
@@ -790,6 +846,31 @@ impl<'a> VerifyContext<'a> {
         stats::bump(|s| s.graph_timing.0.probe += t.elapsed().as_secs_f64());
         stats::bump(|s| s.probe_saturations += 1);
         stats::bump(|s| s.probe_iterations += s.sat_iterations - iters_before);
+        out
+    }
+
+    /// Run only the terminating structural reductions over a detached probe —
+    /// the `reduce` counterpart of [`Self::run_probe`], driving the same rule set
+    /// as [`VerifyContext::reduce`] and [`Self::reduce_scratch`].
+    ///
+    /// This is what an `ite_decompose` link costs between picks: assuming a
+    /// condition makes the surviving arm's `ite` collapse by const-fold plus these
+    /// reductions, which is all the *telescope* needs — the full rule set is only
+    /// required when the chain stalls (see [`Self::prove_by_ite_decomposition`]).
+    fn run_reduce(
+        &mut self,
+        probe: egg::EGraph<Symbolic, ConstFold>,
+    ) -> egg::EGraph<Symbolic, ConstFold> {
+        let _scope = crate::verify::rewrite::ScratchScope::enter();
+        let t = std::time::Instant::now();
+        let (out, iterations) = run_rules(
+            probe,
+            self.static_reduce.iter().chain(self.alloc.rules()),
+            None,
+        );
+        stats::bump(|s| s.graph_timing.0.probe += t.elapsed().as_secs_f64());
+        stats::bump(|s| s.probe_reduces += 1);
+        stats::bump(|s| s.record_run(&iterations));
         out
     }
 
