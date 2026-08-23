@@ -645,6 +645,32 @@ pub(super) fn run_rules<'r>(
     rules: impl IntoIterator<Item = &'r egg::Rewrite<Symbolic, ConstFold>>,
     iter_limit: Option<usize>,
 ) -> (egg::EGraph<Symbolic, ConstFold>, Vec<egg::Iteration<()>>) {
+    run_rules_until(egraph, rules, iter_limit, None)
+}
+
+/// As [`run_rules`], but stopping as soon as `goal` is settled.
+///
+/// egg checks a `Runner`'s hooks at the start of every iteration and treats an
+/// `Err` as a stop, so this costs one class lookup per iteration and saves every
+/// iteration after the answer exists.
+///
+/// **`goal` is only sound on a throwaway graph.** The returned e-graph is *not*
+/// saturated, so a caller that records it as clean — `VerifyContext::saturate`
+/// (which sets `self.clean`) or `saturate_scratch` (which clears `dirty` on a graph
+/// shared by every obligation in the block) — would make later obligations read a
+/// fixpoint that was never reached. Pass `None` there and `Some` only for a probe
+/// that dies with the call.
+///
+/// The *inconsistency* stop below carries no such condition and so is installed for
+/// every caller: a contradictory graph proves everything, which is exactly why
+/// `run_rules` refuses to start on one, so abandoning its saturation cannot change
+/// a verdict either.
+pub(super) fn run_rules_until<'r>(
+    egraph: egg::EGraph<Symbolic, ConstFold>,
+    rules: impl IntoIterator<Item = &'r egg::Rewrite<Symbolic, ConstFold>>,
+    iter_limit: Option<usize>,
+    goal: Option<egg::Id>,
+) -> (egg::EGraph<Symbolic, ConstFold>, Vec<egg::Iteration<()>>) {
     // A contradictory graph proves everything, so no rule can change any verdict
     // it yields — stop running them. This is the single choke point for every
     // graph (ground saturate/reduce, scratch saturate/reduce, every probe), and
@@ -670,12 +696,35 @@ pub(super) fn run_rules<'r>(
     // deterministic for a fixed rule set + input") for any program whose
     // saturation approaches it. Disabled outright — the node and iteration limits
     // are the real backstops, and unlike a clock they are reproducible.
-    let runner = egg::Runner::default()
+    let mut runner = egg::Runner::default()
         .with_scheduler(egg::SimpleScheduler)
         .with_node_limit(100_000)
         .with_iter_limit(iter_limit.unwrap_or(100))
         .with_time_limit(std::time::Duration::MAX)
-        .with_egraph(egraph);
+        .with_egraph(egraph)
+        // Contradiction reached mid-run: every remaining iteration is spent
+        // elaborating a graph that already proves everything.
+        .with_hook(|r| {
+            if graph_inconsistent(&r.egraph) {
+                stats::bump(|s| s.probe_early_stops += 1);
+                return Err("inconsistent".to_owned());
+            }
+            Ok(())
+        });
+    if let Some(goal) = goal {
+        runner = runner.with_hook(move |r| {
+            // `ConstFold` settles a class without merging it into `true`, so ask
+            // the analysis rather than comparing canonical ids.
+            if matches!(
+                r.egraph[r.egraph.find(goal)].data.known(),
+                Some(Literal::Bool(true))
+            ) {
+                stats::bump(|s| s.probe_early_stops += 1);
+                return Err("goal proven".to_owned());
+            }
+            Ok(())
+        });
+    }
     let runner = runner.run(rules);
     (runner.egraph, runner.iterations)
 }

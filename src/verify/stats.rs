@@ -76,10 +76,13 @@ pub struct VerifyStats {
     /// egg `Runner` iterations spent inside `probe_saturations` (subset of
     /// `sat_iterations`).
     pub probe_iterations: u64,
-    /// Terminating-reduction-only runs on a throwaway clone (`run_reduce`) — one
-    /// per `ite_decompose` link. Paired with `probe_saturations`: a chain that
-    /// telescopes cleanly spends these instead of full saturations.
+    /// Terminating-reduction-only runs on a throwaway clone (`run_reduce`) — the
+    /// middle rung of the `ite_decompose` ladder. Paired with `probe_saturations`:
+    /// a chain that telescopes cleanly spends neither.
     pub probe_reduces: u64,
+    /// Rule runs abandoned by a `Runner` hook — the goal was settled, or the graph
+    /// went contradictory, before the fixpoint. Counts iterations *not* spent.
+    pub probe_early_stops: u64,
     /// Per-block scratch e-graph: ground clones taken to build a block scratch (one per block that reaches
     /// the `probe` tier), full-rule-set saturations of that shared scratch, and the egg
     /// iterations they cost. `block_scratch_freehits` counts obligations

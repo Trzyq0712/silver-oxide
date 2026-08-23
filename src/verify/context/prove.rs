@@ -17,7 +17,7 @@ use egg::Language as _;
 use crate::{
     verify::{
         analysis::ConstFold,
-        context::{VerifyContext, graph_inconsistent, run_rules},
+        context::{VerifyContext, graph_inconsistent, run_rules, run_rules_until},
         lang::Symbolic,
         rewrite::{self},
         stats,
@@ -81,6 +81,22 @@ impl BlockScratch {
             None
         }
     }
+}
+
+/// How hard a decomposition's working graph has been run since its last
+/// assumption — the escalation ladder [`VerifyContext::prove_by_ite_decomposition`]
+/// climbs when its chain stalls, cheapest rung first.
+///
+/// A link itself only ever needs `Rebuilt`; the rungs above it are bought on the
+/// evidence of a stall, so a chain that telescopes cleanly runs no rules at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rung {
+    /// Congruence and const-fold only (`EGraph::rebuild`).
+    Rebuilt,
+    /// Plus the terminating structural reductions (`run_reduce`).
+    Reduced,
+    /// Plus the full rule set (`run_probe`). Nothing above this.
+    Saturated,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -294,7 +310,7 @@ impl<'a> VerifyContext<'a> {
             )
         }) {
             let probe = self.egraph.clone();
-            let proven = self.prove_by_ite_decomposition(&probe, goal, true);
+            let proven = self.prove_by_ite_decomposition(&probe, goal, Rung::Saturated);
             if proven {
                 self.record_proven(imp, true_, pc_lits.is_empty());
             }
@@ -325,10 +341,10 @@ impl<'a> VerifyContext<'a> {
         let proven = if unsat_pc {
             true
         } else {
-            let probe = self.run_probe(probe);
+            let probe = self.run_probe_until(probe, goal);
             // Last resort is the non-forking ite-goal decomposition; there is no
             // case split beyond it.
-            probe.find(goal) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, goal, true)
+            probe.find(goal) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, goal, Rung::Saturated)
         };
 
         // Persist the result so future identical obligations hit the `memo` tier.
@@ -578,7 +594,7 @@ impl<'a> VerifyContext<'a> {
         // go straight to the goal-structural decomposition on the warm scratch.
         if all_sat {
             stats::bump(|s| s.block_scratch_freehits += 1);
-            return self.prove_by_ite_decomposition(&probe_base, tg, true);
+            return self.prove_by_ite_decomposition(&probe_base, tg, Rung::Saturated);
         }
 
         // Off-path: a literal that already folds against its required polarity
@@ -613,7 +629,7 @@ impl<'a> VerifyContext<'a> {
         probe.rebuild();
         // The scratch arrives saturated and the chain assumes nothing until its
         // first pick, so no saturation is owed up front.
-        self.prove_by_ite_decomposition(&probe, imp, true)
+        self.prove_by_ite_decomposition(&probe, imp, Rung::Saturated)
     }
 
     /// Persist a proven obligation so future identical ones hit the `memo` tier.
@@ -674,13 +690,14 @@ impl<'a> VerifyContext<'a> {
     /// bounded by *stalls*, not by picks (one, for a chain that telescopes
     /// cleanly), where the previous shape paid one per pick.
     ///
-    /// `saturated` says whether `probe` arrives saturated; it is cleared by every
-    /// assumption, since a union invalidates the fixpoint.
+    /// `entry` says how hard `probe` has already been run; every assumption drops
+    /// the working graph back to [`Rung::Rebuilt`], since a union invalidates the
+    /// fixpoint.
     fn prove_by_ite_decomposition(
         &mut self,
         probe: &egg::EGraph<Symbolic, ConstFold>,
         goal: egg::Id,
-        mut saturated: bool,
+        entry: Rung,
     ) -> bool {
         if std::env::var_os("SILVER_OXIDE_NO_ITE_DECOMPOSE").is_some() {
             return false;
@@ -689,6 +706,7 @@ impl<'a> VerifyContext<'a> {
         // and `assumed` (a set of condition classes) is a sound progress guard.
         let mut work = probe.clone();
         let mut goal = goal;
+        let mut rung = entry;
         let mut assumed: std::collections::HashSet<egg::Id> = std::collections::HashSet::new();
         loop {
             // The assumptions accumulated along this chain are contradictory, so
@@ -745,16 +763,23 @@ impl<'a> VerifyContext<'a> {
                 }
             }
             let Some((cond, want, branch)) = plan else {
-                // Stalled: no usable candidate in the goal class. If the working
-                // graph is only reduced, the missing link may be one the full rule
-                // set produces (a guarded fact carried in by an axiom or a
-                // quantifier instantiation) — spend the saturation here, once,
-                // rather than after every pick, and retry.
-                if saturated {
-                    return false;
+                // Stalled: no usable candidate in the goal class. Escalate one
+                // rung and retry — the missing link may be one the reductions
+                // collapse, or one only the full rule set produces (a guarded fact
+                // carried in by an axiom or a quantifier instantiation). Rules are
+                // spent here, on evidence that the cheap rung was not enough, and
+                // never on a link that did not need them.
+                match rung {
+                    Rung::Rebuilt => {
+                        work = self.run_reduce(work);
+                        rung = Rung::Reduced;
+                    }
+                    Rung::Reduced => {
+                        work = self.run_probe_until(work, goal);
+                        rung = Rung::Saturated;
+                    }
+                    Rung::Saturated => return false,
                 }
-                work = self.run_probe(work);
-                saturated = true;
                 continue;
             };
             // If the condition already can't take `want`, the constant-`true`
@@ -770,12 +795,13 @@ impl<'a> VerifyContext<'a> {
             }
             let lit = work.add(Symbolic::Lit(Literal::Bool(want)));
             work.union(cond, lit);
+            // A rebuild is the whole cost of a link. `ConstFold` folds an `Ite`
+            // whose condition is a known bool by propagating the taken arm's data
+            // (see `analysis`), rebuild propagates that to parents, and the next
+            // pick is a scan of the surviving arm's own class — no rule derives
+            // either. Anything more is bought at the stall above, not here.
             work.rebuild();
-            // The assumption invalidates the fixpoint; collapsing the arm needs
-            // only the terminating reductions, so pay those and let a later stall
-            // decide whether the full rule set is warranted.
-            work = self.run_reduce(work);
-            saturated = false;
+            rung = Rung::Rebuilt;
             goal = branch;
         }
     }
@@ -843,6 +869,33 @@ impl<'a> VerifyContext<'a> {
         let t = std::time::Instant::now();
         let iters_before = stats::with_stats(|s| s.sat_iterations);
         let out = self.saturate_flat(probe);
+        stats::bump(|s| s.graph_timing.0.probe += t.elapsed().as_secs_f64());
+        stats::bump(|s| s.probe_saturations += 1);
+        stats::bump(|s| s.probe_iterations += s.sat_iterations - iters_before);
+        out
+    }
+
+    /// As [`Self::run_probe`], but stopping as soon as `goal` is settled — for a
+    /// probe whose whole purpose is that one question. Sound only because the graph
+    /// is a throwaway; see `run_rules_until`.
+    pub(crate) fn run_probe_until(
+        &mut self,
+        probe: egg::EGraph<Symbolic, ConstFold>,
+        goal: egg::Id,
+    ) -> egg::EGraph<Symbolic, ConstFold> {
+        let _scope = crate::verify::rewrite::ScratchScope::enter();
+        let t = std::time::Instant::now();
+        let iters_before = stats::with_stats(|s| s.sat_iterations);
+        let (out, iterations) = run_rules_until(
+            probe,
+            self.static_rules
+                .iter()
+                .chain(self.alloc.rules())
+                .chain(self.axiom_rules.iter()),
+            None,
+            Some(goal),
+        );
+        stats::bump(|s| s.record_run(&iterations));
         stats::bump(|s| s.graph_timing.0.probe += t.elapsed().as_secs_f64());
         stats::bump(|s| s.probe_saturations += 1);
         stats::bump(|s| s.probe_iterations += s.sat_iterations - iters_before);
