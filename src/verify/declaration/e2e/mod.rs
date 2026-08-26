@@ -2763,12 +2763,13 @@ method quantified() {
 
 #[test]
 fn statements_after_a_forall_shadow_its_body_temps() {
-    // The quantifier's frame is not reserved: the enclosing stream resumes
-    // numbering at `binder_base`, so a later statement reuses the very temps the
-    // body used: `x + 1` here lands on the very temp the binder had. The two scopes
-    // never overlap in time, so both walks resolve their own `Temp(k)` — the body
-    // against the frame, the method against its own table — and the quantifier
-    // still instantiates at the shadowed term.
+    // The quantifier's frame is not reserved: the body is numbered from the
+    // `forall` step's own temp and the enclosing stream resumes one past it, so a
+    // later statement reuses the very temps the body used: `x + 1` here lands on
+    // the temp the body's first step had. The two scopes never overlap in time, so
+    // both walks resolve their own `Temp(k)` — the body against the frame, the
+    // method against its own table — and the quantifier still instantiates at the
+    // shadowed term.
     let input = r#"
 domain D {
     function foo(i: Int): Bool

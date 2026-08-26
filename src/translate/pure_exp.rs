@@ -678,11 +678,12 @@ impl PureExt for typed::AxiomExt {
 /// through the enclosing `env` to the very temp it already has — nothing to
 /// collect, nothing to remap.
 ///
-/// The step's own temp `p` is allocated first, since the body is numbered from it
-/// (`binder_base == p + 1`, see [`vmir::Forall`]). This sink's counter is left at
-/// `p + 1`, so the enclosing stream shadows the body's temps rather than skipping
-/// past them; the two scopes never overlap in time, so that is sound and it keeps
-/// the verifier's positional value table dense.
+/// The step's own temp `p` is allocated first, since the body is numbered *from*
+/// it (`binder_base == p`, see [`vmir::Forall`]): the first binder shadows the
+/// `forall`'s own boolean, so the quantifier cannot refer to itself. This sink's
+/// counter is left at `p + 1`, so the enclosing stream shadows the body's temps
+/// rather than skipping past them; the two scopes never overlap in time, so that
+/// is sound and it keeps the verifier's positional value table dense.
 fn lower_forall(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
@@ -697,7 +698,7 @@ fn lower_forall(
     let Val::Temp(p) = step else {
         unreachable!("next_val_temp yields a temp")
     };
-    let binder_base = p + 1;
+    let binder_base = p;
 
     // The body's environment: the enclosing one, with the binders bound to the
     // frame's leading temps. Shadowing an enclosing name is exactly what `insert`

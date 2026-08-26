@@ -14,12 +14,13 @@ use std::fmt::{self, Display, Formatter};
 /// | temp | meaning |
 /// |---|---|
 /// | `< p` | free — an enclosing value (this is the capture) |
-/// | `p` | the quantifier's own boolean; never referenced from inside |
 /// | `binder_base .. binder_base + bound.len()` | a binder |
 /// | `>= binder_base + bound.len()` | a body-local step |
 ///
-/// with `binder_base == p + 1`. The enclosing stream resumes numbering at `p + 1`
-/// too, so the body's temps are **shadowed** by whatever follows the quantifier —
+/// with `binder_base == p`: the numbering starts *at* the `forall` step's own
+/// temp, so the first binder **shadows** that boolean and the quantifier has no
+/// way to refer to itself. The enclosing stream resumes numbering at `p + 1`, so
+/// the body's temps are likewise shadowed by whatever follows the quantifier —
 /// ordinary lexical scoping, and harmless because the two scopes never overlap in
 /// time: the body can only mention temps that already exist when the quantifier is
 /// reached.
@@ -32,10 +33,11 @@ use std::fmt::{self, Display, Formatter};
 /// the inner quantifier with the outer σ baked into the children.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Forall {
-    /// The first temp this quantifier owns — one past the `forall` step's own
-    /// temp. Redundant with that step's position in the enclosing stream, but kept
-    /// here so a `Forall` is self-contained: it is passed around alone (recipe
-    /// interning, well-definedness checking) with no access to its host.
+    /// The first temp this quantifier owns — the `forall` step's own temp, which
+    /// the first binder therefore shadows. Redundant with that step's position in
+    /// the enclosing stream, but kept here so a `Forall` is self-contained: it is
+    /// passed around alone (recipe interning, well-definedness checking) with no
+    /// access to its host.
     pub binder_base: usize,
     /// The binder types; binder `i` is `Val::Temp(binder_base + i)`.
     pub bound: Box<[Type]>,
@@ -195,15 +197,15 @@ impl<'a> Display for VmirDisplay<'a, &'a TrigTerm> {
 /// enclosing temps — there is no capture list to print:
 ///
 /// ```text
-///   e1: Bool := forall e2: Int :: {f(e0, e2)} {
-///     e3: Bool := f(e0, e2)
-///     result: e3
+///   e1: Bool := forall e1: Int :: {f(e0, e1)} {
+///     e2: Bool := f(e0, e1)
+///     result: e2
 ///   }
 /// ```
 ///
-/// The binders and the body continue the enclosing numbering from the `forall`
-/// step's own temp (`e1` here), and the enclosing stream resumes at `e2` — so the
-/// nesting, not the numbering, is what tells the two scopes apart.
+/// The binders and the body start the numbering *at* the `forall` step's own temp
+/// (`e1` here, shadowed by the first binder), and the enclosing stream resumes at
+/// `e2` — so the nesting, not the numbering, is what tells the two scopes apart.
 impl<'a> Display for VmirDisplay<'a, &'a Forall> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let q = self.item;

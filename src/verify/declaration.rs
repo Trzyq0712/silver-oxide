@@ -127,10 +127,11 @@ impl EvalState {
 
     /// The evaluation state a quantifier body starts from. Capture is implicit —
     /// the body indexes *this* table directly (see [`vmir::Forall`]) — so the frame
-    /// is this state cut to `binder_base`, with the one slot in between filled by
-    /// `dead`: that is the `forall` step's own boolean, which nothing inside it can
-    /// name. Heaps are dropped; a quantifier body is heap-free by construction.
-    fn frame_for(&self, q: &vmir::Forall, dead: egg::Id) -> Self {
+    /// is this state cut to `binder_base`, which is the `forall` step's own temp:
+    /// the first binder takes that slot, so the step's own boolean is unnameable
+    /// from inside. Heaps are dropped; a quantifier body is heap-free by
+    /// construction.
+    fn frame_for(&self, q: &vmir::Forall) -> Self {
         let mut frame = Self {
             vals: self.vals.clone(),
             val_types: self.val_types.clone(),
@@ -141,9 +142,12 @@ impl EvalState {
             perm_defs: Vec::new(),
             dead_heaps: std::collections::HashSet::new(),
         };
-        frame.vals.resize(q.binder_base, dead);
-        frame.val_types.resize(q.binder_base, Type::Bool);
-        frame.recipes.resize(q.binder_base, None);
+        // The step itself is not evaluated yet, so the table ends exactly at its
+        // temp; the truncation is a no-op guard, not a cut.
+        debug_assert!(frame.vals.len() >= q.binder_base);
+        frame.vals.truncate(q.binder_base);
+        frame.val_types.truncate(q.binder_base);
+        frame.recipes.truncate(q.binder_base);
         frame
     }
 
@@ -2154,9 +2158,9 @@ fn check_forall_wd_in_scratch(
     host_pc: &[(egg::Id, Polarity)],
 ) -> Result<(), VerifyError> {
     // Capture is implicit: the body indexes the *enclosing* value table directly,
-    // so the body's state is that table cut to the quantifier's frame. The one slot
-    // between is the `forall` step's own boolean, which its body cannot mention.
-    let mut state = host.frame_for(q, expr!(ctx, true));
+    // so the body's state is that table cut to the quantifier's frame — which
+    // starts at the `forall` step's own temp, shadowed by the first binder.
+    let mut state = host.frame_for(q);
     for ty in q.bound.iter() {
         let fresh = ctx.fresh_symbolic_value(ty.clone());
         state.push_val(fresh, ty.clone(), None);
