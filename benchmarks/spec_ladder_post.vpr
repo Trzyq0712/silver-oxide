@@ -1,0 +1,20 @@
+// The `spec_ladder` control plus a **vacuous** `ensures true` on every level.
+// The post facts say nothing, yet `need_build = do_union || !facts.is_empty()`
+// materializes a body at every spec-position occurrence anyway, roughly doubling
+// the peak node count. Stage 4 of `design/function-facts/` must bring this file
+// back to `spec_ladder`'s cost.
+function v0(x: Int): Bool ensures true { x > 0 }
+function v1(x: Int): Bool ensures true { v0(x) }
+function v2(x: Int): Bool ensures true { v1(x) }
+function v3(x: Int): Bool ensures true { v2(x) }
+function v4(x: Int): Bool ensures true { v3(x) }
+function v5(x: Int): Bool ensures true { v4(x) }
+function v6(x: Int): Bool ensures true { v5(x) }
+function v7(x: Int): Bool ensures true { v6(x) }
+function v8(x: Int): Bool ensures true { v7(x) }
+
+method ladder(x: Int)
+  requires v8(x)
+{
+  assert v8(x)
+}

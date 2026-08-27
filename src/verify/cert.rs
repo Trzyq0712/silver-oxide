@@ -46,15 +46,17 @@ pub(crate) struct FunctionDefinition {
     /// Guarded facts this function's verification established, replayed at
     /// every occurrence of `f(args)` (Silicon's `bodyProp`/`post` axioms).
     /// Derived from the body's `Assert` insts — each was *proven* under
-    /// `pre ∧ pc`, so replaying it guarded is unconditionally sound. Empty for
-    /// a heap-dependent function (its pre-token encoding is deferred).
+    /// `pre ∧ pc`, so replaying it guarded is unconditionally sound. Carried by
+    /// heap-free and heap-dependent functions alike (a heap-dependent function's
+    /// post is stated over its snapshot parameter like any other arg).
     pub(crate) facts: Vec<Fact>,
 }
 
 /// One exported fact of a [`FunctionDefinition`]: `guards ⟹ cond`, both over
-/// the definition's recipe-temp space. `guards` is outermost-first — the
-/// pre-token (the function's own `f#requires(params)` application) first, then
-/// the originating assert's path condition — and is folded innermost-first at
+/// the definition's recipe-temp space. `guards` is the originating assert's
+/// path condition and nothing else — the precondition gate is the call-site
+/// `f%pre` token, applied outside `guards` at replay (see
+/// [`RecipeBuilder::export_fact`]). Outermost-first, folded innermost-first at
 /// replay, matching `VerifyContext::implication`.
 #[derive(Clone)]
 pub(crate) struct Fact {
@@ -77,10 +79,9 @@ pub(crate) struct Fact {
 /// `f(x) { b ? g(x) : .. }`. Without the guards the release is too eager: `g`'s
 /// own axioms would fire at args where this body never calls it.
 ///
-/// Deliberately not a [`Fact`]: `post` is meaningless here, and
-/// [`RecipeBuilder::export_fact`] prepends the `#requires` application as a
-/// fact's outermost guard, which a token must not inherit (its outer gate is the
-/// call-site token, applied at release time).
+/// Deliberately not a [`Fact`]: `post` is meaningless here, and the two are
+/// released at different points of [`FunctionUnfoldApplier`] — a fact only on the
+/// first build, a token step on every (re-)union.
 ///
 /// `guards` is outermost-first, like [`Fact::guards`], and folded innermost-first
 /// at release.

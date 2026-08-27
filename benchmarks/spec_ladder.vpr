@@ -1,0 +1,20 @@
+// 8-deep validator ladder, control case: each level's body calls the next-lower
+// one and the ladder occurs only in spec position (a method's `requires`), so no
+// value-position call mints a `%pre` token for it. Pairs with `spec_ladder_post`,
+// which differs only by a vacuous `ensures true` per level — the gap between the
+// two is what `design/function-facts/` Stage 4 closes.
+function v0(x: Int): Bool { x > 0 }
+function v1(x: Int): Bool { v0(x) }
+function v2(x: Int): Bool { v1(x) }
+function v3(x: Int): Bool { v2(x) }
+function v4(x: Int): Bool { v3(x) }
+function v5(x: Int): Bool { v4(x) }
+function v6(x: Int): Bool { v5(x) }
+function v7(x: Int): Bool { v6(x) }
+function v8(x: Int): Bool { v7(x) }
+
+method ladder(x: Int)
+  requires v8(x)
+{
+  assert v8(x)
+}

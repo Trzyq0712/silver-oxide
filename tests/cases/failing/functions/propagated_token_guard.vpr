@@ -1,0 +1,19 @@
+// The propagated precondition token must stay behind the enclosing `f%pre`.
+//
+// `f`'s body calls `g`, so `f`'s definition carries a propagated token step for
+// `g%pre(x)`. That step is released as `f%pre(a) ==> g%pre(a)`. Strip the
+// `f%pre(a) ==>` and `g`'s vacuously-false postcondition escapes onto the `!b`
+// arm, where `f` is never called — and `assert false` verifies.
+//
+// README fact 2 of `design/function-facts/`. Must keep being rejected.
+function g(a: Int): Bool
+  ensures false
+
+function f(x: Int): Bool
+{ g(x) }
+
+method leak(b: Bool)
+{
+  var r: Bool := b ? f(1) : true
+  assert false
+}
