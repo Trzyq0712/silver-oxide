@@ -237,13 +237,6 @@ pub(crate) struct RecipeBuilder {
     /// address and permission (sliced into standalone [`SlotRecipe`]s at the
     /// end of the walk).
     pub(crate) pending_slots: Vec<(LocationKind, Type, Val, PermRecipe<Val>)>,
-    /// This recipe is a **spec** body — a contract function (`#requires` /
-    /// `#ensures`), i.e. a lowered pre/postcondition. Its nested function calls
-    /// are spec-position occurrences (Silicon's limited symbol), so they emit **no**
-    /// precondition-propagation token: when this body is unfolded at a client the
-    /// callees stay dormant, discharged by congruence rather than by unfolding.
-    /// A regular function body (value position) sets this `false` and propagates.
-    spec: bool,
     /// Orphan steps that must survive [`Self::slice`]'s backward closure: the
     /// `g%pre` precondition tokens emitted alongside a callee application. Their
     /// value is never consumed, so reachability-from-the-result would prune them
@@ -265,28 +258,16 @@ impl RecipeBuilder {
             steps: Vec::new(),
             recursive_scc,
             pending_slots: Vec::new(),
-            spec: false,
             token_steps: Vec::new(),
         }
     }
 
-    /// Mark this recipe as a spec (contract-function) body — suppresses
-    /// precondition-propagation token emission (see [`Self::spec`]).
     /// Record an orphan `g%pre` token step so [`Self::slice`] keeps it (see
     /// [`Self::token_steps`]), together with the callee-internal path condition of
     /// the call it accompanies — empty when the walk has no recipe-space pc to
     /// offer, which reproduces the pre-guard behavior (see [`TokenStep`]).
     pub(crate) fn record_token_step(&mut self, token: Val, guards: Vec<(Val, Polarity)>) {
         self.token_steps.push(TokenStep { token, guards });
-    }
-
-    pub(crate) fn mark_spec(&mut self) {
-        self.spec = true;
-    }
-
-    /// Whether this is a spec (contract-function) recipe body.
-    pub(crate) fn is_spec(&self) -> bool {
-        self.spec
     }
 
     fn next_temp(&self) -> Val {

@@ -282,6 +282,8 @@ impl FunctionTranslator<'_, Metaed> {
                 Some(result),
                 wf_contract,
                 snap_entry,
+                // This *is* the `#ensures` contract definition: a spec body.
+                true,
             )?;
             let name = definer.intern_name(&format!("{fname}#ensures"));
             definer.define_function(
@@ -341,6 +343,8 @@ impl FunctionTranslator<'_, Metaed> {
                 None,
                 Some(contract),
                 snap_entry,
+                // The function's own body: a value position.
+                false,
             )?),
         };
         let name = definer.intern_name(&fname);

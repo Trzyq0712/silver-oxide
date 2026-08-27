@@ -50,6 +50,8 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
                     function: pred_id,
                     type_args: Vec::new(),
                     args: args.into(),
+                    // A predicate `@addr`, not a Silver `function`.
+                    export: false,
                 }),
             ))
         }
@@ -86,6 +88,8 @@ pub(crate) fn field_addr(
             function: field_id,
             type_args: Vec::new(),
             args: vec![base].into(),
+            // A field `@addr`, not a Silver `function`.
+            export: false,
         }),
     ))
 }

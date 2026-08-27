@@ -373,6 +373,7 @@ mod tests {
             function: callee,
             type_args: vec![],
             args: vec![].into(),
+            export: true,
         };
         let inst = Inst {
             pc: PathConds::default(),

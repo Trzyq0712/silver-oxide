@@ -140,6 +140,31 @@ pub struct FunctionCall {
     pub function: MemberId,
     pub type_args: Vec<Type>,
     pub args: Args,
+    /// **Export** this call's callee precondition token: when the body containing
+    /// this call is replayed at a call site, release the callee's `%pre(args)`
+    /// there under this call's path condition (Silicon's
+    /// `bodyPreconditionPropagation`). Rendered as a leading `export`.
+    ///
+    /// Set by the translator, which knows why it emitted the call, rather than
+    /// re-derived by the verifier from the call's shape. It is `true` for a
+    /// genuine value-position use of a Silver `function` — the one whose result
+    /// flows onward, so whose application really is materialized at the caller
+    /// and really does need its token. It is `false` for:
+    ///
+    /// - a call inside a **spec** body (a `#requires` / `#ensures` definition):
+    ///   unfolding a contract at a client must leave its callees dormant,
+    ///   discharged by congruence rather than by unfolding;
+    /// - an **obligation** call — `g#requires(gargs)` before a call, the exit
+    ///   `f#ensures(..)` — which feeds no result, and whose callee is a contract
+    ///   member whose rule is ungated anyway, so the released token is junk;
+    /// - a field or predicate `@addr` application and a domain function, which are
+    ///   not Silver `function`s at all: no body recipe, no unfold rule, nothing a
+    ///   token could activate.
+    ///
+    /// The verifier still mints the token *at* the call while checking this body
+    /// itself; that is a different role of the same token (presence here vs.
+    /// re-release there) and this flag does not govern it.
+    pub export: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -264,6 +289,9 @@ impl Display for VmirDisplay<'_, &'_ FunctionCall> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let function = self.member(self.item.function);
         let args = &self.item.args;
+        if self.item.export {
+            write!(f, "export ")?;
+        }
         write!(f, "{function}")?;
         // A generic call shows its full type-argument instantiation in angle
         // brackets (`[..]` is reserved for heaps / addr groups).

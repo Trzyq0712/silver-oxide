@@ -420,13 +420,19 @@ fn eval_pure_inst(
                     func_id
                 };
                 // Precondition propagation (Silicon's `bodyPreconditionPropagation`):
-                // in a **value** (non-spec) body, emit the non-recursive callee's
-                // `g%pre(gargs)` token as an orphan recipe step so that when *this*
-                // body is unfolded (its own token present), the nested token
-                // re-materializes and `g` may unfold in turn — the cascade proceeds
-                // down genuine value chains. A **spec** (contract) body emits none,
-                // so its callees stay dormant when it is unfolded at a client.
-                let propagate = !recursive && !ctx.recipe.as_ref().unwrap().is_spec();
+                // emit the callee's `g%pre(gargs)` token as an orphan recipe step so
+                // that when *this* body is unfolded (its own token present), the
+                // nested token re-materializes and `g` may unfold in turn — the
+                // cascade proceeds down genuine value chains.
+                //
+                // Which calls those are is the **translator's** call, carried on the
+                // inst as `FunctionCall::export`: a value-position use of a Silver
+                // function exports, an obligation call / a call inside a contract
+                // definition / an `@addr` or domain application does not. A
+                // recursive call is excluded here rather than there, because SCC
+                // membership is a verifier fact: it already targets the limited twin
+                // `f'`, which has no unfold rule for a token to trigger.
+                let propagate = fc.export && !recursive;
                 let g_pre = propagate.then(|| {
                     let name = ctx.member_name(fc.function);
                     ctx.alloc.fn_pre_token(fc.function, &name)
@@ -2529,17 +2535,10 @@ pub(crate) fn verify_function(
     // `ensures` link once the walk is done (`post_fact`). No precondition guard
     // is prepared: a function's facts are gated by its `f%pre` token, released
     // at the call.
-    let mut recipe =
-        crate::verify::cert::RecipeBuilder::new(function.params.len(), recursive_scc.cloned());
-    // A **contract** function (some other function's `#requires`/`#ensures`, i.e. a
-    // lowered pre/postcondition) is a spec body: its nested calls emit no
-    // precondition-propagation token, so unfolding it at a client leaves the
-    // callees dormant (discharged by congruence, not by unfolding) — the pcguard
-    // validator-ladder win. A regular function body stays a value position.
-    if contract_members(program).contains(&self_id) {
-        recipe.mark_spec();
-    }
-    ctx.recipe = Some(recipe);
+    ctx.recipe = Some(crate::verify::cert::RecipeBuilder::new(
+        function.params.len(),
+        recursive_scc.cloned(),
+    ));
     // Recursive batch: every SCC member's spec-derived post axiom is available
     // while this body is checked (Silicon emits `post` in phase 1, before the
     // phase-2 body check) — this is what lets the exit assert use a recursive
