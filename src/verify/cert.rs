@@ -55,9 +55,8 @@ pub(crate) struct FunctionDefinition {
 /// One exported fact of a [`FunctionDefinition`]: `guards ⟹ cond`, both over
 /// the definition's recipe-temp space. `guards` is the originating assert's
 /// path condition and nothing else — the precondition gate is the call-site
-/// `f%pre` token, applied outside `guards` at replay (see
-/// [`RecipeBuilder::export_fact`]). Outermost-first, folded innermost-first at
-/// replay, matching `VerifyContext::implication`.
+/// `f%pre` token, applied outside `guards` at replay. Outermost-first, folded
+/// innermost-first at replay, matching `VerifyContext::implication`.
 #[derive(Clone)]
 pub(crate) struct Fact {
     pub(crate) guards: Vec<(Val, Polarity)>,
@@ -323,19 +322,6 @@ impl RecipeBuilder {
 
     pub(crate) fn is_recursive_callee(&self, m: MemberId) -> bool {
         self.recursive_scc.as_ref().is_some_and(|s| s.contains(&m))
-    }
-
-    /// Export a guarded fact under the caller-supplied (already
-    /// recipe-translated) path-condition guards.
-    ///
-    /// A fact carries **no precondition guard of its own**. Its release is gated
-    /// by the function's `f%pre` token, which is minted and released only at a
-    /// value-position call — and `lower_func_app` emits that call's precondition
-    /// check at the same point, over the same args, unconditionally. So "the
-    /// token is true here" already means "the precondition was established
-    /// here", and a second conjunct restating it added nothing.
-    pub(crate) fn export_fact(&mut self, pc: Vec<(Val, Polarity)>, cond: Val, post: bool) {
-        self.facts.push(Fact { guards: pc, cond, post });
     }
 
     /// Consume the builder into a function definition's parts. A function

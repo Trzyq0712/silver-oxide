@@ -1,0 +1,35 @@
+// Heap-free preconditions in a call chain. Each level's body calls the next
+// down, so each body carries an `assert step{i-1}#requires(x)` discharged by
+// congruence from its own entry assumption, and the client calls the top of the
+// chain under a path condition.
+//
+// Before Stage 2 of `design/function-facts/` every one of those asserts was
+// *also* exported as a guarded fact, so the `#requires` formula inlined and
+// cascaded at each occurrence. An assert is now a pure obligation and publishes
+// nothing; the propagated `%pre` token still rides down the chain.
+function step0(x: Int): Int
+  requires 0 < x
+{ x }
+
+function step1(x: Int): Int
+  requires 0 < x
+{ step0(x) }
+
+function step2(x: Int): Int
+  requires 0 < x
+{ step1(x) }
+
+function step3(x: Int): Int
+  requires 0 < x
+{ step2(x) }
+
+function step4(x: Int): Int
+  requires 0 < x
+{ step3(x) }
+
+method client(b: Bool, x: Int)
+  requires 0 < x
+{
+  var r: Int := b ? step4(x) : 0
+  assert b ==> 0 < r
+}

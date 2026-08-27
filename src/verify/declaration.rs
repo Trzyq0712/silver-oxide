@@ -1216,18 +1216,13 @@ fn eval_method_inst(
                 }
                 return Err(VerifyError::AssertionFailed);
             }
-            // A certificate walk re-exports the assert as a guarded fact —
-            // it was *proven* under `pre ∧ pc`, so replaying it guarded at
-            // every occurrence of the function is unconditionally sound
-            // (Silicon's `bodyProp`). The exit `assert f#ensures(..)` is not
-            // special-cased here: the exported post comes from the declaration's
-            // `ensures` link (see `post_fact`), and this assert is a pure
-            // obligation like any other.
-            if ctx.recipe.is_some() {
-                let pc_r = state.recipe_pc(&inst.pc)?;
-                let cond = state.require_recipe(val, OPERAND_RECIPE)?;
-                ctx.recipe.as_mut().unwrap().export_fact(pc_r, cond, false);
-            }
+            // An assert in a body **publishes nothing**. `ensures` is a
+            // function's single export mechanism (`post_fact`, built from the
+            // declaration link), and this assert — the exit `f#ensures(..)`, or a
+            // heap-free callee's `g#requires(gargs)` — is a pure obligation:
+            // discharged here and dropped. Silicon likewise hands a caller the
+            // nested `g%precondition` *stamp* (our propagated `TokenStep`), never
+            // the precondition formula.
         }
         InstKind::Refute(val) => {
             // `refute A` succeeds iff `A` is NOT provable in this state.
@@ -2662,8 +2657,8 @@ fn contract_members(program: &vmir::Program) -> std::collections::HashSet<Member
 /// Temps therefore continue from wherever that stream ended.
 ///
 /// The fact carries **no guards of its own**: it is gated by the call-site
-/// `f%pre` token, which exists exactly where the precondition was checked (see
-/// [`RecipeBuilder::export_fact`]). It expresses the result as the application
+/// `f%pre` token, which is minted exactly where the precondition was checked.
+/// It expresses the result as the application
 /// `f(params)` — not a rebuilt body — so at a recursive unroll's `f'(smaller)`
 /// occurrence it talks about that very node, which is Silicon's `post` axiom.
 fn post_fact(
