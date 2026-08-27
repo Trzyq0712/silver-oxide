@@ -392,6 +392,9 @@ fn eval_pure_inst(
             // function-unfold encoding; every axiom above inherits it transitively
             // through the token. `.rev()` because `pc_lits` is outermost-first and
             // `implication` folds innermost-first (cf. `InstKind::Assume`).
+            if ctx
+                .fn_certs
+                .is_none_or(|certs| certs.contains_key(&fc.function))
             {
                 let name = ctx.member_name(fc.function);
                 let tok = ctx.alloc.fn_pre_token(fc.function, &name);
