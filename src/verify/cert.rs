@@ -34,7 +34,7 @@ pub(crate) struct FunctionDefinition {
     /// `f(x) == f'(x)` at every full occurrence, and the recipe's own in-SCC
     /// recursive calls already target `f'` (uninterpreted) so unfolding halts
     /// after one level. `None` for a non-recursive function (unchanged behavior).
-    pub(crate) limited: Option<crate::verify::lang::FuncId>,
+    pub(crate) limited: Option<FuncId>,
     /// Temps holding a nested callee's `g%pre(gargs)` token — Silicon's
     /// `bodyPreconditionPropagation`, emitted as an ordinary `App` step whose
     /// value is never read (see [`RecipeBuilder::token_steps`]). Rebuilding a step
@@ -221,22 +221,6 @@ enum RecipeStep {
     Inst(AxiomInst),
 }
 
-/// Post-fact metadata of a function under verification: how to recognize and
-/// re-shape the exit `assert f#ensures(..)` into the exported `post` fact
-/// `ens(params, f(params))` (with the limited twin `f'` when recursive).
-pub(crate) struct PostMeta {
-    /// The `#ensures` contract function's member (spotted via `callee_of`).
-    pub(crate) ensures_member: MemberId,
-    /// Its verifier `FuncId`.
-    pub(crate) ensures_func: FuncId,
-    /// This function's own id in the fact — the limited twin for a recursive
-    /// function (Silicon triggers `post` on `f'`), the full id otherwise.
-    pub(crate) self_func: FuncId,
-    /// The ensures link's argument shape (`Val` in body-temp space, or the
-    /// function's own result).
-    pub(crate) args: Vec<crate::vmir::ContractArg>,
-}
-
 /// The recipe under construction during a function's or resource's **single**
 /// eval walk: pure steps are mirrored into this stream as the body is
 /// evaluated, so the certificate falls out of verification itself (no second
@@ -245,15 +229,13 @@ pub(crate) struct PostMeta {
 pub(crate) struct RecipeBuilder {
     n_params: usize,
     steps: Vec<RecipeStep>,
-    /// Guarded facts exported so far (`Assert`s and nested pre-tokens).
+    /// Guarded facts exported so far (`Assert`s and nested pre-tokens). The
+    /// **post** fact is not among them: it is built from the declaration's
+    /// `ensures` link after the walk, not recognized out of the body.
     pub(crate) facts: Vec<Fact>,
-    /// Body-temp index of each `FunctionCall` → callee (post-assert detection).
-    callee_of: std::collections::HashMap<usize, MemberId>,
     /// In-SCC callees (a recursion cycle's members), lowered to their limited
     /// twin so a downstream unfold halts after one level.
     recursive_scc: Option<std::collections::HashSet<MemberId>>,
-    /// Exit-post shaping — functions with an ensures link only.
-    pub(crate) post_meta: Option<PostMeta>,
     /// Footprint slots recorded by a resource body's `acc`s, in body order:
     /// the slot's location kind, element type, and the recipe temps of its
     /// address and permission (sliced into standalone [`SlotRecipe`]s at the
@@ -281,15 +263,12 @@ impl RecipeBuilder {
     pub(crate) fn new(
         n_params: usize,
         recursive_scc: Option<std::collections::HashSet<MemberId>>,
-        post_meta: Option<PostMeta>,
     ) -> Self {
         Self {
             n_params,
             steps: Vec::new(),
             facts: Vec::new(),
-            callee_of: std::collections::HashMap::new(),
             recursive_scc,
-            post_meta,
             pending_slots: Vec::new(),
             spec: false,
             token_steps: Vec::new(),
@@ -342,14 +321,6 @@ impl RecipeBuilder {
         v
     }
 
-    pub(crate) fn record_callee(&mut self, body_temp: usize, callee: MemberId) {
-        self.callee_of.insert(body_temp, callee);
-    }
-
-    pub(crate) fn callee_at(&self, body_temp: usize) -> Option<MemberId> {
-        self.callee_of.get(&body_temp).copied()
-    }
-
     pub(crate) fn is_recursive_callee(&self, m: MemberId) -> bool {
         self.recursive_scc.as_ref().is_some_and(|s| s.contains(&m))
     }
@@ -365,42 +336,6 @@ impl RecipeBuilder {
     /// here", and a second conjunct restating it added nothing.
     pub(crate) fn export_fact(&mut self, pc: Vec<(Val, Polarity)>, cond: Val, post: bool) {
         self.facts.push(Fact { guards: pc, cond, post });
-    }
-
-    /// Whether an `Assert`ed value is the exit `assert f#ensures(..)` — a body
-    /// temp holding a call to the ensures contract member.
-    pub(crate) fn is_post_assert(&self, val: &Val) -> bool {
-        let Some(pm) = self.post_meta.as_ref() else {
-            return false;
-        };
-        matches!(val, Val::Temp(n) if self.callee_at(*n) == Some(pm.ensures_member))
-    }
-
-    /// Export the exit-post fact `ens(params, f(params))` (with the limited
-    /// twin for a recursive function): the fact expresses the result as the
-    /// application itself — not the rebuilt body — so at a recursive unroll's
-    /// `f'(smaller)` occurrence the fact talks about that very node (Silicon's
-    /// `post` axiom). `args` are the ensures link's arguments, already
-    /// recipe-translated; `None` marks the `Result` slot.
-    pub(crate) fn export_post_fact(&mut self, pc: Vec<(Val, Polarity)>, args: Vec<Option<Val>>) {
-        let pm = self.post_meta.as_ref().expect("post fact needs post_meta");
-        let (self_func, ens_func) = (pm.self_func, pm.ensures_func);
-        let params: Vec<Val> = (0..self.n_params).map(Val::Temp).collect();
-        let self_app = self.emit(AxiomPure::App {
-            func: self_func,
-            type_args: Vec::new(),
-            args: params,
-        });
-        let args = args
-            .into_iter()
-            .map(|a| a.unwrap_or_else(|| self_app.clone()))
-            .collect();
-        let cond = self.emit(AxiomPure::App {
-            func: ens_func,
-            type_args: Vec::new(),
-            args,
-        });
-        self.export_fact(pc, cond, true);
     }
 
     /// Consume the builder into a function definition's parts. A function

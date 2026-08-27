@@ -431,11 +431,7 @@ fn eval_pure_inst(
                     let name = ctx.member_name(fc.function);
                     ctx.alloc.fn_pre_token(fc.function, &name)
                 });
-                // Record the callee under the body temp this inst will occupy,
-                // to spot the exit `assert f#ensures(..)`.
-                let body_temp = state.vals.len();
                 let rb = ctx.recipe.as_mut().unwrap();
-                rb.record_callee(body_temp, fc.function);
                 let call = rb.emit(AxiomPure::App {
                     func,
                     type_args: fc.type_args.clone(),
@@ -1223,33 +1219,14 @@ fn eval_method_inst(
             // A certificate walk re-exports the assert as a guarded fact —
             // it was *proven* under `pre ∧ pc`, so replaying it guarded at
             // every occurrence of the function is unconditionally sound
-            // (Silicon's `bodyProp`; the exit post assert is its `post` axiom).
+            // (Silicon's `bodyProp`). The exit `assert f#ensures(..)` is not
+            // special-cased here: the exported post comes from the declaration's
+            // `ensures` link (see `post_fact`), and this assert is a pure
+            // obligation like any other.
             if ctx.recipe.is_some() {
                 let pc_r = state.recipe_pc(&inst.pc)?;
-                if ctx.recipe.as_ref().unwrap().is_post_assert(val) {
-                    let pm_args = ctx
-                        .recipe
-                        .as_ref()
-                        .unwrap()
-                        .post_meta
-                        .as_ref()
-                        .unwrap()
-                        .args
-                        .clone();
-                    let args: Vec<Option<Val>> = pm_args
-                        .iter()
-                        .map(|a| match a {
-                            vmir::ContractArg::Val(v) => {
-                                state.require_recipe(v, OPERAND_RECIPE).map(Some)
-                            }
-                            vmir::ContractArg::Result => Ok(None),
-                        })
-                        .collect::<Result<_, _>>()?;
-                    ctx.recipe.as_mut().unwrap().export_post_fact(pc_r, args);
-                } else {
-                    let cond = state.require_recipe(val, OPERAND_RECIPE)?;
-                    ctx.recipe.as_mut().unwrap().export_fact(pc_r, cond, false);
-                }
+                let cond = state.require_recipe(val, OPERAND_RECIPE)?;
+                ctx.recipe.as_mut().unwrap().export_fact(pc_r, cond, false);
             }
         }
         InstKind::Refute(val) => {
@@ -2443,7 +2420,6 @@ pub(crate) fn verify_resource(
     ctx.recipe = Some(crate::verify::cert::RecipeBuilder::new(
         resource.params.len(),
         None,
-        None,
     ));
     let params: Vec<egg::Id> = resource
         .params
@@ -2552,29 +2528,14 @@ pub(crate) fn verify_function(
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
     assume_axioms(&mut ctx, program)?;
-    // The certificate recipe is built by the walk itself (single pass): the
-    // limited-twin substitution set and the exit-post shape are fixed up front.
-    // No precondition guard is prepared -- a function's facts are gated by its
-    // `f%pre` token, released at the call.
-    let post_meta = function.ensures.as_ref().map(|en| {
-        let self_func = if recursive_scc.is_some() {
-            let name = ctx.member_name(self_id);
-            ctx.alloc.limited(self_id, &name)
-        } else {
-            crate::verify::func_registry::func_id_for_member(self_id)
-        };
-        crate::verify::cert::PostMeta {
-            ensures_member: en.member,
-            ensures_func: crate::verify::func_registry::func_id_for_member(en.member),
-            self_func,
-            args: en.args.clone(),
-        }
-    });
-    let mut recipe = crate::verify::cert::RecipeBuilder::new(
-        function.params.len(),
-        recursive_scc.cloned(),
-        post_meta,
-    );
+    // The certificate recipe is built by the walk itself (single pass): only the
+    // limited-twin substitution set is fixed up front. The exported post is not
+    // recognized out of the walk at all -- it is built from the declaration's
+    // `ensures` link once the walk is done (`post_fact`). No precondition guard
+    // is prepared: a function's facts are gated by its `f%pre` token, released
+    // at the call.
+    let mut recipe =
+        crate::verify::cert::RecipeBuilder::new(function.params.len(), recursive_scc.cloned());
     // A **contract** function (some other function's `#requires`/`#ensures`, i.e. a
     // lowered pre/postcondition) is a spec body: its nested calls emit no
     // precondition-propagation token, so unfolding it at a client leaves the
@@ -2633,7 +2594,21 @@ pub(crate) fn verify_function(
     // entry `assume f#requires` was dropped (Finding B — `Assume` emits no
     // recipe step, so the precondition cannot leak into callers).
     let rb = ctx.recipe.take().expect("function walk builds a recipe");
-    let (steps, facts, token_steps) = rb.into_function_parts()?;
+    let (mut steps, mut facts, token_steps) = rb.into_function_parts()?;
+    // `ensures` is the single export mechanism: the post fact is built from the
+    // declaration link, identically to an abstract function's, and appended to
+    // the body's stream. The body's own exit `assert f#ensures(..)` stayed a
+    // pure obligation — it proved the link, it does not publish it.
+    if let Some(post) = post_fact(
+        ctx.alloc,
+        program,
+        self_id,
+        function,
+        recursive_scc.is_some(),
+        &mut steps,
+    ) {
+        facts.push(post);
+    }
     let res = state
         .recipe_of(&body.res)
         .ok_or(VerifyError::Unimplemented(
@@ -2676,35 +2651,41 @@ fn contract_members(program: &vmir::Program) -> std::collections::HashSet<Member
     set
 }
 
-/// Synthesize an **abstract** function's definition: no body, nothing to
-/// verify — just the guarded post axiom `pre-token ⟹ f#ensures(params,
-/// f(params))` built from the contract links. (Silicon's phase 1 emits
-/// `post`/`postProp` for abstract functions once the spec is well-defined; our
-/// contract decls get that WF check as ordinary `Function` verification,
-/// scheduled first by the link edges in `analyze`.) `None` when there is nothing
-/// to export: no ensures, or a generic function.
-fn contract_post_definition(
+/// The **single** fact a function publishes to its callers: `f#ensures(params,
+/// f(params))`, built from the declaration's `ensures` link — never from
+/// anything the body contains. Identical for abstract and bodied functions,
+/// heap-free and heap-dependent ones (a heap-dependent function's snapshot is a
+/// trailing param, so it is just another `ContractArg::Val`).
+///
+/// The steps are appended to `steps`, which is the definition's shared recipe
+/// stream: empty for an abstract function, the body's stream for a bodied one.
+/// Temps therefore continue from wherever that stream ended.
+///
+/// The fact carries **no guards of its own**: it is gated by the call-site
+/// `f%pre` token, which exists exactly where the precondition was checked (see
+/// [`RecipeBuilder::export_fact`]). It expresses the result as the application
+/// `f(params)` — not a rebuilt body — so at a recursive unroll's `f'(smaller)`
+/// occurrence it talks about that very node, which is Silicon's `post` axiom.
+fn post_fact(
     alloc: &mut crate::verify::func_registry::FuncRegistry,
     program: &vmir::Program,
     self_id: MemberId,
     function: &Function,
     // Set when this is the function's *own* definition and it sits in a
     // recursion cycle: the fact then expresses the result as the limited twin
-    // `f'(params)` and the definition records `f'`, so the unfold rule frames
-    // `f(x) == f'(x)`. Without the frame an abstract SCC member would be
-    // unreachable from a sibling's recipe, which lowers it to `f'`. Cleared for
-    // the in-batch pre-seed (rules keyed on the full ids, no frames installed
-    // yet).
+    // `f'(params)`, matching the `f(x) == f'(x)` frame its unfold rule installs.
+    // Without the frame an abstract SCC member would be unreachable from a
+    // sibling's recipe, which lowers it to `f'`. Cleared for the in-batch
+    // pre-seed (rules keyed on the full ids, no frames installed yet).
     recursive: bool,
-) -> Option<std::sync::Arc<FunctionDefinition>> {
+    steps: &mut Vec<crate::verify::rewrite::AxiomInst>,
+) -> Option<crate::verify::cert::Fact> {
     use crate::verify::cert::Fact;
     use crate::verify::func_registry::func_id_for_member;
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
 
     let en = function.ensures.as_ref()?;
-    let limited = recursive.then(|| alloc.limited(self_id, program.name(self_id)));
     let n_params = function.params.len();
-    let mut steps: Vec<AxiomInst> = Vec::new();
     let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
         let v = Val::Temp(n_params + steps.len());
         steps.push(AxiomInst::Val(pure));
@@ -2712,13 +2693,13 @@ fn contract_post_definition(
     };
     // Link args are over the params (`Temp(0..n_params)`) — identity in recipe
     // space, so they can be used verbatim.
-    // No precondition guard: like every other function, an abstract function's
-    // fact is gated by its `f%pre` token, released at the call.
-    let guards = Vec::new();
     let self_app = emit(
-        &mut steps,
+        steps,
         AxiomPure::App {
-            func: limited.unwrap_or_else(|| func_id_for_member(self_id)),
+            func: match recursive {
+                true => alloc.limited(self_id, program.name(self_id)),
+                false => func_id_for_member(self_id),
+            },
             type_args: Vec::new(),
             args: (0..n_params).map(Val::Temp).collect(),
         },
@@ -2732,25 +2713,44 @@ fn contract_post_definition(
         })
         .collect();
     let cond = emit(
-        &mut steps,
+        steps,
         AxiomPure::App {
             func: func_id_for_member(en.member),
             type_args: Vec::new(),
             args,
         },
     );
+    Some(Fact {
+        guards: Vec::new(),
+        cond,
+        post: true,
+    })
+}
+
+/// Synthesize an **abstract** function's definition: no body, nothing to
+/// verify — just [`post_fact`], the guarded post axiom `pre-token ⟹
+/// f#ensures(params, f(params))` built from the contract links. (Silicon's
+/// phase 1 emits `post`/`postProp` for abstract functions once the spec is
+/// well-defined; our contract decls get that WF check as ordinary `Function`
+/// verification, scheduled first by the link edges in `analyze`.) `None` when
+/// there is nothing to export: no ensures.
+fn contract_post_definition(
+    alloc: &mut crate::verify::func_registry::FuncRegistry,
+    program: &vmir::Program,
+    self_id: MemberId,
+    function: &Function,
+    recursive: bool,
+) -> Option<std::sync::Arc<FunctionDefinition>> {
+    let mut steps = Vec::new();
+    let fact = post_fact(alloc, program, self_id, function, recursive, &mut steps)?;
     Some(std::sync::Arc::new(FunctionDefinition {
-        n_params,
+        n_params: function.params.len(),
         steps,
         res: None,
-        limited,
+        limited: recursive.then(|| alloc.limited(self_id, program.name(self_id))),
         // An abstract function has no body, hence no propagated callee tokens.
         token_steps: Vec::new(),
-        facts: vec![Fact {
-            guards,
-            cond,
-            post: true,
-        }],
+        facts: vec![fact],
     }))
 }
 
