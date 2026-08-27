@@ -1927,7 +1927,7 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
             // A recursive function's post fact also triggers on its limited
             // twin `f'` — that is what delivers the postcondition at a
             // recursive unroll (the twin has no unfold rule by design).
-            if def.limited.is_some() && def.facts.iter().any(|f| f.post) {
+            if def.limited.is_some() && def.post.is_some() {
                 ctx.axiom_rules
                     .push(crate::verify::rewrite::function_post_rule(
                         &name,
@@ -2554,7 +2554,7 @@ pub(crate) fn verify_function(
                 let name = ctx.member_name(m);
                 let func = crate::verify::func_registry::func_id_for_member(m);
                 ctx.axiom_rules
-                    .push(crate::verify::rewrite::facts_rule(&name, func, post));
+                    .push(crate::verify::rewrite::post_rule(&name, func, post));
             }
         }
     }
@@ -2589,21 +2589,19 @@ pub(crate) fn verify_function(
     // entry `assume f#requires` was dropped (Finding B — `Assume` emits no
     // recipe step, so the precondition cannot leak into callers).
     let rb = ctx.recipe.take().expect("function walk builds a recipe");
-    let (mut steps, mut facts, token_steps) = rb.into_function_parts()?;
-    // `ensures` is the single export mechanism: the post fact is built from the
+    let (mut steps, token_steps) = rb.into_function_parts()?;
+    // `ensures` is the single export mechanism: the post is built from the
     // declaration link, identically to an abstract function's, and appended to
     // the body's stream. The body's own exit `assert f#ensures(..)` stayed a
     // pure obligation — it proved the link, it does not publish it.
-    if let Some(post) = post_fact(
+    let post = post_fact(
         ctx.alloc,
         program,
         self_id,
         function,
         recursive_scc.is_some(),
         &mut steps,
-    ) {
-        facts.push(post);
-    }
+    );
     let res = state
         .recipe_of(&body.res)
         .ok_or(VerifyError::Unimplemented(
@@ -2622,7 +2620,7 @@ pub(crate) fn verify_function(
         res: Some(res),
         limited,
         token_steps,
-        facts,
+        post,
     })))
 }
 
@@ -2674,8 +2672,7 @@ fn post_fact(
     // pre-seed (rules keyed on the full ids, no frames installed yet).
     recursive: bool,
     steps: &mut Vec<crate::verify::rewrite::AxiomInst>,
-) -> Option<crate::verify::cert::Fact> {
-    use crate::verify::cert::Fact;
+) -> Option<Val> {
     use crate::verify::func_registry::func_id_for_member;
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
 
@@ -2707,19 +2704,14 @@ fn post_fact(
             vmir::ContractArg::Result => self_app.clone(),
         })
         .collect();
-    let cond = emit(
+    Some(emit(
         steps,
         AxiomPure::App {
             func: func_id_for_member(en.member),
             type_args: Vec::new(),
             args,
         },
-    );
-    Some(Fact {
-        guards: Vec::new(),
-        cond,
-        post: true,
-    })
+    ))
 }
 
 /// Synthesize an **abstract** function's definition: no body, nothing to
@@ -2737,7 +2729,7 @@ fn contract_post_definition(
     recursive: bool,
 ) -> Option<std::sync::Arc<FunctionDefinition>> {
     let mut steps = Vec::new();
-    let fact = post_fact(alloc, program, self_id, function, recursive, &mut steps)?;
+    let post = post_fact(alloc, program, self_id, function, recursive, &mut steps)?;
     Some(std::sync::Arc::new(FunctionDefinition {
         n_params: function.params.len(),
         steps,
@@ -2745,7 +2737,7 @@ fn contract_post_definition(
         limited: recursive.then(|| alloc.limited(self_id, program.name(self_id))),
         // An abstract function has no body, hence no propagated callee tokens.
         token_steps: Vec::new(),
-        facts: vec![fact],
+        post: Some(post),
     }))
 }
 

@@ -1,5 +1,5 @@
 //! Function unfolding: the lazy rule that installs `f(args) == body` and replays
-//! a verified definition's exported facts at a call site.
+//! a verified definition's postcondition at a call site.
 
 use std::sync::Arc;
 
@@ -29,15 +29,15 @@ pub(super) struct FunctionUnfoldApplier {
     pub(super) func: FuncId,
     pub(super) def: Arc<FunctionDefinition>,
     /// `false`: the full rule (keyed on `f`) — definitional union, limited
-    /// framing, and every exported fact. `true`: the limited-post rule (keyed
-    /// on `f'`) — replays **only** post facts, no unions: unfolding a recursive
-    /// body yields `f'(smaller)`, and this is what delivers the postcondition
-    /// there (Silicon's `post` axiom triggering on the limited symbol).
+    /// framing, and the post. `true`: the limited-post rule (keyed on `f'`) —
+    /// the post and nothing else, no unions: unfolding a recursive body yields
+    /// `f'(smaller)`, and this is what delivers the postcondition there
+    /// (Silicon's `post` axiom triggering on the limited symbol).
     pub(super) limited_post: bool,
-    /// Guards the (expensive) body build + fact replay: done at most once per call.
+    /// Guards the (expensive) body build + post replay: done at most once per call.
     pub(super) memo: Memo<CallKey>,
     /// Guards the definitional union separately from the build: a call first built
-    /// facts-only (no token yet) and later reached by a propagation-minted token
+    /// post-only (no token yet) and later reached by a propagation-minted token
     /// must still union `f==body`, which `memo` alone would suppress.
     pub(super) union_memo: Memo<CallKey>,
     /// The function's uniform pre-token `f%pre` (`FuncRegistry::fn_pre_token`),
@@ -45,14 +45,14 @@ pub(super) struct FunctionUnfoldApplier {
     /// `f(fargs)==body` union+build fires only when a `FuncApp(f%pre, fargs)` node
     /// is present for the *same* `fargs`, i.e. this occurrence came from a genuine
     /// value-position call. Mirrors Silicon's `f%pre ⟹ f==body`. `None` on the
-    /// facts-only rule, where there is no definitional union to gate.
+    /// post-only rule, where there is no definitional union to gate.
     pub(super) pre_token: Option<FuncId>,
 }
 
 /// Wrap `inner` in a recipe-space guard chain: `guards ==> inner`, as nested
 /// `Ite`s with `true` on the dead side. `guards` is outermost-first (matching
-/// [`Fact::guards`] and [`TokenStep::guards`]) and is folded innermost-first, the
-/// same shape `VerifyContext::implication` builds. Empty `guards` returns `inner`.
+/// [`TokenStep::guards`]) and is folded innermost-first, the same shape
+/// `VerifyContext::implication` builds. Empty `guards` returns `inner`.
 pub(super) fn fold_guards(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     vals: &[Id],
@@ -74,44 +74,33 @@ pub(super) fn fold_guards(
     imp
 }
 
-/// Replay a definition's exported facts against one built instance: for each
-/// fact, merge `token ⟹ guards ⟹ cond` (an `Ite` chain, innermost-first — the
-/// shape `VerifyContext::implication` builds) with `true`. Guarded, so a fact
-/// never fires outside its callee-side `#requires` + path condition, nor outside
-/// the caller-side path condition the `token` carries.
+/// Replay a definition's post against one built instance: merge
+/// `token ⟹ post` (an `Ite`, the shape `VerifyContext::implication` builds) with
+/// `true`. Guarded, so the postcondition never fires outside the caller-side
+/// path condition the `token` carries.
 ///
 /// `token` is the callee's `f%pre(args)` class at *this* call, `None` when the
 /// definition has no pre-token (a contract function) or when no token exists for
-/// these args. It is threaded separately rather than pushed onto `Fact.guards`
-/// because those `Val`s live in the callee's recipe-temp space and resolve
+/// these args. It is threaded separately rather than folded into the recipe
+/// because the post's `Val`s live in the callee's recipe-temp space and resolve
 /// through `vals`, whereas this is already a caller-side `Id`.
-///
-/// It is applied **outermost**, continuing `Fact.guards`' most-global-to-most-
-/// local order (`#requires` application, then the originating assert's
-/// callee-internal pc). Nesting order is logically free — `a ⟹ b ⟹ c` is
-/// `b ⟹ a ⟹ c` — and collapse is order-insensitive too, since `ite-reduce`
-/// rewrites an `ite(g, x, true)` with `g` true at whatever depth it sits.
-pub(super) fn replay_facts(
+pub(super) fn replay_post(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     def: &FunctionDefinition,
-    only_post: bool,
     vals: &[Id],
     token: Option<Id>,
     changed: &mut Vec<Id>,
 ) {
+    let Some(post) = def.post.as_ref() else {
+        return;
+    };
     let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-    for fact in &def.facts {
-        if only_post && !fact.post {
-            continue;
-        }
-        let cond = resolve_val(egraph, vals, &fact.cond);
-        let mut imp = fold_guards(egraph, vals, &fact.guards, cond);
-        if let Some(tok) = token {
-            imp = expr!(egraph, {tok} ==> {imp});
-        }
-        if egraph.union(imp, true_) {
-            changed.push(egraph.find(imp));
-        }
+    let mut imp = resolve_val(egraph, vals, post);
+    if let Some(tok) = token {
+        imp = expr!(egraph, {tok} ==> {imp});
+    }
+    if egraph.union(imp, true_) {
+        changed.push(egraph.find(imp));
     }
 }
 
@@ -160,11 +149,11 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             });
             let has_token = self.pre_token.is_none() || tok_id.is_some();
             // The body instance is needed for the definitional union (token
-            // present, non-limited) and for fact replay (facts reference body
-            // temps). A call with neither needs no build — and must NOT be memoized,
+            // present, non-limited) and to resolve the post's recipe temps. A call
+            // with neither needs no build — and must NOT be memoized,
             // so it can fire later once propagation mints its token mid-saturation.
             let do_union = !self.limited_post && has_token;
-            let need_build = do_union || !self.def.facts.is_empty();
+            let need_build = do_union || self.def.post.is_some();
             if !need_build {
                 continue;
             }
@@ -266,16 +255,9 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
                     }
                 }
             }
-            // Replay facts only on the first build (idempotent; guarded internally).
+            // Replay the post only on the first build (idempotent; guarded internally).
             if first_build {
-                replay_facts(
-                    egraph,
-                    &self.def,
-                    self.limited_post,
-                    &vals,
-                    tok_id,
-                    &mut changed,
-                );
+                replay_post(egraph, &self.def, &vals, tok_id, &mut changed);
             }
         }
         changed
@@ -307,13 +289,13 @@ pub(crate) fn function_rule(
     timed(Rewrite::new(format!("fn-{name}"), searcher, applier).expect("function rule"))
 }
 
-/// Mint a facts-only rule keyed on `func`: replays only the definition's post
-/// facts, no definitional union. Two users:
+/// Mint a post-only rule keyed on `func`: replays the definition's post, no
+/// definitional union. Two users:
 /// - the limited-twin post rule of a recursive function ([`function_post_rule`]);
 /// - the spec-derived post rule installed for each SCC member **during** a
 ///   recursive batch's own verification, which is what makes induction over a
 ///   recursive call work (Silicon's phase-1 `post` axiom).
-pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>) -> Rule {
+pub(crate) fn post_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>) -> Rule {
     let searcher = AxiomTriggerSearcher { func };
     let applier = FunctionUnfoldApplier {
         func,
@@ -321,7 +303,7 @@ pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>)
         limited_post: true,
         memo: Memo::new(),
         union_memo: Memo::new(),
-        // Facts-only rule: no definitional union, so no token gate.
+        // Post-only rule: no definitional union, so no token gate.
         pre_token: None,
     };
     timed(Rewrite::new(format!("fn-post-{name}"), searcher, applier).expect("function post rule"))
@@ -329,12 +311,12 @@ pub(crate) fn facts_rule(name: &str, func: FuncId, def: Arc<FunctionDefinition>)
 
 /// Mint the limited-twin post rule for a **recursive** function: keyed on
 /// `f'(args)` occurrences (which unfolding a recursive body produces), replays
-/// only the definition's post facts (no definitional union — that's the point
+/// the definition's post (no definitional union — that's the point
 /// of the limited symbol). Registered alongside [`function_rule`] when
 /// `def.limited` is set and a post fact exists.
 pub(crate) fn function_post_rule(name: &str, def: Arc<FunctionDefinition>) -> Rule {
     let func = def.limited.expect("post rule requires a limited twin");
-    facts_rule(name, func, def)
+    post_rule(name, func, def)
 }
 
 

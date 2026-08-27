@@ -24,7 +24,7 @@ pub(crate) use recipe::{
     AxiomInst, AxiomPure, build_instance_releasing_tokens,
     build_instance_vals_guarded,
 };
-pub(crate) use function::{facts_rule, function_post_rule, function_rule};
+pub(crate) use function::{post_rule, function_post_rule, function_rule};
 pub(crate) use memo::{Memo, ScratchScope, new_memo_unit, new_scope_id};
 pub(crate) use timing::take_rule_timing;
 pub use adt::{inj_rule, proj_rule, tag_rule};

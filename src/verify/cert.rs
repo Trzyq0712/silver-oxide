@@ -43,31 +43,18 @@ pub(crate) struct FunctionDefinition {
     /// nested callee's axioms activate exactly when this body's own do, and only
     /// under the body-internal condition guarding the nested call.
     pub(crate) token_steps: Vec<TokenStep>,
-    /// Guarded facts this function's verification established, replayed at
-    /// every occurrence of `f(args)` (Silicon's `bodyProp`/`post` axioms).
-    /// Derived from the body's `Assert` insts — each was *proven* under
-    /// `pre ∧ pc`, so replaying it guarded is unconditionally sound. Carried by
-    /// heap-free and heap-dependent functions alike (a heap-dependent function's
-    /// post is stated over its snapshot parameter like any other arg).
-    pub(crate) facts: Vec<Fact>,
-}
-
-/// One exported fact of a [`FunctionDefinition`]: `guards ⟹ cond`, both over
-/// the definition's recipe-temp space. `guards` is the originating assert's
-/// path condition and nothing else — the precondition gate is the call-site
-/// `f%pre` token, applied outside `guards` at replay. Outermost-first, folded
-/// innermost-first at replay, matching `VerifyContext::implication`.
-#[derive(Clone)]
-pub(crate) struct Fact {
-    pub(crate) guards: Vec<(Val, Polarity)>,
-    pub(crate) cond: Val,
-    /// The exit-post fact (`f#requires(params) ⟹ f#ensures(params, f(params))`,
-    /// with `f'` for a recursive function). Additionally replayed at
-    /// limited-twin occurrences (Silicon triggers `post` on `f'`), which is
-    /// what makes induction over a recursive call work; body-derived facts must
-    /// NOT be — replaying them on `f'` would re-mention `f'` at smaller args,
-    /// an unbounded matching loop.
-    pub(crate) post: bool,
+    /// The **only** thing this function publishes to a caller: the temp holding
+    /// `f#ensures(params, f(params))` (`f'` when recursive), built from the
+    /// declaration's `ensures` link — never from the body, which is why it is
+    /// identical for abstract and bodied functions and why it references no body
+    /// temp. `None` when the function declares no `ensures`.
+    ///
+    /// Replayed as `f%pre(args) ⟹ post` at every occurrence of `f(args)`
+    /// (Silicon's `post` axiom), and at limited-twin occurrences too, which is
+    /// what makes induction over a recursive call work. Carries no guards of its
+    /// own: the call-site token is minted exactly where the precondition was
+    /// checked, so a second conjunct restating it would add nothing.
+    pub(crate) post: Option<Val>,
 }
 
 /// One propagated precondition token: a nested callee's `g%pre(gargs)` step plus
@@ -78,12 +65,12 @@ pub(crate) struct Fact {
 /// `f(x) { b ? g(x) : .. }`. Without the guards the release is too eager: `g`'s
 /// own axioms would fire at args where this body never calls it.
 ///
-/// Deliberately not a [`Fact`]: `post` is meaningless here, and the two are
-/// released at different points of [`FunctionUnfoldApplier`] — a fact only on the
-/// first build, a token step on every (re-)union.
+/// Distinct from [`FunctionDefinition::post`]: that is a *fact* about the
+/// callee's value, released once on the first build; this is a *presence* stamp,
+/// re-released on every (re-)union so a propagation-minted token can still
+/// reach a call that was first built without one.
 ///
-/// `guards` is outermost-first, like [`Fact::guards`], and folded innermost-first
-/// at release.
+/// `guards` is outermost-first and folded innermost-first at release.
 #[derive(Clone)]
 pub(crate) struct TokenStep {
     pub(crate) token: Val,
@@ -228,10 +215,6 @@ enum RecipeStep {
 pub(crate) struct RecipeBuilder {
     n_params: usize,
     steps: Vec<RecipeStep>,
-    /// Guarded facts exported so far (`Assert`s and nested pre-tokens). The
-    /// **post** fact is not among them: it is built from the declaration's
-    /// `ensures` link after the walk, not recognized out of the body.
-    pub(crate) facts: Vec<Fact>,
     /// In-SCC callees (a recursion cycle's members), lowered to their limited
     /// twin so a downstream unfold halts after one level.
     recursive_scc: Option<std::collections::HashSet<MemberId>>,
@@ -266,7 +249,6 @@ impl RecipeBuilder {
         Self {
             n_params,
             steps: Vec::new(),
-            facts: Vec::new(),
             recursive_scc,
             pending_slots: Vec::new(),
             spec: false,
@@ -326,10 +308,11 @@ impl RecipeBuilder {
 
     /// Consume the builder into a function definition's parts. A function
     /// stream contains no `Seed` steps (params are pre-seeded), so it converts
-    /// 1:1 — facts and `token_steps` index into the same shared stream, as before.
+    /// 1:1 — `token_steps` index into the same shared stream, as does the post
+    /// fact the caller appends afterwards.
     pub(crate) fn into_function_parts(
         self,
-    ) -> Result<(Vec<AxiomInst>, Vec<Fact>, Vec<TokenStep>), VerifyError> {
+    ) -> Result<(Vec<AxiomInst>, Vec<TokenStep>), VerifyError> {
         let steps = self
             .steps
             .into_iter()
@@ -340,7 +323,7 @@ impl RecipeBuilder {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((steps, self.facts, self.token_steps))
+        Ok((steps, self.token_steps))
     }
 
     /// Slice the self-contained [`BodyRecipe`] computing `out` from the shared
