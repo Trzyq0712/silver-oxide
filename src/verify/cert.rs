@@ -43,18 +43,32 @@ pub(crate) struct FunctionDefinition {
     /// nested callee's axioms activate exactly when this body's own do, and only
     /// under the body-internal condition guarding the nested call.
     pub(crate) token_steps: Vec<TokenStep>,
-    /// The **only** thing this function publishes to a caller: the temp holding
+    /// The **only** thing this function publishes to a caller:
     /// `f#ensures(params, f(params))` (`f'` when recursive), built from the
-    /// declaration's `ensures` link — never from the body, which is why it is
-    /// identical for abstract and bodied functions and why it references no body
-    /// temp. `None` when the function declares no `ensures`.
+    /// declaration's `ensures` link — never from the body. `None` when the
+    /// function declares no `ensures`.
     ///
     /// Replayed as `f%pre(args) ⟹ post` at every occurrence of `f(args)`
     /// (Silicon's `post` axiom), and at limited-twin occurrences too, which is
     /// what makes induction over a recursive call work. Carries no guards of its
     /// own: the call-site token is minted exactly where the precondition was
     /// checked, so a second conjunct restating it would add nothing.
-    pub(crate) post: Option<Val>,
+    pub(crate) post: Option<PostRecipe>,
+}
+
+/// A function's exported postcondition as a **standalone** recipe over the
+/// params alone: `Temp(0..n_params)` are the args, then one temp per step, and
+/// `res` is `f#ensures(params, f(params))`.
+///
+/// Standalone, and not a slice of [`FunctionDefinition::steps`], is the whole
+/// point: it mentions no body temp, so it can be replayed at an occurrence where
+/// no body was materialized. That is what lets the definitional union's presence
+/// gate actually gate — an occurrence no call produced pays for the post and
+/// nothing else.
+#[derive(Clone)]
+pub(crate) struct PostRecipe {
+    pub(crate) steps: Vec<AxiomInst>,
+    pub(crate) res: Val,
 }
 
 /// One propagated precondition token: a nested callee's `g%pre(gargs)` step plus

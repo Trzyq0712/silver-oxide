@@ -2589,19 +2589,12 @@ pub(crate) fn verify_function(
     // entry `assume f#requires` was dropped (Finding B — `Assume` emits no
     // recipe step, so the precondition cannot leak into callers).
     let rb = ctx.recipe.take().expect("function walk builds a recipe");
-    let (mut steps, token_steps) = rb.into_function_parts()?;
+    let (steps, token_steps) = rb.into_function_parts()?;
     // `ensures` is the single export mechanism: the post is built from the
-    // declaration link, identically to an abstract function's, and appended to
-    // the body's stream. The body's own exit `assert f#ensures(..)` stayed a
-    // pure obligation — it proved the link, it does not publish it.
-    let post = post_fact(
-        ctx.alloc,
-        program,
-        self_id,
-        function,
-        recursive_scc.is_some(),
-        &mut steps,
-    );
+    // declaration link, identically to an abstract function's, and kept as its
+    // own recipe over the params. The body's own exit `assert f#ensures(..)`
+    // stayed a pure obligation — it proved the link, it does not publish it.
+    let post = post_fact(ctx.alloc, program, self_id, function, recursive_scc.is_some());
     let res = state
         .recipe_of(&body.res)
         .ok_or(VerifyError::Unimplemented(
@@ -2650,9 +2643,8 @@ fn contract_members(program: &vmir::Program) -> std::collections::HashSet<Member
 /// heap-free and heap-dependent ones (a heap-dependent function's snapshot is a
 /// trailing param, so it is just another `ContractArg::Val`).
 ///
-/// The steps are appended to `steps`, which is the definition's shared recipe
-/// stream: empty for an abstract function, the body's stream for a bodied one.
-/// Temps therefore continue from wherever that stream ended.
+/// Returned as a **standalone** [`PostRecipe`] over the params rather than as a
+/// slice of the body's stream, so that replaying it needs no body instance.
 ///
 /// The fact carries **no guards of its own**: it is gated by the call-site
 /// `f%pre` token, which is minted exactly where the precondition was checked.
@@ -2671,13 +2663,14 @@ fn post_fact(
     // sibling's recipe, which lowers it to `f'`. Cleared for the in-batch
     // pre-seed (rules keyed on the full ids, no frames installed yet).
     recursive: bool,
-    steps: &mut Vec<crate::verify::rewrite::AxiomInst>,
-) -> Option<Val> {
+) -> Option<crate::verify::cert::PostRecipe> {
+    use crate::verify::cert::PostRecipe;
     use crate::verify::func_registry::func_id_for_member;
     use crate::verify::rewrite::{AxiomInst, AxiomPure};
 
     let en = function.ensures.as_ref()?;
     let n_params = function.params.len();
+    let mut steps: Vec<AxiomInst> = Vec::new();
     let emit = |steps: &mut Vec<AxiomInst>, pure: AxiomPure| -> Val {
         let v = Val::Temp(n_params + steps.len());
         steps.push(AxiomInst::Val(pure));
@@ -2686,7 +2679,7 @@ fn post_fact(
     // Link args are over the params (`Temp(0..n_params)`) — identity in recipe
     // space, so they can be used verbatim.
     let self_app = emit(
-        steps,
+        &mut steps,
         AxiomPure::App {
             func: match recursive {
                 true => alloc.limited(self_id, program.name(self_id)),
@@ -2704,14 +2697,15 @@ fn post_fact(
             vmir::ContractArg::Result => self_app.clone(),
         })
         .collect();
-    Some(emit(
-        steps,
+    let res = emit(
+        &mut steps,
         AxiomPure::App {
             func: func_id_for_member(en.member),
             type_args: Vec::new(),
             args,
         },
-    ))
+    );
+    Some(PostRecipe { steps, res })
 }
 
 /// Synthesize an **abstract** function's definition: no body, nothing to
@@ -2728,11 +2722,10 @@ fn contract_post_definition(
     function: &Function,
     recursive: bool,
 ) -> Option<std::sync::Arc<FunctionDefinition>> {
-    let mut steps = Vec::new();
-    let post = post_fact(alloc, program, self_id, function, recursive, &mut steps)?;
+    let post = post_fact(alloc, program, self_id, function, recursive)?;
     Some(std::sync::Arc::new(FunctionDefinition {
         n_params: function.params.len(),
-        steps,
+        steps: Vec::new(),
         res: None,
         limited: recursive.then(|| alloc.limited(self_id, program.name(self_id))),
         // An abstract function has no body, hence no propagated callee tokens.

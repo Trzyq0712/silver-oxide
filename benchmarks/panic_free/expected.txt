@@ -1,0 +1,89 @@
+# Expected outcome per member. Format: <vpr-stem> <member> <OK|FAIL>
+#
+# OK   = the program cannot panic and we must prove it (a FAIL here is incompleteness).
+# FAIL = the program can panic and we must reject it (an OK here is UNSOUNDNESS).
+#
+# Members not listed are ignored, so Prusti's generated helpers do not need entries.
+
+tier_a_no_arith m_div_guard_ne                  OK
+tier_a_no_arith m_div_guard_eq_else             OK
+tier_a_no_arith m_rem_guard_ne                  OK
+tier_a_no_arith m_div_by_literal                OK
+tier_a_no_arith m_div_guard_through_local       OK
+tier_a_no_arith m_div_twice_one_guard           OK
+tier_a_no_arith m_div_guard_nested              OK
+tier_a_no_arith m_explicit_panic_unreachable    OK
+tier_a_no_arith m_match_exhaustive              OK
+tier_a_no_arith m_div_by_match_literal          OK
+
+tier_b_trivial_arith m_div_guard_gt_zero            OK
+tier_b_trivial_arith m_div_guard_gt_zero_flipped    OK
+tier_b_trivial_arith m_div_guard_ge_one             OK
+tier_b_trivial_arith m_div_guard_lt_zero            OK
+tier_b_trivial_arith m_div_guard_lt_minus_one       OK
+tier_b_trivial_arith m_div_guard_either_sign        OK
+tier_b_trivial_arith m_div_guard_gt_zero_delayed    OK
+tier_b_trivial_arith m_div_overflow_guard_dividend  OK
+tier_b_trivial_arith m_rem_guard_gt_zero            OK
+tier_b_trivial_arith m_neg_guard_not_min            OK
+
+tier_c_range_arith m_add_bounded                OK
+tier_c_range_arith m_sub_bounded                OK
+tier_c_range_arith m_mul_bounded                OK
+tier_c_range_arith m_div_by_computed_positive   OK
+tier_c_range_arith m_div_by_scaled              OK
+tier_c_range_arith m_average                    OK
+tier_c_range_arith m_sum_three_bounded          OK
+tier_c_range_arith m_rem_then_div               OK
+tier_c_range_arith m_neg_bounded                OK
+tier_c_range_arith m_div_after_join             OK
+
+# Non-arithmetic unreachability. Every member is provable and Prusti/Silicon proves it,
+# EXCEPT the last two: a non-`#[pure]` call is opaque and passing `&mut` loses framing, so
+# without a spec on the helper those two genuinely cannot be discharged. Prusti reports
+# exactly those two, which is what makes the rest a clean measurement.
+probe_unreachable_nonarith m_bool_direct             OK
+probe_unreachable_nonarith m_bool_through_copy       OK
+probe_unreachable_nonarith m_bool_through_negation   OK
+probe_unreachable_nonarith m_bool_after_join         OK
+probe_unreachable_nonarith m_bool_nested_deep        OK
+probe_unreachable_nonarith m_eq_two_vars             OK
+probe_unreachable_nonarith m_eq_transitive           OK
+probe_unreachable_nonarith m_eq_two_literals         OK
+probe_unreachable_nonarith m_enum_rematch            OK
+probe_unreachable_nonarith m_enum_via_bool           OK
+probe_unreachable_nonarith m_frame_other_field       OK
+probe_unreachable_nonarith m_write_then_read         OK
+probe_unreachable_nonarith m_call_congruence         FAIL
+probe_unreachable_nonarith m_guard_survives_call     FAIL
+
+probe_unreachable m_unreachable_exhaustive          OK
+probe_unreachable m_unreachable_guarded_eq          OK
+probe_unreachable m_unreachable_contradiction_eq    OK
+probe_unreachable m_unreachable_contradiction_order OK
+probe_unreachable m_unreachable_actually_reachable  FAIL
+
+tier_d_index m_index_const                      OK
+tier_d_index m_index_guard_lt_len               OK
+tier_d_index m_index_guard_too_loose            FAIL
+tier_d_index m_index_unguarded                  FAIL
+
+must_fail m_div_unguarded                       FAIL
+must_fail m_div_guard_wrong_var                 FAIL
+must_fail m_div_guard_incomplete                FAIL
+must_fail m_div_overflow_unguarded              FAIL
+must_fail m_rem_unguarded                       FAIL
+must_fail m_add_unguarded                       FAIL
+must_fail m_add_half_bounded                    FAIL
+must_fail m_sub_unguarded                       FAIL
+must_fail m_mul_unguarded                       FAIL
+must_fail m_neg_unguarded                       FAIL
+must_fail m_div_guard_stale                     FAIL
+
+# Reachable `panic!` is NOT an obligation in this encoding, so OK is the correct answer.
+# Prusti encodes `panic!` as a call to a `m_std::rt::panic_fmt` stub whose contract is
+# `ensures false`; the call poisons the state before the `exhale false` that follows it,
+# so the check is vacuous. Silicon accepts this member too — Prusti reports 11 errors on
+# must_fail.rs, one for every other member and none for this one. Listed as OK to record
+# the encoding's actual semantics; it is not evidence that we check explicit panics.
+must_fail m_explicit_panic_reachable            OK

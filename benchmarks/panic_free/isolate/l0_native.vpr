@@ -1,0 +1,61 @@
+// L0: the five failing shapes in native Viper. No domain boxing, no predicates, no
+// snapshot functions -- Int is Int and Bool is Bool.
+//
+// Every method here must verify. Whatever fails at L0 is a plain reasoning gap; whatever
+// passes at L0 but fails at L1/L2 is caused by the encoding layer that L1/L2 adds.
+
+field f: Int
+field g: Int
+
+// --- bool_after_join: both arms assign the same constant.
+method n_join(b: Bool)
+{
+  var flag: Bool
+  if (b) {
+    flag := true
+  } else {
+    flag := true
+  }
+  assert flag
+}
+
+// --- eq_transitive: x == y, y == z |- x == z.
+method n_eq_transitive(x: Int, y: Int, z: Int)
+{
+  if (x == y) {
+    if (y == z) {
+      assert x == z
+    }
+  }
+}
+
+// --- eq_two_literals: x == 5 excludes x == 7.
+method n_two_literals(x: Int)
+{
+  if (x == 5) {
+    assert !(x == 7)
+  }
+}
+
+// --- frame_other_field: writing r.g leaves r.f alone.
+method n_frame_other_field(r: Ref, v: Int)
+  requires acc(r.f, write)
+  requires acc(r.g, write)
+{
+  var before: Int
+  var after: Int
+  before := r.f
+  r.g := v
+  after := r.f
+  assert before == after
+}
+
+// --- write_then_read: read back what was just written.
+method n_write_then_read(r: Ref, v: Int)
+  requires acc(r.f, write)
+{
+  var got: Int
+  r.f := v
+  got := r.f
+  assert got == v
+}

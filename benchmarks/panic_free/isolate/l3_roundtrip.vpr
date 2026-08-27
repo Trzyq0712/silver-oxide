@@ -1,0 +1,301 @@
+// L3: L2 plus the layer the real encoding actually puts between a write and the read
+// that follows it -- a struct predicate with address-function fields, `unfold`/`fold`
+// around every field access, and a `make_generic` / `make_concrete` round trip through
+// the erased `p_Param` representation.
+//
+// This is the shape of `m_write_then_read` in probe_unreachable_nonarith.vpr, minus the
+// `&mut` reborrow: write a field, fold, make_generic, make_concrete, unfold, read it
+// back. The value survives only if the conversion pair is the identity on snapshots,
+// which is what their `old(...)`-based postconditions state.
+//
+// Every method here must verify.
+
+domain s_Int_i32 {
+  function s_Int_i32_cons(arg0: Int): s_Int_i32
+  function s_Int_i32_value(arg0: s_Int_i32): Int
+
+  axiom s_Int_i32_ax_cons {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      s_Int_i32_cons(s_Int_i32_value(s)) == s)
+  }
+
+  axiom s_Int_i32_ax_value {
+    (forall value: Int ::
+      { s_Int_i32_cons(value) }
+      -2147483648 <= value && value <= 2147483647 ==>
+      s_Int_i32_value(s_Int_i32_cons(value)) == value)
+  }
+}
+
+domain s_Pair {
+  function s_Pair_cons(arg0: s_Int_i32, arg1: s_Int_i32): s_Pair
+  function s_Pair_0(arg0: s_Pair): s_Int_i32
+  function s_Pair_1(arg0: s_Pair): s_Int_i32
+
+  axiom s_Pair_ax_0 {
+    (forall a: s_Int_i32, b: s_Int_i32 ::
+      { s_Pair_cons(a, b) }
+      s_Pair_0(s_Pair_cons(a, b)) == a)
+  }
+
+  axiom s_Pair_ax_1 {
+    (forall a: s_Int_i32, b: s_Int_i32 ::
+      { s_Pair_cons(a, b) }
+      s_Pair_1(s_Pair_cons(a, b)) == b)
+  }
+}
+
+domain s_Param {
+}
+
+domain Type {
+  function s_Pair_type(): Type
+}
+
+// Injectivity of the erasure comes from this mutual-inverse pair, exactly as emitted:
+// neither function has a body, and the postconditions are the only thing relating them.
+function make_generic_s_Pair(self: s_Pair): s_Param
+  ensures make_concrete_s_Pair(result) == self
+
+function make_concrete_s_Pair(snap: s_Param): s_Pair
+  ensures make_generic_s_Pair(result) == snap
+
+field p_Int_i32_val: s_Int_i32
+field p_Param_val: s_Param
+
+function s_Pair_field_0(self: Ref): Ref
+  ensures (self == null) == (result == null)
+
+function s_Pair_field_1(self: Ref): Ref
+  ensures (self == null) == (result == null)
+
+predicate p_Int_i32(self: Ref) {
+  acc(self.p_Int_i32_val, write)
+}
+
+predicate p_Pair(self: Ref) {
+  acc(p_Int_i32(s_Pair_field_0(self)), write) &&
+  acc(p_Int_i32(s_Pair_field_1(self)), write)
+}
+
+predicate p_Param(self: Ref, T: Type) {
+  acc(self.p_Param_val, write)
+}
+
+function p_Int_i32_snap(self: Ref): s_Int_i32
+  requires acc(p_Int_i32(self), write)
+{
+  (unfolding acc(p_Int_i32(self), write) in self.p_Int_i32_val)
+}
+
+function p_Pair_snap(self: Ref): s_Pair
+  requires acc(p_Pair(self), write)
+{
+  (unfolding acc(p_Pair(self), write) in
+    s_Pair_cons(p_Int_i32_snap(s_Pair_field_0(self)),
+      p_Int_i32_snap(s_Pair_field_1(self))))
+}
+
+function p_Param_snap(self: Ref, T: Type): s_Param
+  requires acc(p_Param(self, T), write)
+{
+  (unfolding acc(p_Param(self, T), write) in self.p_Param_val)
+}
+
+method p_Int_i32_assign(self: Ref, value: s_Int_i32)
+  ensures acc(p_Int_i32(self), write)
+  ensures p_Int_i32_snap(self) == value
+
+method make_generic_Pair(self: Ref)
+  requires acc(p_Pair(self), write)
+  ensures acc(p_Param(self, s_Pair_type()), write)
+  ensures old(make_generic_s_Pair(p_Pair_snap(self))) ==
+    p_Param_snap(self, s_Pair_type())
+
+method make_concrete_Pair(self: Ref)
+  requires acc(p_Param(self, s_Pair_type()), write)
+  ensures acc(p_Pair(self), write)
+  ensures old(p_Param_snap(self, s_Pair_type())) ==
+    make_generic_s_Pair(p_Pair_snap(self))
+
+// --- Micro-probes: the round trip needs three links, tested here one at a time.
+
+// Link 1: the function postcondition itself, no heap involved.
+method r_link1_inverse(a: s_Pair)
+{
+  assert make_concrete_s_Pair(make_generic_s_Pair(a)) == a
+}
+
+// Link 2: injectivity, i.e. link 1 applied to both sides of an equation.
+method r_link2_injective(a: s_Pair, b: s_Pair)
+{
+  if (make_generic_s_Pair(a) == make_generic_s_Pair(b)) {
+    assert a == b
+  }
+}
+
+// Link 3: chaining the two methods' `old`-based postconditions through the erased
+// snapshot, stopping short of applying injectivity.
+method r_link3_old_chain(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var g: s_Param
+  make_generic_Pair(self)
+  g := p_Param_snap(self, s_Pair_type())
+  make_concrete_Pair(self)
+  assert make_generic_s_Pair(p_Pair_snap(self)) == g
+}
+
+// Link 4: does the callee's `old(p_Pair_snap(self))` bind to the value the CALLER read
+// into `before` just before the call? This is the only step of the round trip that link 3
+// does not already cover.
+method r_link4_old_binds_to_caller(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Pair
+  var g: s_Param
+  before := p_Pair_snap(self)
+  make_generic_Pair(self)
+  g := p_Param_snap(self, s_Pair_type())
+  assert make_generic_s_Pair(before) == g
+}
+
+// Link 5: the whole round trip with every intermediate step asserted explicitly. Links
+// 1-4 each pass in isolation, so whichever assert fails here is the composition step
+// that is actually missing.
+method r_link5_stepwise(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Pair
+  var after: s_Pair
+  var g: s_Param
+  before := p_Pair_snap(self)
+  make_generic_Pair(self)
+  g := p_Param_snap(self, s_Pair_type())
+  assert make_generic_s_Pair(before) == g
+  make_concrete_Pair(self)
+  after := p_Pair_snap(self)
+  assert make_generic_s_Pair(after) == g
+  assert make_generic_s_Pair(before) == make_generic_s_Pair(after)
+  assert before == after
+}
+
+// Links 6/7: link 5 passes with all three intermediates asserted and the bare round trip
+// fails with none. These two ask which single intermediate is enough -- i.e. exactly
+// which term has to exist in the e-graph before the proof closes.
+method r_link6_only_erased_eq(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Pair
+  var after: s_Pair
+  before := p_Pair_snap(self)
+  make_generic_Pair(self)
+  make_concrete_Pair(self)
+  after := p_Pair_snap(self)
+  assert make_generic_s_Pair(before) == make_generic_s_Pair(after)
+  assert before == after
+}
+
+// The same hint, but mentioning only the pre-state side of the equation.
+method r_link7_only_before_term(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Pair
+  var after: s_Pair
+  var hint: s_Param
+  before := p_Pair_snap(self)
+  make_generic_Pair(self)
+  make_concrete_Pair(self)
+  after := p_Pair_snap(self)
+  hint := make_generic_s_Pair(before)
+  assert before == after
+}
+
+// Link 8: no assert at all -- just READ the erased snapshot between the two calls. That
+// term is the bridge between the two postconditions (`make_generic(before) == g` from the
+// first, `make_generic(after) == g` from the second), and after `make_concrete_Pair` the
+// `p_Param` predicate is gone, so the term can no longer be formed. If merely reading it
+// is enough, the gap is that the bridge is never materialised.
+method r_link8_only_bridge_read(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Pair
+  var after: s_Pair
+  var g: s_Param
+  before := p_Pair_snap(self)
+  make_generic_Pair(self)
+  g := p_Param_snap(self, s_Pair_type())
+  make_concrete_Pair(self)
+  after := p_Pair_snap(self)
+  assert before == after
+}
+
+// --- The round trip alone: does a Pair snapshot survive generic/concrete conversion?
+method r_roundtrip_identity(self: Ref)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Pair
+  var after: s_Pair
+  before := p_Pair_snap(self)
+  make_generic_Pair(self)
+  make_concrete_Pair(self)
+  after := p_Pair_snap(self)
+  assert before == after
+}
+
+// --- write_then_read across fold/unfold, no conversion.
+method r_write_then_read_fold(self: Ref, v: s_Int_i32)
+  requires acc(p_Pair(self), write)
+{
+  var got: s_Int_i32
+  unfold acc(p_Pair(self), write)
+  exhale acc(p_Int_i32(s_Pair_field_0(self)), write)
+  p_Int_i32_assign(s_Pair_field_0(self), v)
+  fold acc(p_Pair(self), write)
+
+  unfold acc(p_Pair(self), write)
+  got := p_Int_i32_snap(s_Pair_field_0(self))
+  fold acc(p_Pair(self), write)
+  assert got == v
+}
+
+// --- write_then_read across fold/unfold AND the conversion round trip: the real shape.
+method r_write_then_read_roundtrip(self: Ref, v: s_Int_i32)
+  requires acc(p_Pair(self), write)
+{
+  var got: s_Int_i32
+  unfold acc(p_Pair(self), write)
+  exhale acc(p_Int_i32(s_Pair_field_0(self)), write)
+  p_Int_i32_assign(s_Pair_field_0(self), v)
+  fold acc(p_Pair(self), write)
+  make_generic_Pair(self)
+
+  make_concrete_Pair(self)
+  unfold acc(p_Pair(self), write)
+  got := p_Int_i32_snap(s_Pair_field_0(self))
+  fold acc(p_Pair(self), write)
+  make_generic_Pair(self)
+  assert got == v
+}
+
+// --- frame_other_field across the same round trip: writing field 1 leaves field 0 alone.
+method r_frame_other_field(self: Ref, v: s_Int_i32)
+  requires acc(p_Pair(self), write)
+{
+  var before: s_Int_i32
+  var after: s_Int_i32
+  unfold acc(p_Pair(self), write)
+  before := p_Int_i32_snap(s_Pair_field_0(self))
+  exhale acc(p_Int_i32(s_Pair_field_1(self)), write)
+  p_Int_i32_assign(s_Pair_field_1(self), v)
+  fold acc(p_Pair(self), write)
+  make_generic_Pair(self)
+
+  make_concrete_Pair(self)
+  unfold acc(p_Pair(self), write)
+  after := p_Int_i32_snap(s_Pair_field_0(self))
+  fold acc(p_Pair(self), write)
+  make_generic_Pair(self)
+  assert before == after
+}

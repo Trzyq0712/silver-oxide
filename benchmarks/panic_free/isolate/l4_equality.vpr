@@ -1,0 +1,61 @@
+// L4: the composition step the round trip needs, with everything else removed -- no
+// heap, no predicates, no `old`, no branches. Just two equalities sharing a term.
+//
+// `r_link6_only_erased_eq` passes (the equation asserted directly) while
+// `r_link8_only_bridge_read` fails (both halves present, nothing joining them), so the
+// suspect is chaining two equalities through a shared term. These four methods test that
+// claim at its plainest, and compare an uninterpreted symbol against a boxed one.
+
+domain s_Int_i32 {
+  function s_Int_i32_cons(arg0: Int): s_Int_i32
+  function s_Int_i32_value(arg0: s_Int_i32): Int
+
+  axiom s_Int_i32_ax_cons {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      s_Int_i32_cons(s_Int_i32_value(s)) == s)
+  }
+}
+
+domain s_Pair {
+}
+
+domain s_Param {
+}
+
+function make_generic_s_Pair(self: s_Pair): s_Param
+  ensures make_concrete_s_Pair(result) == self
+
+function make_concrete_s_Pair(snap: s_Param): s_Pair
+  ensures make_generic_s_Pair(result) == snap
+
+// --- Both halves given directly, joined through the shared term `g`.
+method q_shared_term(a: s_Pair, b: s_Pair, g: s_Param)
+{
+  inhale make_generic_s_Pair(a) == g
+  inhale make_generic_s_Pair(b) == g
+  assert a == b
+}
+
+// --- The same conclusion, with the two halves already combined.
+method q_direct(a: s_Pair, b: s_Pair)
+{
+  inhale make_generic_s_Pair(a) == make_generic_s_Pair(b)
+  assert a == b
+}
+
+// --- Transitivity alone, no injectivity step: does `x == g`, `y == g` give `x == y`?
+method q_transitive_plain(x: s_Param, y: s_Param, g: s_Param)
+{
+  inhale x == g
+  inhale y == g
+  assert x == y
+}
+
+// --- Transitivity where both sides are function applications rather than variables.
+method q_transitive_under_app(a: s_Pair, b: s_Pair, g: s_Param)
+{
+  inhale make_generic_s_Pair(a) == g
+  inhale make_generic_s_Pair(b) == g
+  assert make_generic_s_Pair(a) == make_generic_s_Pair(b)
+}

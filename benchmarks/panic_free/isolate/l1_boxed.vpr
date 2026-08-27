@@ -1,0 +1,125 @@
+// L1: the same five shapes, with Prusti's value boxing but NO heap predicates.
+//
+// Adds exactly three things over l0_native.vpr, copied verbatim from Prusti's output:
+//   - `s_Int_i32` / `s_Bool` domains with cons/value and their round-trip axioms,
+//   - comparisons as functions returning a boxed bool (`mir_binop_Eq_...`),
+//   - branch tests spelled `s_Bool_value(t) == false`, which is how Prusti encodes
+//     `switchInt` (the else-arm is the literal, so the then-arm is its negation).
+//
+// Locations stay native fields, so any L0-passes/L1-fails difference isolates the
+// boxing rather than the heap.
+
+domain s_Int_i32 {
+  function s_Int_i32_cons(arg0: Int): s_Int_i32
+  function s_Int_i32_value(arg0: s_Int_i32): Int
+
+  axiom s_Int_i32_ax_cons {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      s_Int_i32_cons(s_Int_i32_value(s)) == s)
+  }
+
+  axiom s_Int_i32_ax_bounds {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      -2147483648 <= s_Int_i32_value(s) && s_Int_i32_value(s) <= 2147483647)
+  }
+
+  axiom s_Int_i32_ax_value {
+    (forall value: Int ::
+      { s_Int_i32_cons(value) }
+      -2147483648 <= value && value <= 2147483647 ==>
+      s_Int_i32_value(s_Int_i32_cons(value)) == value)
+  }
+}
+
+domain s_Bool {
+  function s_Bool_cons(arg0: Bool): s_Bool
+  function s_Bool_value(arg0: s_Bool): Bool
+
+  axiom s_Bool_ax_cons {
+    (forall s: s_Bool ::
+      { s_Bool_value(s) }
+      s_Bool_cons(s_Bool_value(s)) == s)
+  }
+
+  axiom s_Bool_ax_value {
+    (forall value: Bool ::
+      { s_Bool_cons(value) }
+      s_Bool_value(s_Bool_cons(value)) == value)
+  }
+}
+
+function mir_binop_Eq_Int_i32_Int_i32(arg1: s_Int_i32, arg2: s_Int_i32): s_Bool
+{
+  s_Bool_cons(s_Int_i32_value(arg1) == s_Int_i32_value(arg2))
+}
+
+field bf: s_Int_i32
+field bg: s_Int_i32
+
+// --- bool_after_join, boxed.
+method b_join(b: s_Bool)
+{
+  var flag: s_Bool
+  if (s_Bool_value(b) == false) {
+    flag := s_Bool_cons(true)
+  } else {
+    flag := s_Bool_cons(true)
+  }
+  assert s_Bool_value(flag) == true
+}
+
+// --- eq_transitive, boxed.
+method b_eq_transitive(x: s_Int_i32, y: s_Int_i32, z: s_Int_i32)
+{
+  var t1: s_Bool
+  var t2: s_Bool
+  var t3: s_Bool
+  t1 := mir_binop_Eq_Int_i32_Int_i32(x, y)
+  if (s_Bool_value(t1) == false) {
+  } else {
+    t2 := mir_binop_Eq_Int_i32_Int_i32(y, z)
+    if (s_Bool_value(t2) == false) {
+    } else {
+      t3 := mir_binop_Eq_Int_i32_Int_i32(x, z)
+      assert s_Bool_value(t3) == true
+    }
+  }
+}
+
+// --- eq_two_literals, boxed.
+method b_two_literals(x: s_Int_i32)
+{
+  var t1: s_Bool
+  var t2: s_Bool
+  t1 := mir_binop_Eq_Int_i32_Int_i32(x, s_Int_i32_cons(5))
+  if (s_Bool_value(t1) == false) {
+  } else {
+    t2 := mir_binop_Eq_Int_i32_Int_i32(x, s_Int_i32_cons(7))
+    assert s_Bool_value(t2) == false
+  }
+}
+
+// --- frame_other_field, boxed values in native fields.
+method b_frame_other_field(r: Ref, v: s_Int_i32)
+  requires acc(r.bf, write)
+  requires acc(r.bg, write)
+{
+  var before: s_Int_i32
+  var after: s_Int_i32
+  before := r.bf
+  r.bg := v
+  after := r.bf
+  assert before == after
+}
+
+// --- write_then_read, boxed values in native fields.
+method b_write_then_read(r: Ref, v: s_Int_i32)
+  requires acc(r.bf, write)
+{
+  var got: s_Int_i32
+  r.bf := v
+  got := r.bf
+  assert got == v
+}

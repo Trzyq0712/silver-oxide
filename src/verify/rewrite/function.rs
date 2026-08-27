@@ -74,28 +74,34 @@ pub(super) fn fold_guards(
     imp
 }
 
-/// Replay a definition's post against one built instance: merge
-/// `token ⟹ post` (an `Ite`, the shape `VerifyContext::implication` builds) with
-/// `true`. Guarded, so the postcondition never fires outside the caller-side
-/// path condition the `token` carries.
+/// Replay a definition's post at one call: build its standalone recipe off the
+/// **arguments** and merge `token ⟹ post` (an `Ite`, the shape
+/// `VerifyContext::implication` builds) with `true`. Guarded, so the
+/// postcondition never fires outside the caller-side path condition the `token`
+/// carries.
+///
+/// Off the arguments, not off a built body instance: [`PostRecipe`] mentions only
+/// the params and `f(params)`, so nothing here materializes the callee's body.
+/// That is what makes the definitional union's presence gate load-bearing.
 ///
 /// `token` is the callee's `f%pre(args)` class at *this* call, `None` when the
 /// definition has no pre-token (a contract function) or when no token exists for
 /// these args. It is threaded separately rather than folded into the recipe
-/// because the post's `Val`s live in the callee's recipe-temp space and resolve
-/// through `vals`, whereas this is already a caller-side `Id`.
+/// because the post's `Val`s live in the callee's recipe-temp space, whereas
+/// this is already a caller-side `Id`.
 pub(super) fn replay_post(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     def: &FunctionDefinition,
-    vals: &[Id],
+    args: &[Id],
     token: Option<Id>,
     changed: &mut Vec<Id>,
 ) {
     let Some(post) = def.post.as_ref() else {
         return;
     };
+    let vals = build_instance_vals(egraph, &post.steps, args, changed);
     let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-    let mut imp = resolve_val(egraph, vals, post);
+    let mut imp = resolve_val(egraph, &vals, &post.res);
     if let Some(tok) = token {
         imp = expr!(egraph, {tok} ==> {imp});
     }
@@ -148,32 +154,42 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
                 egraph.lookup(Symbolic::FuncApp(tok, Box::new([]), args.clone().into()))
             });
             let has_token = self.pre_token.is_none() || tok_id.is_some();
-            // The body instance is needed for the definitional union (token
-            // present, non-limited) and to resolve the post's recipe temps. A call
-            // with neither needs no build — and must NOT be memoized,
-            // so it can fire later once propagation mints its token mid-saturation.
+            // The body instance is needed for the definitional union, and for
+            // nothing else: the post is a standalone recipe over the params. So an
+            // occurrence that no value-position call produced — no token, hence no
+            // union — materializes no body at all, which is what the presence gate
+            // was always supposed to buy. It must NOT be union-memoized, so it can
+            // still union later once propagation mints its token mid-saturation.
             let do_union = !self.limited_post && has_token;
-            let need_build = do_union || self.def.post.is_some();
-            if !need_build {
+            let has_post = self.def.post.is_some();
+            if !do_union && !has_post {
                 continue;
             }
             let key = (tys.clone(), args.clone());
-            let first_build = self.memo.insert(key.clone());
-            // `do_union` is short-circuited first so the union memo is only ever
-            // touched when the token is present: a fresh union, or a call built
-            // facts-only earlier and now reached by a propagation-minted token.
+            // Two independent memos, because the two releases happen at different
+            // times: `memo` says the post has been replayed at this call, and
+            // `do_union` is short-circuited before `union_memo` so the union memo is
+            // only ever touched when the token is present — a fresh union, or a call
+            // that replayed its post earlier and is now reached by a
+            // propagation-minted token.
+            let first_post = has_post && self.memo.insert(key.clone());
             let do_union_now = do_union && self.union_memo.insert(key);
-            // Nothing new to do: already built and no (new) union due.
-            if !first_build && !do_union_now {
+            // Nothing new to do: post already replayed and no (new) union due.
+            if !first_post && !do_union_now {
                 continue;
             }
-            let vals = build_instance_vals_guarded(
-                egraph,
-                &self.def.steps,
-                &args,
-                &mut changed,
-                tok_id,
-            );
+            // Seed slots for the body instance. Only built when the union needs it;
+            // otherwise there is no body here and `vals` stays unused.
+            let vals = match do_union_now {
+                true => build_instance_vals_guarded(
+                    egraph,
+                    &self.def.steps,
+                    &args,
+                    &mut changed,
+                    tok_id,
+                ),
+                false => Vec::new(),
+            };
             // Definitional axiom `tok ==> f(args) == body`. Absent for an abstract
             // function.
             //
@@ -215,7 +231,12 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             // only where this body's own release fires. Never truer than the
             // release it accompanies, so it cannot lose a proof: if `tok` is not
             // true, this body's equality is not released either.
-            if do_union_now || first_build {
+            //
+            // Released with the **union**, never with a bare post replay: a
+            // post-only occurrence built no body, so there is no `g(gargs)` node
+            // here for a `g%pre` token to activate — and minting one would
+            // reintroduce exactly the cascade the presence gate exists to stop.
+            if do_union_now {
                 for ts in &self.def.token_steps {
                     let tok_node = resolve_val(egraph, &vals, &ts.token);
                     // `guards` is the body-internal condition guarding the nested
@@ -249,15 +270,16 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             // on `FuncApp(f)`.
             if !self.limited_post {
                 if let Some(lim) = self.def.limited {
-                    let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.into()));
+                    let twin =
+                        egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.clone().into()));
                     if egraph.union(eclass, twin) {
                         changed.push(egraph.find(eclass));
                     }
                 }
             }
-            // Replay the post only on the first build (idempotent; guarded internally).
-            if first_build {
-                replay_post(egraph, &self.def, &vals, tok_id, &mut changed);
+            // Replay the post once per call (idempotent; guarded internally).
+            if first_post {
+                replay_post(egraph, &self.def, &args, tok_id, &mut changed);
             }
         }
         changed

@@ -1,0 +1,99 @@
+// L1b: L1 mixed two changes at once -- values boxed into `s_Int_i32`, AND comparisons
+// reified into `s_Bool` with `s_Bool_value(t) == false` branch tests. `eq_transitive` and
+// `eq_two_literals` fail at L1 and pass at L0, so one of those two changes is responsible.
+// These four methods apply them one at a time.
+//
+// Every method here must verify.
+
+domain s_Int_i32 {
+  function s_Int_i32_cons(arg0: Int): s_Int_i32
+  function s_Int_i32_value(arg0: s_Int_i32): Int
+
+  axiom s_Int_i32_ax_cons {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      s_Int_i32_cons(s_Int_i32_value(s)) == s)
+  }
+
+  axiom s_Int_i32_ax_bounds {
+    (forall s: s_Int_i32 ::
+      { s_Int_i32_value(s) }
+      -2147483648 <= s_Int_i32_value(s) && s_Int_i32_value(s) <= 2147483647)
+  }
+
+  axiom s_Int_i32_ax_value {
+    (forall value: Int ::
+      { s_Int_i32_cons(value) }
+      -2147483648 <= value && value <= 2147483647 ==>
+      s_Int_i32_value(s_Int_i32_cons(value)) == value)
+  }
+}
+
+domain s_Bool {
+  function s_Bool_cons(arg0: Bool): s_Bool
+  function s_Bool_value(arg0: s_Bool): Bool
+
+  axiom s_Bool_ax_cons {
+    (forall s: s_Bool ::
+      { s_Bool_value(s) }
+      s_Bool_cons(s_Bool_value(s)) == s)
+  }
+
+  axiom s_Bool_ax_value {
+    (forall value: Bool ::
+      { s_Bool_cons(value) }
+      s_Bool_value(s_Bool_cons(value)) == value)
+  }
+}
+
+function mir_binop_Eq_Int_i32_Int_i32(arg1: s_Int_i32, arg2: s_Int_i32): s_Bool
+{
+  s_Bool_cons(s_Int_i32_value(arg1) == s_Int_i32_value(arg2))
+}
+
+// --- Values boxed, comparisons and branches native.
+method v_eq_transitive_boxed_values(x: s_Int_i32, y: s_Int_i32, z: s_Int_i32)
+{
+  if (s_Int_i32_value(x) == s_Int_i32_value(y)) {
+    if (s_Int_i32_value(y) == s_Int_i32_value(z)) {
+      assert s_Int_i32_value(x) == s_Int_i32_value(z)
+    }
+  }
+}
+
+method v_two_literals_boxed_values(x: s_Int_i32)
+{
+  if (s_Int_i32_value(x) == 5) {
+    assert !(s_Int_i32_value(x) == 7)
+  }
+}
+
+// --- Values native, comparisons reified into a boxed bool with Prusti's branch idiom.
+method v_eq_transitive_reified_bool(x: Int, y: Int, z: Int)
+{
+  var t1: s_Bool
+  var t2: s_Bool
+  var t3: s_Bool
+  t1 := s_Bool_cons(x == y)
+  if (s_Bool_value(t1) == false) {
+  } else {
+    t2 := s_Bool_cons(y == z)
+    if (s_Bool_value(t2) == false) {
+    } else {
+      t3 := s_Bool_cons(x == z)
+      assert s_Bool_value(t3) == true
+    }
+  }
+}
+
+method v_two_literals_reified_bool(x: Int)
+{
+  var t1: s_Bool
+  var t2: s_Bool
+  t1 := s_Bool_cons(x == 5)
+  if (s_Bool_value(t1) == false) {
+  } else {
+    t2 := s_Bool_cons(x == 7)
+    assert s_Bool_value(t2) == false
+  }
+}

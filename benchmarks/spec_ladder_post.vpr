@@ -1,20 +1,33 @@
-// The `spec_ladder` control plus a **vacuous** `ensures true` on every level.
-// The post facts say nothing, yet `need_build = do_union || !facts.is_empty()`
-// materializes a body at every spec-position occurrence anyway, roughly doubling
-// the peak node count. Stage 4 of `design/function-facts/` must bring this file
-// back to `spec_ladder`'s cost.
-function v0(x: Int): Bool ensures true { x > 0 }
-function v1(x: Int): Bool ensures true { v0(x) }
-function v2(x: Int): Bool ensures true { v1(x) }
-function v3(x: Int): Bool ensures true { v2(x) }
-function v4(x: Int): Bool ensures true { v3(x) }
-function v5(x: Int): Bool ensures true { v4(x) }
-function v6(x: Int): Bool ensures true { v5(x) }
-function v7(x: Int): Bool ensures true { v6(x) }
-function v8(x: Int): Bool ensures true { v7(x) }
+// Spec-position occurrences, the pathological case.
+//
+// `mk`'s postcondition mentions `h5`, so a client that calls `mk` sees an `h5`
+// application arrive through `mk#ensures` — a contract body, which propagates no
+// precondition token. That occurrence therefore carries no `h5%pre`: no
+// value-position call produced it, and the presence gate should keep `h5`'s body
+// out of the caller entirely.
+//
+// `spec_ladder` with a **vacuous** `ensures true` on every level of the chain.
+// The posts say nothing, but before Stage 4 of `design/function-facts/` the mere
+// presence of one defeated the gate — `need_build = do_union || has facts` —
+// so the untokened `h5` occurrence materialized a body, which minted an
+// untokened `h4` occurrence, and so on down. Stage 4 must bring the caller's
+// share of the cost back to what the control pays.
+function h0(x: Int): Int ensures true { x + 1 }
+function h1(x: Int): Int ensures true { h0(x) + h0(x + 1) }
+function h2(x: Int): Int ensures true { h1(x) + h1(x + 1) }
+function h3(x: Int): Int ensures true { h2(x) + h2(x + 1) }
+function h4(x: Int): Int ensures true { h3(x) + h3(x + 1) }
+function h5(x: Int): Int ensures true { h4(x) + h4(x + 1) }
 
-method ladder(x: Int)
-  requires v8(x)
+function mk(x: Int): Int
+  ensures result == h5(x)
+
+function consume(y: Int): Int
+  requires 0 <= y
+{ y }
+
+method client(x: Int)
+  requires 0 <= mk(x)
 {
-  assert v8(x)
+  var r: Int := consume(mk(x))
 }
