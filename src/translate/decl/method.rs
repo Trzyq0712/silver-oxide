@@ -593,10 +593,11 @@ pub(crate) fn lower_method(
         // --- body phase: lower the block's statements and terminator under pc ---
         let blk = &cfg.blocks[bid];
         let body_mark = sink.insts.len();
-        // Fork model: push the cube as `Cube` (guards obligations, does NOT gate
-        // permissions — the join merge SELECTs).
-        let cube_kind = PcKind::Cube;
-        let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_conds_kind(&pc, cube_kind, |sink| {
+        // Fork model: the cube is this phase's **ambient** — proof context for every
+        // inst in it (it does NOT gate permissions; the join merge SELECTs), and
+        // elided from each `Inst.pc`, which is a delta over it. `Block.cube` below
+        // is the single place it is recorded.
+        let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_ambient_cube(&pc, |sink| {
             let mut heap = h_in;
             for stmt in &blk.stmts {
                 heap = lower_stmt(b, &mut env, sink, heap, baseline, &mut labeled, stmt)?;

@@ -287,8 +287,11 @@ method m(c: Bool, x: Int)
     };
     // params: c = Temp(0), x = Temp(1); the branch cond is the bare param c.
     let c = vmir::Val::Temp(0);
-    let asserts: Vec<&vmir::PathConds> = m.iter_insts()
-        .filter_map(|i| matches!(i.kind, vmir::InstKind::Assert(_)).then_some(&i.pc))
+    // The arm condition is the block **cube**, and `Inst.pc` is a delta over it,
+    // so the property lives in the *effective* pc.
+    let asserts: Vec<vmir::PathConds> = m
+        .iter_insts_with_pc()
+        .filter_map(|(pc, i)| matches!(i.kind, vmir::InstKind::Assert(_)).then_some(pc))
         .collect();
     assert_eq!(asserts.len(), 2, "one assert per arm");
     assert!(
@@ -331,24 +334,26 @@ method m(a: Bool, b: Bool, x: Ref)
         panic!("m must be a Method");
     };
     // params: a = Temp(0), b = Temp(1).
-    let assert = m.iter_insts()
-        .find(|i| matches!(i.kind, vmir::InstKind::Assert(_)))
+    let (assert_pc, _) = m
+        .iter_insts_with_pc()
+        .find(|(_, i)| matches!(i.kind, vmir::InstKind::Assert(_)))
         .expect("inner assert");
     assert_eq!(
-        assert.pc.conds,
+        assert_pc.conds,
         vec![
             (vmir::Val::Temp(0), vmir::Polarity::Positive),
             (vmir::Val::Temp(1), vmir::Polarity::Positive),
         ],
         "nested guard must be the two real branch literals <a, b>, not a materialized OR"
     );
-    let exhale = m.iter_insts()
-        .find(|i| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
+    let (exhale_pc, _) = m
+        .iter_insts_with_pc()
+        .find(|(_, i)| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
         .expect("ensures exhale");
     assert!(
-        exhale.pc.conds.is_empty(),
+        exhale_pc.conds.is_empty(),
         "both merges return to the dominator pc; final exhale is <>, got {:?}",
-        exhale.pc
+        exhale_pc
     );
 }
 

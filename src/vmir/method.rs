@@ -82,6 +82,29 @@ impl Method {
             .iter()
             .flat_map(|b| b.join.iter().chain(&b.body))
     }
+
+    /// [`Method::iter_insts`], paired with each instruction's **effective** path
+    /// condition:
+    ///
+    /// ```text
+    /// effective_pc(inst) = ambient_cube(phase) ++ inst.pc
+    /// ```
+    ///
+    /// `Inst.pc` is a *delta*. The ambient is [`Block::cube`] for a body-phase
+    /// inst and empty for a join-phase one — a join materializes its own cube
+    /// literals (in `bb6 <e10> join e9 [..]`, `e10` is defined by the join), so
+    /// there the delta is already the whole condition. Derived, never stored.
+    pub fn iter_insts_with_pc(&self) -> impl Iterator<Item = (PathConds, &Inst)> {
+        self.blocks.iter().flat_map(|b| {
+            let joins = b.join.iter().map(|i| (i.pc.clone(), i));
+            let bodies = b.body.iter().map(|i| {
+                let mut pc = b.cube.clone();
+                pc.conds.extend(i.pc.conds.iter().cloned());
+                (pc, i)
+            });
+            joins.chain(bodies)
+        })
+    }
 }
 
 // ======================

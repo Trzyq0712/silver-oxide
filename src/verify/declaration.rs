@@ -8,7 +8,7 @@ use crate::{
         context::VerifyContext,
         error::VerifyError,
         heap::{
-            Chunk, ChunkPerm, Heap, LocationKind, cube_eq, gate_perm_by_guard,
+            Chunk, ChunkPerm, Heap, LocationKind, gate_perm_by_guard,
             algebra::{
                 Demand, chunk_under_pc, find_chunk_consolidated, heap_subtract, heap_union,
                 merge_heaps, perm_held_at,
@@ -243,7 +243,10 @@ fn display_heaps(state: &EvalState, kind: &InstKind, heaps_before: usize) -> Vec
     }
 }
 
-fn collect_pc_lits(
+/// Lower `pc.conds` to live ids, and nothing else. Use this only where the
+/// ambient cube is already accounted for by the caller; every ordinary inst
+/// wants [`collect_pc_lits`].
+fn pc_lits_raw(
     ctx: &mut VerifyContext<'_>,
     state: &EvalState,
     pc: &PathConds,
@@ -252,6 +255,29 @@ fn collect_pc_lits(
         .iter()
         .map(|(v, p)| (state.get_val(ctx, v), *p))
         .collect()
+}
+
+/// The **effective** path condition of an instruction:
+///
+/// ```text
+/// effective_pc(inst) = ambient_cube(phase) ++ inst.pc
+/// ```
+///
+/// `Inst.pc` is a delta (see [`Sink::ambient`](crate::translate::sink)), so the
+/// ambient cube has to be prepended here. `ctx.current_cube()` *is* that ambient:
+/// it is set by `begin_block` before a block's body walk and cleared by
+/// `end_block` before its join walk, which is exactly the phase split the delta
+/// rule names — a join materializes its own cube literals, so there the ambient
+/// is empty and the delta is the whole pc.
+fn collect_pc_lits(
+    ctx: &mut VerifyContext<'_>,
+    state: &EvalState,
+    pc: &PathConds,
+) -> Vec<(egg::Id, Polarity)> {
+    // Owned first: `state.get_val` needs `&mut ctx`.
+    let mut lits = ctx.current_cube().to_vec();
+    lits.extend(pc_lits_raw(ctx, state, pc));
+    lits
 }
 
 /// Error tag for a certificate-walk operand whose recipe is missing — cannot
@@ -876,44 +902,45 @@ fn scale_perm(ctx: &mut VerifyContext<'_>, pm: egg::Id, pm_wild: bool, perm: Chu
 
 /// Invariant 6 of the two-egraph block model (`design/block-vmir/82-*.md`):
 /// statement-level heap instructions operate at the **block-PC level only** — their
-/// `inst.pc` is exactly the block cube, never a cube plus a suffix — because they
+/// effective pc is exactly the block cube, never a cube plus a suffix — because they
 /// cannot appear as sub-expressions. Expression-embedded obligations (a function
 /// precondition, a division check) are the only things allowed an extra suffix.
 ///
 /// A violation means a heap effect landing under a condition the block model does
-/// not know about. Gated on `SILVER_OXIDE_ASSERT_BLOCK_PC` so it can be run over
-/// the corpus in release builds, where a `debug_assert` would compile out.
+/// not know about.
 ///
-/// Known violating shape: `unfolding p in e` is a Viper *expression* but lowers to
-/// statement-level instructions, so it can sit under an extra ternary guard. Since the
-/// fold/unfold desugaring it is the pair's *resource* half that carries the shape --
-/// the slot halves are sub-statement and were never listed -- so it is still caught,
-/// just through a different variant. Plan 82 proposes rejecting it until it becomes a
-/// scoped node.
-fn assert_statement_pc_is_block_cube(
-    ctx: &mut VerifyContext<'_>,
-    state: &EvalState,
-    inst: &Inst,
-) {
+/// Since `Inst.pc` became a **delta** over the phase's ambient cube, the "is the
+/// cube" half of this is by construction: the body phase elides the ambient at
+/// emission ([`Sink::with_ambient_cube`](crate::translate::sink)), so there is no
+/// representation in which a statement inst could restate or contradict it. What is
+/// left to check is the *suffix* half, and that is a plain emptiness test on the
+/// delta — no e-graph, no `cube_eq`.
+///
+/// Still gated on `SILVER_OXIDE_ASSERT_BLOCK_PC` rather than promoted to an
+/// always-on `debug_assert`, because the suffix half has a **known, deliberate
+/// counterexample**: `unfolding p in e` is a Viper *expression* that lowers to
+/// statement-level instructions, so under a ternary it legitimately carries a
+/// suffix (`tests/cases/passing/predicates/unfolding_expr_scoped_read.vpr`, and
+/// `tests/cases/failing/functions/predicate_graft_token_guard.vpr`). Plan 82
+/// proposed rejecting that construct; measurement says the lowering re-folds and
+/// fabricates no permission, so it is the invariant that is too strong. Until
+/// `unfolding` becomes a scoped node, this stays an opt-in corpus check.
+fn assert_statement_pc_is_block_cube(ctx: &mut VerifyContext<'_>, inst: &Inst) {
     if !ctx.in_block() || std::env::var_os("SILVER_OXIDE_ASSERT_BLOCK_PC").is_none() {
         return;
     }
     let statement_level = matches!(
         inst.kind,
-        InstKind::Heap(
-            HeapInst::Inhale { .. } | HeapInst::Exhale { .. } | HeapInst::Assign(..)
-        )
+        InstKind::Heap(HeapInst::Inhale { .. } | HeapInst::Exhale { .. } | HeapInst::Assign(..))
     );
     if !statement_level {
         return;
     }
-    let pc = collect_pc_lits(ctx, state, &inst.pc);
     assert!(
-        cube_eq(ctx, &pc, ctx.current_cube()),
-        "invariant 6: statement-level inst carries a pc other than the block cube \
-         ({} literals vs {} in the cube) — kind {:?}",
-        pc.len(),
-        ctx.current_cube().len(),
+        inst.pc.conds.is_empty(),
+        "invariant 6: statement-level inst carries a pc suffix beyond the block cube \
+         ({} extra literals) — kind {:?}",
+        inst.pc.conds.len(),
         std::mem::discriminant(&inst.kind),
     );
 }
@@ -2165,8 +2192,12 @@ fn check_forall_wd_in_scratch(
     for inst in &q.body.insts {
         // The body's own guards sit *under* the host's: a side condition must hold
         // wherever the quantifier is stated, and wherever the body reaches it.
+        // `host_pc` came from a `collect_pc_lits` at the enclosing inst, so it
+        // already carries the ambient cube — the body's ambient *is* `host_pc`.
+        // Prepending the cube a second time here would break `cube_matches`'s
+        // length test and silently disable the block scratch.
         let mut pc_lits = host_pc.to_vec();
-        pc_lits.extend(collect_pc_lits(ctx, &state, &inst.pc));
+        pc_lits.extend(pc_lits_raw(ctx, &state, &inst.pc));
 
         for (goal, err) in inst_obligations(ctx, &state, &inst.kind, &pc_lits) {
             if !ctx.prove_under_pc(goal, &pc_lits) {
@@ -2247,7 +2278,7 @@ fn walk_body(
     mut footprint_ops: Option<&mut Vec<(Val, vmir::PermVal)>>,
 ) -> Result<(), VerifyError> {
     for (inst_idx, inst) in insts.iter().enumerate() {
-        assert_statement_pc_is_block_cube(ctx, state, inst);
+        assert_statement_pc_is_block_cube(ctx, inst);
         if let (Some(ops), InstKind::Heap(HeapInst::Add { loc, perm, .. } | HeapInst::Sub { loc, perm, .. })) =
             (&mut footprint_ops, &inst.kind)
         {
@@ -2371,7 +2402,7 @@ pub(crate) fn verify_method(
         )?;
         // Record this block's cube for the (experimental) per-block scratch. All
         // body insts share it (vmir::Block::cube), so the scratch assumes it once.
-        let cube = collect_pc_lits(&mut ctx, &state, &block.cube);
+        let cube = pc_lits_raw(&mut ctx, &state, &block.cube);
         ctx.begin_block(cube);
         walk_body(
             &mut ctx,
@@ -2389,7 +2420,9 @@ pub(crate) fn verify_method(
         // it instead of forming a `0`-leaf that would need a case split. Cheap:
         // just consults folded literals, no clone.
         if let vmir::HeapVal::Temp(n) = block.h_out {
-            let lits = collect_pc_lits(&mut ctx, &state, &block.cube);
+            // Raw: this runs *inside* the block, so `collect_pc_lits` would
+            // prepend the very cube being lowered.
+            let lits = pc_lits_raw(&mut ctx, &state, &block.cube);
             let refuted = lits.iter().any(|(id, pol)| {
                 matches!(
                     ctx.egraph[ctx.egraph.find(*id)].data.known(),

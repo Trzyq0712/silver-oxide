@@ -45,6 +45,19 @@ pub(crate) struct Sink {
     /// Running path condition of the lowering point. Sidecond instructions
     /// are emitted gated by this; branch arms push/pop guards via `with_cond`.
     pub pc: Vec<(Val, Polarity, PcKind)>,
+    /// Watermark into `pc`: everything below it is the **ambient cube** of the
+    /// phase being lowered, already recorded on the enclosing `vmir::Block` and
+    /// re-derived by the verifier, so it is elided from every emitted `Inst`.
+    /// An `Inst.pc` is therefore a *delta*:
+    ///
+    /// ```text
+    /// effective_pc(inst) = ambient_cube(phase) ++ inst.pc
+    /// ```
+    ///
+    /// Set only for a block's **body** phase (see [`Sink::with_ambient_cube`]);
+    /// `0` everywhere else — a block's *join* phase materializes its own cube
+    /// literals, so there the pc must stay full.
+    ambient: usize,
     /// The current heap an obligation's side condition is checked in. Delivered
     /// like `pc`: set for a lowering region via [`Sink::with_heap`], snapshotted
     /// onto a heapless obligation's `Inst` by the emitters. `None` outside any
@@ -61,7 +74,10 @@ pub(crate) struct Sink {
     /// The `pc` component exists for [`Sink::emit_call`]: a call inst carries its
     /// lowering pc (the verifier assumes the callee's `f%pre` token under it), so
     /// two occurrences of the same call under *different* pcs must not collide —
-    /// see that method for what a collision would cost. Every other emitter
+    /// see that method for what a collision would cost. It is the **full** pc
+    /// ([`Sink::full_guard`]), ambient cube included, not the delta written onto
+    /// the `Inst`: the memo spans every block of a method, so two blocks whose
+    /// cubes are the only difference must still get two temps. Every other emitter
     /// passes `PathConds::default()`, so their behavior is unchanged.
     memo: HashMap<(Type, PureInst, PathConds), Val>,
     /// Read-only (function/pure) lowering: every `acc`/unfolding permission is
@@ -97,6 +113,7 @@ impl Sink {
             heap_count: heap_base,
             perm_count: 0,
             pc: Vec::new(),
+            ambient: 0,
             heap: None,
             memo: HashMap::new(),
             read_only: false,
@@ -164,10 +181,41 @@ impl Sink {
         r
     }
 
+    /// Run `f` with `conds` pushed as the phase's **ambient cube**: each literal
+    /// enters the pc as a [`PcKind::Cube`] (so it is proof context but never gates
+    /// a permission), and the watermark moves past them so they are elided from
+    /// every `Inst` emitted inside. The block already records the same cube in
+    /// [`vmir::Block::cube`], and the verifier re-derives it via `begin_block`.
+    ///
+    /// Only a block's **body** phase gets an ambient. A join phase defines its own
+    /// cube literals (`bb6 <e10> join e9 [..]` mints `e10` in the join itself), so
+    /// its insts must carry the full pc; those sites use [`Sink::with_conds_kind`]
+    /// and leave the watermark alone.
+    pub(crate) fn with_ambient_cube<R>(
+        &mut self,
+        conds: &PathConds,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prev = self.ambient;
+        for (cond, pol) in &conds.conds {
+            self.pc.push((cond.clone(), *pol, PcKind::Cube));
+        }
+        self.ambient = self.pc.len();
+        let r = f(self);
+        self.ambient = prev;
+        for _ in &conds.conds {
+            self.pc.pop();
+        }
+        r
+    }
+
     /// The currently-active **branch** path-condition literals (the ones that
-    /// gate permissions); `Fact` entries are excluded.
+    /// gate permissions); `Fact` entries are excluded. Sliced from the ambient
+    /// watermark, so that a block cube can never reach [`Sink::gate_perm`] is
+    /// visible at the one place it would matter (the ambient is all `Cube`
+    /// anyway, so the slice changes no result).
     pub(crate) fn branch_conds(&self) -> Vec<(Val, Polarity)> {
-        self.pc
+        self.pc[self.ambient..]
             .iter()
             .filter(|(_, _, k)| *k == PcKind::Branch)
             .map(|(c, p, _)| (c.clone(), *p))
@@ -293,9 +341,23 @@ impl Sink {
         HeapVal::Temp(id)
     }
 
-    /// A snapshot of the running path condition, to attach to a side-condition
-    /// instruction. Empty outside any branch.
+    /// The pc to attach to an emitted instruction: the running path condition
+    /// **minus the ambient cube** (see [`Sink::ambient`]). Empty outside any
+    /// branch, and empty for an inst emitted directly under a block cube.
     fn guard(&self) -> PathConds {
+        PathConds {
+            conds: self.pc[self.ambient..]
+                .iter()
+                .map(|(c, p, _)| (c.clone(), *p))
+                .collect(),
+        }
+    }
+
+    /// The **whole** path-condition stack, ambient included. The only consumer is
+    /// [`Sink::emit_call`]'s memo key: the memo is shared across all blocks of a
+    /// method, so two calls distinguished only by their block cubes must not
+    /// collide — with deltas both would key the empty pc.
+    fn full_guard(&self) -> PathConds {
         PathConds {
             conds: self.pc.iter().map(|(c, p, _)| (c.clone(), *p)).collect(),
         }
@@ -305,7 +367,8 @@ impl Sink {
     /// Deterministic insts are value-numbered (see [`Sink::memo`]): a repeat
     /// `(ty, inst)` returns the earlier temp without emitting.
     pub fn emit_pure(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
-        self.emit_pure_gated(ty, inst,PathConds::default())
+        let pc = PathConds::default();
+        self.emit_pure_gated(ty, inst, pc.clone(), pc)
     }
 
     /// Emit a **function call** carrying the running path condition. Unlike every
@@ -325,24 +388,35 @@ impl Sink {
     /// unfold; unconditional-then-conditional makes the token unconditionally
     /// true and lets the callee's facts leak to sibling paths.
     pub fn emit_call(&mut self, ty: vmir::Type, inst: PureInst) -> Val {
-        let pc = self.guard();
-        self.emit_pure_gated(ty, inst,pc)
+        // Emit the delta, but key the memo on the **full** pc. The memo is shared
+        // across every block of a method, so `f(x)` in `bb1 <e1>` and `f(x)` in
+        // `bb2 <!e1>` have equal deltas (both empty) and would collide on the
+        // delta — reintroducing exactly the `f%pre` damage described above.
+        self.emit_pure_gated(ty, inst, self.guard(), self.full_guard())
     }
 
     /// Shared body of [`Sink::emit_pure`] and [`Sink::emit_call`]: emit `inst`
-    /// gated by `pc`, value-numbering on `(ty, inst, pc)`.
-    fn emit_pure_gated(&mut self, ty: vmir::Type, inst: PureInst, pc: PathConds) -> Val {
+    /// gated by `pc`, value-numbering on `(ty, inst, key_pc)`. The two pcs differ
+    /// only for [`Sink::emit_call`], where `pc` is the delta written onto the
+    /// `Inst` and `key_pc` is the full path condition the memo must distinguish on.
+    fn emit_pure_gated(
+        &mut self,
+        ty: vmir::Type,
+        inst: PureInst,
+        pc: PathConds,
+        key_pc: PathConds,
+    ) -> Val {
         if inst == PureInst::Fresh {
             let v = self.next_val_temp();
             self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
             return v;
         }
-        if let Some(v) = self.memo.get(&(ty.clone(), inst.clone(), pc.clone())) {
+        if let Some(v) = self.memo.get(&(ty.clone(), inst.clone(), key_pc.clone())) {
             return v.clone();
         }
         let v = self.next_val_temp();
         self.memo
-            .insert((ty.clone(), inst.clone(), pc.clone()), v.clone());
+            .insert((ty.clone(), inst.clone(), key_pc), v.clone());
         self.insts.push(Inst::new(pc, InstKind::Pure(ty, inst)));
         v
     }

@@ -6,6 +6,29 @@ use std::fmt::{self, Display, Formatter};
 /// An instruction gated by a path condition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Inst {
+    /// The instruction's path condition, as a **delta over the ambient cube of
+    /// the phase it sits in**:
+    ///
+    /// ```text
+    /// effective_pc(inst) = ambient_cube(phase) ++ inst.pc
+    /// ```
+    ///
+    /// | phase | ambient cube |
+    /// |---|---|
+    /// | [`Block::body`](crate::vmir::Block::body) | [`Block::cube`](crate::vmir::Block::cube) |
+    /// | [`Block::join`](crate::vmir::Block::join) | empty |
+    /// | resource / function body, `forall` body | empty (no block) |
+    ///
+    /// A join's ambient is empty because a join *materializes* its own cube
+    /// literals — in `bb6 <e10> join e9 [..]`, `e10` is defined by a reach inst
+    /// inside the join phase — so there the delta is the whole condition.
+    ///
+    /// Consequences worth knowing: a block cube is stated **once**, on
+    /// `Block::cube`, and so can never be restated or contradicted by an inst;
+    /// and it can never reach a permission amount, because gating reads the
+    /// delta. Use [`Method::iter_insts_with_pc`](crate::vmir::Method::iter_insts_with_pc)
+    /// when you need the effective condition. The dump prints the delta, and the
+    /// block header prints the cube, so a reader can reconstruct it.
     pub pc: PathConds,
     /// The heap this instruction's side condition must be **checked in** — the
     /// heap the verifier will consolidate (materialising aliasing-dependent
