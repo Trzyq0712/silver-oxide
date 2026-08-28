@@ -133,20 +133,26 @@ pub(crate) struct BodyRecipe {
     /// backward closure would otherwise prune them). Rebuilding a step only *adds*
     /// the node; [`Self::build`] additionally releases each token's truth, which is
     /// what lets a contract-introduced function application unfold at a client.
-    /// Released **unguarded**: a resource graft has no enclosing `f%pre` to inherit,
-    /// and it is function *facts*, not resource footprints, that the call-site pc
-    /// gating exists to confine. Each token's own body-internal guards still apply
-    /// (see [`TokenStep`]).
+    /// Released under the **graft site's** path condition, which the caller passes
+    /// to [`Self::build`]: a resource has no enclosing `f%pre` to inherit, but a
+    /// graft on one arm of a branch must no more release its callees' axioms on the
+    /// other arm than a function call's own token may. Each token's body-internal
+    /// guards apply inside that (see [`TokenStep`]).
     pub(crate) token_steps: Vec<TokenStep>,
 }
 
 impl BodyRecipe {
     /// Rebuild this recipe in `egraph`, resolving each seed slot via `resolve`.
     /// Add-only (imports no e-classes). `changed` accumulates altered classes.
+    ///
+    /// `pc` is the graft site's path condition (outermost-first), applied to the
+    /// [`Self::token_steps`] releases — the built terms themselves need no guard,
+    /// being terms rather than facts.
     pub(crate) fn build(
         &self,
         egraph: &mut EGraph<Symbolic, ConstFold>,
         resolve: impl Fn(&SeedRef) -> Id,
+        pc: &[(Id, Polarity)],
         changed: &mut Vec<Id>,
     ) -> Id {
         let seed: Vec<Id> = self.seed_refs.iter().map(resolve).collect();
@@ -156,6 +162,7 @@ impl BodyRecipe {
             &self.res,
             &seed,
             &self.token_steps,
+            pc,
             changed,
         )
     }

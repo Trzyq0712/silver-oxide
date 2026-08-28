@@ -1,0 +1,20 @@
+// A resource graft's propagated tokens must carry the graft site's path
+// condition, exactly as a function call's own token does.
+//
+// A method contract lowers to a *resource*, not to a contract function, so the
+// precondition exhale at `callee(x)` grafts `callee#requires`'s body and
+// releases `g%pre(x)`. Released unguarded, `g`'s vacuously-false postcondition
+// reaches the `!b` arm, where `callee` is never called — and `assert false`
+// verifies. The predicate form of the same shape is
+// `predicate_graft_token_guard.vpr`.
+function g(a: Int): Bool
+  ensures false
+
+method callee(x: Int)
+  requires g(x)
+
+method leak(b: Bool, x: Int)
+{
+  if (b) { callee(x) }
+  assert false
+}

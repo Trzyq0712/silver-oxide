@@ -1,0 +1,20 @@
+// The positive control for `failing/functions/{resource,predicate}_graft_token_guard`.
+//
+// The guard on a resource graft's propagated tokens must not be so strong that
+// the arm which *did* graft loses them: `x.v == 2` needs `g(1)` to unfold, and
+// the only thing that makes `g` unfoldable here is the token `P`'s body released
+// when the predicate was grafted — under the branch.
+function g(a: Int): Int { a + 1 }
+
+field v: Int
+
+predicate P(x: Ref) { acc(x.v, write) && x.v == g(1) }
+
+method graft_token_is_usable_inside_its_branch(b: Bool, x: Ref)
+  requires acc(P(x), write)
+{
+  if (b) {
+    unfold acc(P(x), write)
+    assert x.v == 2
+  }
+}

@@ -49,10 +49,31 @@ pub(super) struct FunctionUnfoldApplier {
     pub(super) pre_token: Option<FuncId>,
 }
 
-/// Wrap `inner` in a recipe-space guard chain: `guards ==> inner`, as nested
-/// `Ite`s with `true` on the dead side. `guards` is outermost-first (matching
-/// [`TokenStep::guards`]) and is folded innermost-first, the same shape
-/// `VerifyContext::implication` builds. Empty `guards` returns `inner`.
+/// Wrap `inner` in a guard chain over **live ids**: `guards ==> inner`, as nested
+/// `Ite`s with `true` on the dead side. `guards` is outermost-first and folded
+/// innermost-first, the same shape `VerifyContext::implication` builds. Empty
+/// `guards` returns `inner`.
+pub(crate) fn fold_guard_ids(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    guards: &[(Id, Polarity)],
+    inner: Id,
+) -> Id {
+    if guards.is_empty() {
+        return inner;
+    }
+    let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+    let mut imp = inner;
+    for (g, pol) in guards.iter().rev() {
+        imp = match pol {
+            Polarity::Positive => egraph.add(Symbolic::Ite([*g, imp, true_])),
+            Polarity::Negative => egraph.add(Symbolic::Ite([*g, true_, imp])),
+        };
+    }
+    imp
+}
+
+/// [`fold_guard_ids`] over **recipe-space** guards (matching
+/// [`TokenStep::guards`]), resolving each against the built instance's slots.
 pub(super) fn fold_guards(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     vals: &[Id],
@@ -62,16 +83,11 @@ pub(super) fn fold_guards(
     if guards.is_empty() {
         return inner;
     }
-    let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-    let mut imp = inner;
-    for (g, pol) in guards.iter().rev() {
-        let g = resolve_val(egraph, vals, g);
-        imp = match pol {
-            Polarity::Positive => egraph.add(Symbolic::Ite([g, imp, true_])),
-            Polarity::Negative => egraph.add(Symbolic::Ite([g, true_, imp])),
-        };
-    }
-    imp
+    let resolved: Vec<(Id, Polarity)> = guards
+        .iter()
+        .map(|(g, pol)| (resolve_val(egraph, vals, g), *pol))
+        .collect();
+    fold_guard_ids(egraph, &resolved, inner)
 }
 
 /// Replay a definition's post at one call: build its standalone recipe off the

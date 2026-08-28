@@ -145,17 +145,49 @@ pub(crate) fn build_instance(
 /// merging it with `true` is what activates `g`'s own axioms, and is what lets a
 /// contract-introduced function application unfold at a client.
 ///
-/// No *outer* gate here — a resource graft has no enclosing `f%pre` truth to
-/// inherit, and the call-site pc gating exists to confine a function's *facts*,
-/// not a resource footprint. Each token's own **body-internal** guards do apply
-/// though: a call under a condition inside the resource body must not release its
-/// callee's axioms where that condition fails.
+/// Two guard layers apply, outer first. `outer` is the **graft site's** path
+/// condition: a resource grafted on one arm of a branch must not release its
+/// callees' axioms on the other, exactly as a function call's token carries the
+/// pc it was minted under. (There is no enclosing `f%pre` truth to inherit — a
+/// resource has no pre-token — so this is the whole outer gate.) Then each
+/// token's own **body-internal** guards: a call under a condition inside the
+/// resource body must not release its callee's axioms where that condition fails.
+///
+/// Viper scopes an `unfolding`'s *heap*, not the facts derived under it —
+/// `joiner.join` resets `h`/`g`/`oldHeaps` and re-assumes the recorded path
+/// conditions in `conditionalized` form (`Joiner.scala`,
+/// `PathConditions.scala:263`). So a token minted inside one legitimately
+/// outlives it, guarded by the branch conditions it was derived under, which is
+/// what `outer` carries.
+/// The conjunction of a guard cube as one boolean e-class, `None` when empty.
+/// `And` has no e-node — a conjunction is `ite(a, b, false)` and a negated
+/// literal is `ite(g, false, true)`, matching the encoding elsewhere.
+fn cube_id(
+    egraph: &mut EGraph<Symbolic, ConstFold>,
+    guards: &[(Id, crate::vmir::Polarity)],
+) -> Option<Id> {
+    if guards.is_empty() {
+        return None;
+    }
+    let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+    let false_ = egraph.add(Symbolic::Lit(Literal::Bool(false)));
+    let mut acc = true_;
+    for (g, pol) in guards.iter().rev() {
+        acc = match pol {
+            Polarity::Positive => egraph.add(Symbolic::Ite([*g, acc, false_])),
+            Polarity::Negative => egraph.add(Symbolic::Ite([*g, false_, acc])),
+        };
+    }
+    Some(acc)
+}
+
 pub(crate) fn build_instance_releasing_tokens(
     egraph: &mut EGraph<Symbolic, ConstFold>,
     insts: &[AxiomInst],
     res: &Val,
     vals_seed: &[Id],
     token_steps: &[crate::verify::cert::TokenStep],
+    outer: &[(Id, crate::vmir::Polarity)],
     changed: &mut Vec<Id>,
 ) -> Id {
     // Most recipes propagate no callee token, and then this *is* `build_instance`.
@@ -163,10 +195,20 @@ pub(crate) fn build_instance_releasing_tokens(
         return build_instance(egraph, insts, res, vals_seed, changed);
     }
     let vals = build_instance_vals(egraph, insts, vals_seed, changed);
+    // One cube node for the whole graft, not one guard spine per token: a
+    // footprint with `t` tokens under a `d`-deep pc costs `d + t` nodes this way
+    // instead of `d * t`. `And` has no e-node (booleans are `Ite`-only), so the
+    // cube is `ite(g1, ite(g2, .., true), false)` and `ite-reduce` collapses it
+    // wherever the literals are known.
+    let cube = cube_id(egraph, outer);
     for ts in token_steps {
         let tok = resolve_val(egraph, &vals, &ts.token);
-        let rel = fold_guards(egraph, &vals, &ts.guards, tok);
+        let inner = fold_guards(egraph, &vals, &ts.guards, tok);
         let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
+        let rel = match cube {
+            None => inner,
+            Some(c) => egraph.add(Symbolic::Ite([c, inner, true_])),
+        };
         if egraph.union(rel, true_) {
             changed.push(egraph.find(rel));
         }

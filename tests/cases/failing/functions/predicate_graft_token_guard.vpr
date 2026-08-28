@@ -1,0 +1,25 @@
+// The predicate twin of `resource_graft_token_guard.vpr`, through an
+// `unfolding` under a ternary.
+//
+// Viper scopes an `unfolding`'s heap, not the facts derived under it — Silicon's
+// `joiner.join` resets `h`/`g`/`oldHeaps` and re-assumes the recorded path
+// conditions `conditionalized` on the branch conditions they were derived under.
+// So the token `P`'s body mints for `g` legitimately outlives the unfolding, but
+// only on the arm that took it.
+function g(a: Int): Bool
+  ensures false
+
+field v: Int
+
+predicate P(x: Ref) { acc(x.v, write) && g(x.v) }
+
+function reads(x: Ref): Int
+  requires acc(P(x), wildcard)
+{ unfolding acc(P(x), wildcard) in 1 }
+
+method leak(b: Bool, x: Ref)
+  requires acc(P(x), write)
+{
+  var r: Int := b ? reads(x) : 0
+  assert false
+}

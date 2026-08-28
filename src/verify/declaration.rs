@@ -781,6 +781,7 @@ fn build_perm(
     ctx: &mut VerifyContext<'_>,
     perm: &PermRecipe,
     resolve: &impl Fn(&crate::verify::cert::SeedRef) -> egg::Id,
+    pc: &[(egg::Id, Polarity)],
     changed: &mut Vec<egg::Id>,
     wildcard_as: WildcardAs,
 ) -> ChunkPerm {
@@ -789,12 +790,13 @@ fn build_perm(
         pv: &vmir::PermVal<crate::verify::cert::BodyRecipe>,
         built: &[ChunkPerm],
         resolve: &impl Fn(&crate::verify::cert::SeedRef) -> egg::Id,
+        pc: &[(egg::Id, Polarity)],
         changed: &mut Vec<egg::Id>,
         wildcard_as: WildcardAs,
     ) -> ChunkPerm {
         match pv {
             vmir::PermVal::Amount(r) => {
-                ChunkPerm::leaf(r.build(&mut ctx.egraph, resolve, changed))
+                ChunkPerm::leaf(r.build(&mut ctx.egraph, resolve, pc, changed))
             }
             // `WildcardAs::One` builds a **presence** indicator, not a share: it is
             // the literal `1`, with no wildcard left in it, so the leaf is concrete.
@@ -811,12 +813,12 @@ fn build_perm(
     let mut built: Vec<ChunkPerm> = Vec::with_capacity(perm.steps.len());
     for step in &perm.steps {
         let vmir::PermInst::Ite(c, t, e) = step;
-        let c = c.build(&mut ctx.egraph, resolve, changed);
-        let t = leaf(ctx, t, &built, resolve, changed, wildcard_as);
-        let e = leaf(ctx, e, &built, resolve, changed, wildcard_as);
+        let c = c.build(&mut ctx.egraph, resolve, pc, changed);
+        let t = leaf(ctx, t, &built, resolve, pc, changed, wildcard_as);
+        let e = leaf(ctx, e, &built, resolve, pc, changed, wildcard_as);
         built.push(ChunkPerm::select(ctx, c, t, e));
     }
-    leaf(ctx, &perm.res, &built, resolve, changed, wildcard_as)
+    leaf(ctx, &perm.res, &built, resolve, pc, changed, wildcard_as)
 }
 
 /// Scale every leaf of a permission by `pm`, preserving the branch structure.
@@ -1382,14 +1384,14 @@ fn walk_footprint(
         };
         let wc_slot = frame_only && slot_wildcard;
         let before = ctx.egraph.total_number_of_nodes();
-        let addr = slot.addr.build(&mut ctx.egraph, resolve, &mut changed);
+        let addr = slot.addr.build(&mut ctx.egraph, resolve, pc_lits, &mut changed);
         let wildcard_as = if wc_slot {
             WildcardAs::One
         } else {
             WildcardAs::Fresh
         };
         let bperm = {
-            let p = build_perm(ctx, &slot.perm, &resolve, &mut changed, wildcard_as);
+            let p = build_perm(ctx, &slot.perm, &resolve, pc_lits, &mut changed, wildcard_as);
             if wc_slot {
                 SlotPerm::Presence(p)
             } else {
@@ -1522,7 +1524,10 @@ fn walk_footprint(
             SeedRef::SlotValue(j) => values[*j],
         }
     };
-    let bool_id = def.bool.build(&mut ctx.egraph, resolve, &mut changed);
+    // `bool_guard`, not `pc_lits`: it is the path condition at every call site
+    // (an `inhale` extends it with `0 < scale`, the others pass `pc_lits`
+    // itself), so it is the tighter of the two and always a superset.
+    let bool_id = def.bool.build(&mut ctx.egraph, resolve, pc_lits, &mut changed);
     match direction {
         // The precondition/predicate body must hold over the consumed values.
         Direction::Consume => {
