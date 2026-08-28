@@ -32,15 +32,27 @@ pub(crate) struct ScratchScope;
 
 impl ScratchScope {
     /// A one-shot scope: its overlay dies with the returned guard. For throwaway
-    /// clones (`probe`-tier probes, WD checks).
+    /// clones (`probe`-tier probes, WD checks). Such a clone is taken from the
+    /// graph *as it is now*, so every base entry is already materialized in it —
+    /// it reads the base.
     pub(crate) fn enter() -> Self {
-        Self::resume(new_scope_id())
+        SCRATCH_STACK.with(|s| s.borrow_mut().push((new_scope_id(), false)));
+        ScratchScope
     }
 
     /// Re-enter the scope `id`, so a graph that outlives one run keeps its memo
     /// across runs. Must nest LIFO with every other scope.
+    ///
+    /// **Detached**: the graph this scope belongs to was cloned at some earlier
+    /// point and the live graph has moved on since, so a base entry recorded
+    /// after the clone describes an instance this graph does *not* have. Runs
+    /// under a detached scope therefore ignore the base and re-instantiate into
+    /// their own overlay. Reading it instead loses the instance in both graphs:
+    /// the live run claims the key, and the clone — which never saw the union,
+    /// because an applier unions its e-graph directly and only
+    /// `VerifyContext::union` mirrors — is told it already has it.
     pub(crate) fn resume(id: u64) -> Self {
-        SCRATCH_STACK.with(|s| s.borrow_mut().push(id));
+        SCRATCH_STACK.with(|s| s.borrow_mut().push((id, true)));
         ScratchScope
     }
 }
@@ -91,9 +103,11 @@ thread_local! {
     /// Bumped per verification unit (`VerifyContext::new`): unit boundaries
     /// switch to a fresh e-graph, so all remembered ids are meaningless.
     static UNIT_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// The active scratch scopes, innermost last. Each entry is a scope id whose
-    /// overlay is readable (and, for the last one, writable). Empty = a live run.
-    static SCRATCH_STACK: std::cell::RefCell<Vec<u64>> =
+    /// The active scratch scopes, innermost last: a scope id whose overlay is
+    /// readable (and, for the last one, writable), plus whether that scope is
+    /// **detached** from the live graph (see [`ScratchScope::resume`]). Empty = a
+    /// live run.
+    static SCRATCH_STACK: std::cell::RefCell<Vec<(u64, bool)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Source of scope ids. Fresh per [`ScratchScope::enter`]; a block scratch
     /// takes one at build time and `resume`s it for each of its runs.
@@ -121,10 +135,10 @@ impl<K: Eq + std::hash::Hash> Memo<K> {
             memo.base.clear();
             memo.overlays.clear();
         }
-        if memo.base.contains(&key) {
+        let stack = SCRATCH_STACK.with(|s| s.borrow().clone());
+        if stack.is_empty() && memo.base.contains(&key) {
             return false;
         }
-        let stack = SCRATCH_STACK.with(|s| s.borrow().clone());
         if stack.is_empty() {
             memo.overlays.clear();
             return memo.base.insert(key);
@@ -134,7 +148,7 @@ impl<K: Eq + std::hash::Hash> Memo<K> {
         let keep = stack
             .iter()
             .zip(memo.overlays.iter())
-            .take_while(|(id, (oid, _))| *id == oid)
+            .take_while(|((id, _), (oid, _))| id == oid)
             .count();
         memo.overlays.truncate(keep);
         if memo.overlays.iter().any(|(_, set)| set.contains(&key)) {
@@ -143,7 +157,7 @@ impl<K: Eq + std::hash::Hash> Memo<K> {
         // Materialize the remaining active scopes (each nested clone contains
         // everything its parent had, so an empty set for a scope is just "nothing
         // recorded there yet"), then record against the innermost.
-        for id in &stack[memo.overlays.len()..] {
+        for (id, _) in &stack[memo.overlays.len()..] {
             memo.overlays.push((*id, HashSet::new()));
         }
         memo.overlays

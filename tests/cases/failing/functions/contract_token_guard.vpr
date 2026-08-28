@@ -1,0 +1,21 @@
+// The token a contract body propagates must stay behind the call's own path
+// condition — the `requires` twin of `propagated_token_guard.vpr`.
+//
+// `f`'s precondition names `g`, so `f#requires`'s definition carries a
+// propagated token step for `g%pre(x)`, released under `f#requires%pre`. That
+// token is minted by the obligation call, which is why the obligation call
+// carries its lowering pc (`call_contract` uses `emit_call`). Mint it
+// unguarded and `g`'s vacuously-false postcondition escapes onto the `!b` arm,
+// where `f` is never called — and `assert false` verifies.
+function g(a: Int): Bool
+  ensures false
+
+function f(x: Int): Bool
+  requires g(x)
+{ true }
+
+method leak(b: Bool)
+{
+  var r: Bool := b ? f(1) : true
+  assert false
+}

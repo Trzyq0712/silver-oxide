@@ -1,15 +1,18 @@
 // Spec-position occurrences, control case.
 //
 // `mk`'s postcondition mentions `h5`, so a client that calls `mk` sees an `h5`
-// application arrive through `mk#ensures` — a contract body, which propagates no
-// precondition token. That occurrence therefore carries no `h5%pre`: no
-// value-position call produced it, and the presence gate should keep `h5`'s body
-// out of the caller entirely.
+// application arrive through `mk#ensures`. Since Stage 6 of
+// `design/function-facts/` that occurrence is tokened: the export releases
+// `mk#ensures%pre`, the contract body propagates `h5%pre`, and the ladder
+// materializes at the client. That is the cost of the fact being *usable* —
+// `mk(x) == h5(x)` says nothing a client can act on while `h5` stays opaque —
+// and Silicon pays the same cascade through its
+// `postPreconditionPropagationAxiom`.
 //
-// Here the `h` chain declares no `ensures`, so there is nothing to publish and
-// the gate holds trivially. Pairs with `spec_ladder_post`, which adds a vacuous
-// `ensures true` per level — enough, before Stage 4 of
-// `design/function-facts/`, to drag all six bodies into the caller.
+// Before Stage 6 the caller paid nothing here, because a contract body
+// propagated no token at all. The number this file guards is therefore the
+// ladder's *steady* cost, not its absence. Pairs with `spec_ladder_post`, which
+// adds a vacuous `ensures true` per level.
 function h0(x: Int): Int { x + 1 }
 function h1(x: Int): Int { h0(x) + h0(x + 1) }
 function h2(x: Int): Int { h1(x) + h1(x + 1) }

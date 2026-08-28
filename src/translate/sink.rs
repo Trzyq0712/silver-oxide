@@ -79,18 +79,6 @@ pub(crate) struct Sink {
     /// own `Sink` and return a `ResourceBody`, while a method body's statements
     /// share the method's sink. Same shape as `read_only` above.
     pub(crate) in_resource_body: bool,
-    /// Whether this sink is lowering a **spec** body — a boolean `f#requires` or
-    /// `f#ensures` definition, i.e. a lowered pre/postcondition. Its function
-    /// calls are spec-position occurrences: they set
-    /// [`FunctionCall::export`](crate::vmir::FunctionCall::export) to `false`, so
-    /// that unfolding this contract at a client leaves its callees dormant,
-    /// discharged by congruence rather than by unfolding.
-    ///
-    /// A method's contract lowers to a *resource*, not to a contract function,
-    /// and is not spec in this sense — a predicate-like body's callees do need
-    /// their tokens when the body is grafted at a client. Same shape as
-    /// `read_only` above.
-    pub(crate) spec_body: bool,
 }
 
 impl Sink {
@@ -106,7 +94,6 @@ impl Sink {
             memo: HashMap::new(),
             read_only: false,
             in_resource_body: false,
-            spec_body: false,
         }
     }
 

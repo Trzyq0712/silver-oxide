@@ -113,8 +113,6 @@ pub(crate) fn lower_pure_precond_body(
     val_base: usize,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
-    // This *is* the `f#requires` contract definition: a spec body.
-    sink.spec_body = true;
     let bv = lower_assertion_bool(b, env, &mut sink, HeapVal::Empty, None, exp)?;
     Ok(vmir::FunctionBody {
         insts: sink.insts,

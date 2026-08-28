@@ -1,0 +1,18 @@
+// The `#ensures` member's own token is released by the export, so it inherits
+// the call's path condition through `f%pre` — and everything the contract body
+// propagates inherits it in turn.
+//
+// `g`'s postcondition is `false`. It reaches the client only through `f`'s
+// post, on the `b` arm. Release `f#ensures%pre` ungated and `g%pre(1)` follows,
+// putting `false` on the `!b` arm too.
+function g(a: Int): Bool
+  ensures false
+
+function f(x: Int): Bool
+  ensures result == g(x)
+
+method leak(b: Bool)
+{
+  var r: Bool := b ? f(1) : true
+  assert false
+}

@@ -1,0 +1,20 @@
+// The precondition side of `post_names_a_callee`: a callee named in a
+// `requires` must unfold where the obligation is discharged.
+//
+// The client has to prove `f#requires(3)`, i.e. `g(3) == 4`, and has no other
+// route to `g`'s definition. A contract function is an ordinary function and
+// occurs here as a call, so the obligation call mints `f#requires%pre(3)` and
+// the contract body propagates `g%pre(3)`.
+//
+// Silicon reaches the same place by evaluating the precondition expression at
+// the call site (`consumes(pres)` recurses into the `FuncApp` case and stamps
+// `g%pre`), where we assert one opaque `f#requires(args)`.
+function g(a: Int): Int { a + 1 }
+
+function f(x: Int): Int
+  requires g(x) == 4
+{ x }
+
+method precond_callee_unfolds() {
+  assert f(3) == 3
+}

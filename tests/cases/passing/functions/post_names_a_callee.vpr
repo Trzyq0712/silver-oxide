@@ -1,0 +1,19 @@
+// A fact delivered through `ensures` must be usable: the callee the
+// postcondition names has to unfold at the client.
+//
+// `f`'s post is `result == g(x)`, so a caller learns `f(3) == g(3)` — worth
+// nothing unless `g(3)` reduces to `4`. The `#ensures` member is an ordinary
+// function whose only occurrence is inside the post, so no call site mints its
+// token; the export carries it (`f%pre ==> f#ensures ^ f#ensures%pre`), and the
+// contract body then propagates `g%pre(3)` like any other body.
+//
+// Silicon's `postPreconditionPropagationAxiom` (`FunctionData.scala:311`).
+// Stage 6 of `design/function-facts/`.
+function g(a: Int): Int { a + 1 }
+
+function f(x: Int): Int
+  ensures result == g(x)
+
+method post_callee_unfolds() {
+  assert f(3) == 4
+}

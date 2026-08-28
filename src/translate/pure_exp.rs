@@ -575,14 +575,17 @@ fn lower_func_app<Ext: PureExt>(
     // The one call in this file that exports: a genuine value-position use whose
     // result flows onward, so the callee's application really is materialized at
     // a client of the enclosing body and really does need its `%pre` token there.
-    // Suppressed in a spec body (see `Sink::spec_body`).
+    // A contract definition (`f#requires` / `f#ensures`) is no exception — it is
+    // an ordinary function, and a call in its body is a value position like any
+    // other. Without the token the fact the contract carries is stranded: a
+    // client of `f` learns `f(3) == g(3)` and cannot unfold `g`.
     let ret = sink.emit_call(
         ty,
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
             args: call_args.into(),
-            export: !sink.spec_body,
+            export: true,
         }),
     );
     Ok(ret)
@@ -994,16 +997,23 @@ pub(crate) struct SnapEntry {
 }
 
 /// Emit a heap-free boolean contract call `func(args)` and return its `Val`.
+///
+/// `emit_call`, not `emit_pure`: a contract function is an ordinary function, so
+/// the verifier assumes its `%pre` token here, and that token's truth is what
+/// releases the callees the contract names. A `g#requires(1)` check under `b`
+/// must therefore carry `b` — otherwise the release is unconditional and `g`'s
+/// own postcondition leaks onto sibling paths.
 fn call_contract(sink: &mut Sink, func: vmir::MemberId, args: Vec<Val>) -> Val {
-    sink.emit_pure(
+    sink.emit_call(
         vmir::Type::Bool,
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
             args: args.into(),
             // Obligation position (an entry `assume`, a `g#requires` check, the
-            // exit `f#ensures` assert): feeds no result, so nothing downstream
-            // materializes it and its token would activate nothing.
+            // exit `f#ensures` assert): feeds no result, so no *enclosing* body
+            // needs to re-mint this token when it is replayed at its own call
+            // sites. The token minted here, at this occurrence, is unaffected.
             export: false,
         }),
     )
@@ -1030,16 +1040,11 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
     result: Option<Val>,
     contract: Option<FnContract>,
     snap_entry: Option<SnapEntry>,
-    // Set when this *is* a contract definition (a `#requires` / `#ensures`
-    // boolean) rather than a function's own body: its calls are spec-position
-    // occurrences and export no precondition token (see `Sink::spec_body`).
-    spec: bool,
 ) -> Result<vmir::FunctionBody, TranslationError> {
     let mut sink = Sink::new(val_base, 0);
     // Function bodies are read-only: every `unfolding`/`acc` permission is
     // weakened to a wildcard (a function only needs *some* positive share).
     sink.read_only = true;
-    sink.spec_body = spec;
     // A heap-dependent body reads the heap reconstructed from its snapshot
     // parameter; a heap-free body reads the inert `heap` (`Empty`).
     let heap = match snap_entry {
