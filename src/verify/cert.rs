@@ -479,7 +479,45 @@ impl RecipeBuilder {
     }
 }
 
+/// Visit every `Val` operand of a pure recipe step **in place**.
+///
+/// The mutating traversal is the one [`map_operands`] is built on: rebuilding a
+/// step is a `clone` with its operands overwritten, never a re-construction of
+/// every variant. That is what makes it impossible to silently drop a
+/// *non*-operand field (`func`, `type_args`, `recipe`, a guard's `Polarity`) when
+/// a step shape gains one — the old reconstructing form had to restate each of
+/// them by hand at every arm.
+fn for_each_operand_mut(inst: &mut AxiomInst, mut f: impl FnMut(&mut Val)) {
+    match inst {
+        AxiomInst::Val(p) => match p {
+            AxiomPure::Binary(_, l, r) => {
+                f(l);
+                f(r);
+            }
+            AxiomPure::Ternary(c, t, e) => {
+                f(c);
+                f(t);
+                f(e);
+            }
+            AxiomPure::RealCast(v) => f(v),
+            AxiomPure::App { args, .. } => args.iter_mut().for_each(f),
+        },
+        AxiomInst::Forall { caps, .. } => caps.iter_mut().for_each(f),
+        AxiomInst::Assume(v) => f(v),
+        AxiomInst::Token { args, guards, .. } => {
+            for v in args.iter_mut().chain(guards.iter_mut().map(|(g, _)| g)) {
+                f(v);
+            }
+        }
+    }
+}
+
 /// Visit each `Val` operand of a pure recipe step.
+///
+/// Read-only mirror of [`for_each_operand_mut`]: Rust cannot abstract one
+/// traversal over mutability without a macro, so the two are kept adjacent and
+/// arm-for-arm identical. A step shape that gains an operand must be added to
+/// both — but only to the *walk*, never to a rebuild.
 fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
     match inst {
         AxiomInst::Val(p) => match p {
@@ -507,34 +545,10 @@ fn for_each_operand(inst: &AxiomInst, mut f: impl FnMut(&Val)) {
 
 /// Rebuild a pure recipe step with each `Val` operand translated by `tr`.
 pub(crate) fn map_operands(inst: &AxiomInst, tr: impl Fn(&Val) -> Val) -> AxiomInst {
-    match inst {
-        AxiomInst::Val(p) => AxiomInst::Val(match p {
-            AxiomPure::Binary(op, l, r) => AxiomPure::Binary(*op, tr(l), tr(r)),
-            AxiomPure::Ternary(c, t, e) => AxiomPure::Ternary(tr(c), tr(t), tr(e)),
-            AxiomPure::RealCast(v) => AxiomPure::RealCast(tr(v)),
-            AxiomPure::App {
-                func,
-                type_args,
-                args,
-            } => AxiomPure::App {
-                func: *func,
-                type_args: type_args.clone(),
-                args: args.iter().map(&tr).collect(),
-            },
-        }),
-        AxiomInst::Forall { recipe, caps } => AxiomInst::Forall {
-            recipe: *recipe,
-            caps: caps.iter().map(&tr).collect(),
-        },
-        AxiomInst::Assume(v) => AxiomInst::Assume(tr(v)),
-        AxiomInst::Token {
-            func,
-            args,
-            guards,
-        } => AxiomInst::Token {
-            func: *func,
-            args: args.iter().map(&tr).collect(),
-            guards: guards.iter().map(|(g, pol)| (tr(g), *pol)).collect(),
-        },
-    }
+    let mut out = inst.clone();
+    for_each_operand_mut(&mut out, |v| {
+        let mapped = tr(v);
+        *v = mapped;
+    });
+    out
 }
