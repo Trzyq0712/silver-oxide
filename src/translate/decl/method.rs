@@ -12,7 +12,7 @@ use lasso::Spur;
 use typed_index_collections::TiVec;
 
 use crate::translate::reach::{and_val, block_reach, merge_two_envs, not_val};
-use crate::translate::sink::Sink;
+use crate::translate::sink::{PcKind, Sink};
 use crate::translate::spatial::{self, SpatialMode};
 use crate::translate::{DeclSlot, Declarator, Definer};
 use crate::translate::{
@@ -547,7 +547,15 @@ pub(crate) fn lower_method(
         let h_in = if let Some(l) = cfg.loops.at_head(bid) {
             let mark = sink.insts.len();
             let invs = cfg.blocks[bid].invs.clone();
-            let (frame, h_in) = sink.with_conds(&pc, |sink| {
+            // The cube rides in the pc — these insts land in the *join* phase,
+            // where the verifier has no ambient cube, so the pc is the only proof
+            // context for the exhale's sufficiency check and the re-inhale's
+            // `perm >= 0`. It must NOT gate the permissions: the cube's effect is
+            // already carried by dataflow (this block's `h_out` reaches successors
+            // only under the cube; the other arm carries its own heap through the
+            // join's `Merge`), so gating would emit `e ? 1/1 : 0/1` for an exhale
+            // that always needs the full share.
+            let (frame, h_in) = sink.with_conds_kind(&pc, PcKind::Cube, |sink| {
                 let old = pure_exp::OldHeaps {
                     baseline,
                     labeled: &labeled,
@@ -587,7 +595,7 @@ pub(crate) fn lower_method(
         let body_mark = sink.insts.len();
         // Fork model: push the cube as `Cube` (guards obligations, does NOT gate
         // permissions — the join merge SELECTs).
-        let cube_kind = crate::translate::sink::PcKind::Cube;
+        let cube_kind = PcKind::Cube;
         let (new_heap, cond): (HeapVal, Option<Val>) = sink.with_conds_kind(&pc, cube_kind, |sink| {
             let mut heap = h_in;
             for stmt in &blk.stmts {
