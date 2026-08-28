@@ -69,6 +69,22 @@ pub(crate) struct FunctionDefinition {
 pub(crate) struct PostRecipe {
     pub(crate) steps: Vec<AxiomInst>,
     pub(crate) res: Val,
+    /// The `#ensures` member's own presence token,
+    /// `f#ensures%pre(link_args, f(params))` — one more step of `steps`, so
+    /// replaying the recipe *adds* the node, and the unfold rule additionally
+    /// releases its truth under the call-site `f%pre`.
+    ///
+    /// A `#ensures` is an ordinary function whose only occurrence is here: no
+    /// call ever mints its token, so without this it would never unfold and the
+    /// callees it names would stay opaque at the caller. Silicon's
+    /// `postPreconditionPropagationAxiom` (`FunctionData.scala:311`),
+    /// `f%pre ⟹ tr(post)`, is the same release — our post *is* one opaque call,
+    /// so `tr` of it is exactly this token.
+    ///
+    /// Presence, not knowledge: it licenses unfolding, it does not state that the
+    /// postcondition holds. That is [`PostRecipe::res`], released beside it.
+    /// `None` only for a declaration whose `ensures` link has no member.
+    pub(crate) token: Option<Val>,
 }
 
 /// One propagated precondition token: a nested callee's `g%pre(gargs)` step plus

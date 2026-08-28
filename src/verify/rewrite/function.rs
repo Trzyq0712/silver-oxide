@@ -101,12 +101,19 @@ pub(super) fn replay_post(
     };
     let vals = build_instance_vals(egraph, &post.steps, args, changed);
     let true_ = egraph.add(Symbolic::Lit(Literal::Bool(true)));
-    let mut imp = resolve_val(egraph, &vals, &post.res);
-    if let Some(tok) = token {
-        imp = expr!(egraph, {tok} ==> {imp});
-    }
-    if egraph.union(imp, true_) {
-        changed.push(egraph.find(imp));
+    // The truth (`f#ensures(args, f(args))`) and, beside it, the `#ensures`
+    // member's own presence token — Silicon's `postPreconditionPropagationAxiom`.
+    // Both are needed: the token alone licenses unfolding the postcondition but
+    // never says it holds, and the truth alone leaves the callees the post names
+    // opaque at this caller.
+    for v in [Some(&post.res), post.token.as_ref()].into_iter().flatten() {
+        let mut imp = resolve_val(egraph, &vals, v);
+        if let Some(tok) = token {
+            imp = expr!(egraph, {tok} ==> {imp});
+        }
+        if egraph.union(imp, true_) {
+            changed.push(egraph.find(imp));
+        }
     }
 }
 

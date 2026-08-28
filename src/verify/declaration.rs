@@ -1915,18 +1915,28 @@ fn assume_axioms(ctx: &mut VerifyContext<'_>, program: &vmir::Program) -> Result
     // rule rebuilds the recipe's body lazily (add-only) when a `FuncApp(f, ..)`
     // occurrence is seen during saturation (see `rewrite::function_rule`).
     if let Some(fn_certs) = ctx.fn_certs {
-        let contracts = contract_members(program);
-        for (&id, def) in fn_certs.iter() {
+        // Sorted: `fn_certs` is a `HashMap`, whose iteration order varies per
+        // process, and rule order decides which of several equivalent unfoldings
+        // saturation reaches first — hence the peak-node count. Without this the
+        // `verification_cost_matches_baseline` gate reads a different number on
+        // every run.
+        let mut certs: Vec<_> = fn_certs.iter().collect();
+        certs.sort_unstable_by_key(|&(&id, _)| id);
+        for (&id, def) in certs {
             let name = ctx.member_name(id);
             let func = crate::verify::func_registry::func_id_for_member(id);
-            // The uniform `f%pre` presence trigger gates the body-unfold of a
-            // **genuine** function: the rule only fires where a `FuncApp(f%pre,
-            // args)` node was minted (a value-position call, or a propagation step
-            // in an unfolded value body). A **contract** function (`#requires` /
-            // `#ensures`) is left ungated (`None`) — it must inline its formula
-            // freely, as before, or a `f#ensures` occurrence stays opaque and its
-            // post never reaches `f(args)`.
-            let pre_token = (!contracts.contains(&id)).then(|| ctx.alloc.fn_pre_token(id, &name));
+            // The uniform `f%pre` presence trigger gates every body-unfold: the
+            // rule fires only where a `FuncApp(f%pre, args)` node was minted (a
+            // value-position call, or a propagation step in an unfolded body).
+            //
+            // A **contract** function (`#requires` / `#ensures`) is no different —
+            // what distinguishes it is only *where it occurs*. A `#requires` occurs
+            // as a call (the entry `assume`, a call-site obligation), so the
+            // `FunctionCall` arm mints its token like any other callee's. A
+            // `#ensures` occurs only inside a post, which reaches a caller through
+            // [`post_fact`] and never through a call — so its token is released by
+            // the export instead ([`PostRecipe::token`]).
+            let pre_token = Some(ctx.alloc.fn_pre_token(id, &name));
             ctx.axiom_rules.push(crate::verify::rewrite::function_rule(
                 &name,
                 func,
@@ -2619,26 +2629,6 @@ pub(crate) fn verify_function(
     })))
 }
 
-/// The set of **contract** functions — every function's lowered
-/// `#requires`/`#ensures` (booleans carrying a pre/postcondition), collected from
-/// the contract links. Contract-function bodies are spec positions: they are left
-/// ungated (must inline freely) and suppress precondition propagation.
-fn contract_members(program: &vmir::Program) -> std::collections::HashSet<MemberId> {
-    let mut set = std::collections::HashSet::new();
-    for decl in program.decls.iter() {
-        let vmir::Declaration::Function(f) = decl else {
-            continue;
-        };
-        if let Some(r) = f.requires.as_ref() {
-            set.insert(r.member());
-        }
-        if let Some(e) = f.ensures.as_ref() {
-            set.insert(e.member);
-        }
-    }
-    set
-}
-
 /// The **single** fact a function publishes to its callers: `f#ensures(params,
 /// f(params))`, built from the declaration's `ensures` link — never from
 /// anything the body contains. Identical for abstract and bodied functions,
@@ -2704,10 +2694,25 @@ fn post_fact(
         AxiomPure::App {
             func: func_id_for_member(en.member),
             type_args: Vec::new(),
+            args: args.clone(),
+        },
+    );
+    // The `#ensures` member's own presence token. It is an ordinary function, and
+    // this is the only position it ever occurs in — no call site mints it — so the
+    // export carries it alongside the truth (`PostRecipe::token`).
+    let token = emit(
+        &mut steps,
+        AxiomPure::App {
+            func: alloc.fn_pre_token(en.member, program.name(en.member)),
+            type_args: Vec::new(),
             args,
         },
     );
-    Some(PostRecipe { steps, res })
+    Some(PostRecipe {
+        steps,
+        res,
+        token: Some(token),
+    })
 }
 
 /// Synthesize an **abstract** function's definition: no body, nothing to
