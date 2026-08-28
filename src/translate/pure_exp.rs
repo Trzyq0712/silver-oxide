@@ -579,13 +579,16 @@ fn lower_func_app<Ext: PureExt>(
     // an ordinary function, and a call in its body is a value position like any
     // other. Without the token the fact the contract carries is stranded: a
     // client of `f` learns `f(3) == g(3)` and cannot unfold `g`.
+    //
+    // A **method body** is the one place the mark is meaningless: nothing ever
+    // replays it, so there is no later site for the token to be re-released at.
     let ret = sink.emit_call(
         ty,
         PureInst::FunctionCall(vmir::FunctionCall {
             function: func,
             type_args: Vec::new(),
             args: call_args.into(),
-            export: true,
+            export: !sink.in_method_body,
         }),
     );
     Ok(ret)

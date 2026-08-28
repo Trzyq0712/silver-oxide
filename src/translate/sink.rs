@@ -79,6 +79,13 @@ pub(crate) struct Sink {
     /// own `Sink` and return a `ResourceBody`, while a method body's statements
     /// share the method's sink. Same shape as `read_only` above.
     pub(crate) in_resource_body: bool,
+    /// Whether this sink is lowering a **method body**. A method body is never
+    /// replayed anywhere — only functions, contract functions and resources
+    /// become recipes a call site grafts — so nothing would ever act on a
+    /// [`FunctionCall::export`](crate::vmir::FunctionCall::export) mark here, and
+    /// setting one would make the IR dump claim a propagation that cannot
+    /// happen. Same shape as `read_only` above.
+    pub(crate) in_method_body: bool,
 }
 
 impl Sink {
@@ -94,6 +101,7 @@ impl Sink {
             memo: HashMap::new(),
             read_only: false,
             in_resource_body: false,
+            in_method_body: false,
         }
     }
 

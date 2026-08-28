@@ -237,6 +237,8 @@ pub(crate) fn lower_method(
     })?;
 
     let mut sink = Sink::new(0, 0);
+    // Nothing replays a method body, so its calls carry no `export` mark.
+    sink.in_method_body = true;
 
     // Initial environment: fresh values for params and rets. The method has no
     // signature on the VMIR side — params/rets are just initial Fresh insts.

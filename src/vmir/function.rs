@@ -149,17 +149,21 @@ pub struct FunctionCall {
     /// re-derived by the verifier from the call's shape. It is `true` for a
     /// genuine value-position use of a Silver `function` — the one whose result
     /// flows onward, so whose application really is materialized at the caller
-    /// and really does need its token. It is `false` for:
+    /// and really does need its token. A **contract** definition
+    /// (`#requires` / `#ensures`) is no exception: it is an ordinary function and
+    /// a call in its body is an ordinary value position, or the fact the contract
+    /// carries is stranded at the client. It is `false` for:
     ///
-    /// - a call inside a **spec** body (a `#requires` / `#ensures` definition):
-    ///   unfolding a contract at a client must leave its callees dormant,
-    ///   discharged by congruence rather than by unfolding;
-    /// - an **obligation** call — `g#requires(gargs)` before a call, the exit
-    ///   `f#ensures(..)` — which feeds no result, and whose callee is a contract
-    ///   member whose rule is ungated anyway, so the released token is junk;
+    /// - an **obligation** call — `g#requires(gargs)` before a call, the entry
+    ///   `assume f#requires(..)`, the exit `assert f#ensures(..)` — which feeds no
+    ///   result, so no enclosing body has to re-mint it when replayed;
     /// - a field or predicate `@addr` application and a domain function, which are
     ///   not Silver `function`s at all: no body recipe, no unfold rule, nothing a
-    ///   token could activate.
+    ///   token could activate;
+    /// - every call in a **method body**, which nothing ever replays — there is no
+    ///   later site for the token to be re-released at, and the verifier reads
+    ///   this field only while building a recipe (`ctx.recipe.is_some()`, which a
+    ///   method walk never sets).
     ///
     /// The verifier still mints the token *at* the call while checking this body
     /// itself; that is a different role of the same token (presence here vs.
