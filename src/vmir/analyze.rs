@@ -177,11 +177,7 @@ fn check_perm_locality(
                 phase(&b.insts, 0, &mut 0, &name)?;
             }
         }
-        Declaration::Resource(r) => {
-            if let Some(b) = &r.body {
-                phase(&b.insts, 0, &mut 0, &name)?;
-            }
-        }
+        Declaration::Resource(r) => phase(&r.body.insts, 0, &mut 0, &name)?,
         _ => {}
     }
     Ok(())
@@ -261,9 +257,7 @@ fn decl_deps(decl: &Declaration, out: &mut Vec<MemberId>) {
             if let Precond::Ctx(req, _) = &r.precond {
                 out.push(*req);
             }
-            if let Some(body) = &r.body {
-                resource_body_deps(body, out);
-            }
+            resource_body_deps(&r.body, out);
         }
         Declaration::Method(m) => method_deps(m, out),
         Declaration::Function(f) => {
@@ -401,7 +395,10 @@ mod tests {
                 Some(r) => Precond::Ctx(r, vec![]),
                 None => Precond::SelfFramed,
             },
-            body: None,
+            body: ResourceBody {
+                insts: vec![],
+                res: (HeapVal::Empty, Val::Literal(crate::vmir::Literal::Bool(true))),
+            },
         })
     }
 

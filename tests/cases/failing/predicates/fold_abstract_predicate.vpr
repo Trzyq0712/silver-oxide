@@ -1,0 +1,17 @@
+// An abstract (bodyless) predicate is a bare location: there is no body to
+// exchange the location for, so `fold` on it is rejected at typecheck
+// (`AbstractPredicateNotFoldable`). Downstream it is also unrepresentable —
+// an abstract predicate lowers to a `function` + `domain` pair, not a
+// `vmir::Resource`, so there is no `ResourceCall` for a fold to name.
+//
+// Before this rule existed the file reported `[OK] P` and then failed the
+// *method* with "depends on a resource that failed to verify", which was
+// false: `P` has no cert because it has no body.
+
+predicate P(x: Ref)
+
+method m(x: Ref)
+    requires acc(P(x), write)
+{
+    fold P(x)
+}

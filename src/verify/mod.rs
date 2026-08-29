@@ -132,9 +132,7 @@ pub fn verify_with_stats(
                 match declaration::verify_resource(program, &name, r, &certs, &fn_certs, &mut alloc)
                 {
                     Ok(cert) => {
-                        if let Some(cert) = cert {
-                            certs.insert(id, cert);
-                        }
+                        certs.insert(id, cert);
                         Some(Ok(()))
                     }
                     Err(e) => Some(Err(e)),

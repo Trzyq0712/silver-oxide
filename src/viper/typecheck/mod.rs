@@ -25,6 +25,29 @@ use lattice::{ViperTcType, type_to_tc};
 
 type TypeTable = HashMap<TcKey, Type>;
 
+/// Reject `fold` / `unfold` / `unfolding` on a bodyless (abstract) predicate.
+/// An abstract predicate is a bare location — it has no body to exchange the
+/// location for, and lowers to a `function` + `domain` pair rather than a
+/// `vmir::Resource`, so the fold instruction is unrepresentable downstream.
+/// Written once here and called from both fold/unfold and `unfolding`.
+fn check_predicate_foldable(
+    globals: &Globals,
+    interner: &Interner,
+    name: Spur,
+) -> Result<(), TypeError> {
+    let foldable = globals
+        .resolve(name)
+        .and_then(|s| s.as_predicate())
+        .is_some_and(|sig| sig.has_body);
+    if foldable {
+        Ok(())
+    } else {
+        Err(TypeError::AbstractPredicateNotFoldable(
+            interner.resolve(&name).to_string(),
+        ))
+    }
+}
+
 /// Persistent lexical environment for a declaration (function, method, or predicate).
 /// Holds only scope data: `locals` grows incrementally as params and `var` stmts are
 /// processed (so uses before declarations produce UndefinedVariable), and pre-collected
@@ -155,6 +178,7 @@ impl<'g> LocalEnv<'g> {
                 ));
             }
         };
+        check_predicate_foldable(self.globals, self.interner, pred_call.name.0)?;
         Ok(PredicateWithPerm { pred_call, perm })
     }
 }
@@ -1149,6 +1173,11 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                         return Err(TypeError::Other("cannot unfold a field".to_string()));
                     }
                 };
+                check_predicate_foldable(
+                    self.env.globals,
+                    self.env.interner,
+                    pred_call.name.0,
+                )?;
                 let body_exp = self.lower_pure::<Ext>(body)?;
                 let node =
                     typed::HeapNode::Unfolding(PredicateWithPerm { pred_call, perm }, body_exp);

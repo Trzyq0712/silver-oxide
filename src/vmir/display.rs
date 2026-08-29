@@ -4,7 +4,7 @@
 //! Per-type `Display` impls live next to their types; the inst-block
 //! walker lives in `vmir/inst.rs`.
 
-use crate::vmir::{Declaration, MemberId, Program, Snapshot};
+use crate::vmir::{Declaration, MemberId, Program};
 use lasso::{Rodeo, Spur};
 use std::fmt::{self, Display, Formatter, Write};
 use typed_index_collections::TiVec;
@@ -111,25 +111,16 @@ impl Program {
                 "function {name}@addr{}",
                 VmirDisplay::new(&loc, &self.decls, &self.interner, &self.groups)
             );
-            // The derived snapshot type, printed by kind for every snapshottable
-            // (self-framed) resource: a concrete one is an `adt` with a single
-            // constructor; an abstract one is an opaque empty `domain`.
-            match r.derive_snapshot() {
-                Some(Snapshot::Concrete(adt)) => {
-                    let _ = writeln!(
-                        out,
-                        "adt {name}@snap {}",
-                        VmirDisplay::new(&adt, &self.decls, &self.interner, &self.groups)
-                    );
-                }
-                Some(Snapshot::Abstract(domain)) => {
-                    let _ = writeln!(
-                        out,
-                        "domain {name}@snap {}",
-                        VmirDisplay::new(&domain, &self.decls, &self.interner, &self.groups)
-                    );
-                }
-                None => {}
+            // The derived snapshot type: an `adt` with a single constructor over
+            // the footprint slots. Present for every snapshottable (self-framed)
+            // resource — a bodyless predicate is not a resource, so it has no
+            // derived pair here at all.
+            if let Some(adt) = r.derive_snapshot() {
+                let _ = writeln!(
+                    out,
+                    "adt {name}@snap {}",
+                    VmirDisplay::new(&adt, &self.decls, &self.interner, &self.groups)
+                );
             }
         }
         out
@@ -140,10 +131,12 @@ impl Display for Program {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for item in self.decls.iter_enumerated() {
-            // A field's address function is an ordinary `Declaration::Function`
-            // (printed like any function); a predicate's address is its own
-            // resource and its snapshot is derived (`Resource::derive_snapshot`).
-            // No `@addr`/`@snap` member decls — nothing to hide here.
+            // Every location's address function is already an ordinary
+            // declaration: a field's and an abstract predicate's are
+            // `Declaration::Function` (printed like any function), a concrete
+            // predicate's is its own `Resource`, whose snapshot is derived
+            // (`Resource::derive_snapshot`). No `@addr`/`@snap` member decls —
+            // nothing to hide here.
             if !first {
                 writeln!(f)?;
             }

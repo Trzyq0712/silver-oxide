@@ -1,6 +1,7 @@
 //! Lower `typed::ResourceExp` (the addressable resources `e.f` / `P(args)`) to
-//! its VMIR address `Val`. An address is an ordinary heap-independent function
-//! call (`field@addr(base)` / the predicate's own id applied to its args).
+//! its VMIR address `Val`. An address is an ordinary heap-independent call to
+//! the location's own function — the field's, or the predicate's — with the
+//! `Type::Addr` return type published in `addr_types` during `declare`/`meta`.
 
 use std::collections::HashMap;
 
@@ -10,11 +11,11 @@ use crate::translate::pure_exp::{self, HeapCtx, PureExt};
 use crate::translate::sink::Sink;
 use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
-use crate::vmir::{self, PureInst, Type, Val};
+use crate::vmir::{self, PureInst, Val};
 
-/// Lower a `ResourceExp` to its address: the `@addr` function applied to the
-/// resource's base/arguments (`field@addr(base)` or `pred@addr(args)`). The
-/// `@addr` call is heap-independent. Shared by `acc`, `perm`, and `new`.
+/// Lower a `ResourceExp` to its address: the location's own function applied to
+/// the resource's base/arguments (`f(base)` or `P(args)`). The call is
+/// heap-independent. Shared by `acc`, `perm`, and `new`.
 pub(crate) fn lower_resource_addr<Ext: PureExt>(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
@@ -29,72 +30,54 @@ pub(crate) fn lower_resource_addr<Ext: PureExt>(
             field_addr(b, sink, base_val, fname.0)
         }
         R::PredicateCall(call) => {
-            // The predicate's address location IS the predicate itself: its id is
-            // the `LocId`; the verifier synthesizes the signature via
-            // `Resource::derive_location`. No `@addr` decl exists.
-            let &pred_id = b.name_map.get(&call.name.0).ok_or_else(|| {
-                TranslationError::UnknownIdent(b.interner.resolve(&call.name.0).to_string())
-            })?;
             let mut args = Vec::with_capacity(call.args.len());
             for a in &call.args {
                 args.push(pure_exp::lower(b, env, sink, hctx, a)?);
             }
-            // The predicate's address type: group = its interned tag, value = its
-            // snapshot, unbounded permission cap. The address is an ordinary call
-            // to the predicate's address function (its own id).
-            let group = b.group_tag(call.name.0);
-            let ret_ty = Type::addr(group, Type::Snap(pred_id), vmir::Bound::Unbounded);
-            Ok(sink.emit_pure(
-                ret_ty,
-                PureInst::FunctionCall(vmir::FunctionCall {
-                    function: pred_id,
-                    type_args: Vec::new(),
-                    args: args.into(),
-                    // A predicate `@addr`, not a Silver `function`.
-                    export: false,
-                }),
-            ))
+            addr_call(b, sink, call.name.0, args)
         }
     }
 }
 
-/// Emit `field@addr(base)`: the field's heap-independent `@addr` function
-/// applied to the receiver, typed `Addr<field_ty>`. Shared by every site that
-/// needs a field location (`acc`, `perm`, `new`, field assignment).
+/// Emit a location's address call: the address function interned under `name`
+/// applied to `args`, typed by the `Type::Addr` published in `addr_types`. The
+/// one shape shared by every location — a field's `f(base)` and a predicate's
+/// `P(args)` differ only in arity and in the permission cap carried by that
+/// published type.
+fn addr_call(
+    b: &TranslationContext<'_>,
+    sink: &mut Sink,
+    name: Spur,
+    args: Vec<Val>,
+) -> Result<Val, TranslationError> {
+    let unknown = || TranslationError::UnknownIdent(b.interner.resolve(&name).to_string());
+    let id = *b.name_map.get(&name).ok_or_else(unknown)?;
+    let ret_ty = b.addr_types.get(&name).cloned().ok_or_else(unknown)?;
+    Ok(sink.emit_pure(
+        ret_ty,
+        PureInst::FunctionCall(vmir::FunctionCall {
+            function: id,
+            type_args: Vec::new(),
+            args: args.into(),
+            // An address function, not a Silver `function`.
+            export: false,
+        }),
+    ))
+}
+
+/// Emit `field(base)`: the field's heap-independent address function applied to
+/// the receiver, typed `Addr<field_ty>`. Its own entry point because field
+/// assignment and `new` reach a field location without a `ResourceExp`.
 pub(crate) fn field_addr(
     b: &TranslationContext<'_>,
     sink: &mut Sink,
     base: Val,
     fname: Spur,
 ) -> Result<Val, TranslationError> {
-    // The field's address type: group = the field's interned tag, value = the
-    // field's (already lowered) value type, bound = full permission `1/1`.
-    let group = b.group_tag(fname);
-    let value =
-        b.field_types.get(&fname).cloned().ok_or_else(|| {
-            TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string())
-        })?;
-    let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
-    let ret_ty = Type::addr(group, value, bound);
-    // The field's address is an ordinary call to its address function (declared by
-    // `declare_field_accessor` under the field's bare name).
-    let field_id = *b
-        .name_map
-        .get(&fname)
-        .ok_or_else(|| TranslationError::UnknownIdent(b.interner.resolve(&fname).to_string()))?;
-    Ok(sink.emit_pure(
-        ret_ty,
-        PureInst::FunctionCall(vmir::FunctionCall {
-            function: field_id,
-            type_args: Vec::new(),
-            args: vec![base].into(),
-            // A field `@addr`, not a Silver `function`.
-            export: false,
-        }),
-    ))
+    addr_call(b, sink, fname, vec![base])
 }
 
-/// Lower `acc(base.fname, perm)` to its `(loc, perm)`: the field's `@addr`
+/// Lower `acc(base.fname, perm)` to its `(loc, perm)`: the field's address
 /// function applied to `base`, paired with the permission amount. The caller
 /// emits the `HeapInst::Add`. Shared by `new(...)` lowering.
 pub(crate) fn field_acc(

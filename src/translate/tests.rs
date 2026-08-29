@@ -70,27 +70,29 @@ method add(this: Ref, other: Ref) returns (res: Ref)
     assert!(p.id("number@addr").is_none());
 
     let pred_id = p.id("number").expect("missing number");
-
-    // Predicate itself is abstract; its address location is derived.
-    let vmir::Declaration::Resource(pred) = &p.decls[pred_id] else {
-        panic!("number must be a Resource");
-    };
-    assert!(
-        pred.body.is_none(),
-        "abstract predicate must have body=None"
-    );
+    let snap_id = p.id("number#snap").expect("missing number#snap");
     let group = p.groups.get("number").expect("predicate group tag");
-    let addr_fn = pred.derive_location(pred_id, group);
-    assert_eq!(addr_fn.params, vec![vmir::Type::Ref].into());
+
+    // An abstract predicate is *not* a resource: it is its location `Function`
+    // (under the bare name) plus the opaque `Domain` that is its value sort
+    // (under `{name}#snap`). Nothing about it is derived on demand.
+    let vmir::Declaration::Function(loc) = &p.decls[pred_id] else {
+        panic!("an abstract predicate's location must be a Function");
+    };
+    assert_eq!(loc.params, vec![vmir::Type::Ref].into());
     assert_eq!(
-        addr_fn.ret,
-        vmir::Type::addr(group, vmir::Type::Snap(pred_id), vmir::Bound::Unbounded)
+        loc.ret,
+        vmir::Type::addr(group, vmir::Type::domain(snap_id), vmir::Bound::Unbounded),
+        "the location's return carries the group tag, the opaque snapshot sort, \
+         and the unbounded permission cap"
     );
-    // Abstract predicate (no body) derives an opaque empty Domain snapshot.
+    assert!(loc.body.is_none(), "a location function has no body");
     assert!(matches!(
-        pred.derive_snapshot(),
-        Some(vmir::Snapshot::Abstract(_))
+        &p.decls[snap_id],
+        vmir::Declaration::Domain(_)
     ));
+    // The function is declared before its snapshot domain (dump order).
+    assert!(pred_id < snap_id);
 
     // Method contracts.
     for name in [
@@ -104,8 +106,8 @@ method add(this: Ref, other: Ref) returns (res: Ref)
             .id(name)
             .unwrap_or_else(|| panic!("missing resource {name}"));
         assert!(
-            matches!(&p.decls[id], vmir::Declaration::Resource(r) if r.body.is_some()),
-            "{name} must be a concrete Resource"
+            matches!(&p.decls[id], vmir::Declaration::Resource(_)),
+            "{name} must be a Resource"
         );
     }
     assert!(
@@ -120,7 +122,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
     let vmir::Declaration::Resource(read_req) = &p.decls[read_req_id] else {
         unreachable!();
     };
-    let body = read_req.body.as_ref().unwrap();
+    let body = &read_req.body;
     let mut saw_addr_call = false;
     let mut saw_acc = false;
     let number_group = p.groups.get("number").expect("number group tag");
@@ -189,7 +191,7 @@ method m(x: Int, y: Int)
     let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
         panic!("m#requires must be a Resource");
     };
-    let body = req.body.as_ref().unwrap();
+    let body = &req.body;
 
     let div = body
         .insts
@@ -225,7 +227,7 @@ method m(x: Int, y: Int)
     let vmir::Declaration::Resource(req) = &p.decls[req_id] else {
         panic!("m#requires must be a Resource");
     };
-    let body = req.body.as_ref().unwrap();
+    let body = &req.body;
 
     let div = body
         .insts
@@ -715,7 +717,7 @@ function get(x: Ref): Int
     };
     assert_eq!(req.params, vec![vmir::Type::Ref]);
     assert!(matches!(req.precond, vmir::Precond::SelfFramed));
-    assert!(req.body.is_some());
+    assert!(!req.body.insts.is_empty());
 
     let snap_ty = vmir::Type::Snap(req_id);
 

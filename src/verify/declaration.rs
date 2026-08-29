@@ -2447,9 +2447,9 @@ pub(crate) fn verify_method(
 /// Verify a resource self-contained: run its body in a fresh egraph with fresh
 /// symbolic params (a two-state resource's pre-state snapshot is an ordinary
 /// trailing param), discharging each instruction's side-condition obligations
-/// under its path condition. Abstract resources have nothing to check. This
-/// establishes well-formedness **once**; method call sites reuse it without
-/// re-checking (see [`eval_resource_call`]).
+/// under its path condition. A resource always has a body, so this always
+/// yields a definition. This establishes well-formedness **once**; method call
+/// sites reuse it without re-checking (see [`eval_resource_call`]).
 pub(crate) fn verify_resource(
     program: &vmir::Program,
     resource_name: &str,
@@ -2457,11 +2457,8 @@ pub(crate) fn verify_resource(
     certs: &HashMap<MemberId, ResourceDefinition>,
     fn_certs: &HashMap<MemberId, std::sync::Arc<FunctionDefinition>>,
     alloc: &mut crate::verify::func_registry::FuncRegistry,
-) -> Result<Option<ResourceDefinition>, VerifyError> {
-    let Some(body) = resource.body.as_ref() else {
-        // Abstract resource: nothing to prove, no definition.
-        return Ok(None);
-    };
+) -> Result<ResourceDefinition, VerifyError> {
+    let body = &resource.body;
 
     let mut ctx = VerifyContext::new(&program.interner, &program.decls, &program.groups, alloc);
     ctx.fn_certs = Some(fn_certs);
@@ -2525,10 +2522,10 @@ pub(crate) fn verify_resource(
         .ok_or(VerifyError::Unimplemented(
             "purify: resource bool without a recipe",
         ))?;
-    Ok(Some(ResourceDefinition {
+    Ok(ResourceDefinition {
         footprint,
         bool: rb.slice_with_tokens(&bool_r)?,
-    }))
+    })
 }
 
 /// Verify a non-recursive function and capture its body as a **pure term

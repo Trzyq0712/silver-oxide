@@ -394,8 +394,7 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
         }
         if let vmir::Declaration::Resource(cr) = decl {
             let cname = program.name(cid).to_string();
-            if let Ok(Some(cert)) =
-                verify_resource(program, &cname, cr, &certs, &fn_certs, &mut alloc)
+            if let Ok(cert) = verify_resource(program, &cname, cr, &certs, &fn_certs, &mut alloc)
             {
                 certs.insert(cid, cert);
             }
@@ -459,11 +458,9 @@ fn build_certs(
     for (id, decl) in program.decls.iter_enumerated() {
         if let vmir::Declaration::Resource(r) = decl {
             let name = program.name(id).to_string();
-            if let Some(cert) = verify_resource(program, &name, r, &certs, fn_certs, alloc)
-                .expect("resource verifies")
-            {
-                certs.insert(id, cert);
-            }
+            let cert = verify_resource(program, &name, r, &certs, fn_certs, alloc)
+                .expect("resource verifies");
+            certs.insert(id, cert);
         }
     }
     certs
@@ -536,8 +533,7 @@ fn build_all_certs(
             match decl {
                 vmir::Declaration::Resource(r) if !certs.contains_key(&id) => {
                     let name = program.name(id).to_string();
-                    if let Ok(Some(cert)) =
-                        verify_resource(program, &name, r, &certs, &fn_certs, alloc)
+                    if let Ok(cert) = verify_resource(program, &name, r, &certs, &fn_certs, alloc)
                     {
                         certs.insert(id, cert);
                         progress = true;

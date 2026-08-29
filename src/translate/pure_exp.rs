@@ -160,8 +160,17 @@ pub(crate) fn lower_pred_call<Ext: PureExt>(
     hctx: HeapCtx<'_>,
     pwp: &typed::PredicateWithPerm<Ext>,
 ) -> Result<(ResourceCall, vmir::PermVal), TranslationError> {
-    let pred_id = *b.name_map.get(&pwp.pred_call.name.0).ok_or_else(|| {
-        TranslationError::UnknownIdent(b.interner.resolve(&pwp.pred_call.name.0).to_string())
+    let name = pwp.pred_call.name.0;
+    if !b.name_map.contains_key(&name) {
+        return Err(TranslationError::UnknownIdent(
+            b.interner.resolve(&name).to_string(),
+        ));
+    }
+    // Only a *concrete* predicate has a `Resource` id. An abstract one is a
+    // `Function` + `Domain` pair, so the miss here is the whole abstractness
+    // test — there is no `ResourceCall` to build.
+    let pred_id = *b.pred_resources.get(&name).ok_or_else(|| {
+        TranslationError::AbstractPredicateNotFoldable(b.interner.resolve(&name).to_string())
     })?;
     let mut args = Vec::with_capacity(pwp.pred_call.args.len());
     for a in &pwp.pred_call.args {

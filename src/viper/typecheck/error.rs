@@ -51,6 +51,9 @@ pub enum TypeError {
     FieldAccessInAxiom,
     /// An `unfolding` expression in a domain axiom.
     UnfoldingInAxiom,
+    /// `fold` / `unfold` / `unfolding` naming a bodyless (abstract) predicate.
+    /// An abstract predicate is a bare location with no body to exchange for.
+    AbstractPredicateNotFoldable(String),
     /// An axiom calls a Silver `function` that has a precondition.
     PreconditionedFunctionInAxiom(String),
     /// A call in an axiom left a type parameter of a *foreign* domain's
@@ -140,6 +143,12 @@ impl std::fmt::Display for TypeError {
             }
             TypeError::UnfoldingInAxiom => {
                 write!(f, "`unfolding` not allowed in a domain axiom")
+            }
+            TypeError::AbstractPredicateNotFoldable(name) => {
+                write!(
+                    f,
+                    "predicate `{name}` has no body: it cannot be folded, unfolded, or used in `unfolding`"
+                )
             }
             TypeError::PreconditionedFunctionInAxiom(name) => {
                 write!(

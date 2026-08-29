@@ -2,8 +2,8 @@
 //!
 //! A field is an ordinary [`vmir::Function`] interned under the field's **bare
 //! name** (no `@`-suffix) — there is no distinct "address" declaration. It has
-//! no body, so `meta` only publishes the field's value type into
-//! `field_types`, and `define` reuses that published type for the function's
+//! no body, so `meta` only publishes the field's address type into
+//! `addr_types`, and `define` reuses that published type for the function's
 //! `Addr<T>` return.
 
 use std::marker::PhantomData;
@@ -45,11 +45,14 @@ impl<'a> FieldTranslator<'a, Declared> {
         }
     }
 
-    /// Publish the field's lowered value type (`name_map` is complete now, so
-    /// an ADT-typed field resolves to its real `Addr<Adt>` value).
+    /// Publish the field's complete address type (`name_map` is complete now,
+    /// so an ADT-typed field resolves to its real `Addr<Adt>` value). A field's
+    /// cap is full permission, `1/1`.
     pub(crate) fn meta(self, ctx: &mut TranslationContext<'_>) -> FieldTranslator<'a, Metaed> {
         let value = ctx.lower_type(&self.src.0.ty);
-        ctx.field_types.insert(self.silver_name, value);
+        let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
+        let addr = vmir::Type::addr(self.group, value, bound);
+        ctx.addr_types.insert(self.silver_name, addr);
         FieldTranslator {
             src: self.src,
             silver_name: self.silver_name,
@@ -66,14 +69,12 @@ impl FieldTranslator<'_, Metaed> {
         ctx: &TranslationContext<'_>,
         definer: &mut impl Definer,
     ) -> Result<(), TranslationError> {
-        // Reuse the value type `meta` already lowered into `field_types`.
-        let value = ctx
-            .field_types
+        // Reuse the address type `meta` already lowered into `addr_types`.
+        let ret = ctx
+            .addr_types
             .get(&self.silver_name)
-            .expect("meta publishes every field's value type before define")
+            .expect("meta publishes every field's address type before define")
             .clone();
-        let bound = vmir::Bound::Bounded(num::BigRational::from(num::BigInt::from(1)));
-        let ret = vmir::Type::addr(self.group, value, bound);
         let name = definer.intern_name(ctx.interner.resolve(&self.silver_name));
         definer.define_function(
             self.slot,

@@ -188,7 +188,7 @@ impl FunctionTranslator<'_, Metaed> {
                             name,
                             params: params.clone(),
                             precond: vmir::Precond::SelfFramed,
-                            body: Some(body),
+                            body,
                         },
                     );
                 }

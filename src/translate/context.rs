@@ -46,8 +46,17 @@ pub(crate) struct TranslationContext<'a> {
     pub interner: &'a Interner,
     /// Silver `Spur` names to VMIR `MemberId`s.
     pub name_map: HashMap<Spur, vmir::MemberId>,
-    /// A field's `Spur` to its lowered value type (for `field@addr`'s `Addr<T>`).
-    pub field_types: HashMap<Spur, vmir::Type>,
+    /// A location's `Spur` (field **or** predicate name) to the complete
+    /// `Type::Addr` its address function returns — group tag, value type, and
+    /// permission bound (`1/1` for a field, unbounded for a predicate). Read by
+    /// `resource::lower_resource_addr`, which is thereby the same lookup for
+    /// both kinds of location.
+    pub addr_types: HashMap<Spur, vmir::Type>,
+    /// A **concrete** predicate's `Spur` to its `vmir::Resource` id. An abstract
+    /// predicate has no entry: it lowers to a `Function` + `Domain` pair, so a
+    /// miss here *is* the "cannot fold an abstract predicate" error, with no
+    /// explicit abstractness test anywhere.
+    pub pred_resources: HashMap<Spur, vmir::MemberId>,
     /// A method's `Spur` to its contract resource ids.
     pub contracts: HashMap<Spur, MethodContracts>,
     /// ADT constructor/destructor metadata.
@@ -64,7 +73,8 @@ impl<'a> TranslationContext<'a> {
         Self {
             interner,
             name_map: HashMap::new(),
-            field_types: HashMap::new(),
+            addr_types: HashMap::new(),
+            pred_resources: HashMap::new(),
             contracts: HashMap::new(),
             adt: AdtInfo::default(),
             groups: Rodeo::new(),

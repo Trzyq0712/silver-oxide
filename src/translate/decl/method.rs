@@ -144,7 +144,7 @@ impl MethodTranslator<'_, Metaed> {
                     name,
                     params,
                     precond: vmir::Precond::SelfFramed,
-                    body: Some(body),
+                    body,
                 },
             );
         }
@@ -203,7 +203,7 @@ impl MethodTranslator<'_, Metaed> {
                     name,
                     params,
                     precond,
-                    body: Some(body),
+                    body,
                 },
             );
         }

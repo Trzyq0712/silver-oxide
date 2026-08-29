@@ -116,7 +116,7 @@ impl FuncRegistry {
         }
         for (id, decl) in program.decls.iter_enumerated() {
             if let Declaration::Resource(r) = decl
-                && let Some(crate::vmir::Snapshot::Concrete(adt)) = r.derive_snapshot()
+                && let Some(adt) = r.derive_snapshot()
             {
                 shapes.insert(
                     id,

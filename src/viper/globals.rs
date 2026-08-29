@@ -41,6 +41,11 @@ pub struct MethodSig {
 #[derive(Debug, Clone)]
 pub struct PredicateSig {
     pub params: Vec<Type>,
+    /// Whether the declaration supplied a body. A bodyless (abstract) predicate
+    /// is a bare location: it cannot be folded, unfolded, or used in
+    /// `unfolding`, and lowers to a `function` + `domain` pair rather than a
+    /// `vmir::Resource`.
+    pub has_body: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +392,7 @@ impl<'ast, 'i> AstWalker<'ast> for GlobalsCollector<'i> {
                 .iter()
                 .map(|p| Type::from(p.ty()))
                 .collect(),
+            has_body: pred.body.is_some(),
         };
         self.register(&pred.signature.name, GlobalSignature::Predicate(sig));
     }

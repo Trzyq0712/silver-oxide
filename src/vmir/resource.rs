@@ -1,23 +1,24 @@
 use crate::vmir::display::VmirDisplay;
 use crate::vmir::{
-    Adt, AdtVariant, Bind, Bound, Domain, Function, HeapInst, HeapVal, Inst, InstKind, MemberId,
-    Type, Val,
+    Adt, AdtVariant, Bind, Bound, Function, HeapInst, HeapVal, Inst, InstKind, MemberId, Type, Val,
 };
 use lasso::Spur;
 use std::fmt::{self, Display, Formatter};
 
 /// A reusable unit of proof.
 ///
-/// A resource computes a heap delta and a boolean condition. Its address function
-/// and snapshot type are not stored — they are mechanically implied by the
-/// definition and derived on demand (the `@addr` function via
+/// A resource computes a heap delta and a boolean condition, and it **always has
+/// a body** — a bodyless Silver predicate is not a resource at all, but the
+/// `function` + `domain` pair it implied (see `translate::decl::predicate`). Its
+/// address function and snapshot type are not stored — they are mechanically
+/// implied by the definition and derived on demand (the `@addr` function via
 /// [`Resource::derive_location`]; the snapshot via [`Resource::derive_snapshot`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Resource {
     pub name: Spur,
     pub params: Vec<Type>,
     pub precond: Precond,
-    pub body: Option<ResourceBody>,
+    pub body: ResourceBody,
 }
 
 /// A resource's precondition mode.
@@ -59,14 +60,13 @@ impl Resource {
         }
     }
 
-    /// Derive this resource's snapshot type (see [`Snapshot`]):
-    /// - a concrete predicate → a single-constructor [`Adt`] over the footprint
-    ///   slots, each typed `Option[T]` (a slot is present-or-absent — `fold` packs
-    ///   `present ? Some(v) : None`);
-    /// - an abstract (bodyless) predicate → an opaque empty [`Domain`].
+    /// Derive this resource's snapshot type: a single-constructor [`Adt`] over
+    /// the footprint slots, each typed `Option[T]` (a slot is present-or-absent
+    /// — `fold` packs `present ? Some(v) : None`).
     ///
-    /// `None` for a non self-framed resource (two-state; no foldable snapshot).
-    /// Not stored in the IR — the verifier mints the snapshot's
+    /// `None` for a non self-framed resource (two-state; no foldable snapshot)
+    /// — that [`Precond::Ctx`] case is now the *only* reason this returns
+    /// `None`. Not stored in the IR — the verifier mints the snapshot's
     /// constructor/projection ids from this on demand.
     ///
     /// Slot types come from the body: only `Pure` insts produce a `Val`, and
@@ -81,13 +81,11 @@ impl Resource {
     /// slots — a scoped `unfolding` region produces and consumes chunks of
     /// another predicate — and those carry `Bind::Bound`/no bind, so they are
     /// skipped here rather than silently becoming phantom slots.
-    pub fn derive_snapshot(&self) -> Option<Snapshot> {
+    pub fn derive_snapshot(&self) -> Option<Adt> {
         if !self.is_self_framed() {
             return None;
         }
-        let Some(body) = &self.body else {
-            return Some(Snapshot::Abstract(Domain { name: self.name }));
-        };
+        let body = &self.body;
         let mut val_types: Vec<Type> = self.params.clone();
         let mut field_types = Vec::new();
         for inst in &body.insts {
@@ -119,7 +117,7 @@ impl Resource {
                 _ => {}
             }
         }
-        Some(Snapshot::Concrete(Adt {
+        Some(Adt {
             name: self.name,
             ty_params: 0.into(),
             // A snapshot's single constructor is synthetic — no source name.
@@ -127,18 +125,8 @@ impl Resource {
                 name: None,
                 field_types,
             }],
-        }))
+        })
     }
-}
-
-/// The derived snapshot type of a resource (see [`Resource::derive_snapshot`]):
-/// a concrete predicate's is an [`Adt`] with a single constructor over the
-/// `Option`-wrapped footprint slot types; an abstract predicate's is an opaque
-/// empty [`Domain`]. Never stored in the IR.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Snapshot {
-    Concrete(Adt),
-    Abstract(Domain),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -173,22 +161,18 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
         }
         write!(f, ")")?;
 
-        match &self.item.body {
-            None => Ok(()),
-            Some(body) => {
-                // Body heaps always count from `h0` (a two-state resource's
-                // pre-state is reconstructed by its explicit entry bound `inhale`,
-                // which is `h0` itself — no reserved slot).
-                writeln!(f, " {{")?;
-                write!(
-                    f,
-                    "{}",
-                    self.with((self.item.params.len(), 0usize, 0usize, &body.insts[..]))
-                )?;
-                writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
-                write!(f, "}}")
-            }
-        }
+        // Body heaps always count from `h0` (a two-state resource's pre-state is
+        // reconstructed by its explicit entry bound `inhale`, which is `h0`
+        // itself — no reserved slot).
+        let body = &self.item.body;
+        writeln!(f, " {{")?;
+        write!(
+            f,
+            "{}",
+            self.with((self.item.params.len(), 0usize, 0usize, &body.insts[..]))
+        )?;
+        writeln!(f, "  result: ({}, {})", body.res.0, body.res.1)?;
+        write!(f, "}}")
     }
 }
 
