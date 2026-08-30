@@ -252,7 +252,6 @@ impl FuncRegistry {
         id
     }
 
-
     /// The uniform **function** precondition token `f%pre` (minting it on first
     /// use), keyed on the function member and applied to the function's own args
     /// `fargs`. Uninterpreted — no unfold rule — it is only ever *added* (present)

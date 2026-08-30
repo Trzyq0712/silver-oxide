@@ -6,9 +6,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use egg::{
-    Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
-};
+use egg::{Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, FuncId, RecipeId, Symbolic};
@@ -312,7 +310,5 @@ pub(crate) fn forall_rule(table: Arc<RwLock<RecipeTable>>) -> Rule {
     timed(Rewrite::new("forall-instantiate", searcher, applier).expect("forall rule"))
 }
 
-
 /// A partial bound-variable substitution, one slot per binder.
 pub(super) type Sigma = Vec<Option<Id>>;
-

@@ -58,8 +58,8 @@ fn passing_cases_all_verify() {
             Ok(results) => {
                 let mut file_ok = true;
                 for (method, outcome) in &results {
-                    if let Err(e) = outcome {
-                        failures.push(format!("  [FAIL] {name}::{method}: {e}"));
+                    if !outcome.is_ok() {
+                        failures.push(format!("  [{}] {name}::{method}: {outcome}", outcome.tag()));
                         file_ok = false;
                     }
                 }
@@ -107,7 +107,7 @@ fn failing_cases_are_rejected() {
                 println!("  [PIPELINE-ERROR-OK] {name}: {e}");
                 true
             }
-            Ok(results) => results.iter().any(|(_, r)| r.is_err()),
+            Ok(results) => results.iter().any(|(_, r)| !r.is_ok()),
         };
         if rejected {
             ok += 1;
@@ -152,7 +152,7 @@ fn known_limitations_still_fail() {
         let name = file_name(path);
         let still_fails = match pipeline::run_file(path) {
             Err(_) => true,
-            Ok(results) => results.iter().any(|(_, r)| r.is_err()),
+            Ok(results) => results.iter().any(|(_, r)| !r.is_ok()),
         };
         if still_fails {
             println!("  [STILL-FAILING-OK] {name}");
@@ -167,5 +167,85 @@ fn known_limitations_still_fail() {
          and update the tracking doc referenced in the file's header:\n{}",
         newly_passing.len(),
         newly_passing.join("\n")
+    );
+}
+
+/// Unsupported-construct cases: each file uses at least one construct this
+/// verifier does not implement. The pipeline must survive it — the file still
+/// parses and lowers, and its other members are still verified — and the
+/// offending declaration must be reported as `Unsupported`, naming the
+/// construct, never as a verified member and never as a parse error.
+#[test]
+fn unsupported_cases_are_named_and_survived() {
+    let dir = cases_dir().join("unsupported");
+    if !dir.exists() {
+        return;
+    }
+    let files = vpr_files(&dir);
+    assert!(
+        !files.is_empty(),
+        "no .vpr files found in cases/unsupported/"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    for path in &files {
+        let name = file_name(path);
+        match pipeline::run_file(path) {
+            Err(e) => failures.push(format!(
+                "  [PIPELINE-ERROR] {name}: {e} (an unsupported construct must not \
+                 take the file down)"
+            )),
+            Ok(results) => {
+                if !results
+                    .iter()
+                    .any(|(_, s)| matches!(s, pipeline::MemberStatus::Unsupported(_)))
+                {
+                    failures.push(format!(
+                        "  [NOT-REPORTED] {name}: no member was reported as unsupported"
+                    ));
+                }
+                for (member, status) in &results {
+                    println!("  [{}] {name}::{member}: {status}", status.tag());
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} unsupported case(s) mishandled:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The two properties the reporting exists for, on one file: a rejected
+/// declaration does not stop its neighbours from being verified, and a
+/// declaration that depends on a rejected one is reported as skipped rather
+/// than verified.
+#[test]
+fn rejection_is_local_but_infects_dependents() {
+    let path = cases_dir().join("unsupported/dependent_is_skipped.vpr");
+    let results = pipeline::run_file(&path).expect("file must still lower");
+    let status = |name: &str| {
+        results
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s)
+            .unwrap_or_else(|| panic!("no row for `{name}` in {results:?}"))
+    };
+    assert!(
+        matches!(status("p"), pipeline::MemberStatus::Unsupported(_)),
+        "the predicate using a magic wand must be reported unsupported"
+    );
+    assert!(
+        matches!(status("use_p"), pipeline::MemberStatus::Skipped { .. }),
+        "a method whose precondition names a rejected predicate must not verify"
+    );
+
+    let path = cases_dir().join("unsupported/rest_of_file_still_verifies.vpr");
+    let results = pipeline::run_file(&path).expect("file must still lower");
+    assert!(
+        results.iter().any(|(n, s)| n == "fine" && s.is_ok()),
+        "the untouched method must still verify: {results:?}"
     );
 }

@@ -360,7 +360,10 @@ pub(crate) fn lower_method(
                     EdgeSide::Goto => (None, rv),
                     EdgeSide::Then => {
                         let c = cond_val[*p].clone().expect("branch pred has a condition");
-                        (Some((c.clone(), Polarity::Positive)), and_val(&mut sink, rv, c))
+                        (
+                            Some((c.clone(), Polarity::Positive)),
+                            and_val(&mut sink, rv, c),
+                        )
                     }
                     EdgeSide::Else => {
                         let c = cond_val[*p].clone().expect("branch pred has a condition");
@@ -394,7 +397,11 @@ pub(crate) fn lower_method(
         // `then_` is guarded by `cond`, `els` is the unguarded fall-through arm.
         let (env, preds_kind, mut real_join): (HashMap<Spur, Val>, vmir::Preds, Vec<Inst>) =
             if is_entry {
-                (init_env.clone(), vmir::Preds::Entry, prologue.take().unwrap())
+                (
+                    init_env.clone(),
+                    vmir::Preds::Entry,
+                    prologue.take().unwrap(),
+                )
             } else {
                 match edges.as_slice() {
                     [] => unreachable!("a reachable non-entry block has a predecessor"),
@@ -638,13 +645,7 @@ pub(crate) fn lower_method(
                         }
                         // `base` is the exit heap (delta subtracted from it). A
                         // self-framed callee (`!is_ctx`) yields its snapshot.
-                        (heap, _) = emit_resource_exhale(
-                            sink,
-                            ens_id,
-                            heap,
-                            ens_args,
-                            !is_ctx,
-                        );
+                        (heap, _) = emit_resource_exhale(sink, ens_id, heap, ens_args, !is_ctx);
                     }
                     None
                 }
@@ -720,7 +721,6 @@ fn collect_var_types(
         }
     }
 }
-
 
 /// Inhale or exhale a loop invariant against `heap`, clause by clause in source
 /// order (which is what makes self-framing order-dependent, exactly as for a

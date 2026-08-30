@@ -7,9 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egg::{
-    Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
-};
+use egg::{Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::Symbolic;
@@ -122,7 +120,6 @@ impl Applier<Symbolic, ConstFold> for TimedApplier {
         self.inner.vars()
     }
 }
-
 
 // ---- Per-rule timing --------------------------------------------------------
 

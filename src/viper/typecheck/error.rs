@@ -34,6 +34,12 @@ pub enum TypeError {
     UnboundTypeParam(String),
     /// An `exists` quantifier (only pure `forall` is supported so far).
     ExistsUnsupported,
+    /// A Viper construct this verifier does not implement. Carries the
+    /// construct's name as it is written in the source (`magic wand `--*``,
+    /// `Seq`, `package`, ...). Kept apart from the genuine type errors so a
+    /// caller can tell "we do not support this" from "this program is
+    /// ill-typed" — see [`TypeError::is_unsupported`].
+    Unsupported(&'static str),
     /// A `forall` with no trigger group (or an empty one). Triggers are never
     /// inferred — every quantifier must state how it is instantiated.
     MissingTrigger,
@@ -62,6 +68,35 @@ pub enum TypeError {
     UnconstrainedTypeParamInAxiom(String),
     Tc(TcErr<ViperTcType>),
     Other(String),
+}
+
+impl TypeError {
+    /// Whether this is "we do not implement that construct" rather than "this
+    /// program is ill-typed". The distinction is what lets a caller report an
+    /// unsupported declaration as such instead of as a type error.
+    ///
+    /// The test is what Viper itself would say. A program Silver accepts and we
+    /// refuse is our limitation, whatever phase catches it: an inferred trigger,
+    /// `perm()` in a contract, a labelled `old` in a postcondition, an axiom over
+    /// a function with a precondition, a call in an axiom that leans on Silver's
+    /// `ground()` rule. A program Silver also rejects — `old` where there is no
+    /// pre-state, a field read in an axiom, `unfold` of a bodyless predicate — is
+    /// an error in the input and stays one.
+    pub fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            TypeError::Unsupported(_)
+                | TypeError::ExistsUnsupported
+                | TypeError::MissingTrigger
+                | TypeError::TriggerNotAnApplication
+                | TypeError::TriggerBadSubterm
+                | TypeError::TriggerNotCovering(_)
+                | TypeError::PermissionInPureContext
+                | TypeError::IllegalLabeledOldUsage
+                | TypeError::PreconditionedFunctionInAxiom(_)
+                | TypeError::UnconstrainedTypeParamInAxiom(_)
+        )
+    }
 }
 
 impl From<TcErr<ViperTcType>> for TypeError {
@@ -121,6 +156,9 @@ impl std::fmt::Display for TypeError {
             }
             TypeError::ExistsUnsupported => {
                 write!(f, "`exists` quantifiers are not supported yet")
+            }
+            TypeError::Unsupported(what) => {
+                write!(f, "unsupported construct: {what}")
             }
             TypeError::MissingTrigger => write!(
                 f,

@@ -455,19 +455,16 @@ impl RecipeBuilder {
             let Some(token) = new_val[i].clone() else {
                 continue;
             };
-            let guards = t
-                .guards
-                .iter()
-                .map(|(g, pol)| match g {
-                    Val::Temp(j) => new_val[*j]
-                        .clone()
-                        .map(|v| (v, *pol))
-                        .ok_or(VerifyError::Unimplemented(
-                            "purify: token guard pruned by slice",
-                        )),
-                    Val::Literal(l) => Ok((Val::Literal(l.clone()), *pol)),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let guards =
+                t.guards
+                    .iter()
+                    .map(|(g, pol)| match g {
+                        Val::Temp(j) => new_val[*j].clone().map(|v| (v, *pol)).ok_or(
+                            VerifyError::Unimplemented("purify: token guard pruned by slice"),
+                        ),
+                        Val::Literal(l) => Ok((Val::Literal(l.clone()), *pol)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
             token_steps.push(TokenStep { token, guards });
         }
         Ok(BodyRecipe {

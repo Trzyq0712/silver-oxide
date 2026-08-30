@@ -84,10 +84,7 @@ fn reach_val_of(sink: &mut Sink, pc: &PathConds) -> Val {
 /// [`merge_cubes`] only applies the value-preserving adjacency law
 /// (`P∧x ∨ P∧!x ⇒ P`), so the result is always exactly the block's reach
 /// condition, hence sound.
-pub(crate) fn block_reach(
-    sink: &mut Sink,
-    pool: &[PathConds],
-) -> (Vec<PathConds>, PathConds, Val) {
+pub(crate) fn block_reach(sink: &mut Sink, pool: &[PathConds]) -> (Vec<PathConds>, PathConds, Val) {
     if pool.is_empty() {
         // Unreachable (filtered out before lowering); keep it fully gated.
         let pc = PathConds {

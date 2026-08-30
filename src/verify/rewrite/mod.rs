@@ -2,61 +2,42 @@
 
 use std::collections::HashSet;
 
-use egg::{
-    Rewrite, Var,
-};
+use egg::{Rewrite, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::Symbolic;
 
-pub(crate) mod memo;
-pub(crate) mod timing;
-pub(crate) mod arith;
-pub(crate) mod ite;
-pub(crate) mod diseq;
 pub(crate) mod adt;
+pub(crate) mod arith;
+pub(crate) mod diseq;
 pub(crate) mod forall;
-pub(crate) mod recipe;
 pub(crate) mod function;
+pub(crate) mod ite;
+pub(crate) mod memo;
+pub(crate) mod recipe;
+pub(crate) mod timing;
 
-pub(crate) use forall::{PreparedTerm, forall_rule};
-pub(crate) use recipe::{
-    AxiomInst, AxiomPure, build_instance_releasing_tokens,
-    build_instance_vals_guarded,
-};
-pub(crate) use function::{post_rule, function_post_rule, function_rule};
-pub(crate) use memo::{Memo, ScratchScope, new_memo_unit, new_scope_id};
-pub(crate) use timing::take_rule_timing;
 pub use adt::{inj_rule, proj_rule, tag_rule};
+pub(crate) use forall::{PreparedTerm, forall_rule};
+pub(crate) use function::{function_post_rule, function_rule, post_rule};
+pub(crate) use memo::{Memo, ScratchScope, new_memo_unit, new_scope_id};
+pub(crate) use recipe::{
+    AxiomInst, AxiomPure, build_instance_releasing_tokens, build_instance_vals_guarded,
+};
+pub(crate) use timing::take_rule_timing;
 
-pub(in crate::verify::rewrite) use timing::*;
 pub(in crate::verify::rewrite) use arith::*;
-pub(in crate::verify::rewrite) use ite::*;
 pub(in crate::verify::rewrite) use diseq::*;
-pub(in crate::verify::rewrite) use recipe::*;
 pub(in crate::verify::rewrite) use function::*;
+pub(in crate::verify::rewrite) use ite::*;
+pub(in crate::verify::rewrite) use recipe::*;
+pub(in crate::verify::rewrite) use timing::*;
 
 type Rule = Rewrite<Symbolic, ConstFold>;
 
 fn var(name: &str) -> Var {
     name.parse().expect("valid pattern var")
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// The static structural rule set. Per-ADT cons/proj/tag reductions are minted
 /// by the registry (`verify::mono`) and appended by `VerifyContext::new`.
@@ -92,49 +73,3 @@ pub fn reduce_rules() -> Vec<Rule> {
         .map(timed)
         .collect()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

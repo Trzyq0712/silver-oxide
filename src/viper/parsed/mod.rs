@@ -8,4 +8,4 @@ mod ast_ext;
 mod builtins;
 
 pub use ast::*;
-pub use passes::{disambiguate, inline_macros};
+pub use passes::{disambiguate, disambiguate_reporting, inline_macros};

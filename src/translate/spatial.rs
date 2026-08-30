@@ -10,9 +10,7 @@ use crate::translate::resource::lower_resource_addr;
 use crate::translate::sink::{PcKind, Sink};
 use crate::translate::{TranslationContext, TranslationError};
 use crate::viper::typed;
-use crate::vmir::{
-    self, FALSE, HeapInst, HeapVal, PermVal, Polarity, PureInst, TRUE, Type, Val,
-};
+use crate::vmir::{self, FALSE, HeapInst, HeapVal, PermVal, Polarity, PureInst, TRUE, Type, Val};
 
 /// Direction and heap semantics of a spatial lowering.
 ///
@@ -141,7 +139,7 @@ pub(crate) fn lower_spatial_ensures(
              args,
              snap,
          }| {
-sink.emit_heap(HeapInst::Inhale {
+            sink.emit_heap(HeapInst::Inhale {
                 base: HeapVal::Empty,
                 bind: vmir::Bind::Bound(snap),
                 call: vmir::ResourceCall { resource, args },

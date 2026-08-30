@@ -2,6 +2,8 @@ pub mod cfg;
 pub mod loops;
 pub mod parsed;
 pub mod typed;
+pub mod units;
+pub mod unsupported;
 pub mod walk;
 
 mod globals;
@@ -15,4 +17,4 @@ pub use typed::{Show, show};
 pub use globals::{GlobalSignature, Globals, GlobalsCollector};
 pub use interner::{IdentCollector, Interner};
 pub use parser::viper_parser;
-pub use typecheck::{TypeError, typecheck_program};
+pub use typecheck::{TypeError, typecheck_program, typecheck_program_reporting};

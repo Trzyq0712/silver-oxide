@@ -64,7 +64,11 @@ impl std::error::Error for DisambiguationError {}
 struct Disambiguator<'i, 'g> {
     interner: &'i Interner,
     globals: &'g Globals,
-    errors: Vec<DisambiguationError>,
+    /// Each error paired with the declaration it was found in, so the caller can
+    /// reject that declaration alone instead of the file.
+    errors: Vec<(String, DisambiguationError)>,
+    /// The declaration currently being walked.
+    current: String,
 }
 
 impl<'i, 'g> Disambiguator<'i, 'g> {
@@ -73,11 +77,22 @@ impl<'i, 'g> Disambiguator<'i, 'g> {
             interner,
             globals,
             errors: Vec::new(),
+            current: String::new(),
         }
+    }
+
+    fn error(&mut self, e: DisambiguationError) {
+        let owner = self.current.clone();
+        self.errors.push((owner, e));
     }
 }
 
 impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
+    fn walk_mut_declaration(&mut self, decl: &'_ mut crate::viper::Declaration) {
+        self.current = crate::viper::units::unit_name_interned(decl, self.interner);
+        decl.walk_mut_children(self);
+    }
+
     fn walk_mut_assign_rhs(&mut self, rhs: &'_ mut AssignRhs) {
         // Intercept bare identifiers being used as statement right-hand sides.
         if let AssignRhs::Exp(exp) = rhs
@@ -132,7 +147,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                         for arg in &mut call.args {
                             arg.walk_mut(self);
                         }
-                        self.errors.push(DisambiguationError::NotCallable(
+                        self.error(DisambiguationError::NotCallable(
                             call_tgt_name(),
                             actual_kind,
                         ));
@@ -143,8 +158,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                 for arg in &mut call.args {
                     arg.walk_mut(self);
                 }
-                self.errors
-                    .push(DisambiguationError::UnresolvedCallable(call_tgt_name()));
+                self.error(DisambiguationError::UnresolvedCallable(call_tgt_name()));
             }
         } else {
             rhs.walk_mut_children(self);
@@ -170,16 +184,15 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
 
                 // INVALID: Trying to use a Statement inside an Expression!
                 kind @ GlobalKind::Method | kind @ GlobalKind::StmtMacro => {
-                    self.errors
-                        .push(DisambiguationError::StatementCallInExpression(
-                            call_tgt_name(),
-                            kind,
-                        ));
+                    self.error(DisambiguationError::StatementCallInExpression(
+                        call_tgt_name(),
+                        kind,
+                    ));
                 }
 
                 // INVALID: Targets that cannot be called at all (Fields, Domains, etc.)
                 actual_kind => {
-                    self.errors.push(DisambiguationError::NotCallable(
+                    self.error(DisambiguationError::NotCallable(
                         call_tgt_name(),
                         actual_kind,
                     ));
@@ -187,8 +200,7 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
             }
         } else {
             // UNRESOLVED IDENTIFIER
-            self.errors
-                .push(DisambiguationError::UnresolvedCallable(call_tgt_name()));
+            self.error(DisambiguationError::UnresolvedCallable(call_tgt_name()));
         }
     }
 
@@ -246,10 +258,11 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
                 } else {
                     let name = self.interner.resolve(&id).to_string();
                     match self.globals.resolve(id) {
-                        Some(sym) => self
-                            .errors
-                            .push(DisambiguationError::NotAField(name, sym.kind())),
-                        None => self.errors.push(DisambiguationError::UnknownField(name)),
+                        Some(sym) => {
+                            let kind = sym.kind();
+                            self.error(DisambiguationError::NotAField(name, kind))
+                        }
+                        None => self.error(DisambiguationError::UnknownField(name)),
                     }
                 }
             }
@@ -262,16 +275,28 @@ impl<'i, 'g> AstWalkerMut<'_> for Disambiguator<'i, 'g> {
 /// Disambiguate the parsed AST against `globals`: tag call nodes, demote
 /// non-statement assignment RHSs, desugar macros, and validate field
 /// accesses.
+/// Resolve every call and field reference, reporting each failure against the
+/// declaration it was found in.
+pub fn disambiguate_reporting(
+    program: &mut crate::viper::Program,
+    interner: &Interner,
+    globals: &Globals,
+) -> Vec<(String, DisambiguationError)> {
+    let mut disambiguator = Disambiguator::new(interner, globals);
+    program.walk_mut(&mut disambiguator);
+    disambiguator.errors
+}
+
+/// All-or-nothing disambiguation, discarding the declaration names.
 pub fn disambiguate(
     program: &mut crate::viper::Program,
     interner: &Interner,
     globals: &Globals,
 ) -> Result<(), Vec<DisambiguationError>> {
-    let mut disambiguator = Disambiguator::new(interner, globals);
-    program.walk_mut(&mut disambiguator);
-    if disambiguator.errors.is_empty() {
+    let errors = disambiguate_reporting(program, interner, globals);
+    if errors.is_empty() {
         Ok(())
     } else {
-        Err(disambiguator.errors)
+        Err(errors.into_iter().map(|(_, e)| e).collect())
     }
 }

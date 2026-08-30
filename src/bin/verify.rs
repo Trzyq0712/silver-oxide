@@ -3,11 +3,16 @@
 //! Usage: `cargo run --bin verify -- [--breakdown] cases/foo.vpr`
 //!
 //! `--breakdown` (`-b`) prints per-member verify times, slowest first.
+//!
+//! Exit status is 1 if any row is not `[OK]` — an unproved obligation, an
+//! unsupported construct, a declaration skipped because one it depends on was
+//! rejected, or a file that could not be parsed at all. 0 only when every unit
+//! of the file verified.
 
 use silver_oxide::pipeline;
-use std::{error::Error, path::Path};
+use std::{path::Path, process::ExitCode};
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> ExitCode {
     let mut file = None;
     let mut breakdown = false;
     for arg in std::env::args().skip(1) {
@@ -16,19 +21,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             _ => file = Some(arg),
         }
     }
-    let file = file.ok_or("usage: verify [--breakdown] <file.vpr>")?;
+    let Some(file) = file else {
+        eprintln!("usage: verify [--breakdown] <file.vpr>");
+        return ExitCode::FAILURE;
+    };
 
     match pipeline::run_file_timed(Path::new(&file)) {
-        Err(e) => eprintln!("[PIPELINE-ERROR] {e}"),
+        Err(e) => {
+            eprintln!("[PIPELINE-ERROR] {e}");
+            ExitCode::FAILURE
+        }
         Ok((results, timings, member_times, stats)) => {
             if results.is_empty() {
                 println!("[INFO] no method bodies to verify");
-            } else {
-                for (name, outcome) in &results {
-                    match outcome {
-                        Ok(()) => println!("  [OK] {name}"),
-                        Err(e) => println!("  [FAIL] {name}: {e}"),
-                    }
+            }
+            let mut clean = true;
+            for (name, status) in &results {
+                clean &= status.is_ok();
+                let tag = status.tag();
+                let detail = status.to_string();
+                if detail.is_empty() {
+                    println!("  [{tag}] {name}");
+                } else {
+                    println!("  [{tag}] {name}: {detail}");
                 }
             }
             eprintln!("[TIMING]\n{timings}");
@@ -51,8 +66,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             eprintln!("[STATS] {stats:?}");
+            if clean {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
-
-    Ok(())
 }

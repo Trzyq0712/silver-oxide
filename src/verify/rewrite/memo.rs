@@ -9,9 +9,6 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-
-
-
 /// Mint a scope id to be `resume`d later — for a scratch graph that outlives a
 /// single run (the per-block scratch).
 pub(crate) fn new_scope_id() -> u64 {
@@ -78,8 +75,6 @@ pub(super) struct MemoInner<K> {
 /// A unit-scoped applier memo with a scratch overlay (see module docs above).
 pub(crate) struct Memo<K>(Mutex<MemoInner<K>>);
 
-
-
 // Applier-memo scoping ("already instantiated this call/σ"). A pure cost guard
 // keyed on canonical e-class ids; re-instantiating is idempotent.
 //
@@ -113,7 +108,6 @@ thread_local! {
     /// takes one at build time and `resume`s it for each of its runs.
     static NEXT_SCOPE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-
 
 impl<K: Eq + std::hash::Hash> Memo<K> {
     pub(super) fn new() -> Self {

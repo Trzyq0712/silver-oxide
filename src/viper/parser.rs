@@ -60,10 +60,15 @@ peg::parser! {
             / "Perm" { Type::Real }
             / "Ref" { Type::Ref }
             / "Rational"   { Type::Real }
-            // / "Seq" _ "[" _ ty:type_() _ "]" { Type::Domain(Ident::seq(), vec![ty]) }
-            // / "Set" _ "[" _ ty:type_() _ "]" { Type::Domain(Ident::set(), vec![ty]) }
-            // / "Multiset" _ "[" _ ty:type_() _ "]" { Type::Domain(Ident::multiset(), vec![ty]) }
-            // / "Map" _ "[" _ a:type_() _ "," _ b:type_() _ "]" { Type::Domain(Ident::map(), vec![a, b]) }
+            // The collection types are parsed but not implemented: they are kept
+            // as ordinary domain types under their own name so that
+            // `scan_unsupported` can name the construct and reject only the
+            // declaration that mentions one, instead of failing the whole file
+            // with a parse error.
+            / "Seq" _ "[" _ ty:type_() _ "]" { Type::Domain(Ident::Raw("Seq".to_string()), vec![ty]) }
+            / "Set" _ "[" _ ty:type_() _ "]" { Type::Domain(Ident::Raw("Set".to_string()), vec![ty]) }
+            / "Multiset" _ "[" _ ty:type_() _ "]" { Type::Domain(Ident::Raw("Multiset".to_string()), vec![ty]) }
+            / "Map" _ "[" _ a:type_() _ "," _ b:type_() _ "]" { Type::Domain(Ident::Raw("Map".to_string()), vec![a, b]) }
             / type_constr()
 
         rule type_constr() -> Type = nm:ident() _ tys:("[" _ tys:(type_() ** comma()) _ "]" { tys })?
@@ -96,6 +101,21 @@ peg::parser! {
 
 
         /// Expressions
+
+        /// Collection literals. Parsed into an `Unsupported` marker rather than
+        /// a real expression: the construct is named, the declaration around it
+        /// is rejected, and the rest of the file still runs.
+        rule collection_exp() -> ExpKind
+            = n:$("Seq" / "Set" / "Multiset" / "Map") _ ("[" _ type_() ** comma() _ "]")? _ "(" _ collection_elems() _ ")"
+                { ExpKind::Unsupported(collection_name(n)) }
+
+        rule collection_elems() = (e:exp() _ (":=" _ exp())? {}) ** comma()
+
+        /// `|s|` — the cardinality of a collection.
+        rule cardinality_exp() -> ExpKind = "|" _ exp() _ "|" { ExpKind::Unsupported("|s| (cardinality)") }
+
+        /// `[a..b)` — a sequence range.
+        rule range_exp() -> ExpKind = "[" _ exp() _ ".." _ exp() _ ")" { ExpKind::Unsupported("[a..b) (sequence range)") }
 
         // rule set_constructor_exp() -> ExpKind
         //     = "Set" _ "[" _ ty:type_() _ "]" _ "(" _ ")" { ExpKind::Ascribe(Box::new(ExpKind::Call(Call { kind: None, name: Ident::set(), args: Vec::new() })), Type::Domain(Ident::set(), vec![ty])) }
@@ -137,7 +157,7 @@ peg::parser! {
             }
             / kw(<"old">) _ i:("[" _ i:ident() _ "]" {i})? _ "(" _ e:exp() _ ")" { ExpKind::Old(i, e) }
             // / "[" _ i:ident() _ "]" _ "(" _ e:exp() _ ")" { ExpKind::At(i, Box::new(e)) }
-            // / kw(<"lhs">) _ "(" _ e:exp() _ ")" { ExpKind::Lhs(Box::new(e)) }
+            / kw(<"lhs">) _ "(" _ exp() _ ")" { ExpKind::Unsupported("lhs") }
             / kw(<"none">) { ExpKind::Const(ConstKind::Real(num::BigInt::from(0).into())) }
             / kw(<"write">) { ExpKind::Const(ConstKind::Real(num::BigInt::from(1).into())) }
             / kw(<"epsilon">) { ExpKind::Const(ConstKind::Epsilon) }
@@ -146,16 +166,15 @@ peg::parser! {
             / "[" _ e:exp() _ "," _ f:exp() _ "]" { ExpKind::BinOp(BinOp::InhaleExhale, e, f)}
 
             / kw(<"unfolding">) _ acc:fold_target() _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Unfold, acc, e) }
-            // / kw(<"folding">) _ acc:predicate_perm() _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Fold, acc, e) }
-
-            // / kw(<"applying">) _ "(" _ mwexp:magic_wand_exp() _ ")" _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Apply, mwexp, e) }
-            // / kw(<"packaging">) _ "(" _ mwexp:magic_wand_exp() _ ")" _ "in" _ e:exp() { ExpKind::HeapUpdate(HeapUpdateOp::Package, mwexp, e) }
+            / kw(<"folding">) _ fold_target() _ "in" _ exp() { ExpKind::Unsupported("folding") }
+            / kw(<"applying">) _ "(" _ exp() _ ")" _ "in" _ exp() { ExpKind::Unsupported("applying") }
+            / kw(<"packaging">) _ "(" _ exp() _ ")" _ "in" _ exp() { ExpKind::Unsupported("packaging") }
             / kw(<"forall">) _ args:(formal_arg() ++ comma()) _ "::" _ triggers:(trigger()**_) _ e:exp() { ExpKind::Quantifier(QuantifierKind::Forall, args, triggers, e) }
             / kw(<"exists">) _ args:(formal_arg() ++ comma()) _ "::" _ triggers:(trigger()**_) _ e:exp() { ExpKind::Quantifier(QuantifierKind::Exists, args, triggers, e) }
 
-            // / s:seq_constructor_exp()
-            // / s:set_constructor_exp()
-            // / m:map_constructor_exp()
+            / collection_exp()
+            / cardinality_exp()
+            / range_exp()
             / let_in_exp()
             / forperm_exp()
             / a:acc_exp() { ExpKind::Acc(a) }
@@ -251,10 +270,20 @@ peg::parser! {
             / kw(<"var">) _ args:(formal_arg() ** comma()) _ e:(":=" _ e:assign_rhs() {e})? { Statement::Var(args, e)}
             / while_statement()
             / if_statement()
+            // Statements we do not implement. Each is parsed into an
+            // `Unsupported` marker so the declaration containing it is reported
+            // by name and the rest of the file still verifies.
+            / kw(<"package">) _ exp() _ block()? { Statement::Unsupported("package") }
+            / kw(<"apply">) _ exp() { Statement::Unsupported("apply") }
+            / kw(<"quasihavocall">) _ (formal_arg() ++ comma()) _ "::" _ exp() { Statement::Unsupported("quasihavocall") }
+            / kw(<"quasihavoc">) _ exp() { Statement::Unsupported("quasihavoc") }
+            / kw(<"fresh">) _ (ident() ++ comma()) { Statement::Unsupported("fresh") }
+            / constraining_block() { Statement::Unsupported("constraining") }
+            // `a, b := e1, e2`: Viper binds several targets only from a method
+            // call, so this is reported as unsupported rather than as a parse
+            // error that names the comma.
+            / multi_assign_stmt()
             / assign_stmt()
-            // Seem dead?
-            // / fresh_statement()
-            // / constraining_block()
             / b:block() { Statement::Block(b) }
 
 
@@ -292,6 +321,14 @@ peg::parser! {
         rule elsif_block() -> (Exp, StmtBlock) =
             "elseif" _ "(" _ exp:exp() _ ")" _ block:block() { (exp, block)}
 
+        rule multi_assign_stmt() -> Statement =
+            (assign_target() ++ comma()) _ ":=" _ e:(exp() ++ comma())
+            {? if e.len() > 1 {
+                Ok(Statement::Unsupported("multi-target assignment from an expression"))
+            } else {
+                Err("a single right-hand side")
+            } }
+
         rule assign_stmt() -> Statement = tgts:(tgts:(assign_target() ++ comma()) _ ":=" { tgts })? _ rhs:assign_rhs()
             { Statement::Assign(tgts.unwrap_or_default(), rhs) }
 
@@ -309,7 +346,7 @@ peg::parser! {
                 _ => AssignRhs::Exp(e)
             }}
 
-        rule constraining_block() -> () = "constraining" _ "(" _ ident() ++ comma() _ ")" _ block()
+        rule constraining_block() -> () = "constraining" _ "(" _ exp() ++ comma() _ ")" _ block()
 
         rule expression_or_block() -> ExpOrBlock = exp:exp()  { ExpOrBlock::Exp(exp) } / block:block() { ExpOrBlock::Block(block) }
 
@@ -433,6 +470,17 @@ peg::parser! {
             }
 
 
+    }
+}
+
+/// The construct name reported for a collection literal, as a `&'static str`
+/// (the grammar action only has a borrowed slice of the input).
+fn collection_name(n: &str) -> &'static str {
+    match n {
+        "Seq" => "Seq",
+        "Set" => "Set",
+        "Multiset" => "Multiset",
+        _ => "Map",
     }
 }
 

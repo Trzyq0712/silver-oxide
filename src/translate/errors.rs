@@ -44,4 +44,18 @@ impl fmt::Display for TranslationError {
     }
 }
 
+impl TranslationError {
+    /// Whether this is "we do not implement that construct" rather than a
+    /// genuine error in the input program. Mirrors
+    /// `TypeError::is_unsupported`.
+    pub fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            TranslationError::Unsupported(_)
+                | TranslationError::GenericDomainUnsupported(_)
+                | TranslationError::HeapDepFunctionInQuantifier(_)
+        )
+    }
+}
+
 impl std::error::Error for TranslationError {}

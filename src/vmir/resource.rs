@@ -179,7 +179,11 @@ impl<'a> Display for VmirDisplay<'a, &'a Resource> {
 impl<'a> Display for VmirDisplay<'a, &'a ResourceBody> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "{{")?;
-        write!(f, "{}", self.with((0usize, 0usize, 0usize, &self.item.insts[..])))?;
+        write!(
+            f,
+            "{}",
+            self.with((0usize, 0usize, 0usize, &self.item.insts[..]))
+        )?;
         writeln!(f, "  result: ({}, {})", self.item.res.0, self.item.res.1)?;
         write!(f, "}}")
     }

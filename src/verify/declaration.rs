@@ -8,20 +8,21 @@ use crate::{
         context::VerifyContext,
         error::VerifyError,
         heap::{
-            Chunk, ChunkPerm, Heap, LocationKind, gate_perm_by_guard,
+            Chunk, ChunkPerm, Heap, LocationKind,
             algebra::{
                 Demand, chunk_under_pc, find_chunk_consolidated, heap_subtract, heap_union,
-                merge_heaps, perm_held_at,
-                prove_perm_positive, prove_perm_write, summarize_perm_at, union_heaps,
+                merge_heaps, perm_held_at, prove_perm_positive, prove_perm_write,
+                summarize_perm_at, union_heaps,
             },
+            gate_perm_by_guard,
         },
         lang::Symbolic,
         stats,
         viz::Snapshotter,
     },
     vmir::{
-        self, Assign, BinOp, Declaration, Function, HeapInst, HeapVal, Inst, InstKind,
-        Bind, Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, Type, Val,
+        self, Assign, BinOp, Bind, Declaration, Function, HeapInst, HeapVal, Inst, InstKind,
+        Literal, MemberId, Method, PathConds, Polarity, PureInst, Resource, Type, Val,
     },
 };
 
@@ -358,10 +359,9 @@ fn eval_pure_inst(
         PureInst::Deref(hv, loc) => {
             let heap = get_heap(state, hv);
             let addr = state.get_val(ctx, loc);
-            let chunk = state.loc_kind(loc).and_then(|k| {
-                chunk_under_pc(ctx, heap.chunks_of(&k), addr, pc_lits)
-                    .cloned()
-            });
+            let chunk = state
+                .loc_kind(loc)
+                .and_then(|k| chunk_under_pc(ctx, heap.chunks_of(&k), addr, pc_lits).cloned());
             match chunk {
                 Some(c) => {
                     // The chunk's recipe provenance is the deref's pure term —
@@ -510,8 +510,7 @@ fn eval_pure_inst(
             // not borrow `ctx` across the `&mut ctx.alloc`.
             let (interner, decls) = (ctx.interner, ctx.decls);
             let names = move |m| crate::verify::context::member_name_in(interner, decls, m);
-            let (recipe_id, free) =
-                crate::verify::quant::intern_forall(ctx.alloc, &names, q)?;
+            let (recipe_id, free) = crate::verify::quant::intern_forall(ctx.alloc, &names, q)?;
             let free: Vec<Val> = free.iter().map(|&k| Val::Temp(k)).collect();
             let caps: Box<[egg::Id]> = free.iter().map(|v| state.get_val(ctx, v)).collect();
             let id = ctx.add(Symbolic::Forall(recipe_id, caps));
@@ -562,7 +561,7 @@ fn eval_pure_inst(
                     let chunks = heap.chunks_of(&k).to_vec();
                     perm_held_at(ctx, &chunks, addr, pc_lits)
                 }
-                None => expr!(ctx, 0/1),
+                None => expr!(ctx, 0 / 1),
             };
             (id, None)
         }
@@ -853,7 +852,12 @@ fn build_perm(
 /// is what keeps the `ChunkPerm` tree intact through an `unfolding`'s multiplier. The
 /// two are equal but not identical; `mul-one-real-l` puts them in one class once the
 /// slot's `ctx.reduce()` runs, which is why the common `1/1` scale costs nothing.
-fn scale_perm(ctx: &mut VerifyContext<'_>, pm: egg::Id, pm_wild: bool, perm: ChunkPerm) -> ChunkPerm {
+fn scale_perm(
+    ctx: &mut VerifyContext<'_>,
+    pm: egg::Id,
+    pm_wild: bool,
+    perm: ChunkPerm,
+) -> ChunkPerm {
     match perm {
         // A wildcard *scale* (an `unfolding` inside a function body) makes every
         // scaled leaf wildcard-derived, whatever the slot's own amount was.
@@ -868,37 +872,6 @@ fn scale_perm(ctx: &mut VerifyContext<'_>, pm: egg::Id, pm_wild: bool, perm: Chu
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Invariant 6 of the two-egraph block model (`design/block-vmir/82-*.md`):
 /// statement-level heap instructions operate at the **block-PC level only** — their
@@ -944,11 +917,6 @@ fn assert_statement_pc_is_block_cube(ctx: &mut VerifyContext<'_>, inst: &Inst) {
         std::mem::discriminant(&inst.kind),
     );
 }
-
-
-
-
-
 
 /// Evaluate a heap inst. `Sub` may fail with `InsufficientPermission`.
 fn eval_heap_inst(
@@ -1095,7 +1063,7 @@ fn eval_heap_inst(
             let perm = held
                 .as_ref()
                 .map(|c| c.ungated_perm().clone())
-                .unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0/1)));
+                .unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0 / 1)));
             let guard = held
                 .as_ref()
                 .map(|c| c.guard_pc())
@@ -1411,14 +1379,23 @@ fn walk_footprint(
         };
         let wc_slot = frame_only && slot_wildcard;
         let before = ctx.egraph.total_number_of_nodes();
-        let addr = slot.addr.build(&mut ctx.egraph, resolve, pc_lits, &mut changed);
+        let addr = slot
+            .addr
+            .build(&mut ctx.egraph, resolve, pc_lits, &mut changed);
         let wildcard_as = if wc_slot {
             WildcardAs::One
         } else {
             WildcardAs::Fresh
         };
         let bperm = {
-            let p = build_perm(ctx, &slot.perm, &resolve, pc_lits, &mut changed, wildcard_as);
+            let p = build_perm(
+                ctx,
+                &slot.perm,
+                &resolve,
+                pc_lits,
+                &mut changed,
+                wildcard_as,
+            );
             if wc_slot {
                 SlotPerm::Presence(p)
             } else {
@@ -1488,7 +1465,7 @@ fn walk_footprint(
                     Direction::Produce => heap_union(ctx, &heap, &slot.kind, chunk, pc_lits),
                 };
                 let bperm_id = bperm.to_id(ctx);
-                expr!(ctx, (0/1) <r {bperm_id})
+                expr!(ctx, (0 / 1) < r { bperm_id })
             }
             // Wildcard `Snap` slot: no heap effect (Snap frames). Presence is the
             // gating guard `0 < ite(guard, 1, 0)` (folds to `guard`, `true` when
@@ -1497,7 +1474,7 @@ fn walk_footprint(
             // caller's (concrete) held permission; no wildcard is ever built.
             SlotPerm::Presence(pp) => {
                 let pp = pp.to_id(ctx);
-                let guard = expr!(ctx, (0/1) <r {pp});
+                let guard = expr!(ctx, (0 / 1) < r { pp });
                 let (_, existing) =
                     find_chunk_consolidated(ctx, &heap, &slot.kind, addr, pc_lits, true);
                 let suff = match existing {
@@ -1515,7 +1492,7 @@ fn walk_footprint(
                     // No chunk held here: sound only if the slot is not required
                     // on this path (`guard` is false).
                     None => {
-                        let not_guard = expr!(ctx, not {guard});
+                        let not_guard = expr!(ctx, not { guard });
                         ctx.prove_under_pc(not_guard, pc_lits)
                     }
                 };
@@ -1554,7 +1531,9 @@ fn walk_footprint(
     // `bool_guard`, not `pc_lits`: it is the path condition at every call site
     // (an `inhale` extends it with `0 < scale`, the others pass `pc_lits`
     // itself), so it is the tighter of the two and always a superset.
-    let bool_id = def.bool.build(&mut ctx.egraph, resolve, pc_lits, &mut changed);
+    let bool_id = def
+        .bool
+        .build(&mut ctx.egraph, resolve, pc_lits, &mut changed);
     match direction {
         // The precondition/predicate body must hold over the consumed values.
         Direction::Consume => {
@@ -1654,7 +1633,7 @@ fn eval_sub_yield(
     // For a literal amount it const-folds to `true` and `option_member` collapses
     // to a bare `Some`, so the paired `inhale`'s unwrap peels with no proof goal.
     let perm_id = cperm.to_id(ctx);
-    let present = expr!(ctx, (0/1) <r {perm_id});
+    let present = expr!(ctx, (0 / 1) < r { perm_id });
     let elem = kind.value.clone();
     let opt = ctx.option_member(elem.clone(), present, held);
     // The recipe must purify the value that is *pushed*, which is the option --
@@ -1709,123 +1688,128 @@ fn eval_resource_op(
         unreachable!("eval_resource_op called on a non-resource-op instruction");
     };
 
-        let is_inhale = matches!(hi, HeapInst::Inhale { .. });
-        // A frame-only exhale is the implicit precondition check of a
-        // heap-dependent function call: sufficiency is proven on a scratch
-        // subtraction chain (so aliased slots require their sum) whose result
-        // is discarded, and a bare-wildcard slot takes the presence path
-        // rather than materializing a wildcard permission.
-        let frame_only = matches!(hi, HeapInst::Exhale { frame_only: true, .. });
-        let base_h = get_heap(state, base);
-        let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
-        let scale = eval_perm(ctx, state, perm);
-        let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
-        // Inhale: produce fresh chunks, assume the bool guarded by `0 < scale`
-        // (it carries no path condition — the branch lives in the perm scale).
-        // Exhale: consume the held chunks, assert the bool under `pc`.
-        let (source, direction, bool_guard) = if is_inhale {
-            // The bind is the value source: `Fresh` havocs each slot, while
-            // `Bound(s)` recovers it as `unwrap(proj_i(s))` so this heap and
-            // any other reconstruction from `s` name the *same* terms.
-            let source = match hi {
-                HeapInst::Inhale {
-                    bind: Bind::Bound(v),
-                    ..
-                } => {
-                    // Always a plain `Snap`: a desugared `unfold` names the
-                    // `PureInst::OptionUnwrap` temp, not the `Option` itself, so
-                    // the seam is explicit in the instruction stream.
-                    let sv = state.get_val(ctx, v);
-                    ValueSource::ProjectSnap(sv, state.recipe_of(v))
-                }
-                HeapInst::Inhale {
-                    bind: Bind::SelfSlot,
-                    ..
-                } => {
-                    return Err(VerifyError::Unimplemented(
-                        "`with self` on a resource inhale",
-                    ));
-                }
-                _ => ValueSource::Fresh,
-            };
-            let pos = expr!(ctx, (0/1) <r {scale});
-            let mut guard = vec![(pos, Polarity::Positive)];
-            // Fork model: arms run unguarded (the branch no longer rides in
-            // the perm scale), so the block cube must guard the inhaled bool
-            // — otherwise a conditional `inhale` on one arm leaks its fact
-            // past the branch.
-            guard.extend_from_slice(&pc_lits);
-            (source, Direction::Produce, guard)
-        } else {
-            (
-                ValueSource::ReadHeap(base_h.clone()),
-                Direction::Consume,
-                pc_lits.clone(),
-            )
+    let is_inhale = matches!(hi, HeapInst::Inhale { .. });
+    // A frame-only exhale is the implicit precondition check of a
+    // heap-dependent function call: sufficiency is proven on a scratch
+    // subtraction chain (so aliased slots require their sum) whose result
+    // is discarded, and a bare-wildcard slot takes the presence path
+    // rather than materializing a wildcard permission.
+    let frame_only = matches!(
+        hi,
+        HeapInst::Exhale {
+            frame_only: true,
+            ..
+        }
+    );
+    let base_h = get_heap(state, base);
+    let args: Vec<egg::Id> = call.args.iter().map(|v| state.get_val(ctx, v)).collect();
+    let scale = eval_perm(ctx, state, perm);
+    let pc_lits = collect_pc_lits(ctx, state, &inst.pc);
+    // Inhale: produce fresh chunks, assume the bool guarded by `0 < scale`
+    // (it carries no path condition — the branch lives in the perm scale).
+    // Exhale: consume the held chunks, assert the bool under `pc`.
+    let (source, direction, bool_guard) = if is_inhale {
+        // The bind is the value source: `Fresh` havocs each slot, while
+        // `Bound(s)` recovers it as `unwrap(proj_i(s))` so this heap and
+        // any other reconstruction from `s` name the *same* terms.
+        let source = match hi {
+            HeapInst::Inhale {
+                bind: Bind::Bound(v),
+                ..
+            } => {
+                // Always a plain `Snap`: a desugared `unfold` names the
+                // `PureInst::OptionUnwrap` temp, not the `Option` itself, so
+                // the seam is explicit in the instruction stream.
+                let sv = state.get_val(ctx, v);
+                ValueSource::ProjectSnap(sv, state.recipe_of(v))
+            }
+            HeapInst::Inhale {
+                bind: Bind::SelfSlot,
+                ..
+            } => {
+                return Err(VerifyError::Unimplemented(
+                    "`with self` on a resource inhale",
+                ));
+            }
+            _ => ValueSource::Fresh,
         };
-        let FootprintResult {
-            heap: out,
-            members,
-            slot_recipes,
-        } = walk_footprint(
-            ctx,
-            program,
-            certs,
-            call.resource,
-            &args,
-            base_h,
-            source,
-            direction,
-            // A frame check does not scale: it reads the footprint at the
-            // callee's own slot permissions, exactly as the dedicated `Snap`
-            // did. Scaling by the (unused) `1/1` operand would rebuild every
-            // slot permission as `1 * p`, which is equal but not identical,
-            // and identity is what the `old(f(x)) == f(x)` congruence needs.
-            if frame_only { None } else { Some(scale) },
-            state.perm_is_wild(perm),
-            &pc_lits,
-            &bool_guard,
-            frame_only,
-        )?;
-        if hi.produces_heap() {
-            state.push_heap(out);
-        }
-        if let Some(res_id) = hi.snap_yield(&program.decls) {
-            let s = build_snapshot(ctx, res_id, members);
-            // A certificate walk mirrors the snapshot as `cons(Some(v_i))`
-            // over the read values' recipes -- a self-framed footprint is
-            // fully held, so every slot is `Some`. Only a frame-only exhale
-            // (a function's precondition check) is ever reached during a
-            // recipe walk; a consuming inhale/exhale is method-only, where no
-            // recipe is in flight and this yields `None` as before.
-            let recipe = if ctx.recipe.is_some() {
-                let def = certs.get(&res_id).ok_or(VerifyError::DependencyFailed)?;
-                let elems: Vec<Type> =
-                    def.footprint.iter().map(|sl| sl.elem.clone()).collect();
-                let some_id = ctx.alloc.option_some();
-                let cons_id = ctx.alloc.cons(res_id, 0);
-                let rb = ctx.recipe.as_mut().unwrap();
-                let mut members_r = Vec::with_capacity(slot_recipes.len());
-                for (i, r) in slot_recipes.iter().enumerate() {
-                    let v = r.clone().ok_or(VerifyError::Unimplemented(
-                        "purify: snap value outside footprint",
-                    ))?;
-                    members_r.push(rb.emit(crate::verify::rewrite::AxiomPure::App {
-                        func: some_id,
-                        type_args: vec![elems[i].clone()],
-                        args: vec![v],
-                    }));
-                }
-                Some(rb.emit(crate::verify::rewrite::AxiomPure::App {
-                    func: cons_id,
-                    type_args: Vec::new(),
-                    args: members_r,
-                }))
-            } else {
-                None
-            };
-            state.push_val(s, Type::Snap(res_id), recipe);
-        }
+        let pos = expr!(ctx, (0 / 1) < r { scale });
+        let mut guard = vec![(pos, Polarity::Positive)];
+        // Fork model: arms run unguarded (the branch no longer rides in
+        // the perm scale), so the block cube must guard the inhaled bool
+        // — otherwise a conditional `inhale` on one arm leaks its fact
+        // past the branch.
+        guard.extend_from_slice(&pc_lits);
+        (source, Direction::Produce, guard)
+    } else {
+        (
+            ValueSource::ReadHeap(base_h.clone()),
+            Direction::Consume,
+            pc_lits.clone(),
+        )
+    };
+    let FootprintResult {
+        heap: out,
+        members,
+        slot_recipes,
+    } = walk_footprint(
+        ctx,
+        program,
+        certs,
+        call.resource,
+        &args,
+        base_h,
+        source,
+        direction,
+        // A frame check does not scale: it reads the footprint at the
+        // callee's own slot permissions, exactly as the dedicated `Snap`
+        // did. Scaling by the (unused) `1/1` operand would rebuild every
+        // slot permission as `1 * p`, which is equal but not identical,
+        // and identity is what the `old(f(x)) == f(x)` congruence needs.
+        if frame_only { None } else { Some(scale) },
+        state.perm_is_wild(perm),
+        &pc_lits,
+        &bool_guard,
+        frame_only,
+    )?;
+    if hi.produces_heap() {
+        state.push_heap(out);
+    }
+    if let Some(res_id) = hi.snap_yield(&program.decls) {
+        let s = build_snapshot(ctx, res_id, members);
+        // A certificate walk mirrors the snapshot as `cons(Some(v_i))`
+        // over the read values' recipes -- a self-framed footprint is
+        // fully held, so every slot is `Some`. Only a frame-only exhale
+        // (a function's precondition check) is ever reached during a
+        // recipe walk; a consuming inhale/exhale is method-only, where no
+        // recipe is in flight and this yields `None` as before.
+        let recipe = if ctx.recipe.is_some() {
+            let def = certs.get(&res_id).ok_or(VerifyError::DependencyFailed)?;
+            let elems: Vec<Type> = def.footprint.iter().map(|sl| sl.elem.clone()).collect();
+            let some_id = ctx.alloc.option_some();
+            let cons_id = ctx.alloc.cons(res_id, 0);
+            let rb = ctx.recipe.as_mut().unwrap();
+            let mut members_r = Vec::with_capacity(slot_recipes.len());
+            for (i, r) in slot_recipes.iter().enumerate() {
+                let v = r.clone().ok_or(VerifyError::Unimplemented(
+                    "purify: snap value outside footprint",
+                ))?;
+                members_r.push(rb.emit(crate::verify::rewrite::AxiomPure::App {
+                    func: some_id,
+                    type_args: vec![elems[i].clone()],
+                    args: vec![v],
+                }));
+            }
+            Some(rb.emit(crate::verify::rewrite::AxiomPure::App {
+                func: cons_id,
+                type_args: Vec::new(),
+                args: members_r,
+            }))
+        } else {
+            None
+        };
+        state.push_val(s, Type::Snap(res_id), recipe);
+    }
     Ok(())
 }
 
@@ -2279,8 +2263,10 @@ fn walk_body(
 ) -> Result<(), VerifyError> {
     for (inst_idx, inst) in insts.iter().enumerate() {
         assert_statement_pc_is_block_cube(ctx, inst);
-        if let (Some(ops), InstKind::Heap(HeapInst::Add { loc, perm, .. } | HeapInst::Sub { loc, perm, .. })) =
-            (&mut footprint_ops, &inst.kind)
+        if let (
+            Some(ops),
+            InstKind::Heap(HeapInst::Add { loc, perm, .. } | HeapInst::Sub { loc, perm, .. }),
+        ) = (&mut footprint_ops, &inst.kind)
         {
             ops.push((loc.clone(), perm.clone()));
         }
@@ -2641,7 +2627,13 @@ pub(crate) fn verify_function(
     // declaration link, identically to an abstract function's, and kept as its
     // own recipe over the params. The body's own exit `assert f#ensures(..)`
     // stayed a pure obligation — it proved the link, it does not publish it.
-    let post = post_fact(ctx.alloc, program, self_id, function, recursive_scc.is_some());
+    let post = post_fact(
+        ctx.alloc,
+        program,
+        self_id,
+        function,
+        recursive_scc.is_some(),
+    );
     let res = state
         .recipe_of(&body.res)
         .ok_or(VerifyError::Unimplemented(
@@ -2801,8 +2793,7 @@ fn inst_obligations(
             let addr = state.get_val(ctx, loc);
             let held = get_heap(state, heap);
             let perm = state.loc_kind(loc).and_then(|k| {
-                let c = chunk_under_pc(ctx, held.chunks_of(&k), addr, pc_lits)?
-                    .clone();
+                let c = chunk_under_pc(ctx, held.chunks_of(&k), addr, pc_lits)?.clone();
                 // Frame against the gated perm: a conditionally-held location
                 // frames only where its guard holds.
                 Some(c.gated_perm(ctx))
@@ -2811,13 +2802,13 @@ fn inst_obligations(
                 // A bare (or absent) perm: the goal `0 < leaf` is discharged by
                 // the caller exactly as before (flag-OFF byte-identical).
                 None => {
-                    let zero = expr!(ctx, 0/1);
+                    let zero = expr!(ctx, 0 / 1);
                     let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, zero]));
                     vec![(goal, VerifyError::InsufficientPermission)]
                 }
                 Some(p @ ChunkPerm::Leaf { .. }) => {
                     let leaf = p.as_leaf().unwrap();
-                    let zero = expr!(ctx, 0/1);
+                    let zero = expr!(ctx, 0 / 1);
                     let goal = ctx.add(Symbolic::Binary(BinOp::LtR, [zero, leaf]));
                     vec![(goal, VerifyError::InsufficientPermission)]
                 }
@@ -2855,7 +2846,7 @@ fn inst_obligations(
         // const-folds.
         InstKind::Heap(HeapInst::Inhale { perm, .. } | HeapInst::Exhale { perm, .. }) => {
             let perm = eval_perm(ctx, state, perm);
-            let goal = expr!(ctx, (0/1) <r {perm});
+            let goal = expr!(ctx, (0 / 1) < r { perm });
             vec![(
                 goal,
                 VerifyError::SideCondition("permission must be positive"),
@@ -2865,13 +2856,11 @@ fn inst_obligations(
         // is legal — and they carry every gated amount (`b ? 1/1 : 0` is exactly
         // `0` on the `!b` path), so a strict rule here would reject every
         // conditional `acc`.
-        InstKind::Heap(
-            HeapInst::Add { perm, .. } | HeapInst::Sub { perm, .. },
-        ) => {
+        InstKind::Heap(HeapInst::Add { perm, .. } | HeapInst::Sub { perm, .. }) => {
             let perm = eval_perm(ctx, state, perm);
-            let zero = expr!(ctx, 0/1);
+            let zero = expr!(ctx, 0 / 1);
             // Permission must not be negative: not (perm < 0).
-            let goal = expr!(ctx, not ({perm} <r {zero}));
+            let goal = expr!(ctx, not({ perm } < r { zero }));
             vec![(
                 goal,
                 VerifyError::SideCondition("permission may be negative"),
@@ -2883,7 +2872,7 @@ fn inst_obligations(
             let rv = state.get_val(ctx, r);
             let zero = zero_of(ctx, ty);
             // Divisor must be non-zero: not (divisor == 0).
-            let goal = expr!(ctx, not ({rv} == {zero}));
+            let goal = expr!(ctx, not({ rv } == { zero }));
             vec![(goal, VerifyError::SideCondition("divisor may be zero"))]
         }
         _ => vec![],
@@ -2894,7 +2883,7 @@ fn inst_obligations(
 fn zero_of(ctx: &mut VerifyContext<'_>, ty: &Type) -> egg::Id {
     match ty {
         Type::Int => ctx.add(Symbolic::Lit(Literal::Int(num::BigInt::from(0)))),
-        _ => expr!(ctx, 0/1),
+        _ => expr!(ctx, 0 / 1),
     }
 }
 
@@ -2906,17 +2895,6 @@ mod tests {
     use super::*;
     use crate::verify::lang::Symbolic;
     use crate::verify::test_support::fresh_ctx;
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn prove_under_empty_pc_proves_known_goal() {
@@ -2981,11 +2959,6 @@ mod tests {
         ctx.saturate();
         assert_eq!(ctx.egraph.find(goal), ctx.egraph.find(true_));
     }
-
-
-
-
-
 
     #[test]
     fn const_fold_folds_subtraction() {
@@ -3106,7 +3079,6 @@ mod tests {
         // Unioning the args lets congruence close `f(a) == f(b)`.
         assert_eq!(ctx.egraph.find(fa), ctx.egraph.find(fb));
     }
-
 
     #[test]
     fn realcast_folds_int_to_real() {

@@ -47,7 +47,14 @@ pub(crate) use builder::{Builder, DeclSlot, Declarator, Definer};
 pub(crate) use context::{MethodContracts, TranslationContext};
 
 /// Build a `vmir::Program` from a typed `typed::Program`.
-pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<TranslationError>> {
+/// Lower a typed program, reporting any failure against the declaration it came
+/// from. A declaration that cannot be lowered leaves its slot unfilled, so
+/// there is no partial program to hand back: the caller drops the named
+/// declarations and calls again. [`translate`] is the wrapper that discards the
+/// names.
+pub fn translate_reporting(
+    program: &typed::Program,
+) -> Result<vmir::Program, Vec<(String, TranslationError)>> {
     let decls = &program.decls;
     let mut builder = Builder::new();
     let mut ctx = TranslationContext::new(&program.interner);
@@ -56,6 +63,8 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
     // Allocate every slot and publish dependency-free meta into `ctx`. One
     // typed collection per Viper declaration kind; order within a kind and
     // across kinds is irrelevant (declare only mints ids + reads its source).
+    // Each translator is carried with the name of the declaration it came from,
+    // so a `define` failure can be reported against that declaration.
     let mut fields = Vec::new();
     let mut preds = Vec::new();
     let mut funcs = Vec::new();
@@ -63,28 +72,43 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
     let mut adts = Vec::new();
     let mut domains = Vec::new();
     for decl_node in decls {
+        let name = decl_name(decl_node, &program.interner);
         match decl_node {
             typed::Declaration::Field(f) => {
-                fields.push(decl::FieldTranslator::declare(f, &mut ctx, &mut builder));
+                fields.push((
+                    name,
+                    decl::FieldTranslator::declare(f, &mut ctx, &mut builder),
+                ));
             }
             typed::Declaration::Predicate(p) => {
-                preds.push(decl::PredicateTranslator::declare(
-                    p,
-                    &mut ctx,
-                    &mut builder,
+                preds.push((
+                    name,
+                    decl::PredicateTranslator::declare(p, &mut ctx, &mut builder),
                 ));
             }
             typed::Declaration::Function(f) => {
-                funcs.push(decl::FunctionTranslator::declare(f, &mut ctx, &mut builder));
+                funcs.push((
+                    name,
+                    decl::FunctionTranslator::declare(f, &mut ctx, &mut builder),
+                ));
             }
             typed::Declaration::Method(m) => {
-                methods.push(decl::MethodTranslator::declare(m, &mut ctx, &mut builder));
+                methods.push((
+                    name,
+                    decl::MethodTranslator::declare(m, &mut ctx, &mut builder),
+                ));
             }
             typed::Declaration::Adt(a) => {
-                adts.push(decl::AdtTranslator::declare(a, &mut ctx, &mut builder));
+                adts.push((
+                    name,
+                    decl::AdtTranslator::declare(a, &mut ctx, &mut builder),
+                ));
             }
             typed::Declaration::Domain(d) => {
-                domains.push(decl::DomainTranslator::declare(d, &mut ctx, &mut builder));
+                domains.push((
+                    name,
+                    decl::DomainTranslator::declare(d, &mut ctx, &mut builder),
+                ));
             }
         }
     }
@@ -97,54 +121,90 @@ pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<Translat
     // ── Phase 2: meta ──
     // Publish `name_map`-dependent meta now that every id exists. No-op for all
     // kinds but Field (`field_types`) and ADT (ctor/dtor info).
-    let fields: Vec<_> = fields.into_iter().map(|t| t.meta(&mut ctx)).collect();
-    let preds: Vec<_> = preds.into_iter().map(|t| t.meta(&mut ctx)).collect();
-    let funcs: Vec<_> = funcs.into_iter().map(|t| t.meta(&mut ctx)).collect();
-    let methods: Vec<_> = methods.into_iter().map(|t| t.meta(&mut ctx)).collect();
-    let adts: Vec<_> = adts.into_iter().map(|t| t.meta(&mut ctx)).collect();
-    let domains: Vec<_> = domains.into_iter().map(|t| t.meta(&mut ctx)).collect();
+    let fields: Vec<_> = fields
+        .into_iter()
+        .map(|(n, t)| (n, t.meta(&mut ctx)))
+        .collect();
+    let preds: Vec<_> = preds
+        .into_iter()
+        .map(|(n, t)| (n, t.meta(&mut ctx)))
+        .collect();
+    let funcs: Vec<_> = funcs
+        .into_iter()
+        .map(|(n, t)| (n, t.meta(&mut ctx)))
+        .collect();
+    let methods: Vec<_> = methods
+        .into_iter()
+        .map(|(n, t)| (n, t.meta(&mut ctx)))
+        .collect();
+    let adts: Vec<_> = adts
+        .into_iter()
+        .map(|(n, t)| (n, t.meta(&mut ctx)))
+        .collect();
+    let domains: Vec<_> = domains
+        .into_iter()
+        .map(|(n, t)| (n, t.meta(&mut ctx)))
+        .collect();
 
     // Barrier: `ctx` is complete.
     // ── Phase 3: define ──
     // Lower bodies and consume every `DeclSlot`, collecting any errors. Order
     // across kinds is free.
-    let mut errors = Vec::new();
+    let mut errors: Vec<(String, TranslationError)> = Vec::new();
     errors.extend(
         fields
             .into_iter()
-            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+            .filter_map(|(n, t)| t.define(&ctx, &mut builder).err().map(|e| (n, e))),
     );
     errors.extend(
         preds
             .into_iter()
-            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+            .filter_map(|(n, t)| t.define(&ctx, &mut builder).err().map(|e| (n, e))),
     );
     errors.extend(
         funcs
             .into_iter()
-            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+            .filter_map(|(n, t)| t.define(&ctx, &mut builder).err().map(|e| (n, e))),
     );
     errors.extend(
         adts.into_iter()
-            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+            .filter_map(|(n, t)| t.define(&ctx, &mut builder).err().map(|e| (n, e))),
     );
     errors.extend(
         methods
             .into_iter()
-            .filter_map(|t| t.define(&ctx, &mut builder).err()),
+            .filter_map(|(n, t)| t.define(&ctx, &mut builder).err().map(|e| (n, e))),
     );
     // Domains take `&mut ctx`: axiom lowering scopes the axiom's type
     // parameters into `ctx.decl_generics` (cleared before returning).
     errors.extend(
         domains
             .into_iter()
-            .filter_map(|t| t.define(&mut ctx, &mut builder).err()),
+            .filter_map(|(n, t)| t.define(&mut ctx, &mut builder).err().map(|e| (n, e))),
     );
 
     if !errors.is_empty() {
         return Err(errors);
     }
     Ok(builder.finalize())
+}
+
+/// The name a typed declaration is reported under.
+fn decl_name(decl: &typed::Declaration, interner: &crate::viper::Interner) -> String {
+    let spur = match decl {
+        typed::Declaration::Function(f) => f.name.0,
+        typed::Declaration::Predicate(p) => p.name.0,
+        typed::Declaration::Method(m) => m.name.0,
+        typed::Declaration::Field(f) => f.0.name.0,
+        typed::Declaration::Adt(a) => a.name.0,
+        typed::Declaration::Domain(d) => d.name.0,
+    };
+    interner.resolve(&spur).to_string()
+}
+
+/// All-or-nothing translation, discarding the declaration names.
+pub fn translate(program: &typed::Program) -> Result<vmir::Program, Vec<TranslationError>> {
+    translate_reporting(program).map_err(|es| es.into_iter().map(|(_, e)| e).collect())
 }
 
 pub(crate) use types::lower_type;

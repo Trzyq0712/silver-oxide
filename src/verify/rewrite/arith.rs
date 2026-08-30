@@ -1,7 +1,6 @@
 //! The declarative arithmetic and equality identities — plain `rw!` patterns with
 //! no hand-written searcher or applier.
 
-
 use egg::{
     Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
     rewrite as rw,

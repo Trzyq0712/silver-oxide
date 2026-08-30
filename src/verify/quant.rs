@@ -101,7 +101,6 @@ impl RecipeTable {
             .get(q)
             .ok_or(VerifyError::Unimplemented("forall recipe not interned"))
     }
-
 }
 
 /// Compile `q` if it has not been compiled yet, and hand back its recipe id and

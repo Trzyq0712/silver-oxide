@@ -18,6 +18,10 @@ pub enum Statement {
     // Apply(AccExp),
     Assign(Vec<AssignLhs>, AssignRhs),
     Block(StmtBlock),
+    /// A statement the verifier does not implement (`package`, `apply`,
+    /// `quasihavoc`, ...), parsed only so the enclosing declaration can be
+    /// reported as unsupported. See [`ExpKind::Unsupported`].
+    Unsupported(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

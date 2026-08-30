@@ -10,8 +10,7 @@ use crate::{
         cert::FunctionDefinition,
         func_registry::FuncRegistry,
         lang::{FuncId, Symbolic},
-        rewrite,
-        stats,
+        rewrite, stats,
     },
     vmir::{Declaration, Literal, MemberId, Polarity, Type},
 };
@@ -132,8 +131,6 @@ pub(crate) struct VerifyContext<'a> {
     block_dead: bool,
 }
 
-
-
 /// Whether any declaration uses a `wildcard` permission. Scanned once per unit at
 /// [`VerifyContext::new`]; lets a wildcard-free program skip the wildcard rules
 /// entirely. A `wildcard` is either inline on a heap op or an arm of a permission
@@ -248,11 +245,6 @@ impl<'a> VerifyContext<'a> {
         merged
     }
 
-
-
-
-
-
     /// Whether the e-graph has reached a contradiction. Once inconsistent, every
     /// goal is vacuously provable — used by [`Self::prove_under_pc`] as the
     /// implicit channel through which an over-permissioned field location proves
@@ -349,7 +341,6 @@ impl<'a> VerifyContext<'a> {
         self.add_func_app_id(value_id, tys, elem, Box::new([opt]))
     }
 
-
     /// Run rewrite saturation over the e-graph in place. The rule set is the
     /// static rules plus the ADT reductions minted so far by the allocator
     /// plus the per-unit axiom/function rules.
@@ -367,7 +358,10 @@ impl<'a> VerifyContext<'a> {
                 "[ground-sat] {n0}n/{c0}c -> {}n/{}c true={} ({} iters)",
                 self.egraph.total_number_of_nodes(),
                 self.egraph.number_of_classes(),
-                { let t = self.egraph.find(self.true_id_cached()); self.egraph[t].nodes.len() },
+                {
+                    let t = self.egraph.find(self.true_id_cached());
+                    self.egraph[t].nodes.len()
+                },
                 stats::with_stats(|s| s.sat_iterations) - it0,
             );
         }
@@ -464,8 +458,6 @@ impl<'a> VerifyContext<'a> {
         }
     }
 
-
-
     /// Add a `FuncApp` over an already-allocated [`FuncId`] (a plain function,
     /// or an ADT constructor/projection/tag id from the allocator). Also used by
     /// grafting, which carries the id verbatim. `type_args` is the ground type
@@ -504,7 +496,7 @@ impl<'a> VerifyContext<'a> {
         self.fresh_counter += 1;
         self.fresh_types.insert(id, crate::vmir::Type::Real);
         let w = self.add(Symbolic::Fresh(id));
-        let pos = expr!(self, (0/1) <r {w});
+        let pos = expr!(self, (0 / 1) < r { w });
         let true_ = expr!(self, true);
         self.union(pos, true_);
         // No eager `rebuild()`: the wildcard is minted mid-heap-op and every heap
@@ -607,22 +599,6 @@ impl<'a> VerifyContext<'a> {
         }
         self.egraph.rebuild();
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
 
 /// One egg run over `rules`. Returns the graph and the iteration log — the

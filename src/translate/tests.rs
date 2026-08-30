@@ -87,10 +87,7 @@ method add(this: Ref, other: Ref) returns (res: Ref)
          and the unbounded permission cap"
     );
     assert!(loc.body.is_none(), "a location function has no body");
-    assert!(matches!(
-        &p.decls[snap_id],
-        vmir::Declaration::Domain(_)
-    ));
+    assert!(matches!(&p.decls[snap_id], vmir::Declaration::Domain(_)));
     // The function is declared before its snapshot domain (dump order).
     assert!(pred_id < snap_id);
 
@@ -382,7 +379,8 @@ method m(a: Bool, b: Bool, x: Ref)
     let vmir::Declaration::Method(m) = &p.decls[m_id] else {
         panic!("m must be a Method");
     };
-    let exhale = m.iter_insts()
+    let exhale = m
+        .iter_insts()
         .find(|i| matches!(&i.kind, vmir::InstKind::Heap(vmir::HeapInst::Exhale { .. })))
         .expect("ensures lowers to an exhale");
     assert!(
@@ -409,7 +407,8 @@ method m(c: Bool, a: Int, b: Int) returns (r: Int)
         panic!("m must be a Method");
     };
     // params: c=Temp(0), a=Temp(1), b=Temp(2); ret r=Temp(3).
-    let phi = m.iter_insts()
+    let phi = m
+        .iter_insts()
         .find(|i| {
             matches!(
                 &i.kind,
@@ -915,8 +914,7 @@ method m() {
 
     // Exactly one assert (the requires check), no assume (raw contributes
     // neither, and postconditions aren't assumed).
-    let count =
-        |pred: fn(&vmir::InstKind) -> bool| insts.iter().filter(|i| pred(&i.kind)).count();
+    let count = |pred: fn(&vmir::InstKind) -> bool| insts.iter().filter(|i| pred(&i.kind)).count();
     assert_eq!(count(|k| matches!(k, vmir::InstKind::Assert(_))), 1);
     assert_eq!(count(|k| matches!(k, vmir::InstKind::Assume(_))), 0);
 }
@@ -1258,7 +1256,10 @@ domain D {
 
     // Outer: reads nothing enclosing, one binder at `e0` (the step's own temp,
     // shadowed), trigger g(i, i).
-    assert!(outer.free_temps().is_empty(), "outer reads nothing enclosing");
+    assert!(
+        outer.free_temps().is_empty(),
+        "outer reads nothing enclosing"
+    );
     assert_eq!(outer.binder_base, 0);
     assert_eq!(outer.bound.len(), 1);
     assert_eq!(
@@ -1361,7 +1362,9 @@ fn sink_value_numbers_total_pure_insts() {
 
 /// Fetch a lowered method by name, panicking if it is missing or not a method.
 fn method<'a>(p: &'a vmir::Program, name: &str) -> &'a vmir::Method {
-    let id = p.id(name).unwrap_or_else(|| panic!("missing method {name}"));
+    let id = p
+        .id(name)
+        .unwrap_or_else(|| panic!("missing method {name}"));
     let vmir::Declaration::Method(m) = &p.decls[id] else {
         panic!("{name} must be a Method");
     };
@@ -1428,7 +1431,11 @@ method m(c: Bool, a: Int, b: Int) returns (r: Int) {
     let vmir::Preds::Join { cond, .. } = &join.preds else {
         unreachable!()
     };
-    assert_eq!(*cond, vmir::Val::Temp(0), "join selects on the branch cond c");
+    assert_eq!(
+        *cond,
+        vmir::Val::Temp(0),
+        "join selects on the branch cond c"
+    );
 }
 
 #[test]

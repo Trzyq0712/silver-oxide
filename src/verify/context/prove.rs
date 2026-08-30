@@ -13,7 +13,6 @@ use std::collections::HashMap;
 
 use egg::Language as _;
 
-
 use crate::{
     verify::{
         analysis::ConstFold,
@@ -100,7 +99,6 @@ pub(super) enum Rung {
 }
 
 impl<'a> VerifyContext<'a> {
-
     /// Translate a **ground** id into the current block scratch's id space.
     /// Identity outside a scratch. Fast path (a mapped or pre-build id) is O(1);
     /// otherwise the ground term at `g` is imported into the scratch (extract a
@@ -128,7 +126,6 @@ impl<'a> VerifyContext<'a> {
         // via `id_to_node(g)`, the node *minted at that id*: `self.egraph[g].nodes[0]`
         // picks an arbitrary member of `g`'s canonical class, which is `Lit(true)`
         // once any union merged `g` into the `true` class.
-        
 
         let node = self.egraph.id_to_node(g).clone();
         let kids: Vec<egg::Id> = node.children().to_vec();
@@ -186,7 +183,6 @@ impl<'a> VerifyContext<'a> {
             sc.dirty_reduce = true;
             return;
         }
-        
 
         let kids: Vec<egg::Id> = node.children().to_vec();
         let tkids: Vec<egg::Id> = kids.iter().map(|c| self.tr(*c)).collect();
@@ -344,7 +340,8 @@ impl<'a> VerifyContext<'a> {
             let probe = self.run_probe_until(probe, goal);
             // Last resort is the non-forking ite-goal decomposition; there is no
             // case split beyond it.
-            probe.find(goal) == probe.find(true_p) || self.prove_by_ite_decomposition(&probe, goal, Rung::Saturated)
+            probe.find(goal) == probe.find(true_p)
+                || self.prove_by_ite_decomposition(&probe, goal, Rung::Saturated)
         };
 
         // Persist the result so future identical obligations hit the `memo` tier.
@@ -448,17 +445,26 @@ impl<'a> VerifyContext<'a> {
         let _scope = rewrite::ScratchScope::resume(sc.scope);
         let _t = std::time::Instant::now();
         let before = stats::with_stats(|s| s.sat_iterations);
-        let (n0, c0) = (sc.egraph.total_number_of_nodes(), sc.egraph.number_of_classes());
+        let (n0, c0) = (
+            sc.egraph.total_number_of_nodes(),
+            sc.egraph.number_of_classes(),
+        );
         sc.egraph = self.saturate_flat(sc.egraph);
         if std::env::var_os("SILVER_OXIDE_TRACE_SCRATCH").is_some() {
             eprintln!(
                 "[scratch-sat] {n0}n/{c0}c -> {}n/{}c true={} (ground {}n/{}c true={}, {} iters)",
                 sc.egraph.total_number_of_nodes(),
                 sc.egraph.number_of_classes(),
-                { let t = sc.egraph.find(sc.true_id); sc.egraph[t].nodes.len() },
+                {
+                    let t = sc.egraph.find(sc.true_id);
+                    sc.egraph[t].nodes.len()
+                },
                 self.egraph.total_number_of_nodes(),
                 self.egraph.number_of_classes(),
-                { let t = self.egraph.find(self.true_id_cached()); self.egraph[t].nodes.len() },
+                {
+                    let t = self.egraph.find(self.true_id_cached());
+                    self.egraph[t].nodes.len()
+                },
                 stats::with_stats(|s| s.sat_iterations) - before,
             );
         }
@@ -515,7 +521,11 @@ impl<'a> VerifyContext<'a> {
     /// [`Self::prove_by_ite_decomposition`], which assumes them by telescoping the
     /// chain. Assuming them here in a loop and saturating would be the same work
     /// with a full saturation where a reduce per literal does.
-    pub(super) fn prove_via_scratch(&mut self, goal: egg::Id, pc_lits: &[(egg::Id, Polarity)]) -> bool {
+    pub(super) fn prove_via_scratch(
+        &mut self,
+        goal: egg::Id,
+        pc_lits: &[(egg::Id, Polarity)],
+    ) -> bool {
         // Ground size at the moment the `probe` tier is reached, before the scratch is built or
         // touched — paired below with the scratch size the obligation actually
         // reasons over (`SILVER_OXIDE_TRACE_SCRATCH`).

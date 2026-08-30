@@ -176,9 +176,18 @@ impl ChunkPerm {
     /// its matching branch survives. CFG lowering makes many joins in one match
     /// arm share the arm's reach `cond`, so without this the perm accretes a
     /// redundant `Select` layer per such join.
-    fn collapse_same_cond(ctx: &VerifyContext<'_>, cond_c: egg::Id, arm: ChunkPerm, take_then: bool) -> ChunkPerm {
+    fn collapse_same_cond(
+        ctx: &VerifyContext<'_>,
+        cond_c: egg::Id,
+        arm: ChunkPerm,
+        take_then: bool,
+    ) -> ChunkPerm {
         match arm {
-            ChunkPerm::Select { cond: c2, then, els } if ctx.egraph.find(c2) == cond_c => {
+            ChunkPerm::Select {
+                cond: c2,
+                then,
+                els,
+            } if ctx.egraph.find(c2) == cond_c => {
                 let inner = if take_then { *then } else { *els };
                 Self::collapse_same_cond(ctx, cond_c, inner, take_then)
             }
@@ -261,10 +270,7 @@ impl ChunkPerm {
     /// stated about it must be gated by that cube. [`Self::for_each_leaf`] drops
     /// this, which is sound only while every leaf independently satisfies the
     /// fact being stated.
-    pub fn for_each_leaf_under(
-        &self,
-        f: &mut impl FnMut(egg::Id, &[(egg::Id, Polarity)]),
-    ) {
+    pub fn for_each_leaf_under(&self, f: &mut impl FnMut(egg::Id, &[(egg::Id, Polarity)])) {
         fn go(
             p: &ChunkPerm,
             path: &mut Vec<(egg::Id, Polarity)>,
@@ -293,9 +299,7 @@ impl ChunkPerm {
             ChunkPerm::Select { cond, .. } => *cond,
         }
     }
-
 }
-
 
 // ---------------------------------------------------------------------------
 // Guard cube algebra
@@ -342,7 +346,8 @@ pub(crate) fn cube_entails(
 ) -> bool {
     sub.iter().all(|(id, pol)| {
         let c = ctx.egraph.find(*id);
-        cube.iter().any(|(i, p)| p == pol && ctx.egraph.find(*i) == c)
+        cube.iter()
+            .any(|(i, p)| p == pol && ctx.egraph.find(*i) == c)
     })
 }
 
@@ -390,7 +395,7 @@ pub(crate) fn gate_perm_by_guard(
 ) -> ChunkPerm {
     let mut acc = perm.clone();
     for (id, pol) in guard {
-        let zero = ChunkPerm::leaf(expr!(ctx, 0/1));
+        let zero = ChunkPerm::leaf(expr!(ctx, 0 / 1));
         acc = match pol {
             Polarity::Positive => ChunkPerm::select(ctx, *id, acc, zero),
             Polarity::Negative => ChunkPerm::select(ctx, *id, zero, acc),
@@ -479,7 +484,6 @@ impl Chunk {
             recipe: None,
         }
     }
-
 
     pub fn with_recipe(mut self, recipe: Option<crate::vmir::Val>) -> Self {
         self.recipe = recipe;

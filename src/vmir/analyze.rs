@@ -122,10 +122,7 @@ pub fn analyze(program: Program) -> Result<AnalyzedProgram, AnalysisError> {
 /// only from a `PermInst` arm or a heap instruction's `perm` field, because those
 /// are the only places the Rust types admit one. That is the point of giving
 /// permissions their own namespace rather than a `Val` type tag.
-fn check_perm_locality(
-    decl: &Declaration,
-    name: impl Fn() -> String,
-) -> Result<(), AnalysisError> {
+fn check_perm_locality(decl: &Declaration, name: impl Fn() -> String) -> Result<(), AnalysisError> {
     use crate::vmir::{HeapInst, PermInst, PermVal};
 
     // `(first p index of this block, count after this phase)`, threaded across
@@ -397,7 +394,10 @@ mod tests {
             },
             body: ResourceBody {
                 insts: vec![],
-                res: (HeapVal::Empty, Val::Literal(crate::vmir::Literal::Bool(true))),
+                res: (
+                    HeapVal::Empty,
+                    Val::Literal(crate::vmir::Literal::Bool(true)),
+                ),
             },
         })
     }

@@ -394,8 +394,7 @@ fn verify_named_resource(program: &vmir::Program, name: &str) -> Result<(), Veri
         }
         if let vmir::Declaration::Resource(cr) = decl {
             let cname = program.name(cid).to_string();
-            if let Ok(cert) = verify_resource(program, &cname, cr, &certs, &fn_certs, &mut alloc)
-            {
+            if let Ok(cert) = verify_resource(program, &cname, cr, &certs, &fn_certs, &mut alloc) {
                 certs.insert(cid, cert);
             }
         }
@@ -533,8 +532,7 @@ fn build_all_certs(
             match decl {
                 vmir::Declaration::Resource(r) if !certs.contains_key(&id) => {
                     let name = program.name(id).to_string();
-                    if let Ok(cert) = verify_resource(program, &name, r, &certs, &fn_certs, alloc)
-                    {
+                    if let Ok(cert) = verify_resource(program, &name, r, &certs, &fn_certs, alloc) {
                         certs.insert(id, cert);
                         progress = true;
                     }
@@ -2727,7 +2725,11 @@ method quantified() {
     let recipes = |alloc: &crate::verify::func_registry::FuncRegistry| {
         alloc.quant_table().read().expect("recipe table lock").len()
     };
-    assert_eq!(recipes(&alloc), 0, "nothing compiled by registry construction");
+    assert_eq!(
+        recipes(&alloc),
+        0,
+        "nothing compiled by registry construction"
+    );
 
     let (certs, fn_certs) = build_all_certs(&program, &mut alloc);
     verify_method(

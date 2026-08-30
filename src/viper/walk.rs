@@ -310,7 +310,8 @@ walk_enum!(
     HeapUpdate(kind, acc_exp, e),
     Quantifier(kind, vars, triggers, e),
     ForPerm(vars, p, e),
-    MagicWand(l, r)
+    MagicWand(l, r),
+    Unsupported(what)
 );
 walk_enum!(
     ExpCallKind,
@@ -422,7 +423,8 @@ walk_enum!(
     While(e, invs, decs, b),
     If(e, then, else_),
     Assign(lhs, rhs),
-    Block(b)
+    Block(b),
+    Unsupported(what)
 );
 walk_enum!(
     AssignLhs,
@@ -607,6 +609,15 @@ impl<T: AstWalkable, U: AstWalkable> AstWalkable for (T, U) {
         self.0.walk_mut(walker);
         self.1.walk_mut(walker);
     }
+}
+
+/// Leaf: the `&'static str` payload of the `Unsupported` variants. Carries no
+/// AST children, so both walks stop here.
+impl AstWalkable for &'static str {
+    fn walk<'a>(&'a self, _walker: &mut impl AstWalker<'a>) {}
+    fn walk_mut<'a>(&'a mut self, _walker: &mut impl AstWalkerMut<'a>) {}
+    fn walk_children<'a>(&'a self, _walker: &mut impl AstWalker<'a>) {}
+    fn walk_mut_children<'a>(&'a mut self, _walker: &mut impl AstWalkerMut<'a>) {}
 }
 
 walk_struct!(String, walk_string, walk_mut_string);

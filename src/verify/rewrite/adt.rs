@@ -3,9 +3,7 @@
 
 use std::collections::HashMap;
 
-use egg::{
-    Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
-};
+use egg::{Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
@@ -314,7 +312,8 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
         _rule_name: Symbol,
     ) -> Vec<Id> {
         let xc = egraph.find(subst[tag_x()]);
-        let (Some(field), _) = self.project(egraph, xc, &mut HashMap::new(), &mut Vec::new()) else {
+        let (Some(field), _) = self.project(egraph, xc, &mut HashMap::new(), &mut Vec::new())
+        else {
             return vec![];
         };
         if egraph.union(eclass, field) {
@@ -328,7 +327,6 @@ impl Applier<Symbolic, ConstFold> for ProjApplier {
         vec![tag_x()]
     }
 }
-
 
 #[cfg(test)]
 mod bench {
@@ -468,4 +466,3 @@ mod bench {
         );
     }
 }
-

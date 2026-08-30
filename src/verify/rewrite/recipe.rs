@@ -5,10 +5,7 @@
 //! Independent of quantifiers — `forall` triggering (see `super::forall`) is one
 //! consumer of `build_instance`, and function unfolding is another.
 
-
-use egg::{
-    EGraph, Id, SearchMatches, Searcher, Subst, Var,
-};
+use egg::{EGraph, Id, SearchMatches, Searcher, Subst, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, FuncId, RecipeId, Symbolic};

@@ -249,7 +249,13 @@ impl HeapInst {
     /// instruction's shape, so this drives both the display and the temp
     /// numbering rather than being stored alongside them.
     pub fn produces_heap(&self) -> bool {
-        !matches!(self, HeapInst::Exhale { frame_only: true, .. })
+        !matches!(
+            self,
+            HeapInst::Exhale {
+                frame_only: true,
+                ..
+            }
+        )
     }
 
     /// The extra pure `Val` this instruction yields, and its type.
@@ -296,14 +302,10 @@ impl HeapInst {
             // `Inhale` yields nothing: its value source arrives through `bind`,
             // so there is no snapshot left for it to hand back. A caller that
             // needs the handle mints one and binds the inhale to it.
-            HeapInst::Exhale { call, .. } => {
-                match &decls[call.resource] {
-                    crate::vmir::Declaration::Resource(r) if r.is_self_framed() => {
-                        Some(call.resource)
-                    }
-                    _ => None,
-                }
-            }
+            HeapInst::Exhale { call, .. } => match &decls[call.resource] {
+                crate::vmir::Declaration::Resource(r) if r.is_self_framed() => Some(call.resource),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -372,12 +374,15 @@ impl<'a> Display for VmirDisplay<'a, &'a HeapInst> {
             write!(f, ")")
         };
         // Render `base <kw> call perm` for a resource inhale/exhale.
-        let resource_combine =
-            |f: &mut Formatter<'_>, base: &HeapVal, kw: &str, call: &ResourceCall, perm: &PermVal| {
-                write!(f, "{base} {kw} ")?;
-                call_head(f, call)?;
-                write!(f, " @ {perm}")
-            };
+        let resource_combine = |f: &mut Formatter<'_>,
+                                base: &HeapVal,
+                                kw: &str,
+                                call: &ResourceCall,
+                                perm: &PermVal| {
+            write!(f, "{base} {kw} ")?;
+            call_head(f, call)?;
+            write!(f, " @ {perm}")
+        };
         match self.item {
             HeapInst::Add {
                 base,

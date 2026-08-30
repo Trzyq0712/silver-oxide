@@ -5,9 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egg::{
-    Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
-};
+use egg::{Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, FuncId, Symbolic};
@@ -292,10 +290,7 @@ pub(super) type Observations = HashMap<(FuncId, Vec<Type>), Id>;
 /// collide. Building both sides as maps turns the pairing below into a hash join —
 /// it used to be a nested loop over both observation lists. Borrows the type slice
 /// instead of cloning it; the whole scan holds the graph immutably.
-pub(super) fn unary_observations(
-    egraph: &EGraph<Symbolic, ConstFold>,
-    x: Id,
-) -> Arc<Observations> {
+pub(super) fn unary_observations(egraph: &EGraph<Symbolic, ConstFold>, x: Id) -> Arc<Observations> {
     let x = egraph.find(x);
     // Parent lists only grow, so the count is a free monotone version stamp —
     // the same one the failure memo uses. An enum match asks `s == cons(k)` once

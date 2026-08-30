@@ -142,11 +142,7 @@ where
                 .then_with(|| a.head.cmp(&b.head))
         });
 
-        let head_index = loops
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (l.head, i))
-            .collect();
+        let head_index = loops.iter().enumerate().map(|(i, l)| (l.head, i)).collect();
 
         Ok(Self {
             loops,
@@ -377,7 +373,16 @@ mod tests {
     #[test]
     fn break_out_of_inner_loop() {
         let ls = Loops::detect(
-            &g(&[(0, 1), (1, 2), (2, 3), (3, 2), (3, 4), (2, 4), (4, 1), (1, 5)]),
+            &g(&[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 2),
+                (3, 4),
+                (2, 4),
+                (4, 1),
+                (1, 5),
+            ]),
             0,
         )
         .unwrap();
@@ -392,7 +397,16 @@ mod tests {
     #[test]
     fn break_out_of_both_loops_is_innermost_first() {
         let ls = Loops::detect(
-            &g(&[(0, 1), (1, 2), (2, 3), (3, 2), (3, 9), (2, 4), (4, 1), (1, 5)]),
+            &g(&[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 2),
+                (3, 9),
+                (2, 4),
+                (4, 1),
+                (1, 5),
+            ]),
             0,
         )
         .unwrap();

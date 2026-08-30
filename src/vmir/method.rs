@@ -163,14 +163,22 @@ impl<'a> Display for VmirDisplay<'a, &'a Method> {
             // one level deeper. Counters advance across both.
             if !blk.join.is_empty() {
                 writeln!(f, "    join:")?;
-                write!(f, "{}", self.with_nested((e_idx, h_idx, p_idx, &blk.join[..])))?;
+                write!(
+                    f,
+                    "{}",
+                    self.with_nested((e_idx, h_idx, p_idx, &blk.join[..]))
+                )?;
                 let (dv, dh, dp) = count_temps(&blk.join, self.decls);
                 e_idx += dv;
                 h_idx += dh;
                 p_idx += dp;
             }
             writeln!(f, "    body:")?;
-            write!(f, "{}", self.with_nested((e_idx, h_idx, p_idx, &blk.body[..])))?;
+            write!(
+                f,
+                "{}",
+                self.with_nested((e_idx, h_idx, p_idx, &blk.body[..]))
+            )?;
             let (dv, dh, dp) = count_temps(&blk.body, self.decls);
             e_idx += dv;
             h_idx += dh;

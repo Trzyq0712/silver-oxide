@@ -164,7 +164,6 @@ macro_rules! expr {
     }};
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,20 +186,32 @@ mod tests {
         let q = ctx.fresh_symbolic_value(crate::vmir::Type::Bool);
 
         // not p  ==  ite(p, false, true)
-        assert_eq!(expr!(&mut ctx, not {p}), ctx.add(Symbolic::Ite([p, f, t])));
+        assert_eq!(
+            expr!(&mut ctx, not { p }),
+            ctx.add(Symbolic::Ite([p, f, t]))
+        );
         // p and q  ==  ite(p, q, false)
-        assert_eq!(expr!(&mut ctx, {p} and {q}), ctx.add(Symbolic::Ite([p, q, f])));
+        assert_eq!(
+            expr!(&mut ctx, {p} and {q}),
+            ctx.add(Symbolic::Ite([p, q, f]))
+        );
         // p or q  ==  ite(p, true, q)
-        assert_eq!(expr!(&mut ctx, {p} or {q}), ctx.add(Symbolic::Ite([p, t, q])));
+        assert_eq!(
+            expr!(&mut ctx, {p} or {q}),
+            ctx.add(Symbolic::Ite([p, t, q]))
+        );
         // p ==> q  ==  ite(p, q, true)
-        assert_eq!(expr!(&mut ctx, {p} ==> {q}), ctx.add(Symbolic::Ite([p, q, t])));
+        assert_eq!(
+            expr!(&mut ctx, {p} ==> {q}),
+            ctx.add(Symbolic::Ite([p, q, t]))
+        );
         // if p then q else p
         assert_eq!(
             expr!(&mut ctx, if {p} then {q} else {p}),
             ctx.add(Symbolic::Ite([p, q, p]))
         );
         assert_eq!(
-            expr!(&mut ctx, {p} == {q}),
+            expr!(&mut ctx, { p } == { q }),
             ctx.add(Symbolic::Binary(BinOp::Eq, [p, q]))
         );
     }
@@ -210,11 +221,11 @@ mod tests {
     fn nested_terms_compose() {
         let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
-        let z = expr!(&mut ctx, 0/1);
+        let z = expr!(&mut ctx, 0 / 1);
         let p = ctx.fresh_symbolic_value(crate::vmir::Type::Real);
 
         // not (0 < p) — the `perm <= b` / `nonpos` shape, in one line.
-        let built = expr!(&mut ctx, not ({z} <r {p}));
+        let built = expr!(&mut ctx, not({ z } < r { p }));
         let lt = ctx.add(Symbolic::Binary(BinOp::LtR, [z, p]));
         let (f, t) = (
             ctx.add(Symbolic::Lit(Literal::Bool(false))),
@@ -230,7 +241,7 @@ mod tests {
     fn numeric_literals_match_hand_built_nodes() {
         let interner = lasso::Rodeo::new();
         let mut ctx = fresh_ctx(&interner);
-        let r0 = expr!(&mut ctx, 0/1);
+        let r0 = expr!(&mut ctx, 0 / 1);
         let i0 = expr!(&mut ctx, 0);
         assert_eq!(
             r0,

@@ -79,6 +79,13 @@ pub enum ExpKind {
     ForPerm(Vec<IdnDeclTyped>, ResAccess, Exp),
     /// e1 --* e2
     MagicWand(Exp, Exp),
+
+    /// A construct the verifier does not implement, parsed only so that the
+    /// declaration containing it can be reported as unsupported instead of
+    /// taking the whole file down with a parse error. Carries the construct's
+    /// name (`Seq`, `lhs`, `folding`, ...). Never lowered: typecheck turns it
+    /// into `TypeError::Unsupported`.
+    Unsupported(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

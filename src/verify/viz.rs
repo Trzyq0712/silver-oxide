@@ -368,7 +368,11 @@ pub(crate) fn dump_term(ctx: &VerifyContext<'_>, root: egg::Id, depth: usize) ->
     let mut out = String::new();
     for c in order {
         let nodes: Vec<String> = eg[c].nodes.iter().map(|n| render_node(ctx, n)).collect();
-        out.push_str(&format!("  @{:<5} = [{}]\n", usize::from(c), nodes.join(", ")));
+        out.push_str(&format!(
+            "  @{:<5} = [{}]\n",
+            usize::from(c),
+            nodes.join(", ")
+        ));
     }
     out
 }

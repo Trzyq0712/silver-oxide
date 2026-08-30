@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use egg::{
-    Applier, EGraph, Id, PatternAst, Rewrite, Subst, Symbol, Var,
-};
+use egg::{Applier, EGraph, Id, PatternAst, Rewrite, Subst, Symbol, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::cert::FunctionDefinition;
@@ -293,8 +291,7 @@ impl Applier<Symbolic, ConstFold> for FunctionUnfoldApplier {
             // on `FuncApp(f)`.
             if !self.limited_post {
                 if let Some(lim) = self.def.limited {
-                    let twin =
-                        egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.clone().into()));
+                    let twin = egraph.add(Symbolic::FuncApp(lim, tys.clone(), args.clone().into()));
                     if egraph.union(eclass, twin) {
                         changed.push(egraph.find(eclass));
                     }
@@ -364,9 +361,6 @@ pub(crate) fn function_post_rule(name: &str, def: Arc<FunctionDefinition>) -> Ru
     post_rule(name, func, def)
 }
 
-
 /// A canonicalized call key: the ground `(type_args, value_args)` an occurrence
 /// of the function was applied to. Memoized so the recipe rebuilds once per call.
 pub(super) type CallKey = (Box<[Type]>, Vec<Id>);
-
-

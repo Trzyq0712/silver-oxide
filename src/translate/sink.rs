@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use crate::vmir::{
-    self, BinOp, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, PermInst, PermVal, Polarity,
-    PureInst, ResourceCall, Type, Val, none,
+    self, BinOp, HeapInst, HeapVal, Inst, InstKind, Literal, PathConds, PermInst, PermVal,
+    Polarity, PureInst, ResourceCall, Type, Val, none,
 };
 
 /// Why a condition sits on the path-condition stack. Both kinds gate the
@@ -254,7 +254,8 @@ impl Sink {
     /// under one branch) must stay two temps: a `p` temp denotes *one* share, so
     /// sharing the temp would hand two distinct locations the same wildcard.
     pub(crate) fn emit_perm(&mut self, inst: PermInst) -> PermVal {
-        self.insts.push(Inst::new(PathConds::default(), InstKind::Perm(inst)));
+        self.insts
+            .push(Inst::new(PathConds::default(), InstKind::Perm(inst)));
         self.next_perm_temp()
     }
 

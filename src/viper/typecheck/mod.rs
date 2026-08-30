@@ -1173,11 +1173,7 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                         return Err(TypeError::Other("cannot unfold a field".to_string()));
                     }
                 };
-                check_predicate_foldable(
-                    self.env.globals,
-                    self.env.interner,
-                    pred_call.name.0,
-                )?;
+                check_predicate_foldable(self.env.globals, self.env.interner, pred_call.name.0)?;
                 let body_exp = self.lower_pure::<Ext>(body)?;
                 let node =
                     typed::HeapNode::Unfolding(PredicateWithPerm { pred_call, perm }, body_exp);
@@ -1231,10 +1227,10 @@ impl<'a, 'g> LoweringCtx<'a, 'g> {
                 Ext::build_forall(*kind, bound, lowered_triggers, lowered_body)
             }
 
-            _ => Err(TypeError::Other(format!(
-                "unsupported pure expression: {:?}",
-                exp.kind
-            ))),
+            // Everything that has no pure lowering. `scan_declaration` names
+            // most of these before typechecking runs; this is the backstop, and
+            // it reports the construct rather than dumping the AST node.
+            other => Err(TypeError::Unsupported(describe_exp(other))),
         }
     }
 
@@ -1407,6 +1403,19 @@ fn const_type(c: &viper::ConstKind) -> Type {
     }
 }
 
+/// A name for an expression form that has no lowering, for the error message.
+fn describe_exp(exp: &viper::ExpKind) -> &'static str {
+    match exp {
+        viper::ExpKind::Unsupported(what) => what,
+        viper::ExpKind::MagicWand(..) => "magic wand `--*`",
+        viper::ExpKind::ForPerm(..) => "forperm",
+        viper::ExpKind::Index(..) => "collection indexing",
+        viper::ExpKind::Acc(..) => "a permission in a pure expression",
+        viper::ExpKind::HeapUpdate(..) => "folding/applying/packaging",
+        _ => "this expression",
+    }
+}
+
 fn lower_const_literal(c: &viper::ConstKind) -> Literal {
     match c {
         viper::ConstKind::Bool(b) => Literal::Bool(*b),
@@ -1474,6 +1483,10 @@ fn lower_statement(
 ) -> Result<typed::Statement, TypeError> {
     use viper::Statement as S;
     match stmt {
+        // Parsed only so the enclosing declaration survives to be reported;
+        // `scan_unsupported` normally rejects the declaration before we get
+        // here, so this is the backstop.
+        S::Unsupported(what) => Err(TypeError::Unsupported(what)),
         S::Assume(e) => Ok(typed::Statement::Assume(ctx.typecheck_spatial(e)?)),
         S::Assert(e) => Ok(typed::Statement::Assert(ctx.typecheck_spatial(e)?)),
         S::Refute(e) => Ok(typed::Statement::Refute(ctx.typecheck_spatial(e)?)),
@@ -1565,11 +1578,7 @@ fn lower_statement(
                 .map(|inv| ctx.typecheck_spatial::<MethodBodyExt>(&mut inv.0))
                 .collect::<Result<Vec<_>, _>>()?;
             let body = lower_stmt_block(&mut body.0, ctx)?;
-            Ok(typed::Statement::While(
-                cond,
-                invs,
-                typed::StmtBlock(body),
-            ))
+            Ok(typed::Statement::While(cond, invs, typed::StmtBlock(body)))
         }
     }
 }
@@ -2079,13 +2088,17 @@ fn check_axiom_function_calls(
 
 /// Type-check `program`, consuming `interner` into the returned typed program
 /// (every `Spur` it holds resolves through that interner).
-pub fn typecheck_program(
+/// Typecheck every declaration, returning what typechecked *and* what did not.
+/// A failing declaration is dropped from the returned program and reported by
+/// name; the rest is still lowered, so one unsupported method does not cost the
+/// file its other members. [`typecheck_program`] is the all-or-nothing wrapper.
+pub fn typecheck_program_reporting(
     program: &mut viper::Program,
     interner: Interner,
     globals: &Globals,
-) -> Result<typed::Program, Vec<TypeError>> {
+) -> (typed::Program, Vec<(String, TypeError)>) {
     let mut decls = Vec::new();
-    let mut errors = Vec::new();
+    let mut errors: Vec<(String, TypeError)> = Vec::new();
 
     // Domain functions/axioms are separate `DomainElement` decls; gather the
     // functions and axioms per owning domain so each `Domain` can carry them.
@@ -2150,7 +2163,7 @@ pub fn typecheck_program(
             });
             match result {
                 Ok(a) => domain_axioms.entry(de.domain.id()).or_default().push(a),
-                Err(e) => errors.push(e),
+                Err(e) => errors.push((interner.resolve(&de.domain.id()).to_string(), e)),
             }
         }
     }
@@ -2185,14 +2198,43 @@ pub fn typecheck_program(
         match result {
             Ok(Some(d)) => decls.push(d),
             Ok(None) => {}
-            Err(e) => errors.push(e),
+            Err(e) => errors.push((decl_name(decl, &interner), e)),
         }
     }
 
+    (typed::Program { decls, interner }, errors)
+}
+
+/// The name a declaration is reported under, matching `viper::units::unit_name`
+/// (a domain member is reported under its domain).
+fn decl_name(decl: &viper::Declaration, interner: &Interner) -> String {
+    let spur = match decl {
+        viper::Declaration::Import(i) => return format!("import {}", i.path),
+        viper::Declaration::Define(d) => d.name.0.id(),
+        viper::Declaration::Domain(d) => d.name.0.id(),
+        viper::Declaration::DomainElement(de) => de.domain.id(),
+        viper::Declaration::Field(f) => f.0.idn.0.id(),
+        viper::Declaration::Function(f) => f.signature.name.0.id(),
+        viper::Declaration::Predicate(p) => p.signature.name.0.id(),
+        viper::Declaration::Method(m) => m.signature.name.0.id(),
+        viper::Declaration::Adt(a) => a.name.0.id(),
+        viper::Declaration::AdtConstructor(c) => c.signature.name.0.id(),
+    };
+    interner.resolve(&spur).to_string()
+}
+
+/// All-or-nothing typechecking: the whole program, or every error it found.
+/// Kept for callers that have no per-declaration reporting to do.
+pub fn typecheck_program(
+    program: &mut viper::Program,
+    interner: Interner,
+    globals: &Globals,
+) -> Result<typed::Program, Vec<TypeError>> {
+    let (typed, errors) = typecheck_program_reporting(program, interner, globals);
     if errors.is_empty() {
-        Ok(typed::Program { decls, interner })
+        Ok(typed)
     } else {
-        Err(errors)
+        Err(errors.into_iter().map(|(_, e)| e).collect())
     }
 }
 

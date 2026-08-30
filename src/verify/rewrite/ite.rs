@@ -5,10 +5,7 @@
 //! same node loop: **decomposition** (the class's known value constrains its
 //! parts) and **reduction** (the parts' known values collapse the class).
 
-
-use egg::{
-    Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var,
-};
+use egg::{Applier, EGraph, Id, PatternAst, Rewrite, SearchMatches, Searcher, Subst, Symbol, Var};
 
 use crate::verify::analysis::ConstFold;
 use crate::verify::lang::{Discriminant, Symbolic};
@@ -209,7 +206,6 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
     }
 }
 
-
 /// Terminating `ite` simplifications, shared by the saturation rule set and the
 /// post-`fold`/`unfold` reduction set. Under an assumed branch literal these
 /// reduce a gated permission `b ? p : 0` to `p` (resp. `0`).
@@ -237,21 +233,3 @@ impl Applier<Symbolic, ConstFold> for IteReduceApplier {
 pub(super) fn terminating_ite_rules() -> Vec<Rule> {
     vec![Rewrite::new("ite-reduce", IteBucketSearcher, IteReduceApplier).expect("ite rule")]
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

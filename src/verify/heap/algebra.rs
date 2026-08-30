@@ -12,7 +12,6 @@
 //! (consume) and [`merge_heaps`]/[`union_heaps`] (control-flow join and loop frame
 //! restore). Everything else supports those.
 
-
 use crate::verify::{
     context::VerifyContext,
     error::VerifyError,
@@ -76,11 +75,7 @@ pub(crate) fn merge_chunks(
         if cube_eq(ctx, a.guard(), b.guard()) {
             // Shared cube: amounts stay bare and the guard is re-attached below.
             let g: HeapPc = a.guard_pc();
-            (
-                a.ungated_perm().clone(),
-                b.ungated_perm().clone(),
-                g,
-            )
+            (a.ungated_perm().clone(), b.ungated_perm().clone(), g)
         } else {
             (
                 a.gated_perm(ctx),
@@ -153,10 +148,7 @@ pub(crate) fn merge_chunks(
 /// why no pc/guard cube is threaded here, unlike the bound axiom.
 fn perm_add_wildcard(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> ChunkPerm {
     match (a, b) {
-        (
-            ChunkPerm::Leaf { id: x, wild: wx },
-            ChunkPerm::Leaf { id: y, wild: wy },
-        ) => {
+        (ChunkPerm::Leaf { id: x, wild: wx }, ChunkPerm::Leaf { id: y, wild: wy }) => {
             let (x, y, wild) = (*x, *y, *wx || *wy);
             let (xpos, ypos) = (perm_known_positive(ctx, x), perm_known_positive(ctx, y));
             if !wild || !(xpos || ypos) {
@@ -174,10 +166,10 @@ fn perm_add_wildcard(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) 
             // (a [`crate::vmir::PermVal`]) — is non-negative by construction.
             let mut facts: Vec<egg::Id> = Vec::new();
             if ypos {
-                facts.push(expr!(ctx, {x} <r {s}));
+                facts.push(expr!(ctx, { x } < r { s }));
             }
             if xpos {
-                facts.push(expr!(ctx, {y} <r {s}));
+                facts.push(expr!(ctx, { y } < r { s }));
             }
             ctx.assume_all_guarded(facts, &[]);
             ChunkPerm::wild_leaf(s)
@@ -314,8 +306,8 @@ pub(crate) fn assume_values_agree(
     other: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) {
-    let p_pos = expr!(ctx, (0/1) <r {p});
-    let eq = expr!(ctx, {v} == {other});
+    let p_pos = expr!(ctx, (0 / 1) < r { p });
+    let eq = expr!(ctx, { v } == { other });
     let antecedents = [(p_pos, Polarity::Positive)]
         .into_iter()
         .chain(pc_lits.iter().rev().copied());
@@ -335,15 +327,15 @@ pub(crate) fn merge_values(
     let zero = ctx.add(Symbolic::Lit(Literal::Real(num::BigRational::from(
         num::BigInt::from(0),
     ))));
-    let p0_pos = expr!(ctx, {zero} <r {p0});
-    let p1_pos = expr!(ctx, {zero} <r {p1});
+    let p0_pos = expr!(ctx, { zero } < r { p0 });
+    let p1_pos = expr!(ctx, { zero } < r { p1 });
 
     let value = expr!(ctx, if {p0_pos} then {v0} else {v1});
 
     // `(PC ∧ p0 > 0 ∧ p1 > 0) ==> (v0 == v1)` as the golden-rule ITE chain.
     // Fold innermost-first: p1_pos, p0_pos, then PC literals in reverse.
     let true_ = expr!(ctx, true);
-    let eq = expr!(ctx, {v0} == {v1});
+    let eq = expr!(ctx, { v0 } == { v1 });
     let antecedents = [(p1_pos, Polarity::Positive), (p0_pos, Polarity::Positive)]
         .into_iter()
         .chain(pc_lits.iter().rev().copied());
@@ -504,7 +496,7 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
         c.perm
             .for_each_leaf_under(&mut |l, arm| leaves.push((l, arm.to_vec())));
         for (leaf, arm) in leaves {
-            let le = expr!(ctx, not ({b} <r {leaf}));
+            let le = expr!(ctx, not({ b } < r { leaf }));
             // `cube ∧ arm ⇒ leaf ≤ b`; with both empty `implication` returns `le`
             // itself, so the unconditional hot path is the old `union(le, true_)`.
             let Some(gate) = cube_meet(ctx, cube, &arm) else {
@@ -561,7 +553,7 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
                 continue;
             };
             let b = ctx.add(Symbolic::Lit(Literal::Real(b.clone())));
-            let gt = expr!(ctx, {b} <r ({pi} +r {pj}));
+            let gt = expr!(ctx, { b } < r({ pi } + r { pj }));
             // Fold the joint guard into the trigger, preserving the
             // `union(eq, ite(gt, false, eq))` collapse shape — the equation stays
             // valid on every path, so the union may stay unconditional.
@@ -571,7 +563,7 @@ pub(crate) fn assume_location_axioms(ctx: &mut VerifyContext<'_>, h: &Heap) {
                 (chunks[i].addr, chunks[j].addr),
                 (chunks[j].addr, chunks[i].addr),
             ] {
-                let eq = expr!(ctx, {x} == {y});
+                let eq = expr!(ctx, { x } == { y });
                 // `gt ==> addr_x != addr_y`: when `gt` folds true the `ite`
                 // collapses `eq` to `false`.
                 let imp = expr!(ctx, if {gt} then false else {eq});
@@ -611,8 +603,7 @@ pub(crate) fn find_chunk_consolidated(
     // after a `reduce` are not comparable.
     let chunks_vec: Vec<Chunk> = h.chunks_of(kind).to_vec();
     let canon = ctx.egraph.find(addr);
-    let chunk_canons: Vec<egg::Id> =
-        chunks_vec.iter().map(|c| ctx.egraph.find(c.addr)).collect();
+    let chunk_canons: Vec<egg::Id> = chunks_vec.iter().map(|c| ctx.egraph.find(c.addr)).collect();
     let collect_found = |canon: egg::Id, chunk_canons: &[egg::Id]| -> Vec<Chunk> {
         chunks_vec
             .iter()
@@ -813,7 +804,7 @@ pub(crate) fn sufficient_leaf(
         }
     }
     // `held >= needed`, i.e. not (held < needed).
-    let goal = expr!(ctx, not ({h} <r {needed}));
+    let goal = expr!(ctx, not({ h } < r { needed }));
     if ctx.prove_under_pc(goal, pc) {
         return true;
     }
@@ -844,8 +835,7 @@ pub(crate) fn sufficient_leaf(
         pc_t.push((c, Polarity::Positive));
         let mut pc_e = pc.to_vec();
         pc_e.push((c, Polarity::Negative));
-        sufficient_leaf(ctx, t, needed, &pc_t, seen)
-            && sufficient_leaf(ctx, e, needed, &pc_e, seen)
+        sufficient_leaf(ctx, t, needed, &pc_t, seen) && sufficient_leaf(ctx, e, needed, &pc_e, seen)
     });
     seen.pop();
     proved
@@ -863,8 +853,8 @@ pub(crate) fn prove_perm_positive(
                 return true;
             }
         }
-        let zero = expr!(ctx, 0/1);
-        let goal = expr!(ctx, {zero} <r {h});
+        let zero = expr!(ctx, 0 / 1);
+        let goal = expr!(ctx, { zero } < r { h });
         ctx.prove_under_pc(goal, pc)
     })
 }
@@ -892,7 +882,7 @@ pub(crate) fn prove_perm_write(
         }
         let write = ctx.add(Symbolic::Lit(Literal::Real(cap.clone())));
         // Write permission at this leaf: not (held < cap).
-        let goal = expr!(ctx, not ({h} <r {write}));
+        let goal = expr!(ctx, not({ h } < r { write }));
         ctx.prove_under_pc(goal, pc)
     })
 }
@@ -915,13 +905,12 @@ pub(crate) fn prove_perm_write(
 /// literals the participating chunks' guards mention, never by a search bound.
 pub(crate) fn perm_add(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm) -> ChunkPerm {
     match (a, b) {
-        (
-            ChunkPerm::Leaf { id: x, wild: wx },
-            ChunkPerm::Leaf { id: y, wild: wy },
-        ) => ChunkPerm::Leaf {
-            id: ctx.add(Symbolic::Binary(BinOp::AddR, [*x, *y])),
-            wild: *wx || *wy,
-        },
+        (ChunkPerm::Leaf { id: x, wild: wx }, ChunkPerm::Leaf { id: y, wild: wy }) => {
+            ChunkPerm::Leaf {
+                id: ctx.add(Symbolic::Binary(BinOp::AddR, [*x, *y])),
+                wild: *wx || *wy,
+            }
+        }
         // Descend on `a` (this arm also covers `Select`/`Select`).
         (ChunkPerm::Select { cond, then, els }, other) => {
             let ot = ChunkPerm::restrict(ctx, *cond, other.clone(), true);
@@ -942,7 +931,11 @@ pub(crate) fn perm_add(ctx: &mut VerifyContext<'_>, a: &ChunkPerm, b: &ChunkPerm
 
 /// `held − needed`, kept structural (leaves get `SubR`, the tree stays a
 /// `Select` via the smart constructor so it never materializes as an `ite`).
-pub(crate) fn perm_sub(ctx: &mut VerifyContext<'_>, held: &ChunkPerm, needed: egg::Id) -> ChunkPerm {
+pub(crate) fn perm_sub(
+    ctx: &mut VerifyContext<'_>,
+    held: &ChunkPerm,
+    needed: egg::Id,
+) -> ChunkPerm {
     match held {
         // The demand is concrete on this path (a wildcard demand goes to
         // `debit_wildcard`), so the remainder's provenance is the held side's.
@@ -1000,9 +993,7 @@ pub(crate) fn perm_all_zero(ctx: &VerifyContext<'_>, perm: &ChunkPerm) -> bool {
             ctx.egraph[ctx.egraph.find(*id)].data.known(),
             Some(Literal::Real(r)) if *r == num::BigRational::from(num::BigInt::from(0))
         ),
-        ChunkPerm::Select { then, els, .. } => {
-            perm_all_zero(ctx, then) && perm_all_zero(ctx, els)
-        }
+        ChunkPerm::Select { then, els, .. } => perm_all_zero(ctx, then) && perm_all_zero(ctx, els),
     }
 }
 
@@ -1170,18 +1161,18 @@ pub(crate) fn heap_subtract_inner(
         // Both rungs stay: an `Err` falls through to the probe below.
         let demand_positive = !matches!(pass, ConsumePass::First)
             && known_real(ctx, chunk2_perm)
-            .is_some_and(|r| r > num::BigRational::from(num::BigInt::from(0)));
+                .is_some_and(|r| r > num::BigRational::from(num::BigInt::from(0)));
         if demand_positive
             && let Ok(h) = heap_subtract_summarized_fallbacks(
-            ctx,
-            h1,
-            out.clone(),
-            kind,
-            None,
-            chunk2.clone(),
-            chunk2_perm,
-            pc_lits,
-        )
+                ctx,
+                h1,
+                out.clone(),
+                kind,
+                None,
+                chunk2.clone(),
+                chunk2_perm,
+                pc_lits,
+            )
         {
             return Ok(h);
         }
@@ -1200,7 +1191,7 @@ pub(crate) fn heap_subtract_inner(
                 }
             )
         {
-            let nonpos = expr!(ctx, not ((0/1) <r {chunk2_perm}));
+            let nonpos = expr!(ctx, not((0 / 1) < r { chunk2_perm }));
             if ctx.prove_under_pc(nonpos, pc_lits) {
                 return Ok(out);
             }
@@ -1225,7 +1216,14 @@ pub(crate) fn heap_subtract_inner(
         // pc-guarded fact ground e-class matching cannot see), or under an equality
         // the pc does not mention.
         return heap_subtract_summarized_fallbacks(
-            ctx, h1, out, kind, None, chunk2, chunk2_perm, pc_lits,
+            ctx,
+            h1,
+            out,
+            kind,
+            None,
+            chunk2,
+            chunk2_perm,
+            pc_lits,
         );
     };
 
@@ -1402,7 +1400,7 @@ fn debit_wildcard_walk(
                 return (held.clone(), held_value, None);
             }
             let held_id = held.to_id(ctx);
-            let held_pos = expr!(ctx, (0/1) <r {held_id});
+            let held_pos = expr!(ctx, (0 / 1) < r { held_id });
             if !ctx.prove_under_pc(held_pos, pc_lits) {
                 return (
                     held.clone(),
@@ -1415,7 +1413,7 @@ fn debit_wildcard_walk(
             // both-held case — and `chunk2.value` is fresh besides.
             ctx.union(held_value, needed_value);
             let remainder = ctx.fresh_wildcard();
-            let lt = expr!(ctx, {remainder} <r {held_id});
+            let lt = expr!(ctx, { remainder } < r { held_id });
             ctx.assume_all_guarded([lt], pc_lits);
             (ChunkPerm::wild_leaf(remainder), held_value, None)
         }
@@ -1481,9 +1479,8 @@ pub(crate) fn heap_subtract_summarized_fallbacks(
     if !partners.is_empty() {
         let (set, total) = pc_alias_set(ctx, h1, kind, existing, &partners, pc_lits);
         if !set.is_empty() {
-            let r = heap_subtract_summarized(
-                ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits,
-            );
+            let r =
+                heap_subtract_summarized(ctx, out, kind, &set, total, chunk2, chunk2_perm, pc_lits);
             return r;
         }
     }
@@ -1589,7 +1586,7 @@ pub(crate) fn pc_alias_set(
     let set = members.into_iter().map(|c| (c, cube.clone())).collect();
     (
         set,
-        total.unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0/1))),
+        total.unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0 / 1))),
     )
 }
 
@@ -1657,7 +1654,7 @@ pub(crate) fn heap_subtract_summarized(
     // gate, so a chunk that is only conditionally at this address claims value
     // agreement only under that condition.
     for (chunk, cube) in set {
-        let agree = expr!(ctx, {chunk.value} == {chunk2.value});
+        let agree = expr!(ctx, { chunk.value } == { chunk2.value });
         ctx.assume_guarded(agree, cube.iter().rev().copied());
     }
 
@@ -1725,7 +1722,12 @@ pub(crate) fn heap_subtract_summarized(
 /// **transiently at each consume site** (`gate_perm_by_guard`), so merges stay
 /// flat while sufficiency/remainder keep the pre-hoist semantics. Runs only when
 /// both arms are live, so an absent side is a genuine conditional footprint.
-pub(crate) fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &Heap, h_els: &Heap) -> Heap {
+pub(crate) fn merge_heaps(
+    ctx: &mut VerifyContext<'_>,
+    cond: egg::Id,
+    h_then: &Heap,
+    h_els: &Heap,
+) -> Heap {
     let mut out = Heap::empty();
     let mut kinds: Vec<LocationKind> = h_then.kinds().cloned().collect();
     for k in h_els.kinds() {
@@ -1757,7 +1759,12 @@ pub(crate) fn merge_heaps(ctx: &mut VerifyContext<'_>, cond: egg::Id, h_then: &H
                         let perm = if ChunkPerm::same(ctx, a.ungated_perm(), b.ungated_perm()) {
                             a.ungated_perm().clone()
                         } else {
-                            ChunkPerm::select(ctx, cond, a.ungated_perm().clone(), b.ungated_perm().clone())
+                            ChunkPerm::select(
+                                ctx,
+                                cond,
+                                a.ungated_perm().clone(),
+                                b.ungated_perm().clone(),
+                            )
                         };
                         Some(
                             Chunk::new_perm(a.addr, perm, value)
@@ -1863,7 +1870,7 @@ pub(crate) fn summarize_perm_at(
             if ctx.egraph.find(c.addr) == canon {
                 (held, std::rc::Rc::from(Vec::new()))
             } else {
-                let eq = expr!(ctx, {c.addr} == {addr});
+                let eq = expr!(ctx, { c.addr } == { addr });
                 // Disproven aliasing contributes nothing — skip before minting the gate.
                 if matches!(
                     ctx.egraph[ctx.egraph.find(eq)].data.known(),
@@ -1900,7 +1907,7 @@ pub(crate) fn summarize_perm_at(
         });
     }
     (
-        total.unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0/1))),
+        total.unwrap_or_else(|| ChunkPerm::leaf(expr!(ctx, 0 / 1))),
         set,
     )
 }
@@ -1928,7 +1935,7 @@ pub(crate) fn perm_held_at(
     // goal. [`perm_known_positive`] reads it off the structure (its `Ite` arm
     // requires both), so state the fact here, once, where the value is built.
     if perm_known_positive(ctx, id) {
-        let pos = expr!(ctx, (0/1) <r {id});
+        let pos = expr!(ctx, (0 / 1) < r { id });
         let t = expr!(ctx, true);
         ctx.union(pos, t);
     }
@@ -1995,19 +2002,20 @@ pub(crate) fn union_heaps(
             out = out.with_chunk(kind, cb.clone());
             continue;
         };
-        let (pa, pb, guard): (ChunkPerm, ChunkPerm, HeapPc) = if cube_eq(ctx, ca.guard(), cb.guard()) {
-            (
-                ca.ungated_perm().clone(),
-                cb.ungated_perm().clone(),
-                ca.guard_pc(),
-            )
-        } else {
-            (
-                ca.gated_perm(ctx),
-                cb.gated_perm(ctx),
-                std::rc::Rc::from(Vec::new()),
-            )
-        };
+        let (pa, pb, guard): (ChunkPerm, ChunkPerm, HeapPc) =
+            if cube_eq(ctx, ca.guard(), cb.guard()) {
+                (
+                    ca.ungated_perm().clone(),
+                    cb.ungated_perm().clone(),
+                    ca.guard_pc(),
+                )
+            } else {
+                (
+                    ca.gated_perm(ctx),
+                    cb.gated_perm(ctx),
+                    std::rc::Rc::from(Vec::new()),
+                )
+            };
         // Decided against the *guard-gated* fractions: a chunk held only under its
         // guard is not held where the guard fails, however positive its bare amount.
         let a_held = prove_perm_positive(ctx, &pa, pc_lits);
@@ -2068,7 +2076,9 @@ mod tests {
     #[test]
     fn multiarg_location_nonaliasing_all_args_equal_is_inconsistent() {
         let interner = lasso::Rodeo::new();
-        let decls = typed_index_collections::TiVec::<crate::vmir::MemberId, crate::vmir::Declaration>::new();
+        let decls =
+            typed_index_collections::TiVec::<crate::vmir::MemberId, crate::vmir::Declaration>::new(
+            );
         let mut groups = lasso::Rodeo::<lasso::Spur>::new();
         let g = groups.get_or_intern("g");
         let mut alloc = crate::verify::func_registry::FuncRegistry::empty();
@@ -2136,7 +2146,10 @@ mod tests {
 
         let expected_perm = ctx.add(Symbolic::Binary(BinOp::AddR, [p1, p2]));
         ctx.saturate();
-        assert_eq!(ctx.egraph.find(chunk.perm_repr_id()), ctx.egraph.find(expected_perm));
+        assert_eq!(
+            ctx.egraph.find(chunk.perm_repr_id()),
+            ctx.egraph.find(expected_perm)
+        );
         // Both fractions positive (1, 2) → agreement axiom fuses the values.
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
         assert_eq!(ctx.egraph.find(chunk.value), ctx.egraph.find(v1));
@@ -2166,8 +2179,15 @@ mod tests {
         ctx.egraph.rebuild();
 
         let one = real(&mut ctx, 1, 1);
-        let out = heap_subtract(&mut ctx, &h, &test_kind(), Chunk::new(a, one, v0), &[], Demand::Concrete)
-            .expect("full permission is held across the two aliased fragments");
+        let out = heap_subtract(
+            &mut ctx,
+            &h,
+            &test_kind(),
+            Chunk::new(a, one, v0),
+            &[],
+            Demand::Concrete,
+        )
+        .expect("full permission is held across the two aliased fragments");
         // 1/2 + 1/2 − 1/1 = 0 const-folds → the emptied chunk is dropped.
         assert_eq!(out.entries().count(), 0);
     }
@@ -2323,9 +2343,16 @@ mod tests {
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p_have, v1));
         // Symbolic perms → `have >= take` not provable by equality saturation.
-        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p_take, v2), &[], Demand::Concrete)
-            .err()
-            .expect("symbolic-perm exhale must fail without a proof");
+        let err = heap_subtract(
+            &mut ctx,
+            &h1,
+            &test_kind(),
+            Chunk::new(a, p_take, v2),
+            &[],
+            Demand::Concrete,
+        )
+        .err()
+        .expect("symbolic-perm exhale must fail without a proof");
         assert!(matches!(
             err.root_cause(),
             VerifyError::InsufficientPermission
@@ -2348,8 +2375,15 @@ mod tests {
         ctx.union(a, b);
         ctx.egraph.rebuild();
 
-        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(b, p1, v2), &[], Demand::Concrete)
-            .expect("subtract should succeed");
+        let result = heap_subtract(
+            &mut ctx,
+            &h1,
+            &test_kind(),
+            Chunk::new(b, p1, v2),
+            &[],
+            Demand::Concrete,
+        )
+        .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         let chunk = result
@@ -2357,7 +2391,10 @@ mod tests {
             .expect("result chunk missing");
         let expected_perm = ctx.add(Symbolic::Lit(Literal::Real(num::BigInt::from(1).into())));
         ctx.egraph.rebuild();
-        assert_eq!(ctx.egraph.find(chunk.perm_repr_id()), ctx.egraph.find(expected_perm));
+        assert_eq!(
+            ctx.egraph.find(chunk.perm_repr_id()),
+            ctx.egraph.find(expected_perm)
+        );
         assert_eq!(ctx.egraph.find(v1), ctx.egraph.find(v2));
     }
 
@@ -2372,8 +2409,15 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
-        let result = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v2), &[], Demand::Concrete)
-            .expect("subtract should succeed");
+        let result = heap_subtract(
+            &mut ctx,
+            &h1,
+            &test_kind(),
+            Chunk::new(a, p1, v2),
+            &[],
+            Demand::Concrete,
+        )
+        .expect("subtract should succeed");
 
         let canon = ctx.egraph.find(a);
         assert!(
@@ -2394,9 +2438,16 @@ mod tests {
         let v2 = ctx.add(Symbolic::Fresh(3));
 
         let h1 = Heap::empty().with_chunk(&test_kind(), Chunk::new(a, p1, v1));
-        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p2, v2), &[], Demand::Concrete)
-            .err()
-            .expect("over-consumption must fail");
+        let err = heap_subtract(
+            &mut ctx,
+            &h1,
+            &test_kind(),
+            Chunk::new(a, p2, v2),
+            &[],
+            Demand::Concrete,
+        )
+        .err()
+        .expect("over-consumption must fail");
         assert!(matches!(
             err.root_cause(),
             VerifyError::InsufficientPermission
@@ -2414,16 +2465,22 @@ mod tests {
         let v1 = ctx.add(Symbolic::Fresh(2));
 
         let h1 = Heap::empty();
-        let err = heap_subtract(&mut ctx, &h1, &test_kind(), Chunk::new(a, p1, v1), &[], Demand::Concrete)
-            .err()
-            .expect("subtract from empty must fail");
+        let err = heap_subtract(
+            &mut ctx,
+            &h1,
+            &test_kind(),
+            Chunk::new(a, p1, v1),
+            &[],
+            Demand::Concrete,
+        )
+        .err()
+        .expect("subtract from empty must fail");
         assert!(matches!(
             err.root_cause(),
             VerifyError::InsufficientPermission
         ));
     }
 }
-
 
 // ---- pc-sensitive location lookups (moved off VerifyContext) ----
 
@@ -2443,7 +2500,7 @@ mod tests {
 /// The returned chunk's `perm`/`value` ids are live-graph ids (the probe never
 /// touches live state), so they are valid to discharge obligations over.
 pub(crate) fn chunk_under_pc<'c>(
-        ctx: &mut VerifyContext<'_>,
+    ctx: &mut VerifyContext<'_>,
     chunks: &'c [Chunk],
     addr: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
@@ -2482,7 +2539,7 @@ pub(crate) fn chunk_under_pc<'c>(
 /// Returns their addresses (stable keys into the heap group). Same probe shape as
 /// [`Self::chunk_under_pc`], but collects every match: sufficiency needs the sum.
 pub(crate) fn pc_alias_partners(
-        ctx: &mut VerifyContext<'_>,
+    ctx: &mut VerifyContext<'_>,
     chunks: &[Chunk],
     addr: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
@@ -2533,7 +2590,7 @@ pub(crate) fn pc_alias_partners(
 /// full amount comes off the demanded chunk where the pc holds, and nothing comes
 /// off where it does not (there the chunks are distinct and nothing was given up).
 pub(crate) fn gate_amount_by_pc(
-        ctx: &mut VerifyContext<'_>,
+    ctx: &mut VerifyContext<'_>,
     amount: egg::Id,
     pc_lits: &[(egg::Id, Polarity)],
 ) -> egg::Id {

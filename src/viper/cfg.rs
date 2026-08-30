@@ -470,9 +470,7 @@ fn insert_preheaders(
         // entry into it.
         let in_edges: Vec<BlockId> = blocks
             .iter_enumerated()
-            .filter(|(id, b)| {
-                successors(&b.term).contains(&head) && !loops.is_back_edge(*id, head)
-            })
+            .filter(|(id, b)| successors(&b.term).contains(&head) && !loops.is_back_edge(*id, head))
             .map(|(id, _)| id)
             .collect();
         // The entry block being the head means control also arrives from outside
@@ -629,7 +627,12 @@ mod tests {
     fn forward_goto_is_acyclic() {
         let mut r = Rodeo::default();
         let l = r.get_or_intern("L");
-        let body = block(vec![Statement::Goto(l), nop(), Statement::Label(l, vec![]), nop()]);
+        let body = block(vec![
+            Statement::Goto(l),
+            nop(),
+            Statement::Label(l, vec![]),
+            nop(),
+        ]);
         let cfg = build_cfg(&body).unwrap();
         assert_eq!(cfg.labels.get(&l).copied(), Some(BlockId(1)));
         assert!(matches!(cfg.blocks[cfg.entry].term, Terminator::Goto(b) if b == BlockId(1)));
@@ -683,7 +686,10 @@ mod tests {
         let cfg = build_cfg(&body).unwrap();
         assert_eq!(cfg.loops.loops.len(), 1);
         let head = cfg.loops.loops[0].head;
-        assert!(cfg.blocks[head].label.is_none(), "a while head needs no name");
+        assert!(
+            cfg.blocks[head].label.is_none(),
+            "a while head needs no name"
+        );
         assert!(matches!(cfg.blocks[head].term, Terminator::Branch { .. }));
         assert!(cfg.labels.is_empty());
     }

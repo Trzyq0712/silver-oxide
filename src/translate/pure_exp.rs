@@ -80,7 +80,11 @@ pub(crate) fn emit_unfold_pair(
     // The predicate's address: an ordinary application of its own id, typed
     // `&[group] Snap(P) @ unbounded` (see `resource::lower_resource_addr`).
     let group = b.group_tag(name);
-    let addr_ty = vmir::Type::addr(group, vmir::Type::Snap(call.resource), vmir::Bound::Unbounded);
+    let addr_ty = vmir::Type::addr(
+        group,
+        vmir::Type::Snap(call.resource),
+        vmir::Bound::Unbounded,
+    );
     let addr = sink.emit_pure(
         addr_ty,
         PureInst::FunctionCall(vmir::FunctionCall {
@@ -95,10 +99,7 @@ pub(crate) fn emit_unfold_pair(
     // The seam, named rather than implicit: `Sub` yields `Option<Snap(P)>`
     // because it discovers whether anything was there; the resource produce needs
     // a plain `Snap(P)`.
-    let snap = sink.emit_pure(
-        vmir::Type::Snap(call.resource),
-        PureInst::OptionUnwrap(opt),
-    );
+    let snap = sink.emit_pure(vmir::Type::Snap(call.resource), PureInst::OptionUnwrap(opt));
     sink.emit_resource_inhale(h_sub, call, perm, vmir::Bind::Bound(snap))
 }
 
@@ -125,7 +126,11 @@ pub(crate) fn emit_fold_pair(
     perm: vmir::PermVal,
 ) -> HeapVal {
     let group = b.group_tag(name);
-    let addr_ty = vmir::Type::addr(group, vmir::Type::Snap(call.resource), vmir::Bound::Unbounded);
+    let addr_ty = vmir::Type::addr(
+        group,
+        vmir::Type::Snap(call.resource),
+        vmir::Bound::Unbounded,
+    );
     let addr = sink.emit_pure(
         addr_ty,
         PureInst::FunctionCall(vmir::FunctionCall {
@@ -1065,15 +1070,15 @@ pub(crate) fn lower_function_body<Ext: PureExt>(
             args,
             snap,
         }) => sink.emit_heap(HeapInst::Inhale {
-                base: HeapVal::Empty,
-                bind: vmir::Bind::Bound(snap),
-                call: vmir::ResourceCall { resource, args },
-                // `1/1`, NOT `wildcard`: the scale multiplies each footprint
-                // slot's own permission, so `1/1` reproduces the amounts the
-                // dedicated instruction used (`1 * p` folds away). A wildcard
-                // scale would silently rewrite every slot to `w * p`.
-                perm: vmir::PermVal::write(),
-            }),
+            base: HeapVal::Empty,
+            bind: vmir::Bind::Bound(snap),
+            call: vmir::ResourceCall { resource, args },
+            // `1/1`, NOT `wildcard`: the scale multiplies each footprint
+            // slot's own permission, so `1/1` reproduces the amounts the
+            // dedicated instruction used (`1 * p` folds away). A wildcard
+            // scale would silently rewrite every slot to `w * p`.
+            perm: vmir::PermVal::write(),
+        }),
         None => heap,
     };
     let hctx = HeapCtx {
