@@ -393,3 +393,44 @@ method client(r: Ref)
         "a resource body must still release its callee where its condition holds"
     );
 }
+
+#[test]
+fn dead_arm_verdict_does_not_poison_the_join() {
+    // `assume b` makes the `else` arm's cube unsatisfiable, so its `assert false`
+    // holds vacuously. That verdict is valid *only* under the arm's cube — and the
+    // cube is ambient, not part of the obligation's pc delta, so the memo saw an
+    // empty pc and published the bare goal (`false`) into ground, merging `false`
+    // with `true` for every later block. Exported under the cube it is the sound
+    // `¬b ⇒ false`, which folds away where the cube is unsat.
+    let input = r#"
+method client(b: Bool)
+{
+    assume b
+    if (b) { assert true } else { assert false }
+    assert false
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_err(),
+        "a vacuous verdict from a dead arm must not discharge the join's `assert false`"
+    );
+}
+
+#[test]
+fn dead_arm_obligation_is_still_vacuously_discharged() {
+    // Non-vacuity for the test above: the dead arm's own `assert false` must
+    // still pass — the fix guards the *export*, it does not drop the verdict.
+    let input = r#"
+method client(b: Bool)
+{
+    assume b
+    if (b) { assert true } else { assert false }
+}
+"#;
+    let program = lower(input);
+    assert!(
+        verify_named_method(&program, "client").is_ok(),
+        "an unreachable arm's obligations hold vacuously"
+    );
+}

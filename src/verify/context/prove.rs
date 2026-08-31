@@ -289,7 +289,23 @@ impl<'a> VerifyContext<'a> {
         if self.in_block {
             let proven = self.prove_via_scratch(goal, pc_lits);
             if proven {
-                self.record_proven(imp, true_, pc_lits.is_empty());
+                // Export under the **full** path condition. `pc_lits` is only the
+                // instruction's delta; the block's cube is ambient — assumed by the
+                // scratch, absent from `imp`. Recording `imp` would publish a verdict
+                // that only holds under the cube as if it held under the delta alone,
+                // and for an empty delta that is the bare goal: a dead arm's
+                // `assert false` merged `false` with `true` in ground and poisoned
+                // every later block. Guarded by the cube it is exactly the fact the
+                // arm licenses (`¬b ⇒ false`), true even where the cube is unsat.
+                let cube = std::mem::take(&mut self.current_cube);
+                let (full_imp, full_empty) = if cube.is_empty() {
+                    (imp, pc_lits.is_empty())
+                } else {
+                    let lits: Vec<_> = cube.iter().chain(pc_lits).rev().copied().collect();
+                    (self.implication(goal, lits.into_iter()), false)
+                };
+                self.current_cube = cube;
+                self.record_proven(full_imp, true_, full_empty);
             }
             return proven;
         }
