@@ -1,0 +1,9 @@
+// `[A, B]` gives the body `A` and charges the caller `B`. Folding the pair into
+// a conjunction would hand the body a permission it was never given.
+field f: Int
+
+method read(x: Ref) returns (v: Int)
+  requires [true, acc(x.f)]
+{
+  v := x.f
+}

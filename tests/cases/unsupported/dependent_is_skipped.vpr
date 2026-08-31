@@ -1,0 +1,14 @@
+// A predicate rejected for an unsupported construct takes its users with it:
+// `use_p` cannot be said to verify once `p` is gone.
+field f: Int
+
+predicate p(x: Ref) {
+  acc(x.f) --* acc(x.f)
+}
+
+method use_p(x: Ref)
+  requires p(x)
+  ensures  p(x)
+{
+  assert true
+}

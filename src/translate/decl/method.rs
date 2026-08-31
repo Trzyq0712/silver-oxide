@@ -722,11 +722,17 @@ fn collect_var_types(
     }
 }
 
-/// Inhale or exhale a loop invariant against `heap`, clause by clause in source
-/// order (which is what makes self-framing order-dependent, exactly as for a
-/// conjunction). Mirrors the `S::Inhale` / `S::Exhale` arms of [`lower_stmt`]:
-/// an inhale assumes the assertion's boolean, an exhale asserts it against the
-/// pre-exhale heap.
+/// Inhale or exhale a loop invariant against `heap`. The clauses are
+/// conjoined into a single assertion tree (`A && B && ...`) and lowered in
+/// one `lower_spatial` call — exactly as a single `invariant A && B` would be
+/// — rather than lowered clause by clause with a separate `lower_spatial`
+/// call per clause. The latter would re-fix `value_heap` (the heap pure
+/// sub-expressions read from) to the *post-previous-clause* heap on every
+/// iteration, so an exhale's later clause would see the permission its
+/// earlier clause had just subtracted and reject a field read the invariant,
+/// read as a whole, plainly justifies (e.g. `invariant acc(a.f) invariant
+/// a.f == 7`). A single `lower_spatial` call keeps `value_heap` fixed for the
+/// whole invariant on exhale, matching `S::Conj`'s own handling of `&&`.
 fn lower_invariant(
     b: &TranslationContext<'_>,
     env: &HashMap<Spur, Val>,
@@ -736,25 +742,26 @@ fn lower_invariant(
     exhale: bool,
     old: &pure_exp::OldHeaps<'_>,
 ) -> Result<HeapVal, TranslationError> {
-    let mut heap = heap;
-    for inv in invs {
-        let mode = if exhale {
-            SpatialMode::Exhale { value_heap: heap }
+    let Some((first, rest)) = invs.split_first() else {
+        return Ok(heap);
+    };
+    let conj = rest.iter().cloned().fold(first.clone(), |acc, inv| {
+        typed::SpatialExp(Box::new(typed::SpatialExpKind::Conj(acc, inv)))
+    });
+    let mode = if exhale {
+        SpatialMode::Exhale { value_heap: heap }
+    } else {
+        SpatialMode::Inhale
+    };
+    let (h_out, bv) = spatial::lower_spatial(b, env, sink, heap, mode, Some(old), &conj)?;
+    if let Some(v) = bv {
+        if exhale {
+            sink.with_heap(heap, |sink| sink.emit_assert(v));
         } else {
-            SpatialMode::Inhale
-        };
-        let pre = heap;
-        let (h_out, bv) = spatial::lower_spatial(b, env, sink, heap, mode, Some(old), inv)?;
-        if let Some(v) = bv {
-            if exhale {
-                sink.with_heap(pre, |sink| sink.emit_assert(v));
-            } else {
-                sink.emit_assume(v);
-            }
+            sink.emit_assume(v);
         }
-        heap = h_out;
     }
-    Ok(heap)
+    Ok(h_out)
 }
 
 /// Every variable a loop body assigns to or declares — the havoc set.

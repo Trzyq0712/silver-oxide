@@ -1,0 +1,23 @@
+// A loop invariant split over several `invariant` clauses must be checked as
+// though the clauses were conjoined with `&&`: the second clause reads `a.f`,
+// which only the first clause's `acc(a.f)` grants. Lowering each clause with
+// its own `lower_spatial` call (fixing `value_heap` to the post-previous-
+// clause heap on every iteration) would exhale away the first clause's
+// permission before the second clause could read it.
+field f: Int
+
+method split_invariant_clauses(a: Ref)
+  requires acc(a.f)
+  ensures acc(a.f)
+{
+    a.f := 7
+    var k: Int := 0
+    while (k < 3)
+      invariant acc(a.f)
+      invariant a.f == 7
+    {
+        k := k + 1
+    }
+    assert acc(a.f)
+    assert a.f == 7
+}

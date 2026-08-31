@@ -1,0 +1,21 @@
+// One method uses a construct we do not implement; the other must still be
+// verified, and the method that calls the rejected one must not be.
+field f: Int
+
+method uses_seq(xs: Seq[Int])
+{
+  assert true
+}
+
+method fine(x: Ref)
+  requires acc(x.f)
+  ensures  acc(x.f)
+{
+  x.f := 1
+  assert x.f == 1
+}
+
+method calls_rejected(xs: Seq[Int])
+{
+  uses_seq(xs)
+}

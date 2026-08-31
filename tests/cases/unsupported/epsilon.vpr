@@ -1,0 +1,10 @@
+// `epsilon` has no representation here: lowering it to a concrete fraction
+// would silently change what the program means.
+field f: Int
+
+method leak(x: Ref)
+  requires acc(x.f, write)
+  ensures  acc(x.f, write)
+{
+  exhale acc(x.f, epsilon)
+}
