@@ -1063,6 +1063,17 @@ fn lower_new(
     let v = sink.emit_pure(Type::Ref, PureInst::Fresh);
     env.insert(lhs, v.clone());
 
+    // `new` always yields a fresh *non-null* reference.
+    let is_null = sink.emit_pure(
+        Type::Bool,
+        PureInst::Binary(vmir::BinOp::Eq, v.clone(), vmir::NULL),
+    );
+    let non_null = sink.emit_pure(
+        Type::Bool,
+        PureInst::Ternary(is_null, vmir::FALSE, vmir::TRUE),
+    );
+    sink.emit_assume(non_null);
+
     match sof {
         typed::StarOrFields::Fields(fields) => {
             let mut heap = current_heap;
